@@ -1,0 +1,13 @@
+name = "stock-research-worker"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# KV namespace for recommendation history + Yahoo crumb cache
+[[kv_namespaces]]
+binding = "REC_LOG"
+id = "6e2feae8a08c4db0b564e5bce18d2b01"
+
+# Secrets — set via CLI (never commit values to source):
+#   npx wrangler secret put ANTHROPIC_API_KEY
+#   npx wrangler secret put ALPACA_KEY
+#   npx wrangler secret put ALPACA_SECRET
