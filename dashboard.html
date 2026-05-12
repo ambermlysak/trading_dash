@@ -221,6 +221,24 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .skeleton { background: linear-gradient(90deg, var(--bg-2) 25%, var(--bg-3) 50%, var(--bg-2) 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 4px; }
 @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
 
+/* EOD card */
+.eod-card {
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: 10px;
+  padding: 18px 28px; margin-bottom: 24px;
+  display: none;
+}
+.eod-card.visible { display: block; }
+.eod-header { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.eod-badge { font-size: 9px; font-family: var(--mono); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; padding: 3px 8px; border-radius: 3px; background: var(--cyan-soft); color: var(--cyan); }
+.eod-headline { font-family: var(--serif); font-size: 16px; font-weight: 300; color: var(--ink-0); font-style: italic; }
+.eod-body { font-size: 13px; color: var(--ink-2); line-height: 1.6; }
+.eod-ts { font-size: 10px; color: var(--ink-3); font-family: var(--mono); margin-top: 8px; }
+
+/* IPO status badge */
+.ipo-status { font-size: 9px; font-family: var(--mono); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 5px; border-radius: 3px; }
+.ipo-status.upcoming { background: var(--bull-soft);  color: var(--bull); }
+.ipo-status.filed    { background: var(--amber-soft); color: var(--amber); }
+
 /* Tab panels */
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
@@ -253,6 +271,15 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <div class="headline-ts" id="headline-ts"></div>
     </div>
 
+    <div class="eod-card" id="eod-card">
+      <div class="eod-header">
+        <span class="eod-badge">Market Close</span>
+        <div class="eod-headline" id="eod-headline"></div>
+      </div>
+      <div class="eod-body" id="eod-body"></div>
+      <div class="eod-ts" id="eod-ts"></div>
+    </div>
+
     <div class="section-head">Market Intelligence</div>
     <div class="news-grid" id="news-grid">
       <!-- populated by JS -->
@@ -276,8 +303,8 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <div class="card">
         <div class="card-title">Upcoming IPOs</div>
         <table class="ipo-table">
-          <thead><tr><th>Company</th><th>Ticker</th><th>Date</th><th>Price</th></tr></thead>
-          <tbody id="ipo-tbody"><tr><td colspan="4" class="loading">Loading…</td></tr></tbody>
+          <thead><tr><th>Company</th><th>Ticker</th><th>Date</th><th>Price</th><th>Status</th></tr></thead>
+          <tbody id="ipo-tbody"><tr><td colspan="5" class="loading">Loading…</td></tr></tbody>
         </table>
       </div>
 
@@ -407,6 +434,17 @@ async function loadDailySnapshot() {
       }
     }
 
+    // EOD summary (shown when available, hides if morning only)
+    if (data.eod) {
+      document.getElementById('eod-headline').textContent = data.eod.headline || '';
+      document.getElementById('eod-body').textContent     = data.eod.body || '';
+      if (data.eod.ts) {
+        const d = new Date(data.eod.ts);
+        document.getElementById('eod-ts').textContent = 'As of ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+      }
+      document.getElementById('eod-card').classList.add('visible');
+    }
+
     // News cards
     const cards = data.newsCards || [];
     document.getElementById('news-grid').innerHTML = cards.map(c => {
@@ -469,7 +507,7 @@ async function loadIPOs() {
     const { ipos } = await apiFetch('/market/ipos');
     const tbody = document.getElementById('ipo-tbody');
     if (!ipos || !ipos.length) {
-      tbody.innerHTML = '<tr><td colspan="4" style="color:var(--ink-3);padding:10px 0;font-size:12px">No upcoming IPOs found.</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="5" style="color:var(--ink-3);padding:10px 0;font-size:12px">No upcoming IPOs found.</td></tr>';
       return;
     }
     tbody.innerHTML = ipos.map(ipo => `<tr>
@@ -477,10 +515,11 @@ async function loadIPOs() {
       <td><span class="ipo-ticker">${esc(ipo.ticker || '—')}</span></td>
       <td><span class="ipo-date">${esc(ipo.date || '—')}</span></td>
       <td style="font-family:var(--mono);font-size:11px">${esc(ipo.price || 'TBD')}</td>
+      <td><span class="ipo-status ${esc(ipo.status || 'upcoming')}">${esc(ipo.status || 'upcoming')}</span></td>
     </tr>`).join('');
   } catch (e) {
     console.error('[ipos]', e.message);
-    document.getElementById('ipo-tbody').innerHTML = '<tr><td colspan="4" style="color:var(--ink-3)">Unavailable.</td></tr>';
+    document.getElementById('ipo-tbody').innerHTML = '<tr><td colspan="5" style="color:var(--ink-3)">Unavailable.</td></tr>';
   }
 }
 
@@ -549,7 +588,7 @@ function renderWatchlist() {
 
     html += `<tr class="${earningsCls}${expandedCls}" data-ticker="${esc(s.symbol)}">
       <td><button class="rm-btn" data-remove="${esc(s.symbol)}" title="Remove">×</button></td>
-      <td class="ticker-cell"><a href="${EQUITY_URL}?t=${esc(s.symbol)}" target="_blank" onclick="event.stopPropagation()">${esc(s.symbol)}</a></td>
+      <td class="ticker-cell"><a href="${EQUITY_URL}?t=${esc(s.symbol)}" onclick="event.stopPropagation()">${esc(s.symbol)}</a></td>
       <td class="mono">${s.price != null ? fmt(s.price) : '—'}</td>
       <td class="${clsChg(s.changePct)}">${fmtPct(s.changePct)}</td>
       <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;color:var(--ink-2);font-size:11px">${esc(s.trend || '—')}</td>

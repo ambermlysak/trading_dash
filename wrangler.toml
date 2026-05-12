@@ -2,12 +2,30 @@ name = "stock-research-worker"
 main = "worker.js"
 compatibility_date = "2024-09-01"
 
-# KV namespace for recommendation history + Yahoo crumb cache
 [[kv_namespaces]]
 binding = "REC_LOG"
 id = "6e2feae8a08c4db0b564e5bce18d2b01"
 
-# Secrets — set via CLI (never commit values to source):
-#   npx wrangler secret put ANTHROPIC_API_KEY
-#   npx wrangler secret put ALPACA_KEY
-#   npx wrangler secret put ALPACA_SECRET
+# KV keys used:
+#   yahoo:crumb         — Yahoo session crumb (50-min TTL)
+#   daily:snapshot      — 6am Claude synthesis (headline, newsCards, opportunity, avoid)
+#   daily:eod           — 1:15pm PT end-of-day summary (headline, body)
+#   analysis:{TICKER}   — per-ticker Claude analysis (trend, pattern, action, summary)
+#   fund:{TICKER}       — per-ticker Yahoo fundamentals cache (6h TTL)
+#   market:ipos         — IPO calendar cache (12h TTL)
+#   rec:{TICKER}        — recommendation history
+
+[triggers]
+# Morning: 6am PT
+#   13:00 UTC = 6am PDT (summer, UTC-7)
+#   14:00 UTC = 6am PST (winter, UTC-8)
+# EOD: 1:15pm PT (≈15 min after market close at 1pm PT)
+#   20:15 UTC = 1:15pm PDT (summer)
+#   21:15 UTC = 1:15pm PST (winter)
+# Each pair deduplicates via KV timestamp check (2-hour window).
+crons = ["0 13 * * 1-5", "0 14 * * 1-5", "15 20 * * 1-5", "15 21 * * 1-5"]
+
+# Required secrets (set via: npx wrangler secret put <NAME>):
+#   ANTHROPIC_API_KEY  — Anthropic API key
+#   ALPACA_KEY         — Alpaca API key ID (optional, improves price + news quality)
+#   ALPACA_SECRET      — Alpaca API secret key

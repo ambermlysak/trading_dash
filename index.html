@@ -118,6 +118,14 @@ body::after {
 
 .topbar-meta { display: flex; gap: 20px; font-size: 12px; color: var(--ink-2); font-family: var(--mono); }
 .topbar-meta b { color: var(--ink-1); font-weight: 500; }
+.back-link {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--sans); font-size: 12px; font-weight: 500; color: var(--ink-2);
+  text-decoration: none; padding: 5px 12px; border-radius: 4px;
+  border: 1px solid var(--line); background: transparent; cursor: pointer;
+  transition: all 0.15s; white-space: nowrap;
+}
+.back-link:hover { color: var(--ink-0); border-color: var(--cyan); }
 
 /* ------- Hero strip ------- */
 .hero {
@@ -491,6 +499,7 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
       <span>STATUS <b id="market-status">—</b></span>
       <span>UPDATED <b id="last-updated">—</b></span>
     </div>
+    <a class="back-link" id="back-link" href="dashboard.html" style="display:none">← Watchlist</a>
   </div>
 
   <!-- HERO STRIP -->
@@ -1973,6 +1982,7 @@ document.querySelectorAll('.chart-btn').forEach(btn => {
 initChart();
 const _urlTicker = new URLSearchParams(location.search).get('t');
 loadTicker((_urlTicker || state.ticker).toUpperCase());
+if (_urlTicker) document.getElementById('back-link').style.display = '';
 </script>
 </body>
 </html>

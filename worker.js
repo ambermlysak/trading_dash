@@ -44,8 +44,10 @@ const SNAPSHOT_SYMBOLS = {
   'ES=F':  'S&P Futures',
   'NQ=F':  'NQ Futures',
   'GC=F':  'Gold',
+  'SI=F':  'Silver',
   'CL=F':  'WTI Oil',
   '^TNX':  '10Y Yield',
+  '^VIX':  'VIX',
 };
 
 const DEFAULT_WATCHLIST = [
@@ -545,30 +547,96 @@ async function handleMarketIPOs(origin, env) {
     if (cached && Date.now() - cached.ts < TTL) return json(cached, 200, origin);
   } catch (_) {}
 
+  const NASDAQ_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Origin': 'https://www.nasdaq.com',
+    'Referer': 'https://www.nasdaq.com/market-activity/ipos',
+  };
+
+  // Build list of months to fetch (current + next 2)
   const today = new Date();
-  const from  = today.toISOString().split('T')[0];
-  const to    = new Date(today.getTime() + 30 * 86_400_000).toISOString().split('T')[0];
+  const months = [0, 1, 2].map(offset => {
+    const d = new Date(today.getFullYear(), today.getMonth() + offset, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  });
 
   let ipos = [];
-  try {
-    const r = await fetch(
-      `https://query2.finance.yahoo.com/v2/finance/calendar/ipo?from=${from}&to=${to}`,
-      { headers: YAHOO_HEADERS },
-    );
-    if (r.ok) {
-      const d      = await r.json();
-      const events = d.ipoCalendar?.ipoData || [];
-      ipos = events.slice(0, 12).map(e => ({
-        name:     e.companyName || e.company || '',
-        ticker:   e.symbol || '',
-        date:     e.startDate?.fmt || e.date || '',
-        exchange: e.exchange || '',
-        price:    e.priceLow && e.priceHigh ? `$${e.priceLow}–$${e.priceHigh}` : (e.price || 'TBD'),
-      }));
-    }
-  } catch (_) {}
 
-  const result = { ipos, ts: Date.now() };
+  // Primary: NASDAQ IPO calendar API
+  try {
+    const results = await Promise.allSettled(
+      months.map(m => fetch(`https://api.nasdaq.com/api/ipo/calendar?date=${m}`, { headers: NASDAQ_HEADERS })),
+    );
+    for (const res of results) {
+      if (res.status !== 'fulfilled' || !res.value.ok) continue;
+      const d = await res.value.json();
+      // Upcoming (not yet priced)
+      const upcoming = d.data?.upcoming?.upcomingTable?.rows || [];
+      for (const row of upcoming) {
+        const sym = row.proposedTickerSymbol?.trim() || '';
+        if (ipos.find(i => i.ticker === sym && sym)) continue;
+        ipos.push({
+          name:     row.companyName || '',
+          ticker:   sym,
+          date:     row.expectedPriceDate || '',
+          exchange: row.proposedExchange || '',
+          price:    row.proposedSharePrice || 'TBD',
+          status:   'upcoming',
+        });
+      }
+      // Recently filed (S-1 / prospectus)
+      const filings = d.data?.filings?.filingTable?.rows || [];
+      for (const row of filings) {
+        const sym = row.proposedTickerSymbol?.trim() || '';
+        if (ipos.find(i => i.ticker === sym && sym)) continue;
+        ipos.push({
+          name:     row.companyName || '',
+          ticker:   sym,
+          date:     row.filedDate || '',
+          exchange: row.proposedExchange || '',
+          price:    row.proposedSharePrice || 'TBD',
+          status:   'filed',
+        });
+      }
+    }
+  } catch (e) {
+    console.error('[ipos] NASDAQ failed:', e.message);
+  }
+
+  // Fallback: Yahoo Finance IPO calendar
+  if (!ipos.length) {
+    try {
+      const from = today.toISOString().split('T')[0];
+      const to   = new Date(today.getTime() + 90 * 86_400_000).toISOString().split('T')[0];
+      const r    = await fetch(
+        `https://query2.finance.yahoo.com/v2/finance/calendar/ipo?from=${from}&to=${to}`,
+        { headers: YAHOO_HEADERS },
+      );
+      if (r.ok) {
+        const d      = await r.json();
+        const events = d.ipoCalendar?.ipoData || [];
+        ipos = events.map(e => ({
+          name:     e.companyName || e.company || '',
+          ticker:   e.symbol || '',
+          date:     e.startDate?.fmt || e.date || '',
+          exchange: e.exchange || '',
+          price:    e.priceLow && e.priceHigh ? `$${e.priceLow}–$${e.priceHigh}` : (e.price || 'TBD'),
+          status:   'upcoming',
+        }));
+      }
+    } catch (e) {
+      console.error('[ipos] Yahoo fallback failed:', e.message);
+    }
+  }
+
+  // Sort: upcoming by date asc, filed after
+  ipos.sort((a, b) => {
+    if (a.status !== b.status) return a.status === 'upcoming' ? -1 : 1;
+    return (a.date || '').localeCompare(b.date || '');
+  });
+
+  const result = { ipos: ipos.slice(0, 20), ts: Date.now() };
   env?.REC_LOG?.put(KV_KEY, JSON.stringify(result), { expirationTtl: 43200 }).catch(() => {});
   return json(result, 200, origin);
 }
@@ -679,15 +747,20 @@ async function handleWatchlistBatch(symbols, origin, env) {
 
 async function handleDailyGet(origin, env, ctx) {
   try {
-    const snapshot = await env?.REC_LOG?.get('daily:snapshot', 'json');
-    if (snapshot) return json(snapshot, 200, origin);
+    const [snapshotRes, eodRes] = await Promise.allSettled([
+      env?.REC_LOG?.get('daily:snapshot', 'json'),
+      env?.REC_LOG?.get('daily:eod', 'json'),
+    ]);
+    const snapshot = snapshotRes.status === 'fulfilled' ? snapshotRes.value : null;
+    const eod      = eodRes.status      === 'fulfilled' ? eodRes.value      : null;
+
+    if (snapshot) return json({ ...snapshot, eod: eod || null }, 200, origin);
   } catch (_) {}
 
-  // No snapshot yet — kick off generation and return loading state
+  // No snapshot yet — kick off generation in background
   if (ctx && env?.ANTHROPIC_API_KEY) {
     ctx.waitUntil(generateDailySnapshot(env));
   }
-
   return json({ loading: true, ts: Date.now() }, 200, origin);
 }
 
@@ -857,6 +930,89 @@ Return ONLY valid JSON, no markdown fences.`;
   console.log('[cron] ticker analyses refreshed');
 }
 
+/* ── Cron: end-of-day summary (1:15pm PT, ~15 min after market close) ── */
+async function generateEODSummary(env) {
+  try {
+    const existing = await env?.REC_LOG?.get('daily:eod', 'json');
+    if (existing && Date.now() - existing.ts < 7_200_000) {
+      console.log('[cron] eod fresh, skipping');
+      return;
+    }
+  } catch (_) {}
+
+  // Current market snapshot
+  let marketLines = '';
+  try {
+    const tickers = Object.keys(SNAPSHOT_SYMBOLS);
+    const results = await Promise.allSettled(
+      tickers.map(t => yahoo(`/v8/finance/chart/${encodeURIComponent(t)}`, '?range=1d&interval=1d')),
+    );
+    marketLines = tickers.map((t, i) => {
+      if (results[i].status !== 'fulfilled') return null;
+      const meta  = results[i].value?.chart?.result?.[0]?.meta || {};
+      const price = meta.regularMarketPrice;
+      const prev  = meta.chartPreviousClose ?? meta.previousClose;
+      if (price == null || prev == null) return null;
+      const chg = ((price - prev) / prev * 100).toFixed(2);
+      return `${SNAPSHOT_SYMBOLS[t]}: ${price.toFixed(2)} (${chg >= 0 ? '+' : ''}${chg}%)`;
+    }).filter(Boolean).join('\n');
+  } catch (_) {}
+
+  // Today's news
+  let newsLines = '';
+  try {
+    if (env?.ALPACA_KEY && env?.ALPACA_SECRET) {
+      const data = await alpacaFetch('/v1beta1/news?limit=20&sort=desc', env);
+      newsLines = (data.news || []).slice(0, 15).map(n => `• ${n.headline}`).join('\n');
+    } else {
+      const r = await fetch(
+        'https://query2.finance.yahoo.com/v1/finance/search?q=stock+market&quotesCount=0&newsCount=15',
+        { headers: YAHOO_HEADERS },
+      );
+      if (r.ok) {
+        const d = await r.json();
+        newsLines = (d.news || []).slice(0, 15).map(n => `• ${n.title}`).join('\n');
+      }
+    }
+  } catch (_) {}
+
+  const dateStr = new Date().toLocaleDateString('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
+    timeZone: 'America/Los_Angeles',
+  });
+
+  const prompt = `You are a professional market analyst. US markets just closed for ${dateStr}.
+
+FINAL MARKET DATA:
+${marketLines || 'Not available'}
+
+TODAY'S NEWS:
+${newsLines || 'Not available'}
+
+Write a concise end-of-day market summary as valid JSON (no markdown):
+{
+  "headline": "One-sentence session summary (max 120 chars)",
+  "body": "3-4 sentences: overall session character, key sector rotation or notable movers, what the close sets up for tomorrow."
+}`;
+
+  let eod;
+  try {
+    const text    = await workerClaude(prompt, env, 500);
+    const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    eod = JSON.parse(cleaned);
+  } catch (e) {
+    console.error('[cron] eod parse failed:', e.message);
+    eod = { headline: `Market closed ${dateStr}`, body: 'Market data unavailable.' };
+  }
+
+  await env?.REC_LOG?.put(
+    'daily:eod',
+    JSON.stringify({ ...eod, ts: Date.now() }),
+    { expirationTtl: 86400 },
+  );
+  console.log('[cron] eod summary saved');
+}
+
 /* ── Main fetch handler ── */
 export default {
   async fetch(request, env, ctx) {
@@ -910,6 +1066,11 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(generateDailySnapshot(env));
+    // EOD crons fire at 20:15 or 21:15 UTC (1:15pm PDT / PST)
+    if (event.cron === '15 20 * * 1-5' || event.cron === '15 21 * * 1-5') {
+      ctx.waitUntil(generateEODSummary(env));
+    } else {
+      ctx.waitUntil(generateDailySnapshot(env));
+    }
   },
 };
