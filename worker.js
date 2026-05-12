@@ -752,12 +752,25 @@ async function handleDailyGet(origin, env, ctx) {
       env?.REC_LOG?.get('daily:eod', 'json'),
     ]);
     const snapshot = snapshotRes.status === 'fulfilled' ? snapshotRes.value : null;
-    const eod      = eodRes.status      === 'fulfilled' ? eodRes.value      : null;
+    const eod      = eodRes.status === 'fulfilled' ? eodRes.value : null;
 
-    if (snapshot) return json({ ...snapshot, eod: eod || null }, 200, origin);
+    // Auto-trigger EOD generation if market is closed, data is missing, and we have API access
+    let eodLoading = false;
+    if (!eod && ctx && env?.ANTHROPIC_API_KEY) {
+      const ptNow    = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+      const isWeekday = ptNow.getDay() >= 1 && ptNow.getDay() <= 5;
+      const minsPT    = ptNow.getHours() * 60 + ptNow.getMinutes();
+      // Market closes at 1pm PT; allow generation from 1pm through midnight
+      if (isWeekday && minsPT >= 780) {
+        ctx.waitUntil(generateEODSummary(env));
+        eodLoading = true;
+      }
+    }
+
+    if (snapshot) return json({ ...snapshot, eod: eod || null, eodLoading }, 200, origin);
   } catch (_) {}
 
-  // No snapshot yet — kick off generation in background
+  // No morning snapshot — kick off generation
   if (ctx && env?.ANTHROPIC_API_KEY) {
     ctx.waitUntil(generateDailySnapshot(env));
   }

@@ -434,7 +434,7 @@ async function loadDailySnapshot() {
       }
     }
 
-    // EOD summary (shown when available, hides if morning only)
+    // EOD summary
     if (data.eod) {
       document.getElementById('eod-headline').textContent = data.eod.headline || '';
       document.getElementById('eod-body').textContent     = data.eod.body || '';
@@ -443,6 +443,13 @@ async function loadDailySnapshot() {
         document.getElementById('eod-ts').textContent = 'As of ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
       }
       document.getElementById('eod-card').classList.add('visible');
+    } else if (data.eodLoading) {
+      document.getElementById('eod-headline').textContent = 'Generating end-of-day summary…';
+      document.getElementById('eod-body').textContent     = 'Claude is analyzing today\'s session. This takes about 20 seconds.';
+      document.getElementById('eod-ts').textContent       = '';
+      document.getElementById('eod-card').classList.add('visible');
+      // Retry once the worker finishes generating
+      setTimeout(loadDailySnapshot, 35000);
     }
 
     // News cards
