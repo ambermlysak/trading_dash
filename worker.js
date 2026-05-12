@@ -1,31 +1,24 @@
 /**
  * Stock Research Dashboard — Cloudflare Worker
  *
- * Data sources:
- *   - Yahoo Finance v8 chart API: OHLCV bars + price meta (no auth required)
- *   - Yahoo Finance v10 quoteSummary: fundamentals, analyst targets, insider data
- *     (requires crumb authentication — obtained via two-step cookie flow)
- *   - Alpaca Market Data API (optional): real-time price snapshot, news headlines
- *   - Anthropic Claude API: AI synthesis
- *
  * Endpoints:
  *   GET  /api/quote/:ticker              → Yahoo v10 fundamentals + Alpaca/chart-meta price
- *   GET  /api/chart/:ticker?range&intvl  → Yahoo v8 OHLCV (no crumb, always works)
+ *   GET  /api/chart/:ticker?range&intvl  → Yahoo v8 OHLCV
  *   GET  /api/options/:ticker[?date]     → Yahoo v7 options chain
  *   GET  /api/search?q=                  → Yahoo ticker search
  *   GET  /api/news/:ticker               → Alpaca news (Yahoo fallback)
  *   GET  /api/peers/:ticker              → Yahoo recommendationsBySymbol
  *   POST /api/claude                     → Anthropic Messages API proxy
- *   POST /api/log-rec                    → Append rating to KV (forward log)
+ *   POST /api/log-rec                    → Append rating to KV
  *   GET  /api/track/:ticker              → Read rating history from KV
+ *   GET  /api/market/snapshot            → Index + futures + commodities + bonds strip
+ *   GET  /api/market/movers              → Pre-market / day gainers + losers
+ *   GET  /api/market/ipos                → Upcoming IPO calendar (12h KV cache)
+ *   GET  /api/watchlist/batch?symbols=   → Bulk fundamentals + RSI + Claude analysis
+ *   GET  /api/daily                      → Daily Claude synthesis (6am PT cron)
  *
- * Required secrets (set via: npx wrangler secret put <NAME>):
- *   ANTHROPIC_API_KEY  — Anthropic API key for Claude synthesis
- *   ALPACA_KEY         — Alpaca API key ID (optional but recommended for real-time price)
- *   ALPACA_SECRET      — Alpaca API secret key
- *
- * KV namespace (wrangler.toml):
- *   REC_LOG — rating history + Yahoo crumb/cookie cache
+ * Required secrets (npx wrangler secret put <NAME>):
+ *   ANTHROPIC_API_KEY  ALPACA_KEY  ALPACA_SECRET
  */
 
 const ALLOWED_ORIGINS = [
@@ -43,9 +36,26 @@ const YAHOO_HEADERS = {
   'Referer': 'https://finance.yahoo.com/',
 };
 
+const SNAPSHOT_SYMBOLS = {
+  '^GSPC': 'S&P 500',
+  '^IXIC': 'NASDAQ',
+  '^DJI':  'Dow Jones',
+  '^RUT':  'Russell 2000',
+  'ES=F':  'S&P Futures',
+  'NQ=F':  'NQ Futures',
+  'GC=F':  'Gold',
+  'CL=F':  'WTI Oil',
+  '^TNX':  '10Y Yield',
+};
+
+const DEFAULT_WATCHLIST = [
+  'PLTR','NVDA','AMD','AAPL','AMZN','GOOGL','QUBT','TWLO','NOW','TSM',
+  'MU','APP','CRCL','CRWV','MRK','UNH','TSLA','PANW','RDDT','CAVA','JPM','HOOD',
+];
+
 /* ── CORS ── */
 function isAllowedOrigin(origin) {
-  if (!origin || origin === 'null') return true; // file:// local dev
+  if (!origin || origin === 'null') return true;
   return ALLOWED_ORIGINS.some(o => origin === o || origin.startsWith(o + ':'));
 }
 
@@ -67,7 +77,7 @@ const json = (data, status = 200, origin = '') =>
 
 const err = (msg, status = 500, origin = '') => json({ error: msg }, status, origin);
 
-/* ── Yahoo Finance (no-auth endpoints) ── */
+/* ── Yahoo Finance (no-auth) ── */
 async function yahoo(path, search = '') {
   const url = `https://query2.finance.yahoo.com${path}${search}`;
   const r = await fetch(url, {
@@ -79,14 +89,8 @@ async function yahoo(path, search = '') {
 }
 
 /* ── Yahoo crumb authentication ── */
-// In-memory per-isolate cache (supplemented by KV for cross-isolate sharing)
 let _crumbCache = null;
 
-/**
- * Read the first N bytes of a response stream looking for a pattern.
- * Returns the capture group [1] on match, null otherwise.
- * Cancels the stream as soon as a match is found or the limit is reached.
- */
 async function scanStream(response, regex, limitBytes = 150_000) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -104,7 +108,6 @@ async function scanStream(response, regex, limitBytes = 150_000) {
   return null;
 }
 
-/** Extract first matching cookie value from a Set-Cookie header string. */
 function extractCookie(rawSetCookie, ...names) {
   for (const name of names) {
     const m = rawSetCookie.match(new RegExp(`${name}=([^;,\\s]+)`));
@@ -117,10 +120,8 @@ async function getYahooCrumb(env) {
   const now = Date.now();
   const TTL = 3_000_000; // 50 minutes
 
-  // 1) in-memory cache
   if (_crumbCache && _crumbCache.ts > now - TTL) return _crumbCache;
 
-  // 2) KV cache
   try {
     const kv = await env?.REC_LOG?.get('yahoo:crumb', 'json');
     if (kv && kv.ts > now - TTL) { _crumbCache = kv; return _crumbCache; }
@@ -129,7 +130,7 @@ async function getYahooCrumb(env) {
   let crumb = null;
   let cookie = '';
 
-  // Strategy A: direct user-agent endpoint (works when Cloudflare IP has a session)
+  // Strategy A: direct user-agent endpoint
   try {
     const r = await fetch('https://query2.finance.yahoo.com/v1/finance/user-agent', {
       headers: YAHOO_HEADERS,
@@ -141,7 +142,7 @@ async function getYahooCrumb(env) {
     }
   } catch (_) {}
 
-  // Strategy B: visit finance.yahoo.com, scan HTML for crumb + extract A1 cookie
+  // Strategy B: scan finance.yahoo.com HTML stream
   if (!crumb) {
     try {
       const r = await fetch('https://finance.yahoo.com', {
@@ -149,11 +150,8 @@ async function getYahooCrumb(env) {
         redirect: 'follow',
       });
       cookie = extractCookie(r.headers.get('set-cookie') || '', 'A1', 'B') || cookie;
-
-      // Scan the HTML stream for the crumb string (stops after first match)
       crumb = await scanStream(r, /"crumb"\s*:\s*"([^"\\]{1,30})"/, 200_000);
 
-      // If crumb not in HTML, try user-agent endpoint again with the cookie we just got
       if (!crumb && cookie) {
         const r2 = await fetch('https://query2.finance.yahoo.com/v1/finance/user-agent', {
           headers: { ...YAHOO_HEADERS, Cookie: cookie },
@@ -186,7 +184,6 @@ async function yahooAuth(path, search, env) {
   let r = await make(crumb, cookie);
 
   if (r.status === 401 || r.status === 403) {
-    // Crumb expired — bust cache and retry once
     _crumbCache = null;
     ({ crumb, cookie } = await getYahooCrumb(env));
     r = await make(crumb, cookie);
@@ -196,11 +193,6 @@ async function yahooAuth(path, search, env) {
   return r.json();
 }
 
-/**
- * Convert the `meta` object from a Yahoo v8 chart response into
- * a minimal quoteSummary `result[0]` structure the frontend expects.
- * Used as a fallback when v10 quoteSummary fails.
- */
 function chartMetaToQuoteSummary(meta, ticker) {
   const p = (v) => (v != null ? { raw: v, fmt: String(v) } : undefined);
   return {
@@ -221,8 +213,6 @@ function chartMetaToQuoteSummary(meta, ticker) {
       fiftyTwoWeekHigh: p(meta.fiftyTwoWeekHigh),
       fiftyTwoWeekLow:  p(meta.fiftyTwoWeekLow),
     },
-    // Remaining modules (fundamentals, analyst, insider) will be empty
-    // — the frontend renders "—" gracefully for missing values
   };
 }
 
@@ -244,7 +234,58 @@ async function alpacaFetch(path, env) {
   return r.json();
 }
 
-/* ── Route handlers ── */
+/* ── Computation helpers ── */
+function computeRSI(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) gains += d; else losses += -d;
+  }
+  let avgGain = gains / period;
+  let avgLoss = losses / period;
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    avgGain = (avgGain * (period - 1) + (d > 0 ? d : 0)) / period;
+    avgLoss = (avgLoss * (period - 1) + (d < 0 ? -d : 0)) / period;
+  }
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return Math.round((100 - 100 / (1 + rs)) * 10) / 10;
+}
+
+function computeSR(highs, lows) {
+  const n = Math.min(20, highs.length);
+  const support = Math.min(...lows.slice(-n));
+  const resist  = Math.max(...highs.slice(-n));
+  return {
+    support: Math.round(support * 100) / 100,
+    resist:  Math.round(resist  * 100) / 100,
+  };
+}
+
+/* ── Worker-side Claude call ── */
+async function workerClaude(prompt, env, maxTokens = 400) {
+  if (!env?.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not set');
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type':      'application/json',
+      'x-api-key':         env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model:      CLAUDE_MODEL,
+      max_tokens: maxTokens,
+      messages:   [{ role: 'user', content: prompt }],
+    }),
+  });
+  if (!r.ok) throw new Error(`Claude ${r.status}`);
+  const d = await r.json();
+  return d.content?.[0]?.text?.trim() || '';
+}
+
+/* ── Existing route handlers ── */
 
 async function handleQuote(ticker, origin, env) {
   const modules = [
@@ -253,7 +294,6 @@ async function handleQuote(ticker, origin, env) {
     'assetProfile', 'insiderTransactions', 'netSharePurchaseActivity',
   ].join(',');
 
-  // Fetch Yahoo v10 fundamentals + chart meta (for fallback) + Alpaca snapshot in parallel
   const [yahooRes, chartRes, alpacaRes] = await Promise.allSettled([
     yahooAuth(`/v10/finance/quoteSummary/${ticker}`, `?modules=${modules}`, env),
     yahoo(`/v8/finance/chart/${ticker}`, '?range=1d&interval=1d'),
@@ -265,7 +305,6 @@ async function handleQuote(ticker, origin, env) {
   if (yahooRes.status === 'fulfilled') {
     data = yahooRes.value;
   } else {
-    // Yahoo v10 failed — build minimal structure from chart meta
     console.error(`[quote] Yahoo v10 failed (${yahooRes.reason?.message}); using chart meta fallback`);
     const chartMeta = chartRes.status === 'fulfilled'
       ? (chartRes.value?.chart?.result?.[0]?.meta || {})
@@ -278,7 +317,6 @@ async function handleQuote(ticker, origin, env) {
     };
   }
 
-  // Patch Alpaca real-time price data over whatever price we have
   if (alpacaRes.status === 'fulfilled') {
     const snap   = alpacaRes.value;
     const result = data.quoteSummary?.result?.[0];
@@ -287,14 +325,12 @@ async function handleQuote(ticker, origin, env) {
       const lp  = snap.latestTrade?.p ?? snap.dailyBar?.c;
       const pc  = snap.prevDailyBar?.c;
       const vol = snap.dailyBar?.v;
-
-      const p = (v) => v != null ? { raw: v, fmt: v.toFixed(2) } : undefined;
+      const p   = (v) => v != null ? { raw: v, fmt: v.toFixed(2) } : undefined;
       if (lp  != null) result.price.regularMarketPrice        = p(lp);
       if (pc  != null) result.price.regularMarketPreviousClose = p(pc);
       if (vol != null) result.price.regularMarketVolume        = { raw: vol, fmt: String(vol) };
       result.price.symbol = result.price.symbol || ticker;
 
-      // Infer market state (Eastern Time)
       if (!result.price.marketState || result.price.marketState === 'CLOSED') {
         const et   = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
         const t    = et.getHours() * 100 + et.getMinutes();
@@ -308,7 +344,6 @@ async function handleQuote(ticker, origin, env) {
 }
 
 async function handleChart(ticker, params, origin) {
-  // Yahoo v8 chart works without crumb — keep using it
   const range    = params.get('range')    || '1y';
   const interval = params.get('interval') || '1d';
   const data = await yahoo(
@@ -335,7 +370,6 @@ async function handleSearch(q, origin) {
 }
 
 async function handleNews(ticker, origin, env) {
-  // Prefer Alpaca news (more structured, includes sentiment signals)
   if (env?.ALPACA_KEY && env?.ALPACA_SECRET) {
     try {
       const data = await alpacaFetch(`/v1beta1/news?symbols=${ticker}&limit=15&sort=desc`, env);
@@ -351,7 +385,6 @@ async function handleNews(ticker, origin, env) {
     }
   }
 
-  // Fallback: Yahoo search news
   const r = await fetch(
     `https://query2.finance.yahoo.com/v1/finance/search?q=${ticker}&quotesCount=0&newsCount=15`,
     { headers: YAHOO_HEADERS },
@@ -413,9 +446,420 @@ async function handleTrack(ticker, env, origin) {
   return json({ ticker: ticker.toUpperCase(), entries: list }, 200, origin);
 }
 
+/* ── New route handlers ── */
+
+async function handleMarketSnapshot(origin, env) {
+  const tickers = Object.keys(SNAPSHOT_SYMBOLS);
+  const results = await Promise.allSettled(
+    tickers.map(t => yahoo(`/v8/finance/chart/${encodeURIComponent(t)}`, '?range=1d&interval=1d')),
+  );
+
+  const snapshot = tickers.map((ticker, i) => {
+    if (results[i].status !== 'fulfilled') {
+      return { ticker, name: SNAPSHOT_SYMBOLS[ticker], price: null, changePct: null };
+    }
+    const meta      = results[i].value?.chart?.result?.[0]?.meta || {};
+    const price     = meta.regularMarketPrice ?? null;
+    const prev      = meta.chartPreviousClose ?? meta.previousClose ?? null;
+    const changePct = price != null && prev != null
+      ? Math.round((price - prev) / prev * 10000) / 100
+      : null;
+    return {
+      ticker,
+      name:      SNAPSHOT_SYMBOLS[ticker],
+      price:     price != null ? Math.round(price * 100) / 100 : null,
+      changePct,
+    };
+  });
+
+  return json({ snapshot, ts: Date.now() }, 200, origin);
+}
+
+async function handleMarketMovers(origin, env) {
+  const MOVER_POOL = [
+    'AAPL','NVDA','MSFT','GOOGL','AMZN','META','TSLA','AMD',
+    'PLTR','HOOD','RDDT','APP','CAVA','PANW','MU','NOW','TSM','JPM','UNH','MRK',
+  ];
+
+  let movers = [];
+
+  // Alpaca batch snapshots (best source)
+  if (env?.ALPACA_KEY && env?.ALPACA_SECRET) {
+    try {
+      const data = await alpacaFetch(`/v2/stocks/snapshots?symbols=${MOVER_POOL.join(',')}`, env);
+      movers = Object.entries(data).map(([sym, snap]) => {
+        const price     = snap.latestTrade?.p ?? snap.dailyBar?.c ?? null;
+        const prev      = snap.prevDailyBar?.c ?? null;
+        const changePct = price != null && prev != null
+          ? Math.round((price - prev) / prev * 10000) / 100
+          : null;
+        return { ticker: sym, price, changePct };
+      }).filter(m => m.changePct != null);
+    } catch (_) {}
+  }
+
+  // Yahoo screener fallback
+  if (!movers.length) {
+    try {
+      const [gainersRes, losersRes] = await Promise.allSettled([
+        fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=day_gainers&count=6', { headers: YAHOO_HEADERS }),
+        fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=day_losers&count=6',  { headers: YAHOO_HEADERS }),
+      ]);
+      for (const res of [gainersRes, losersRes]) {
+        if (res.status === 'fulfilled' && res.value.ok) {
+          const d      = await res.value.json();
+          const quotes = d.finance?.result?.[0]?.quotes || [];
+          for (const q of quotes) {
+            movers.push({
+              ticker:    q.symbol,
+              price:     q.regularMarketPrice?.raw ?? null,
+              changePct: q.regularMarketChangePercent?.raw != null
+                ? Math.round(q.regularMarketChangePercent.raw * 100) / 100
+                : null,
+            });
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  const gainers = movers
+    .filter(m => m.changePct > 0)
+    .sort((a, b) => b.changePct - a.changePct)
+    .slice(0, 5);
+
+  const losers = movers
+    .filter(m => m.changePct < 0)
+    .sort((a, b) => a.changePct - b.changePct)
+    .slice(0, 5);
+
+  return json({ gainers, losers, ts: Date.now() }, 200, origin);
+}
+
+async function handleMarketIPOs(origin, env) {
+  const KV_KEY = 'market:ipos';
+  const TTL    = 43_200_000; // 12 hours
+
+  try {
+    const cached = await env?.REC_LOG?.get(KV_KEY, 'json');
+    if (cached && Date.now() - cached.ts < TTL) return json(cached, 200, origin);
+  } catch (_) {}
+
+  const today = new Date();
+  const from  = today.toISOString().split('T')[0];
+  const to    = new Date(today.getTime() + 30 * 86_400_000).toISOString().split('T')[0];
+
+  let ipos = [];
+  try {
+    const r = await fetch(
+      `https://query2.finance.yahoo.com/v2/finance/calendar/ipo?from=${from}&to=${to}`,
+      { headers: YAHOO_HEADERS },
+    );
+    if (r.ok) {
+      const d      = await r.json();
+      const events = d.ipoCalendar?.ipoData || [];
+      ipos = events.slice(0, 12).map(e => ({
+        name:     e.companyName || e.company || '',
+        ticker:   e.symbol || '',
+        date:     e.startDate?.fmt || e.date || '',
+        exchange: e.exchange || '',
+        price:    e.priceLow && e.priceHigh ? `$${e.priceLow}–$${e.priceHigh}` : (e.price || 'TBD'),
+      }));
+    }
+  } catch (_) {}
+
+  const result = { ipos, ts: Date.now() };
+  env?.REC_LOG?.put(KV_KEY, JSON.stringify(result), { expirationTtl: 43200 }).catch(() => {});
+  return json(result, 200, origin);
+}
+
+async function handleWatchlistBatch(symbols, origin, env) {
+  const tickers = symbols.split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 30);
+  if (!tickers.length) return err('symbols required', 400, origin);
+
+  const stocks = {};
+
+  await Promise.allSettled(tickers.map(async ticker => {
+    try {
+      const [chartRes, fundRes, analysisRes] = await Promise.allSettled([
+        yahoo(`/v8/finance/chart/${ticker}`, '?range=3mo&interval=1d'),
+        yahooAuth(
+          `/v10/finance/quoteSummary/${ticker}`,
+          '?modules=price,summaryDetail,defaultKeyStatistics,financialData,calendarEvents,assetProfile',
+          env,
+        ),
+        env?.REC_LOG?.get(`analysis:${ticker}`, 'json'),
+      ]);
+
+      let price = null, changePct = null, volume = null;
+      let w52High = null, w52Low = null;
+      let rsi = null, support = null, resist = null;
+
+      if (chartRes.status === 'fulfilled') {
+        const result = chartRes.value?.chart?.result?.[0];
+        const meta   = result?.meta || {};
+        const q      = result?.indicators?.quote?.[0] || {};
+        const closes = (q.close || []).filter(v => v != null);
+        const highs  = (q.high  || []).filter(v => v != null);
+        const lows   = (q.low   || []).filter(v => v != null);
+
+        price   = meta.regularMarketPrice ?? null;
+        volume  = meta.regularMarketVolume ?? null;
+        w52High = meta.fiftyTwoWeekHigh ?? null;
+        w52Low  = meta.fiftyTwoWeekLow  ?? null;
+        const prev = meta.chartPreviousClose ?? meta.previousClose ?? null;
+        changePct  = price != null && prev != null
+          ? Math.round((price - prev) / prev * 10000) / 100
+          : null;
+
+        if (closes.length >= 15) rsi = computeRSI(closes);
+        if (highs.length  >= 5)  ({ support, resist } = computeSR(highs, lows));
+      }
+
+      let pe = null, targetLow = null, targetMean = null, targetHigh = null;
+      let shortPct = null, earningsDate = null, daysToEarnings = null, sector = null;
+
+      if (fundRes.status === 'fulfilled') {
+        const r = fundRes.value?.quoteSummary?.result?.[0] || {};
+        pe         = r.summaryDetail?.trailingPE?.raw ?? r.defaultKeyStatistics?.forwardPE?.raw ?? null;
+        targetLow  = r.financialData?.targetLowPrice?.raw ?? null;
+        targetMean = r.financialData?.targetMeanPrice?.raw ?? null;
+        targetHigh = r.financialData?.targetHighPrice?.raw ?? null;
+        shortPct   = r.defaultKeyStatistics?.shortPercentOfFloat?.raw ?? null;
+        sector     = r.assetProfile?.sector ?? null;
+
+        const epoch = r.calendarEvents?.earnings?.earningsDate?.[0]?.raw;
+        if (epoch) {
+          const d = new Date(epoch * 1000);
+          earningsDate    = `${d.toLocaleString('en-US', { month: 'short' })} ${d.getDate()}, '${String(d.getFullYear()).slice(2)}`;
+          daysToEarnings  = Math.ceil((d.getTime() - Date.now()) / 86_400_000);
+        }
+      }
+
+      // Claude analysis from KV (written by cron)
+      let trend = null, pattern = null, action = null, summary = null, analysisTs = null;
+      const cached = analysisRes.status === 'fulfilled' ? analysisRes.value : null;
+      if (cached && Date.now() - (cached.ts || 0) < 172_800_000) {
+        ({ trend, pattern, action, summary } = cached);
+        analysisTs = cached.ts;
+      }
+
+      stocks[ticker] = {
+        symbol: ticker,
+        price,
+        changePct,
+        volume,
+        pe:         pe     != null ? Math.round(pe     * 10) / 10 : null,
+        sector,
+        w52High,
+        w52Low,
+        targetLow:  targetLow  != null ? Math.round(targetLow  * 100) / 100 : null,
+        targetMean: targetMean != null ? Math.round(targetMean * 100) / 100 : null,
+        targetHigh: targetHigh != null ? Math.round(targetHigh * 100) / 100 : null,
+        shortPct:   shortPct   != null ? Math.round(shortPct   * 10000) / 100 : null,
+        earningsDate,
+        daysToEarnings,
+        rsi,
+        support,
+        resist,
+        trend,
+        pattern,
+        action,
+        summary,
+        analysisTs,
+      };
+    } catch (e) {
+      console.error(`[watchlist] ${ticker}:`, e.message);
+      stocks[ticker] = { symbol: ticker, error: e.message };
+    }
+  }));
+
+  return json({ stocks, ts: Date.now() }, 200, origin);
+}
+
+async function handleDailyGet(origin, env, ctx) {
+  try {
+    const snapshot = await env?.REC_LOG?.get('daily:snapshot', 'json');
+    if (snapshot) return json(snapshot, 200, origin);
+  } catch (_) {}
+
+  // No snapshot yet — kick off generation and return loading state
+  if (ctx && env?.ANTHROPIC_API_KEY) {
+    ctx.waitUntil(generateDailySnapshot(env));
+  }
+
+  return json({ loading: true, ts: Date.now() }, 200, origin);
+}
+
+/* ── Cron: per-ticker analysis ── */
+async function refreshTickerAnalysis(ticker, env) {
+  try {
+    const [chartRes, fundRes] = await Promise.allSettled([
+      yahoo(`/v8/finance/chart/${ticker}`, '?range=3mo&interval=1d'),
+      yahooAuth(
+        `/v10/finance/quoteSummary/${ticker}`,
+        '?modules=price,summaryDetail,defaultKeyStatistics,financialData,assetProfile',
+        env,
+      ),
+    ]);
+
+    let priceCtx = '';
+    if (chartRes.status === 'fulfilled') {
+      const result = chartRes.value?.chart?.result?.[0];
+      const meta   = result?.meta || {};
+      const q      = result?.indicators?.quote?.[0] || {};
+      const closes = (q.close || []).filter(v => v != null);
+      const highs  = (q.high  || []).filter(v => v != null);
+      const lows   = (q.low   || []).filter(v => v != null);
+      const price  = meta.regularMarketPrice ?? 'N/A';
+      const w52h   = meta.fiftyTwoWeekHigh ?? 'N/A';
+      const w52l   = meta.fiftyTwoWeekLow  ?? 'N/A';
+      const rsi    = closes.length >= 15 ? computeRSI(closes) : null;
+      const sr     = highs.length  >= 5  ? computeSR(highs, lows) : null;
+      priceCtx = `Price: $${price}, 52W: $${w52l}–$${w52h}` +
+        (rsi != null ? `, RSI(14): ${rsi}` : '') +
+        (sr  ? `, Support: $${sr.support}, Resistance: $${sr.resist}` : '');
+    }
+
+    let fundCtx = '';
+    if (fundRes.status === 'fulfilled') {
+      const r      = fundRes.value?.quoteSummary?.result?.[0] || {};
+      const pe     = r.summaryDetail?.trailingPE?.raw ?? r.defaultKeyStatistics?.forwardPE?.raw ?? null;
+      const sector = r.assetProfile?.sector ?? null;
+      const target = r.financialData?.targetMeanPrice?.raw ?? null;
+      fundCtx = [
+        sector && `Sector: ${sector}`,
+        pe     && `P/E: ${pe.toFixed(1)}`,
+        target && `Analyst target: $${target}`,
+      ].filter(Boolean).join(', ');
+    }
+
+    const prompt = `Analyze ${ticker} briefly as a stock trader. Given: ${priceCtx}. ${fundCtx}.
+
+Return ONLY valid JSON (no markdown):
+{
+  "trend": "10-word trend description",
+  "pattern": "Chart pattern name",
+  "action": "Action phrase (e.g. Hold above $87, Buy dips to $85)",
+  "summary": "2-sentence trader summary"
+}`;
+
+    const text    = await workerClaude(prompt, env, 300);
+    const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    const analysis = JSON.parse(cleaned);
+
+    await env?.REC_LOG?.put(
+      `analysis:${ticker}`,
+      JSON.stringify({ ...analysis, ts: Date.now() }),
+      { expirationTtl: 172800 },
+    );
+  } catch (e) {
+    console.error(`[cron] analysis failed for ${ticker}:`, e.message);
+  }
+}
+
+/* ── Cron: daily snapshot ── */
+async function generateDailySnapshot(env) {
+  // Dedup: skip if already generated in the last 2 hours
+  try {
+    const existing = await env?.REC_LOG?.get('daily:snapshot', 'json');
+    if (existing && Date.now() - existing.ts < 7_200_000) {
+      console.log('[cron] snapshot fresh, skipping');
+      return;
+    }
+  } catch (_) {}
+
+  // Gather macro news
+  let newsLines = '';
+  try {
+    if (env?.ALPACA_KEY && env?.ALPACA_SECRET) {
+      const data = await alpacaFetch('/v1beta1/news?limit=20&sort=desc', env);
+      newsLines = (data.news || []).slice(0, 15).map(n => `• ${n.headline}`).join('\n');
+    } else {
+      const r = await fetch(
+        'https://query2.finance.yahoo.com/v1/finance/search?q=market+today&quotesCount=0&newsCount=15',
+        { headers: YAHOO_HEADERS },
+      );
+      if (r.ok) {
+        const d = await r.json();
+        newsLines = (d.news || []).slice(0, 15).map(n => `• ${n.title}`).join('\n');
+      }
+    }
+  } catch (_) {}
+
+  // Gather market context
+  let marketLines = '';
+  try {
+    const tickers = Object.keys(SNAPSHOT_SYMBOLS);
+    const results = await Promise.allSettled(
+      tickers.map(t => yahoo(`/v8/finance/chart/${encodeURIComponent(t)}`, '?range=1d&interval=1d')),
+    );
+    marketLines = tickers.map((t, i) => {
+      if (results[i].status !== 'fulfilled') return null;
+      const meta      = results[i].value?.chart?.result?.[0]?.meta || {};
+      const price     = meta.regularMarketPrice;
+      const prev      = meta.chartPreviousClose ?? meta.previousClose;
+      if (price == null || prev == null) return null;
+      const chg = ((price - prev) / prev * 100).toFixed(2);
+      return `${SNAPSHOT_SYMBOLS[t]}: ${price.toFixed(2)} (${chg > 0 ? '+' : ''}${chg}%)`;
+    }).filter(Boolean).join('\n');
+  } catch (_) {}
+
+  const today = new Date().toLocaleDateString('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
+    timeZone: 'America/Los_Angeles',
+  });
+
+  const prompt = `You are a professional stock market analyst. Today is ${today}.
+
+MARKET DATA:
+${marketLines || 'Not available'}
+
+RECENT NEWS HEADLINES:
+${newsLines || 'Not available'}
+
+Generate a morning market briefing as valid JSON with exactly these fields:
+{
+  "headline": "One-sentence market summary (max 120 chars)",
+  "newsCards": [
+    { "title": "short title", "body": "2-sentence analysis", "tag": "Macro|Fed|Sector|Geopolitical|Earnings" }
+  ],
+  "opportunity": { "ticker": "SYMBOL", "reason": "1-2 sentences" },
+  "avoid": { "ticker": "SYMBOL", "reason": "1-2 sentences" }
+}
+
+newsCards must have exactly 8 items. For opportunity and avoid, choose from: ${DEFAULT_WATCHLIST.join(', ')}.
+Return ONLY valid JSON, no markdown fences.`;
+
+  let snapshot;
+  try {
+    const text    = await workerClaude(prompt, env, 1500);
+    const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    snapshot = JSON.parse(cleaned);
+  } catch (e) {
+    console.error('[cron] snapshot parse failed:', e.message);
+    snapshot = { headline: `Market update for ${today}`, newsCards: [], opportunity: null, avoid: null };
+  }
+
+  await env?.REC_LOG?.put(
+    'daily:snapshot',
+    JSON.stringify({ ...snapshot, ts: Date.now() }),
+    { expirationTtl: 172800 },
+  );
+  console.log('[cron] daily snapshot saved');
+
+  // Refresh per-ticker Claude analysis in batches of 5
+  for (let i = 0; i < DEFAULT_WATCHLIST.length; i += 5) {
+    await Promise.allSettled(
+      DEFAULT_WATCHLIST.slice(i, i + 5).map(t => refreshTickerAnalysis(t, env)),
+    );
+  }
+  console.log('[cron] ticker analyses refreshed');
+}
+
 /* ── Main fetch handler ── */
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const origin = request.headers.get('Origin') || '';
 
     if (request.method === 'OPTIONS') {
@@ -435,22 +879,37 @@ export default {
     if (parts[0] !== 'api') return err('not found', 404, origin);
 
     try {
-      const [, route, ticker] = parts;
+      const [, route, sub] = parts;
       switch (route) {
-        case 'quote':   return await handleQuote(ticker, origin, env);
-        case 'chart':   return await handleChart(ticker, url.searchParams, origin);
-        case 'options': return await handleOptions(ticker, url.searchParams, origin);
-        case 'search':  return await handleSearch(url.searchParams.get('q') || '', origin);
-        case 'news':    return await handleNews(ticker, origin, env);
-        case 'peers':   return await handlePeers(ticker, origin);
-        case 'claude':  return await handleClaude(request, env, origin);
-        case 'log-rec': return await handleLogRec(request, env, origin);
-        case 'track':   return await handleTrack(ticker, env, origin);
-        default:        return err('unknown route', 404, origin);
+        case 'quote':    return await handleQuote(sub, origin, env);
+        case 'chart':    return await handleChart(sub, url.searchParams, origin);
+        case 'options':  return await handleOptions(sub, url.searchParams, origin);
+        case 'search':   return await handleSearch(url.searchParams.get('q') || '', origin);
+        case 'news':     return await handleNews(sub, origin, env);
+        case 'peers':    return await handlePeers(sub, origin);
+        case 'claude':   return await handleClaude(request, env, origin);
+        case 'log-rec':  return await handleLogRec(request, env, origin);
+        case 'track':    return await handleTrack(sub, env, origin);
+        case 'daily':    return await handleDailyGet(origin, env, ctx);
+        case 'market':
+          if (sub === 'snapshot') return await handleMarketSnapshot(origin, env);
+          if (sub === 'movers')   return await handleMarketMovers(origin, env);
+          if (sub === 'ipos')     return await handleMarketIPOs(origin, env);
+          return err('unknown market route', 404, origin);
+        case 'watchlist':
+          if (sub === 'batch') return await handleWatchlistBatch(
+            url.searchParams.get('symbols') || '', origin, env,
+          );
+          return err('unknown watchlist route', 404, origin);
+        default:         return err('unknown route', 404, origin);
       }
     } catch (e) {
       console.error('[worker] unhandled:', e.message);
       return err(e.message, 500, origin);
     }
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(generateDailySnapshot(env));
   },
 };

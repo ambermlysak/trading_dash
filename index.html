@@ -1971,7 +1971,8 @@ document.querySelectorAll('.chart-btn').forEach(btn => {
    BOOT
    ============================================================ */
 initChart();
-loadTicker(state.ticker);
+const _urlTicker = new URLSearchParams(location.search).get('t');
+loadTicker((_urlTicker || state.ticker).toUpperCase());
 </script>
 </body>
 </html>
