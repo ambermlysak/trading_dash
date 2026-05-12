@@ -478,18 +478,23 @@ async function handleMarketSnapshot(origin, env) {
 }
 
 async function handleMarketMovers(origin, env) {
+  const MIN_PCT = 10;
+
+  // Wider pool for Alpaca batch — increases hit rate for ≥10% moves
   const MOVER_POOL = [
-    'AAPL','NVDA','MSFT','GOOGL','AMZN','META','TSLA','AMD',
-    'PLTR','HOOD','RDDT','APP','CAVA','PANW','MU','NOW','TSM','JPM','UNH','MRK',
+    'AAPL','NVDA','MSFT','GOOGL','AMZN','META','TSLA','AMD','PLTR','HOOD',
+    'RDDT','APP','CAVA','PANW','MU','NOW','TSM','JPM','UNH','MRK',
+    'NFLX','UBER','COIN','MSTR','SMCI','ARM','AVGO','ORCL','CRM','SNOW',
+    'RBLX','UPST','SOFI','RIVN','NIO','BABA','MELI','DKNG','IONQ','QUBT',
   ];
 
-  let movers = [];
+  // ── Regular / pre-market movers ──
+  let dayMovers = [];
 
-  // Alpaca batch snapshots (best source)
   if (env?.ALPACA_KEY && env?.ALPACA_SECRET) {
     try {
       const data = await alpacaFetch(`/v2/stocks/snapshots?symbols=${MOVER_POOL.join(',')}`, env);
-      movers = Object.entries(data).map(([sym, snap]) => {
+      dayMovers = Object.entries(data).map(([sym, snap]) => {
         const price     = snap.latestTrade?.p ?? snap.dailyBar?.c ?? null;
         const prev      = snap.prevDailyBar?.c ?? null;
         const changePct = price != null && prev != null
@@ -500,24 +505,22 @@ async function handleMarketMovers(origin, env) {
     } catch (_) {}
   }
 
-  // Yahoo screener fallback
-  if (!movers.length) {
+  // Yahoo screener fallback (broader universe, no Alpaca needed)
+  if (!dayMovers.length) {
     try {
-      const [gainersRes, losersRes] = await Promise.allSettled([
-        fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=day_gainers&count=6', { headers: YAHOO_HEADERS }),
-        fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=day_losers&count=6',  { headers: YAHOO_HEADERS }),
+      const [gr, lr] = await Promise.allSettled([
+        fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=day_gainers&count=25', { headers: YAHOO_HEADERS }),
+        fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=day_losers&count=25',  { headers: YAHOO_HEADERS }),
       ]);
-      for (const res of [gainersRes, losersRes]) {
+      for (const res of [gr, lr]) {
         if (res.status === 'fulfilled' && res.value.ok) {
-          const d      = await res.value.json();
-          const quotes = d.finance?.result?.[0]?.quotes || [];
-          for (const q of quotes) {
-            movers.push({
+          const d = await res.value.json();
+          for (const q of (d.finance?.result?.[0]?.quotes || [])) {
+            dayMovers.push({
               ticker:    q.symbol,
               price:     q.regularMarketPrice?.raw ?? null,
               changePct: q.regularMarketChangePercent?.raw != null
-                ? Math.round(q.regularMarketChangePercent.raw * 100) / 100
-                : null,
+                ? Math.round(q.regularMarketChangePercent.raw * 100) / 100 : null,
             });
           }
         }
@@ -525,17 +528,58 @@ async function handleMarketMovers(origin, env) {
     } catch (_) {}
   }
 
-  const gainers = movers
-    .filter(m => m.changePct > 0)
-    .sort((a, b) => b.changePct - a.changePct)
-    .slice(0, 5);
+  // ── Post-market / after-hours movers (Yahoo extended-hours screeners) ──
+  let postMovers = [];
+  try {
+    const [agr, alr] = await Promise.allSettled([
+      fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=afterhr_gainers&count=25', { headers: YAHOO_HEADERS }),
+      fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=afterhr_losers&count=25',  { headers: YAHOO_HEADERS }),
+    ]);
+    for (const res of [agr, alr]) {
+      if (res.status === 'fulfilled' && res.value.ok) {
+        const d = await res.value.json();
+        for (const q of (d.finance?.result?.[0]?.quotes || [])) {
+          // Prefer postMarketChangePercent; fall back to regularMarketChangePercent
+          const pct   = q.postMarketChangePercent?.raw ?? q.regularMarketChangePercent?.raw ?? null;
+          const price = q.postMarketPrice?.raw ?? q.regularMarketPrice?.raw ?? null;
+          if (pct != null) {
+            postMovers.push({
+              ticker:    q.symbol,
+              price,
+              changePct: Math.round(pct * 100) / 100,
+            });
+          }
+        }
+      }
+    }
+  } catch (_) {}
 
-  const losers = movers
-    .filter(m => m.changePct < 0)
-    .sort((a, b) => a.changePct - b.changePct)
-    .slice(0, 5);
+  // Also supplement post-market with Alpaca after-hours data (latestTrade vs dailyBar close)
+  if (env?.ALPACA_KEY && env?.ALPACA_SECRET && !postMovers.length) {
+    try {
+      const data = await alpacaFetch(`/v2/stocks/snapshots?symbols=${MOVER_POOL.join(',')}`, env);
+      for (const [sym, snap] of Object.entries(data)) {
+        const afterPrice  = snap.latestTrade?.p ?? null;
+        const regularClose = snap.dailyBar?.c ?? null;
+        if (afterPrice == null || regularClose == null) continue;
+        const pct = Math.round((afterPrice - regularClose) / regularClose * 10000) / 100;
+        postMovers.push({ ticker: sym, price: afterPrice, changePct: pct });
+      }
+    } catch (_) {}
+  }
 
-  return json({ gainers, losers, ts: Date.now() }, 200, origin);
+  const applyFilter = (list, positive) => list
+    .filter(m => positive ? m.changePct >= MIN_PCT : m.changePct <= -MIN_PCT)
+    .sort((a, b) => positive ? b.changePct - a.changePct : a.changePct - b.changePct)
+    .slice(0, 10);
+
+  return json({
+    gainers:     applyFilter(dayMovers,  true),
+    losers:      applyFilter(dayMovers,  false),
+    postGainers: applyFilter(postMovers, true),
+    postLosers:  applyFilter(postMovers, false),
+    ts: Date.now(),
+  }, 200, origin);
 }
 
 async function handleMarketIPOs(origin, env) {

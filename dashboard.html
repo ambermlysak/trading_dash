@@ -112,8 +112,10 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .news-body  { font-size: 12px; color: var(--ink-2); line-height: 1.5; }
 
 /* Bottom row */
-.bottom-row { display: grid; grid-template-columns: 1fr 1fr 280px; gap: 16px; margin-bottom: 28px; }
+.bottom-row { display: grid; grid-template-columns: 1fr 1fr 280px; gap: 16px; margin-bottom: 28px; align-items: start; }
 @media (max-width: 1200px) { .bottom-row { grid-template-columns: 1fr 1fr; } }
+.movers-col { display: flex; flex-direction: column; gap: 16px; }
+.min-pct-badge { font-size: 9px; font-family: var(--mono); font-weight: 600; padding: 2px 6px; border-radius: 3px; background: var(--amber-soft); color: var(--amber); margin-left: 6px; vertical-align: middle; }
 
 /* Movers */
 .card { background: var(--bg-1); border: 1px solid var(--line); border-radius: 8px; padding: 18px; }
@@ -286,16 +288,33 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     </div>
 
     <div class="bottom-row">
-      <div class="card">
-        <div class="card-title">Pre-Market Movers</div>
-        <div class="movers-grid">
-          <div>
-            <div class="movers-col-label">Gainers</div>
-            <div id="gainers-list"><div class="loading">Loading…</div></div>
+      <!-- Movers column: pre-market stacked above post-market -->
+      <div class="movers-col">
+        <div class="card">
+          <div class="card-title">Market Movers <span class="min-pct-badge">≥10%</span></div>
+          <div class="movers-grid">
+            <div>
+              <div class="movers-col-label">Gainers</div>
+              <div id="gainers-list"><div class="loading">Loading…</div></div>
+            </div>
+            <div>
+              <div class="movers-col-label">Losers</div>
+              <div id="losers-list"><div class="loading">Loading…</div></div>
+            </div>
           </div>
-          <div>
-            <div class="movers-col-label">Losers</div>
-            <div id="losers-list"><div class="loading">Loading…</div></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Post-Market Movers <span class="min-pct-badge">≥10%</span></div>
+          <div class="movers-grid">
+            <div>
+              <div class="movers-col-label">Gainers</div>
+              <div id="post-gainers-list"><div class="loading">Loading…</div></div>
+            </div>
+            <div>
+              <div class="movers-col-label">Losers</div>
+              <div id="post-losers-list"><div class="loading">Loading…</div></div>
+            </div>
           </div>
         </div>
       </div>
@@ -489,22 +508,29 @@ async function loadDailySnapshot() {
 
 /* ─── Movers ─── */
 async function loadMovers() {
-  try {
-    const { gainers, losers } = await apiFetch('/market/movers');
-    const renderList = (items) => items.map(m => `
+  const renderList = (items, emptyMsg) => {
+    if (!items || !items.length) return `<div class="loading">${emptyMsg}</div>`;
+    return items.map(m => `
       <div class="mover-row">
         <span class="mover-ticker">${esc(m.ticker)}</span>
         <div class="mover-vals">
           <span class="mover-price">${fmt(m.price)}</span>
           <span class="mover-chg ${m.changePct > 0 ? 'up' : 'dn'}">${fmtPct(m.changePct)}</span>
         </div>
-      </div>`).join('') || '<div class="loading">No data.</div>';
-    document.getElementById('gainers-list').innerHTML = renderList(gainers || []);
-    document.getElementById('losers-list').innerHTML  = renderList(losers  || []);
+      </div>`).join('');
+  };
+
+  try {
+    const { gainers, losers, postGainers, postLosers } = await apiFetch('/market/movers');
+    document.getElementById('gainers-list').innerHTML      = renderList(gainers,     'No movers ≥10% yet.');
+    document.getElementById('losers-list').innerHTML       = renderList(losers,      'No movers ≤−10% yet.');
+    document.getElementById('post-gainers-list').innerHTML = renderList(postGainers, 'No post-market gainers ≥10%.');
+    document.getElementById('post-losers-list').innerHTML  = renderList(postLosers,  'No post-market losers ≤−10%.');
   } catch (e) {
     console.error('[movers]', e.message);
-    document.getElementById('gainers-list').innerHTML = '<div class="loading">Unavailable.</div>';
-    document.getElementById('losers-list').innerHTML  = '<div class="loading">Unavailable.</div>';
+    for (const id of ['gainers-list','losers-list','post-gainers-list','post-losers-list']) {
+      document.getElementById(id).innerHTML = '<div class="loading">Unavailable.</div>';
+    }
   }
 }
 
