@@ -92,6 +92,7 @@ async function yahoo(path, search = '') {
 
 /* ── Yahoo crumb authentication ── */
 let _crumbCache = null;
+let _crumbInflight = null; // dedup concurrent fetches
 
 async function scanStream(response, regex, limitBytes = 150_000) {
   const reader = response.body.getReader();
@@ -122,55 +123,68 @@ async function getYahooCrumb(env) {
   const now = Date.now();
   const TTL = 3_000_000; // 50 minutes
 
+  // Fast path — no await needed
   if (_crumbCache && _crumbCache.ts > now - TTL) return _crumbCache;
 
-  try {
-    const kv = await env?.REC_LOG?.get('yahoo:crumb', 'json');
-    if (kv && kv.ts > now - TTL) { _crumbCache = kv; return _crumbCache; }
-  } catch (_) {}
+  // Dedup: if another concurrent call is already fetching, piggyback on it
+  if (_crumbInflight) return _crumbInflight;
 
-  let crumb = null;
-  let cookie = '';
-
-  // Strategy A: direct user-agent endpoint
-  try {
-    const r = await fetch('https://query2.finance.yahoo.com/v1/finance/user-agent', {
-      headers: YAHOO_HEADERS,
-    });
-    if (r.ok) {
-      cookie = extractCookie(r.headers.get('set-cookie') || '', 'A1', 'B');
-      const txt = (await r.text()).trim();
-      if (txt && txt.length < 50 && !txt.startsWith('<')) crumb = txt;
-    }
-  } catch (_) {}
-
-  // Strategy B: scan finance.yahoo.com HTML stream
-  if (!crumb) {
+  _crumbInflight = (async () => {
     try {
-      const r = await fetch('https://finance.yahoo.com', {
-        headers: { ...YAHOO_HEADERS, Accept: 'text/html' },
-        redirect: 'follow',
-      });
-      cookie = extractCookie(r.headers.get('set-cookie') || '', 'A1', 'B') || cookie;
-      crumb = await scanStream(r, /"crumb"\s*:\s*"([^"\\]{1,30})"/, 200_000);
+      // KV cache
+      try {
+        const kv = await env?.REC_LOG?.get('yahoo:crumb', 'json');
+        if (kv && kv.ts > Date.now() - TTL) { _crumbCache = kv; return _crumbCache; }
+      } catch (_) {}
 
-      if (!crumb && cookie) {
-        const r2 = await fetch('https://query2.finance.yahoo.com/v1/finance/user-agent', {
-          headers: { ...YAHOO_HEADERS, Cookie: cookie },
+      let crumb = null;
+      let cookie = '';
+
+      // Strategy A: direct user-agent endpoint
+      try {
+        const r = await fetch('https://query2.finance.yahoo.com/v1/finance/user-agent', {
+          headers: YAHOO_HEADERS,
         });
-        if (r2.ok) {
-          const txt = (await r2.text()).trim();
+        if (r.ok) {
+          cookie = extractCookie(r.headers.get('set-cookie') || '', 'A1', 'B');
+          const txt = (await r.text()).trim();
           if (txt && txt.length < 50 && !txt.startsWith('<')) crumb = txt;
         }
+      } catch (_) {}
+
+      // Strategy B: scan finance.yahoo.com HTML stream
+      if (!crumb) {
+        try {
+          const r = await fetch('https://finance.yahoo.com', {
+            headers: { ...YAHOO_HEADERS, Accept: 'text/html' },
+            redirect: 'follow',
+          });
+          cookie = extractCookie(r.headers.get('set-cookie') || '', 'A1', 'B') || cookie;
+          crumb = await scanStream(r, /"crumb"\s*:\s*"([^"\\]{1,30})"/, 200_000);
+
+          if (!crumb && cookie) {
+            const r2 = await fetch('https://query2.finance.yahoo.com/v1/finance/user-agent', {
+              headers: { ...YAHOO_HEADERS, Cookie: cookie },
+            });
+            if (r2.ok) {
+              const txt = (await r2.text()).trim();
+              if (txt && txt.length < 50 && !txt.startsWith('<')) crumb = txt;
+            }
+          }
+        } catch (_) {}
       }
-    } catch (_) {}
-  }
 
-  if (!crumb) throw new Error('Yahoo crumb unavailable (all strategies exhausted)');
+      if (!crumb) throw new Error('Yahoo crumb unavailable (all strategies exhausted)');
 
-  _crumbCache = { crumb, cookie, ts: now };
-  env?.REC_LOG?.put('yahoo:crumb', JSON.stringify(_crumbCache), { expirationTtl: 3600 }).catch(() => {});
-  return _crumbCache;
+      _crumbCache = { crumb, cookie, ts: Date.now() };
+      env?.REC_LOG?.put('yahoo:crumb', JSON.stringify(_crumbCache), { expirationTtl: 3600 }).catch(() => {});
+      return _crumbCache;
+    } finally {
+      _crumbInflight = null;
+    }
+  })();
+
+  return _crumbInflight;
 }
 
 async function yahooAuth(path, search, env) {
@@ -685,108 +699,129 @@ async function handleMarketIPOs(origin, env) {
   return json(result, 200, origin);
 }
 
-async function handleWatchlistBatch(symbols, origin, env) {
+async function handleWatchlistBatch(symbols, origin, env, ctx) {
   const tickers = symbols.split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 30);
   if (!tickers.length) return err('symbols required', 400, origin);
 
+  // Pre-warm the crumb once so all parallel Yahoo v10 calls share it
+  await getYahooCrumb(env).catch(() => {});
+
   const stocks = {};
 
-  await Promise.allSettled(tickers.map(async ticker => {
-    try {
-      const [chartRes, fundRes, analysisRes] = await Promise.allSettled([
-        yahoo(`/v8/finance/chart/${ticker}`, '?range=3mo&interval=1d'),
-        yahooAuth(
-          `/v10/finance/quoteSummary/${ticker}`,
-          '?modules=price,summaryDetail,defaultKeyStatistics,financialData,calendarEvents,assetProfile',
-          env,
-        ),
-        env?.REC_LOG?.get(`analysis:${ticker}`, 'json'),
-      ]);
+  // Process in chunks of 4 to avoid rate-limiting Yahoo with 40+ concurrent requests
+  const CHUNK = 4;
+  for (let i = 0; i < tickers.length; i += CHUNK) {
+    const batch = tickers.slice(i, i + CHUNK);
+    await Promise.allSettled(batch.map(async ticker => {
+      try {
+        const [chartRes, fundRes, analysisRes] = await Promise.allSettled([
+          yahoo(`/v8/finance/chart/${ticker}`, '?range=3mo&interval=1d'),
+          yahooAuth(
+            `/v10/finance/quoteSummary/${ticker}`,
+            '?modules=price,summaryDetail,defaultKeyStatistics,financialData,calendarEvents,assetProfile',
+            env,
+          ),
+          env?.REC_LOG?.get(`analysis:${ticker}`, 'json'),
+        ]);
 
-      let price = null, changePct = null, volume = null;
-      let w52High = null, w52Low = null;
-      let rsi = null, support = null, resist = null;
+        let price = null, changePct = null, volume = null;
+        let w52High = null, w52Low = null;
+        let rsi = null, support = null, resist = null;
 
-      if (chartRes.status === 'fulfilled') {
-        const result = chartRes.value?.chart?.result?.[0];
-        const meta   = result?.meta || {};
-        const q      = result?.indicators?.quote?.[0] || {};
-        const closes = (q.close || []).filter(v => v != null);
-        const highs  = (q.high  || []).filter(v => v != null);
-        const lows   = (q.low   || []).filter(v => v != null);
+        if (chartRes.status === 'fulfilled') {
+          const result = chartRes.value?.chart?.result?.[0];
+          const meta   = result?.meta || {};
+          const q      = result?.indicators?.quote?.[0] || {};
+          const closes = (q.close || []).filter(v => v != null);
+          const highs  = (q.high  || []).filter(v => v != null);
+          const lows   = (q.low   || []).filter(v => v != null);
 
-        price   = meta.regularMarketPrice ?? null;
-        volume  = meta.regularMarketVolume ?? null;
-        w52High = meta.fiftyTwoWeekHigh ?? null;
-        w52Low  = meta.fiftyTwoWeekLow  ?? null;
-        const prev = meta.chartPreviousClose ?? meta.previousClose ?? null;
-        changePct  = price != null && prev != null
-          ? Math.round((price - prev) / prev * 10000) / 100
-          : null;
+          price   = meta.regularMarketPrice ?? null;
+          volume  = meta.regularMarketVolume ?? null;
+          w52High = meta.fiftyTwoWeekHigh ?? null;
+          w52Low  = meta.fiftyTwoWeekLow  ?? null;
+          const prev = meta.chartPreviousClose ?? meta.previousClose ?? null;
+          changePct  = price != null && prev != null
+            ? Math.round((price - prev) / prev * 10000) / 100
+            : null;
 
-        if (closes.length >= 15) rsi = computeRSI(closes);
-        if (highs.length  >= 5)  ({ support, resist } = computeSR(highs, lows));
-      }
-
-      let pe = null, targetLow = null, targetMean = null, targetHigh = null;
-      let shortPct = null, earningsDate = null, daysToEarnings = null, sector = null;
-
-      if (fundRes.status === 'fulfilled') {
-        const r = fundRes.value?.quoteSummary?.result?.[0] || {};
-        pe         = r.summaryDetail?.trailingPE?.raw ?? r.defaultKeyStatistics?.forwardPE?.raw ?? null;
-        targetLow  = r.financialData?.targetLowPrice?.raw ?? null;
-        targetMean = r.financialData?.targetMeanPrice?.raw ?? null;
-        targetHigh = r.financialData?.targetHighPrice?.raw ?? null;
-        shortPct   = r.defaultKeyStatistics?.shortPercentOfFloat?.raw ?? null;
-        sector     = r.assetProfile?.sector ?? null;
-
-        const epoch = r.calendarEvents?.earnings?.earningsDate?.[0]?.raw;
-        if (epoch) {
-          const d = new Date(epoch * 1000);
-          earningsDate    = `${d.toLocaleString('en-US', { month: 'short' })} ${d.getDate()}, '${String(d.getFullYear()).slice(2)}`;
-          daysToEarnings  = Math.ceil((d.getTime() - Date.now()) / 86_400_000);
+          if (closes.length >= 15) rsi = computeRSI(closes);
+          if (highs.length  >= 5)  ({ support, resist } = computeSR(highs, lows));
         }
+
+        let pe = null, targetLow = null, targetMean = null, targetHigh = null;
+        let shortPct = null, earningsDate = null, daysToEarnings = null, sector = null;
+
+        if (fundRes.status === 'fulfilled') {
+          const r = fundRes.value?.quoteSummary?.result?.[0] || {};
+          pe         = r.summaryDetail?.trailingPE?.raw ?? r.defaultKeyStatistics?.forwardPE?.raw ?? null;
+          targetLow  = r.financialData?.targetLowPrice?.raw ?? null;
+          targetMean = r.financialData?.targetMeanPrice?.raw ?? null;
+          targetHigh = r.financialData?.targetHighPrice?.raw ?? null;
+          shortPct   = r.defaultKeyStatistics?.shortPercentOfFloat?.raw ?? null;
+          sector     = r.assetProfile?.sector ?? null;
+
+          const epoch = r.calendarEvents?.earnings?.earningsDate?.[0]?.raw;
+          if (epoch) {
+            const d = new Date(epoch * 1000);
+            earningsDate   = `${d.toLocaleString('en-US', { month: 'short' })} ${d.getDate()}, '${String(d.getFullYear()).slice(2)}`;
+            daysToEarnings = Math.ceil((d.getTime() - Date.now()) / 86_400_000);
+          }
+        }
+
+        // Claude analysis from KV (written by cron or previous on-demand run)
+        let trend = null, pattern = null, action = null, summary = null, analysisTs = null;
+        const cached = analysisRes.status === 'fulfilled' ? analysisRes.value : null;
+        if (cached && Date.now() - (cached.ts || 0) < 172_800_000) {
+          ({ trend, pattern, action, summary } = cached);
+          analysisTs = cached.ts;
+        }
+
+        stocks[ticker] = {
+          symbol: ticker,
+          price,
+          changePct,
+          volume,
+          pe:         pe     != null ? Math.round(pe     * 10) / 10 : null,
+          sector,
+          w52High,
+          w52Low,
+          targetLow:  targetLow  != null ? Math.round(targetLow  * 100) / 100 : null,
+          targetMean: targetMean != null ? Math.round(targetMean * 100) / 100 : null,
+          targetHigh: targetHigh != null ? Math.round(targetHigh * 100) / 100 : null,
+          shortPct:   shortPct   != null ? Math.round(shortPct   * 10000) / 100 : null,
+          earningsDate,
+          daysToEarnings,
+          rsi,
+          support,
+          resist,
+          trend,
+          pattern,
+          action,
+          summary,
+          analysisTs,
+        };
+      } catch (e) {
+        console.error(`[watchlist] ${ticker}:`, e.message);
+        stocks[ticker] = { symbol: ticker, error: e.message };
       }
+    }));
+  }
 
-      // Claude analysis from KV (written by cron)
-      let trend = null, pattern = null, action = null, summary = null, analysisTs = null;
-      const cached = analysisRes.status === 'fulfilled' ? analysisRes.value : null;
-      if (cached && Date.now() - (cached.ts || 0) < 172_800_000) {
-        ({ trend, pattern, action, summary } = cached);
-        analysisTs = cached.ts;
+  // Fire on-demand Claude analysis for tickers that have no cached entry.
+  // Runs after the response is sent so it doesn't block the client.
+  const needsAnalysis = tickers.filter(t => stocks[t] && !stocks[t].trend && !stocks[t].error);
+  if (needsAnalysis.length > 0 && ctx && env?.ANTHROPIC_API_KEY) {
+    ctx.waitUntil((async () => {
+      for (let i = 0; i < needsAnalysis.length; i += 5) {
+        await Promise.allSettled(
+          needsAnalysis.slice(i, i + 5).map(t => refreshTickerAnalysis(t, env)),
+        );
       }
+    })());
+  }
 
-      stocks[ticker] = {
-        symbol: ticker,
-        price,
-        changePct,
-        volume,
-        pe:         pe     != null ? Math.round(pe     * 10) / 10 : null,
-        sector,
-        w52High,
-        w52Low,
-        targetLow:  targetLow  != null ? Math.round(targetLow  * 100) / 100 : null,
-        targetMean: targetMean != null ? Math.round(targetMean * 100) / 100 : null,
-        targetHigh: targetHigh != null ? Math.round(targetHigh * 100) / 100 : null,
-        shortPct:   shortPct   != null ? Math.round(shortPct   * 10000) / 100 : null,
-        earningsDate,
-        daysToEarnings,
-        rsi,
-        support,
-        resist,
-        trend,
-        pattern,
-        action,
-        summary,
-        analysisTs,
-      };
-    } catch (e) {
-      console.error(`[watchlist] ${ticker}:`, e.message);
-      stocks[ticker] = { symbol: ticker, error: e.message };
-    }
-  }));
-
-  return json({ stocks, ts: Date.now() }, 200, origin);
+  return json({ stocks, analysisLoading: needsAnalysis.length > 0, ts: Date.now() }, 200, origin);
 }
 
 async function handleDailyGet(origin, env, ctx) {
@@ -1111,7 +1146,7 @@ export default {
           return err('unknown market route', 404, origin);
         case 'watchlist':
           if (sub === 'batch') return await handleWatchlistBatch(
-            url.searchParams.get('symbols') || '', origin, env,
+            url.searchParams.get('symbols') || '', origin, env, ctx,
           );
           return err('unknown watchlist route', 404, origin);
         default:         return err('unknown route', 404, origin);

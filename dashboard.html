@@ -241,6 +241,13 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .ipo-status.upcoming { background: var(--bull-soft);  color: var(--bull); }
 .ipo-status.filed    { background: var(--amber-soft); color: var(--amber); }
 
+/* Analysis loading banner */
+.analysis-banner {
+  background: var(--amber-soft); border: 1px solid rgba(244,183,64,0.25);
+  border-radius: 6px; padding: 10px 16px; margin-bottom: 16px;
+  font-size: 12px; color: var(--amber); font-family: var(--mono);
+}
+
 /* Tab panels */
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
@@ -340,6 +347,9 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 <!-- Watchlist tab -->
 <div class="tab-panel" id="tab-watchlist">
   <div class="main">
+    <div id="analysis-banner" class="analysis-banner" style="display:none">
+      AI analysis is being generated for tickers without cached data — page will auto-refresh in ~45 seconds.
+    </div>
     <div class="wl-controls">
       <input class="wl-input" id="wl-add-input" placeholder="Add ticker…" maxlength="10" />
       <button class="wl-btn" id="wl-add-btn">Add</button>
@@ -569,16 +579,31 @@ function saveWatchlist(tickers) {
 async function loadWatchlistBatch() {
   const tickers = getWatchlist();
   document.getElementById('wl-status').textContent = 'Fetching…';
+  let analysisRefreshTimer = null;
   try {
     const CHUNK = 15;
     const allStocks = {};
+    let anyAnalysisLoading = false;
     for (let i = 0; i < tickers.length; i += CHUNK) {
       const chunk = tickers.slice(i, i + CHUNK);
       const data = await apiFetch('/watchlist/batch?symbols=' + chunk.join(','));
       Object.assign(allStocks, data.stocks || {});
+      if (data.analysisLoading) anyAnalysisLoading = true;
     }
     wlData = allStocks;
-    document.getElementById('wl-status').textContent = `Updated ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`;
+
+    const banner = document.getElementById('analysis-banner');
+    if (anyAnalysisLoading) {
+      document.getElementById('wl-status').textContent =
+        `Updated ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })} · AI analysis generating…`;
+      if (banner) banner.style.display = '';
+      // Retry once analysis should be ready (worker generates ~5 per batch, takes ~45s total)
+      analysisRefreshTimer = setTimeout(loadWatchlistBatch, 45000);
+    } else {
+      document.getElementById('wl-status').textContent =
+        `Updated ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`;
+      if (banner) banner.style.display = 'none';
+    }
     renderWatchlist();
   } catch (e) {
     console.error('[watchlist]', e.message);
@@ -745,6 +770,9 @@ document.querySelectorAll('.wl-table thead th[data-sort]').forEach(th => {
 async function init() {
   tickClock();
   setInterval(tickClock, 1000);
+
+  // Support deep-linking: dashboard.html#watchlist opens the watchlist tab directly
+  if (location.hash === '#watchlist') switchTab('watchlist');
 
   // Market data
   await Promise.allSettled([
