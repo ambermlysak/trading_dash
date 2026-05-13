@@ -295,7 +295,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 
     <div class="eod-card" id="eod-card">
       <div class="eod-header">
-        <span class="eod-badge" id="eod-badge">Market Close</span>
+        <span class="eod-badge" id="eod-badge">Pre-Market</span>
         <div class="eod-headline" id="eod-headline"></div>
       </div>
       <div class="eod-body" id="eod-body"></div>
@@ -509,7 +509,7 @@ async function loadDailySnapshot() {
       }
       document.getElementById('eod-card').classList.add('visible');
     } else if (data.open) {
-      document.getElementById('eod-badge').textContent    = 'Market Open';
+      document.getElementById('eod-badge').textContent    = 'Pre-Market';
       document.getElementById('eod-headline').textContent = data.open.headline || '';
       document.getElementById('eod-body').textContent     = data.open.body || '';
       if (data.ts) {

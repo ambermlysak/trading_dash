@@ -943,6 +943,9 @@ async function generateDailySnapshot(env) {
     }
   } catch (_) {}
 
+  // Clear yesterday's EOD so pre-market context takes over
+  try { await env?.REC_LOG?.delete('daily:eod'); } catch (_) {}
+
   // Gather macro news
   let newsLines = '';
   try {
