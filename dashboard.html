@@ -199,19 +199,15 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .wl-table td.sector { color: var(--ink-2); font-size: 11px; }
 .wl-table td.ai-cell {
   color: var(--ink-2); font-size: 11px; text-overflow: ellipsis;
-  cursor: default; position: relative;
+  cursor: default;
 }
-.wl-table td.ai-cell:not([data-full=""]):hover {
-  overflow: visible; z-index: 20;
-}
-.wl-table td.ai-cell:not([data-full=""]):hover::after {
-  content: attr(data-full);
-  position: absolute; top: calc(100% + 2px); left: 0;
+#wl-tooltip {
+  position: fixed; z-index: 9999; display: none;
   background: var(--bg-2); border: 1px solid var(--line); border-radius: 6px;
   padding: 8px 12px; min-width: 200px; max-width: 380px;
   white-space: normal; word-break: break-word;
   font-size: 12px; color: var(--ink-1); line-height: 1.55;
-  box-shadow: 0 4px 20px rgba(0,0,0,0.45); pointer-events: none; z-index: 21;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.45); pointer-events: none;
 }
 .rm-btn { background: none; border: none; color: var(--ink-3); cursor: pointer; font-size: 14px; padding: 0 4px; line-height: 1; }
 .rm-btn:hover { color: var(--bear); }
@@ -883,6 +879,36 @@ function initColumnResize() {
   });
 }
 
+
+/* ─── AI cell tooltip (body-level, escapes overflow-x:auto clipping) ─── */
+(function initAiTooltip() {
+  const tip = document.createElement('div');
+  tip.id = 'wl-tooltip';
+  document.body.appendChild(tip);
+
+  function show(e) {
+    const cell = e.target.closest('.ai-cell');
+    const text = cell?.dataset?.full;
+    if (!text) { tip.style.display = 'none'; return; }
+    tip.textContent = text;
+    tip.style.display = 'block';
+    position(e);
+  }
+
+  function position(e) {
+    const pad = 14;
+    const x = Math.min(e.clientX + pad, window.innerWidth  - 396);
+    const y = Math.min(e.clientY + pad, window.innerHeight - 120);
+    tip.style.left = x + 'px';
+    tip.style.top  = y + 'px';
+  }
+
+  const tbody = document.getElementById('wl-tbody');
+  tbody.addEventListener('mouseover',  show);
+  tbody.addEventListener('mousemove',  e => { if (tip.style.display === 'block') position(e); });
+  tbody.addEventListener('mouseout',   e => { if (!e.target.closest('.ai-cell')) tip.style.display = 'none'; });
+  tbody.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
+})();
 
 /* ─── Init ─── */
 async function init() {
