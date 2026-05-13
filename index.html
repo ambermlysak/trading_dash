@@ -971,20 +971,25 @@ function renderChart(timestamps, opens, highs, lows, closes, volumes) {
   bbUSeries.setData(toLine(bb.upper));
   bbLSeries.setData(toLine(bb.lower));
 
-  // 30-day projection: simple linear regression over last 30 bars + drift
+  // 30-day projection: dampened log-return momentum
+  // Linear regression on raw prices is inappropriate for financial data — a strong
+  // recent run produces a dollar slope that snowballs into absurd forward values.
+  // Instead: mean daily log return → dampen by 40% → cap at ±0.7%/day → compound.
   const n = Math.min(30, closes.length);
   const recent = closes.slice(-n);
-  let xSum=0, ySum=0, xySum=0, xxSum=0;
-  for (let i = 0; i < n; i++) { xSum += i; ySum += recent[i]; xySum += i*recent[i]; xxSum += i*i; }
-  const slope = (n*xySum - xSum*ySum) / (n*xxSum - xSum*xSum);
-  const intercept = (ySum - slope*xSum) / n;
-  const lastTime = timestamps[timestamps.length - 1];
-  const dayStep = 86400;
-  const proj = [];
-  // Start projection from last close to anchor visually
-  proj.push({ time: lastTime, value: closes[closes.length - 1] });
+  let logReturnSum = 0;
+  for (let i = 1; i < recent.length; i++) {
+    if (recent[i - 1] > 0) logReturnSum += Math.log(recent[i] / recent[i - 1]);
+  }
+  const meanDailyLogReturn = recent.length > 1 ? logReturnSum / (recent.length - 1) : 0;
+  // 40% dampening + ±0.7%/day cap (≈±23% max 30-day move)
+  const drift = Math.max(-0.007, Math.min(0.007, meanDailyLogReturn * 0.4));
+  const lastClose = closes[closes.length - 1];
+  const lastTime  = timestamps[timestamps.length - 1];
+  const dayStep   = 86400;
+  const proj      = [{ time: lastTime, value: lastClose }];
   for (let i = 1; i <= 30; i++) {
-    proj.push({ time: lastTime + dayStep * i, value: intercept + slope * (n - 1 + i) });
+    proj.push({ time: lastTime + dayStep * i, value: lastClose * Math.exp(drift * i) });
   }
   projectionSeries.setData(proj);
 
