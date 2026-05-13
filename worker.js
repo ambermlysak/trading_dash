@@ -740,10 +740,7 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
           volume  = meta.regularMarketVolume ?? null;
           w52High = meta.fiftyTwoWeekHigh ?? null;
           w52Low  = meta.fiftyTwoWeekLow  ?? null;
-          const prev = meta.chartPreviousClose ?? meta.previousClose ?? null;
-          changePct  = price != null && prev != null
-            ? Math.round((price - prev) / prev * 10000) / 100
-            : null;
+          // changePct derived from fundRes price module below for accuracy
 
           if (closes.length >= 15) rsi = computeRSI(closes);
           if (highs.length  >= 5)  ({ support, resist } = computeSR(highs, lows));
@@ -760,6 +757,18 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
           targetHigh = r.financialData?.targetHighPrice?.raw ?? null;
           shortPct   = r.defaultKeyStatistics?.shortPercentOfFloat?.raw ?? null;
           sector     = r.assetProfile?.sector ?? null;
+
+          // Use quoteSummary price module for authoritative 1-day values
+          const qPrice   = r.price?.regularMarketPrice?.raw ?? null;
+          const qPctRaw  = r.price?.regularMarketChangePercent?.raw ?? null;  // decimal, e.g. 0.025 = +2.5%
+          const qPrev    = r.price?.regularMarketPreviousClose?.raw ?? null;
+          if (qPrice  != null) price = qPrice;
+          volume = r.price?.regularMarketVolume?.raw ?? volume;
+          if (qPctRaw != null) {
+            changePct = Math.round(qPctRaw * 10000) / 100;
+          } else if (qPrice != null && qPrev != null) {
+            changePct = Math.round((qPrice - qPrev) / qPrev * 10000) / 100;
+          }
 
           const epoch = r.calendarEvents?.earnings?.earningsDate?.[0]?.raw;
           if (epoch) {
@@ -986,6 +995,10 @@ ${newsLines || 'Not available'}
 Generate a morning market briefing as valid JSON with exactly these fields:
 {
   "headline": "One-sentence market summary (max 120 chars)",
+  "open": {
+    "headline": "One-sentence market open outlook (max 120 chars)",
+    "body": "2-3 sentences on key levels, sectors to watch, and the expected tone of today's session."
+  },
   "newsCards": [
     { "title": "short title", "body": "2-sentence analysis", "tag": "Macro|Fed|Sector|Geopolitical|Earnings" }
   ],
