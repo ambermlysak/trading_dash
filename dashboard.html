@@ -201,6 +201,12 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
   color: var(--ink-2); font-size: 11px; text-overflow: ellipsis;
   cursor: default;
 }
+.wl-table td.rating-cell { text-align: center; vertical-align: middle; }
+.rating-tag { display: inline-block; font-family: var(--mono); font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; padding: 2px 7px; border-radius: 3px; }
+.rating-tag.buy  { background: var(--bull-soft);  color: var(--bull); }
+.rating-tag.sell { background: var(--bear-soft);  color: var(--bear); }
+.rating-tag.hold { background: var(--amber-soft); color: var(--amber); }
+.rating-conf { font-family: var(--mono); font-size: 10px; color: var(--ink-3); margin-top: 3px; }
 #wl-tooltip {
   position: fixed; z-index: 9999; display: none;
   background: var(--bg-2); border: 1px solid var(--line); border-radius: 6px;
@@ -379,6 +385,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
           <col style="width:150px">
           <col style="width:150px">
           <col style="width:150px">
+          <col style="width:86px">
           <col style="width:56px">
           <col style="width:64px">
           <col style="width:74px">
@@ -399,6 +406,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
             <th data-sort="trend">Trend</th>
             <th data-sort="pattern">Pattern</th>
             <th data-sort="action">Action</th>
+            <th data-sort="rating">Rating</th>
             <th data-sort="rsi">RSI</th>
             <th data-sort="pe">P/E</th>
             <th data-sort="shortPct">Short %</th>
@@ -412,7 +420,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
           </tr>
         </thead>
         <tbody id="wl-tbody">
-          <tr><td colspan="17" class="loading" style="padding:24px">Loading watchlist…</td></tr>
+          <tr><td colspan="18" class="loading" style="padding:24px">Loading watchlist…</td></tr>
         </tbody>
       </table>
     </div>
@@ -633,7 +641,7 @@ async function loadWatchlistBatch() {
   btn.disabled = true;
   btn.textContent = '↺ Loading…';
   document.getElementById('wl-tbody').innerHTML =
-    '<tr><td colspan="17" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
+    '<tr><td colspan="18" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
   document.getElementById('wl-status').textContent = 'Fetching…';
 
   try {
@@ -665,7 +673,7 @@ async function loadWatchlistBatch() {
     console.error('[watchlist]', e.message);
     document.getElementById('wl-status').textContent = 'Error — ' + e.message;
     document.getElementById('wl-tbody').innerHTML =
-      '<tr><td colspan="17" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
+      '<tr><td colspan="18" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
   } finally {
     wlLoading = false;
     btn.disabled = false;
@@ -714,6 +722,7 @@ function renderWatchlist() {
       <td class="ai-cell" data-full="${esc(s.trend || '')}">${esc(s.trend || '—')}</td>
       <td class="ai-cell" data-full="${esc(s.pattern || '')}">${esc(s.pattern || '—')}</td>
       <td class="ai-cell" data-full="${esc(s.action || '')}">${esc(s.action || '—')}</td>
+      <td class="rating-cell">${ratingBadge(s.rating, s.confidence)}</td>
       <td class="${clsRsi(s.rsi)}">${s.rsi != null ? s.rsi : '—'}</td>
       <td class="mono">${s.pe != null ? fmt(s.pe, 1) : '—'}</td>
       <td class="mono">${s.shortPct != null ? fmt(s.shortPct, 1) + '%' : '—'}</td>
@@ -729,7 +738,7 @@ function renderWatchlist() {
     // Expanded row
     if (expandedTicker === s.symbol && s.summary) {
       html += `<tr class="expand-row">
-        <td colspan="17">
+        <td colspan="18">
           <div class="expand-content">
             <div class="expand-summary">${esc(s.summary)}</div>
             <div class="expand-meta">
@@ -743,7 +752,14 @@ function renderWatchlist() {
       </tr>`;
     }
   }
-  tbody.innerHTML = html || '<tr><td colspan="17" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
+  tbody.innerHTML = html || '<tr><td colspan="18" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
+}
+
+/* ─── Rating badge ─── */
+function ratingBadge(rating, conf) {
+  if (!rating) return '<span style="color:var(--ink-3)">—</span>';
+  const cls = rating === 'BUY' ? 'buy' : rating === 'SELL' ? 'sell' : 'hold';
+  return `<span class="rating-tag ${cls}">${esc(rating)}</span>${conf != null ? `<div class="rating-conf">${conf}%</div>` : ''}`;
 }
 
 /* ─── Escape HTML ─── */

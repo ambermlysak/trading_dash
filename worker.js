@@ -779,10 +779,10 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
         }
 
         // Claude analysis from KV (written by cron or previous on-demand run)
-        let trend = null, pattern = null, action = null, summary = null, analysisTs = null;
+        let trend = null, pattern = null, action = null, summary = null, rating = null, confidence = null, analysisTs = null;
         const cached = analysisRes.status === 'fulfilled' ? analysisRes.value : null;
         if (cached && Date.now() - (cached.ts || 0) < 172_800_000) {
-          ({ trend, pattern, action, summary } = cached);
+          ({ trend, pattern, action, summary, rating, confidence } = cached);
           analysisTs = cached.ts;
         }
 
@@ -808,6 +808,8 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
           pattern,
           action,
           summary,
+          rating,
+          confidence,
           analysisTs,
         };
       } catch (e) {
@@ -912,6 +914,8 @@ async function refreshTickerAnalysis(ticker, env) {
 
 Return ONLY valid JSON (no markdown):
 {
+  "rating": "BUY" | "HOLD" | "SELL",
+  "confidence": 0-100,
   "trend": "10-word trend description",
   "pattern": "Chart pattern name",
   "action": "Action phrase (e.g. Hold above $87, Buy dips to $85)",
