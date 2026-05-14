@@ -458,6 +458,23 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
 .factor-row .fill { height: 100%; border-radius: 3px; }
 .factor-row .score { font-family: var(--mono); font-size: 11px; color: var(--ink-1); font-weight: 500; text-align: right; }
 
+/* Factor expand panels */
+.card-header.has-factor { cursor: pointer; }
+.card-header.has-factor:hover .card-title { color: var(--ink-0); }
+.factor-toggle { display: inline-flex; align-items: center; gap: 5px; margin-left: 10px; font-family: var(--mono); font-size: 9px; color: var(--ink-3); letter-spacing: 0.05em; text-transform: uppercase; vertical-align: middle; transition: color 0.15s; }
+.factor-toggle::before { content: '›'; font-size: 14px; line-height: 1; transition: transform 0.2s ease; display: inline-block; }
+.factor-toggle.open { color: var(--cyan); }
+.factor-toggle.open::before { transform: rotate(90deg); }
+.factor-panel { display: none; border-top: 1px solid var(--line-soft); padding: 14px 20px 16px; background: var(--bg-2); }
+.factor-panel.open { display: block; }
+.factor-panel-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.factor-panel-track { flex: 1; height: 4px; background: var(--bg-3); border-radius: 2px; overflow: hidden; }
+.factor-panel-fill { height: 100%; border-radius: 2px; }
+.factor-panel-score { font-family: var(--mono); font-size: 13px; font-weight: 600; min-width: 28px; }
+.factor-panel-label { font-family: var(--mono); font-size: 10px; min-width: 52px; letter-spacing: 0.04em; }
+.factor-panel-text { font-size: 13px; color: var(--ink-2); line-height: 1.65; }
+.factor-panel-pending { font-size: 12px; color: var(--ink-3); font-style: italic; }
+
 /* ------- Loaders ------- */
 .skeleton { background: linear-gradient(90deg, var(--bg-2), var(--bg-3), var(--bg-2)); background-size: 200% 100%; animation: shimmer 1.4s infinite; border-radius: 3px; }
 @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
@@ -583,7 +600,7 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     </div>
 
     <!-- 11. TECHNICAL: PRICE CHART (large) -->
-    <div class="card col-8" id="card-chart">
+    <div class="card col-8" id="card-chart" data-factor="technical">
       <div class="card-header">
         <div>
           <div class="card-title"><span class="num">11</span>Technical Analysis</div>
@@ -601,7 +618,7 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     </div>
 
     <!-- 9. ANALYST OPINION -->
-    <div class="card col-4" id="card-analyst">
+    <div class="card col-4" id="card-analyst" data-factor="analyst">
       <div class="card-header">
         <div class="card-title"><span class="num">09</span>Analyst Opinion</div>
         <div class="card-meta" id="analyst-count"></div>
@@ -610,7 +627,7 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     </div>
 
     <!-- 13. FUNDAMENTALS -->
-    <div class="card col-6" id="card-fundamentals">
+    <div class="card col-6" id="card-fundamentals" data-factor="fundamental">
       <div class="card-header">
         <div class="card-title"><span class="num">13</span>Fundamentals &amp; Valuation</div>
         <div class="card-meta" id="fund-rank"></div>
@@ -619,7 +636,7 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     </div>
 
     <!-- 12. SENTIMENT -->
-    <div class="card col-6" id="card-sentiment">
+    <div class="card col-6" id="card-sentiment" data-factor="sentiment">
       <div class="card-header">
         <div class="card-title"><span class="num">12</span>Sentiment Analysis</div>
         <div class="card-meta">News · Insiders · Mood</div>
@@ -630,7 +647,7 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     </div>
 
     <!-- 4. INSIDER TRADES -->
-    <div class="card col-6" id="card-insider">
+    <div class="card col-6" id="card-insider" data-factor="insider">
       <div class="card-header">
         <div class="card-title"><span class="num">04</span>Insider Trades</div>
         <span class="mock-tag" id="insider-tag">Yahoo data · upgrade: SEC EDGAR Form 4</span>
@@ -693,7 +710,7 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     </div>
 
     <!-- News -->
-    <div class="card col-6" id="card-news">
+    <div class="card col-6" id="card-news" data-factor="macro">
       <div class="card-header">
         <div class="card-title">News Flow</div>
         <div class="card-meta">Latest 10</div>
@@ -1751,12 +1768,12 @@ Return STRICT JSON (no markdown fences, no preamble) with keys:
   "rating": "BUY" | "HOLD" | "SELL",
   "confidence": 0–100 integer,
   "factors": {
-    "technical":   { "score": 0–100, "note": "<8 words" },
-    "fundamental": { "score": 0–100, "note": "<8 words" },
-    "sentiment":   { "score": 0–100, "note": "<8 words" },
-    "analyst":     { "score": 0–100, "note": "<8 words" },
-    "insider":     { "score": 0–100, "note": "<8 words" },
-    "macro":       { "score": 0–100, "note": "<8 words" }
+    "technical":   { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on the technical picture" },
+    "fundamental": { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on valuation and fundamentals" },
+    "sentiment":   { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on sentiment and positioning" },
+    "analyst":     { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on analyst views and price targets" },
+    "insider":     { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on insider activity and what it signals" },
+    "macro":       { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on macro backdrop and key risk factors" }
   },
   "thesis": "<2 paragraphs, 60–100 words total, plain prose, no bullet points>"
 }
@@ -1766,7 +1783,7 @@ Score interpretation: 0=very bearish, 50=neutral, 100=very bullish.`;
   try {
     const resp = await claudeCall({
       messages: [{ role: 'user', content: prompt }],
-      max_tokens: 2000,
+      max_tokens: 2500,
     });
     let text = '';
     for (const block of (resp.content || [])) {
@@ -1845,8 +1862,65 @@ function renderSynthesis(r, lastPrice) {
     </div>
     <div style="margin-top:12px;font-family:JetBrains Mono;font-size:10px;color:var(--ink-3);">Synthesis: Claude · factors weighted by recent volatility regime</div>`;
 
+  renderFactorPanels(factors);
+
   state.data.synthesis = r;
   state.data.lastPrice = lastPrice;
+}
+
+/* ============================================================
+   FACTOR PANELS — clickable expand on each section card
+   ============================================================ */
+const FACTOR_CARDS = {
+  technical:   'card-chart',
+  analyst:     'card-analyst',
+  fundamental: 'card-fundamentals',
+  sentiment:   'card-sentiment',
+  insider:     'card-insider',
+  macro:       'card-news',
+};
+
+function initFactorPanels() {
+  for (const [factor, cardId] of Object.entries(FACTOR_CARDS)) {
+    const card = document.getElementById(cardId);
+    if (!card) continue;
+    const header = card.querySelector('.card-header');
+    if (!header) continue;
+
+    const title = header.querySelector('.card-title');
+    if (title) title.insertAdjacentHTML('beforeend', `<span class="factor-toggle" id="toggle-${factor}">Claude</span>`);
+
+    header.classList.add('has-factor');
+
+    const panel = document.createElement('div');
+    panel.className = 'factor-panel';
+    panel.id = `factor-panel-${factor}`;
+    panel.innerHTML = `<div class="factor-panel-pending">Claude synthesis pending…</div>`;
+    header.insertAdjacentElement('afterend', panel);
+
+    header.addEventListener('click', (e) => {
+      if (e.target.closest('button, a, select, .chart-controls')) return;
+      const isOpen = panel.classList.toggle('open');
+      document.getElementById(`toggle-${factor}`)?.classList.toggle('open', isOpen);
+    });
+  }
+}
+
+function renderFactorPanels(factors) {
+  for (const [factor, f] of Object.entries(factors || {})) {
+    const panel = document.getElementById(`factor-panel-${factor}`);
+    if (!panel) continue;
+    const score = f.score ?? 50;
+    const color = score > 60 ? 'var(--bull)' : score < 40 ? 'var(--bear)' : 'var(--amber)';
+    const label = score > 60 ? 'Bullish' : score < 40 ? 'Bearish' : 'Neutral';
+    panel.innerHTML = `
+      <div class="factor-panel-bar">
+        <span class="factor-panel-score" style="color:${color};">${score}</span>
+        <div class="factor-panel-track"><div class="factor-panel-fill" style="width:${score}%;background:${color};"></div></div>
+        <span class="factor-panel-label" style="color:${color};">${label}</span>
+      </div>
+      <div class="factor-panel-text">${f.narrative || f.note || '—'}</div>`;
+  }
 }
 
 /* ============================================================
@@ -1991,6 +2065,7 @@ document.querySelectorAll('.chart-btn').forEach(btn => {
    BOOT
    ============================================================ */
 initChart();
+initFactorPanels();
 const _urlTicker = new URLSearchParams(location.search).get('t');
 loadTicker((_urlTicker || state.ticker).toUpperCase());
 if (_urlTicker) document.getElementById('back-link').style.display = '';
