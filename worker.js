@@ -987,8 +987,14 @@ async function handleWatchlistAuction(symbols, origin, env, ctx) {
 
   try {
     const cached = await env?.REC_LOG?.get(cacheKey, 'json');
-    if (cached && Date.now() - cached.ts < 900_000) return json(cached, 200, origin);
+    if (cached && Date.now() - cached.ts < 72_000_000) return json(cached, 200, origin); // 20h — persists to next morning
   } catch (_) {}
+
+  // Only fetch if the auction window has closed (end time is in the past)
+  const endMs = new Date(end).getTime();
+  if (endMs > Date.now()) {
+    return json({ auction: {}, window: { start, end, date }, pending: true, ts: Date.now() }, 200, origin);
+  }
 
   const BLOCK_MIN = 500; // ≥500 shares = institutional-sized print
   const auction   = {};
@@ -1044,7 +1050,7 @@ async function handleWatchlistAuction(symbols, origin, env, ctx) {
 
   const result = { auction, window: { start, end, date }, ts: Date.now() };
   if (ctx) ctx.waitUntil(
-    env?.REC_LOG?.put(cacheKey, JSON.stringify(result), { expirationTtl: 900 }).catch(() => {})
+    env?.REC_LOG?.put(cacheKey, JSON.stringify(result), { expirationTtl: 72000 }).catch(() => {}) // 20h
   );
   return json(result, 200, origin);
 }
