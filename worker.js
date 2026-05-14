@@ -372,8 +372,13 @@ async function handleChart(ticker, params, origin) {
 async function handleOptions(ticker, params, origin) {
   const date   = params.get('date');
   const search = date ? `?date=${date}` : '';
-  const data   = await yahoo(`/v7/finance/options/${ticker}`, search);
-  return json(data, 200, origin);
+  try {
+    const data = await yahoo(`/v7/finance/options/${ticker}`, search);
+    return json(data, 200, origin);
+  } catch (e) {
+    // Ticker may have no listed options — return empty chain instead of 500
+    return json({ optionChain: { result: [], error: e.message } }, 200, origin);
+  }
 }
 
 async function handleOptionsRecap(params, origin, env, ctx) {

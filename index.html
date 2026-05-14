@@ -1468,7 +1468,11 @@ async function renderUnusualOptions(ticker, lastPrice) {
   try {
     const data  = await fetchOptions(ticker);
     const chain = data?.optionChain?.result?.[0];
-    if (!chain) throw new Error('No options data returned');
+    if (!chain) {
+      document.getElementById('unusual-content').innerHTML =
+        `<div style="color:var(--ink-3);font-size:12px;padding:8px 0;">No listed options data available for ${ticker}.</div>`;
+      return;
+    }
 
     const price = lastPrice || chain.quote?.regularMarketPrice;
     let totalCallVol = 0, totalPutVol = 0;
