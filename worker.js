@@ -376,6 +376,121 @@ async function handleOptions(ticker, params, origin) {
   return json(data, 200, origin);
 }
 
+async function handleOptionsRecap(params, origin, env, ctx) {
+  const symbolsParam = params.get('symbols') || '';
+  const force   = params.get('refresh') === '1';
+  const symbols = symbolsParam.split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 25);
+  if (!symbols.length) return err('symbols required', 400, origin);
+
+  const cacheKey = `options:recap:${symbols.slice().sort().join(',')}`;
+
+  if (!force) {
+    try {
+      const cached = await env?.REC_LOG?.get(cacheKey, 'json');
+      if (cached && Date.now() - cached.ts < 7_200_000) return json(cached, 200, origin);
+    } catch (_) {}
+  }
+
+  // Fetch nearest-expiration chain for each symbol in batches of 5
+  const rawResults = [];
+  for (let i = 0; i < symbols.length; i += 5) {
+    const batch = await Promise.allSettled(
+      symbols.slice(i, i + 5).map(sym => yahoo(`/v7/finance/options/${sym}`, '')),
+    );
+    rawResults.push(...batch);
+  }
+
+  const fmtNotional = n => n >= 1e6 ? '$' + (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? '$' + (n/1e3).toFixed(0) + 'K' : '$' + n;
+
+  const tickers = [];
+  for (let i = 0; i < symbols.length; i++) {
+    const sym = symbols[i];
+    if (rawResults[i].status !== 'fulfilled') continue;
+    const chain = rawResults[i].value?.optionChain?.result?.[0];
+    if (!chain) continue;
+
+    const price = chain.quote?.regularMarketPrice ?? null;
+    let totalCallVol = 0, totalPutVol = 0, totalCallOI = 0, totalPutOI = 0;
+    const unusual = [];
+
+    for (const exp of (chain.options || [])) {
+      const expDte = exp.expirationDate
+        ? Math.max(0, Math.round((exp.expirationDate * 1000 - Date.now()) / 86400000))
+        : null;
+
+      for (const c of (exp.calls || [])) {
+        const vol = c.volume ?? 0;
+        const oi  = c.openInterest ?? 0;
+        totalCallVol += vol;
+        totalCallOI  += oi;
+        const mid = c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : c.lastPrice ?? 0;
+        const notional = Math.round(vol * mid * 100);
+        const voi = oi > 0 ? vol / oi : (vol > 0 ? 99 : 0);
+        if (vol >= 100 && voi >= 2 && notional > 0)
+          unusual.push({ type: 'CALL', strike: c.strike, dte: expDte, vol, oi, volOiRatio: +voi.toFixed(1), notional });
+      }
+      for (const p of (exp.puts || [])) {
+        const vol = p.volume ?? 0;
+        const oi  = p.openInterest ?? 0;
+        totalPutVol += vol;
+        totalPutOI  += oi;
+        const mid = p.bid > 0 && p.ask > 0 ? (p.bid + p.ask) / 2 : p.lastPrice ?? 0;
+        const notional = Math.round(vol * mid * 100);
+        const voi = oi > 0 ? vol / oi : (vol > 0 ? 99 : 0);
+        if (vol >= 100 && voi >= 2 && notional > 0)
+          unusual.push({ type: 'PUT', strike: p.strike, dte: expDte, vol, oi, volOiRatio: +voi.toFixed(1), notional });
+      }
+    }
+
+    tickers.push({
+      symbol: sym, price,
+      totalCallVol, totalPutVol, totalCallOI, totalPutOI,
+      pcRatio:   totalCallVol > 0 ? +(totalPutVol / totalCallVol).toFixed(2) : null,
+      pcOiRatio: totalCallOI  > 0 ? +(totalPutOI  / totalCallOI ).toFixed(2) : null,
+      unusual: unusual.sort((a, b) => b.notional - a.notional).slice(0, 3),
+    });
+  }
+
+  // Claude synthesis
+  let synthesis = null;
+  if (env?.ANTHROPIC_API_KEY && tickers.length > 0) {
+    const lines = tickers.map(t => {
+      const top = t.unusual.slice(0, 2)
+        .map(u => `${u.vol} ${u.type}s $${u.strike} ${u.dte}d (${u.volOiRatio}× V/OI, ${fmtNotional(u.notional)})`)
+        .join('; ');
+      return `${t.symbol} $${t.price?.toFixed(2) ?? '?'}: calls ${t.totalCallVol} puts ${t.totalPutVol} P/C ${t.pcRatio ?? 'N/A'} P/C-OI ${t.pcOiRatio ?? 'N/A'}` +
+        (top ? ` | unusual: ${top}` : '');
+    }).join('\n');
+
+    const prompt = `You are an options market analyst. Review today's options flow for this watchlist (nearest expiration, 15-min delay):
+
+${lines}
+
+Return ONLY valid JSON (no markdown):
+{
+  "overall": "2-sentence summary of collective options tone and any cross-ticker themes",
+  "tickers": {
+    "SYMBOL": "2-3 sentences: where call/put activity concentrated, what unusual prints imply, near-term directional read from the flow"
+  }
+}
+Only include ticker keys that appear in the data above. Be specific about strikes and implications.`;
+
+    try {
+      const text    = await workerClaude(prompt, env, 1500);
+      const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+      synthesis = JSON.parse(cleaned);
+    } catch (e) {
+      console.error('[options recap] synthesis failed:', e.message);
+    }
+  }
+
+  const result = { tickers, synthesis, ts: Date.now() };
+  if (ctx) ctx.waitUntil(
+    env?.REC_LOG?.put(cacheKey, JSON.stringify(result), { expirationTtl: 7200 }).catch(() => {}),
+  );
+  return json(result, 200, origin);
+}
+
 async function handleSearch(q, origin) {
   const r = await fetch(
     `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0`,
@@ -1151,7 +1266,9 @@ export default {
       switch (route) {
         case 'quote':    return await handleQuote(sub, origin, env);
         case 'chart':    return await handleChart(sub, url.searchParams, origin);
-        case 'options':  return await handleOptions(sub, url.searchParams, origin);
+        case 'options':
+          if (sub === 'recap') return await handleOptionsRecap(url.searchParams, origin, env, ctx);
+          return await handleOptions(sub, url.searchParams, origin);
         case 'search':   return await handleSearch(url.searchParams.get('q') || '', origin);
         case 'news':     return await handleNews(sub, origin, env);
         case 'peers':    return await handlePeers(sub, origin);

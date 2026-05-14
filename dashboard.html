@@ -270,6 +270,29 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 /* Tab panels */
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
+
+/* Options recap tab */
+.options-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+.options-synthesis { background: var(--bg-1); border: 1px solid var(--line); border-radius: 10px; padding: 18px 24px; margin-bottom: 24px; }
+.options-synthesis-label { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+.options-synthesis-text { font-family: var(--serif); font-size: 15px; font-weight: 300; color: var(--ink-1); line-height: 1.65; }
+.options-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
+.options-card { background: var(--bg-1); border: 1px solid var(--line); border-radius: 8px; padding: 16px 20px; }
+.options-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.options-sym { font-family: var(--mono); font-weight: 600; font-size: 14px; color: var(--cyan); text-decoration: none; }
+.options-sym:hover { color: var(--ink-0); }
+.options-price { font-family: var(--mono); font-size: 11px; color: var(--ink-2); margin-left: 8px; }
+.options-pc-badge { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+.options-pc-badge.bull { color: var(--bull); }
+.options-pc-badge.bear { color: var(--bear); }
+.options-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-bottom: 14px; }
+.options-stat { }
+.options-stat-label { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
+.options-stat-val { font-family: var(--mono); font-size: 13px; color: var(--ink-0); }
+.options-unusual-head { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; border-top: 1px solid var(--line-soft); padding-top: 12px; }
+.options-unusual-row { display: grid; grid-template-columns: 44px 44px 60px 1fr 1fr 1fr; gap: 4px; font-family: var(--mono); font-size: 11px; padding: 4px 0; border-bottom: 1px solid var(--line-soft); align-items: center; }
+.options-unusual-row:last-child { border-bottom: none; }
+.options-narrative { font-size: 12px; color: var(--ink-2); line-height: 1.6; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
 </style>
 </head>
 <body>
@@ -280,6 +303,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
   <nav class="tabs">
     <button class="tab-btn active" data-tab="market">Market</button>
     <button class="tab-btn" data-tab="watchlist">Watchlist</button>
+    <button class="tab-btn" data-tab="options">Options</button>
   </nav>
   <div class="topbar-right"><span id="clock"></span></div>
 </header>
@@ -423,6 +447,22 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
           <tr><td colspan="18" class="loading" style="padding:24px">Loading watchlist…</td></tr>
         </tbody>
       </table>
+    </div>
+  </div>
+</div>
+
+<!-- Options tab -->
+<div class="tab-panel" id="tab-options">
+  <div class="main">
+    <div class="options-header">
+      <div>
+        <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">Options Flow</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Watchlist EOD recap · nearest expiration · 15-min delay · V/OI ≥ 2× unusual filter</div>
+      </div>
+      <button class="wl-btn refresh" id="options-refresh-btn">↺ Refresh</button>
+    </div>
+    <div id="options-content">
+      <div class="loading" style="padding:40px;text-align:center;">Click Refresh to load options flow.</div>
     </div>
   </div>
 </div>
@@ -798,6 +838,7 @@ function switchTab(tab) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tab));
   if (tab === 'watchlist' && Object.keys(wlData).length === 0) loadWatchlistBatch();
+  if (tab === 'options'   && !optionsData) loadOptionsRecap();
 }
 
 /* ─── Sorting ─── */
@@ -925,6 +966,107 @@ function initColumnResize() {
   tbody.addEventListener('mouseout',   e => { if (!e.target.closest('.ai-cell')) tip.style.display = 'none'; });
   tbody.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
 })();
+
+/* ─── Options recap ─── */
+let optionsData = null;
+let optionsLoading = false;
+
+async function loadOptionsRecap(forceRefresh = false) {
+  if (optionsLoading) return;
+  const symbols = getWatchlist();
+  if (!symbols.length) {
+    document.getElementById('options-content').innerHTML =
+      '<div style="padding:40px;text-align:center;color:var(--ink-3)">Add tickers to your watchlist to see options flow.</div>';
+    return;
+  }
+  optionsLoading = true;
+  const btn = document.getElementById('options-refresh-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '↺ Loading…'; }
+  document.getElementById('options-content').innerHTML =
+    '<div class="loading" style="padding:40px;text-align:center">Fetching options chains and running analysis…</div>';
+  try {
+    const qs = symbols.join(',') + (forceRefresh ? '&refresh=1' : '');
+    const data = await apiFetch(`/options/recap?symbols=${qs}`, { cache: 'no-store' });
+    optionsData = data;
+    renderOptionsRecap(data);
+  } catch (e) {
+    document.getElementById('options-content').innerHTML =
+      `<div style="padding:40px;color:var(--bear)">Failed: ${e.message}</div>`;
+  } finally {
+    optionsLoading = false;
+    if (btn) { btn.disabled = false; btn.textContent = '↺ Refresh'; }
+  }
+}
+
+function renderOptionsRecap(data) {
+  const { tickers, synthesis, ts } = data;
+  const tsStr = ts ? new Date(ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' }) : '';
+  const fmtN  = n => n >= 1e6 ? '$' + (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? '$' + (n/1e3).toFixed(0) + 'K' : '<$1K';
+
+  let html = '';
+
+  if (synthesis?.overall) {
+    html += `<div class="options-synthesis">
+      <div class="options-synthesis-label">Claude's Read · ${tsStr}</div>
+      <div class="options-synthesis-text">${esc(synthesis.overall)}</div>
+    </div>`;
+  }
+
+  if (!tickers?.length) {
+    html += '<div style="color:var(--ink-3);padding:20px">No options data returned.</div>';
+    document.getElementById('options-content').innerHTML = html;
+    return;
+  }
+
+  html += '<div class="options-grid">';
+  for (const t of tickers) {
+    const pcCls   = t.pcRatio == null ? '' : t.pcRatio < 0.8 ? 'bull' : t.pcRatio > 1.2 ? 'bear' : '';
+    const pcArrow = t.pcRatio == null ? '' : t.pcRatio < 0.8 ? '↑ ' : t.pcRatio > 1.2 ? '↓ ' : '';
+    const narrative = synthesis?.tickers?.[t.symbol];
+
+    let unusualHtml = '';
+    if (t.unusual?.length) {
+      unusualHtml = `<div class="options-unusual-head">Unusual Activity</div>`;
+      for (const u of t.unusual) {
+        const cls = u.type === 'CALL' ? 'up' : 'dn';
+        unusualHtml += `<div class="options-unusual-row">
+          <span class="${cls}">${u.type}</span>
+          <span>$${u.strike}</span>
+          <span style="color:var(--ink-3)">${u.dte != null ? u.dte + 'd' : '—'}</span>
+          <span>${fmt(u.vol)}</span>
+          <span style="color:var(--ink-2)">${u.volOiRatio >= 99 ? 'new OI' : u.volOiRatio + '× V/OI'}</span>
+          <span style="color:var(--amber)">${fmtN(u.notional)}</span>
+        </div>`;
+      }
+    }
+
+    html += `<div class="options-card">
+      <div class="options-card-header">
+        <div>
+          <a class="options-sym" href="${EQUITY_URL}?t=${esc(t.symbol)}">${esc(t.symbol)}</a>
+          ${t.price != null ? `<span class="options-price">$${fmt(t.price)}</span>` : ''}
+        </div>
+        <div>
+          <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-right:4px">P/C</span>
+          <span class="options-pc-badge ${pcCls}">${t.pcRatio != null ? pcArrow + t.pcRatio : '—'}</span>
+        </div>
+      </div>
+      <div class="options-stats">
+        <div class="options-stat"><div class="options-stat-label">Calls</div><div class="options-stat-val" style="color:var(--bull)">${fmt(t.totalCallVol)}</div></div>
+        <div class="options-stat"><div class="options-stat-label">Puts</div><div class="options-stat-val" style="color:var(--bear)">${fmt(t.totalPutVol)}</div></div>
+        <div class="options-stat"><div class="options-stat-label">Call OI</div><div class="options-stat-val">${fmt(t.totalCallOI)}</div></div>
+        <div class="options-stat"><div class="options-stat-label">Put OI</div><div class="options-stat-val">${fmt(t.totalPutOI)}</div></div>
+        <div class="options-stat"><div class="options-stat-label">OI P/C</div><div class="options-stat-val ${t.pcOiRatio != null ? (t.pcOiRatio < 0.8 ? 'up' : t.pcOiRatio > 1.2 ? 'dn' : '') : ''}">${t.pcOiRatio ?? '—'}</div></div>
+      </div>
+      ${unusualHtml}
+      ${narrative ? `<div class="options-narrative">${esc(narrative)}</div>` : ''}
+    </div>`;
+  }
+  html += '</div>';
+  document.getElementById('options-content').innerHTML = html;
+}
+
+document.getElementById('options-refresh-btn').addEventListener('click', () => loadOptionsRecap(true));
 
 /* ─── Init ─── */
 async function init() {

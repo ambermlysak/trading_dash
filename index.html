@@ -1463,26 +1463,91 @@ function renderShortInterest(quote) {
   state.data.shortInterest = { si: siPct != null ? +siPct : null, dtc: dtc ?? null };
 }
 
-function renderUnusualOptions(ticker, lastPrice) {
-  const data = mockUnusualOptions(ticker, lastPrice);
-  let html = `<table class="data">
-    <thead><tr><th>DTE</th><th>Strike</th><th>Type</th><th class="right">Vol</th><th class="right">OI</th><th class="right">V/OI</th></tr></thead>
-    <tbody>`;
-  for (const r of data) {
-    const cls = r.type === 'CALL' ? 'bull' : 'bear';
-    html += `
-      <tr>
-        <td>${r.dte}d</td>
-        <td>$${r.strike}</td>
-        <td class="${cls}">${r.type}</td>
-        <td class="right">${fmt.big(r.vol)}</td>
-        <td class="right">${fmt.big(r.oi)}</td>
-        <td class="right ${r.ratio > 5 ? 'bull' : ''}">${r.ratio.toFixed(1)}×</td>
-      </tr>`;
+async function renderUnusualOptions(ticker, lastPrice) {
+  document.getElementById('unusual-content').innerHTML = '<div class="loading" style="padding:12px 0">Loading options chain…</div>';
+  try {
+    const data  = await fetchOptions(ticker);
+    const chain = data?.optionChain?.result?.[0];
+    if (!chain) throw new Error('No options data returned');
+
+    const price = lastPrice || chain.quote?.regularMarketPrice;
+    let totalCallVol = 0, totalPutVol = 0;
+    const contracts = [];
+
+    for (const exp of (chain.options || [])) {
+      const dte = exp.expirationDate
+        ? Math.max(0, Math.round((exp.expirationDate * 1000 - Date.now()) / 86400000))
+        : null;
+
+      for (const c of (exp.calls || [])) {
+        const vol = c.volume ?? 0;
+        const oi  = c.openInterest ?? 0;
+        totalCallVol += vol;
+        const mid = c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : c.lastPrice ?? 0;
+        const notional  = vol * mid * 100;
+        const volOiRatio = oi > 0 ? vol / oi : (vol > 0 ? 99 : 0);
+        if (vol >= 100 && volOiRatio >= 2)
+          contracts.push({ type: 'CALL', strike: c.strike, dte, vol, oi, volOiRatio, notional, itm: c.inTheMoney });
+      }
+      for (const p of (exp.puts || [])) {
+        const vol = p.volume ?? 0;
+        const oi  = p.openInterest ?? 0;
+        totalPutVol += vol;
+        const mid = p.bid > 0 && p.ask > 0 ? (p.bid + p.ask) / 2 : p.lastPrice ?? 0;
+        const notional  = vol * mid * 100;
+        const volOiRatio = oi > 0 ? vol / oi : (vol > 0 ? 99 : 0);
+        if (vol >= 100 && volOiRatio >= 2)
+          contracts.push({ type: 'PUT', strike: p.strike, dte, vol, oi, volOiRatio, notional, itm: p.inTheMoney });
+      }
+    }
+
+    contracts.sort((a, b) => b.notional - a.notional);
+    const top = contracts.slice(0, 8);
+
+    const pcRatio = totalCallVol > 0 ? (totalPutVol / totalCallVol).toFixed(2) : '—';
+    const pcCls   = totalCallVol > 0
+      ? (totalPutVol < totalCallVol * 0.8 ? 'bull' : totalPutVol > totalCallVol * 1.2 ? 'bear' : '')
+      : '';
+
+    const fmtN = n => n >= 1e6 ? '$' + (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? '$' + (n/1e3).toFixed(0) + 'K' : '<$1K';
+
+    let html = `
+      <div style="display:flex;gap:20px;margin-bottom:12px;font-family:var(--mono);font-size:11px;color:var(--ink-2);">
+        <span>Calls <b style="color:var(--bull)">${fmt.big(totalCallVol)}</b></span>
+        <span>Puts <b style="color:var(--bear)">${fmt.big(totalPutVol)}</b></span>
+        <span>P/C <b class="${pcCls}">${pcRatio}</b></span>
+      </div>`;
+
+    if (top.length === 0) {
+      html += `<div style="color:var(--ink-3);font-size:12px;padding:8px 0;">No unusual activity (V/OI ≥ 2×, volume ≥ 100)</div>`;
+    } else {
+      html += `<table class="data"><thead>
+        <tr><th>DTE</th><th>Type</th><th>Strike</th><th class="right">Vol</th><th class="right">OI</th><th class="right">V/OI</th><th class="right">Notional</th></tr>
+        </thead><tbody>`;
+      for (const r of top) {
+        const cls = r.type === 'CALL' ? 'bull' : 'bear';
+        html += `<tr>
+          <td>${r.dte != null ? r.dte + 'd' : '—'}</td>
+          <td class="${cls}">${r.type}</td>
+          <td>${r.itm ? '●' : '○'} $${r.strike}</td>
+          <td class="right">${fmt.big(r.vol)}</td>
+          <td class="right">${fmt.big(r.oi)}</td>
+          <td class="right ${r.volOiRatio >= 5 ? cls : ''}">${r.volOiRatio >= 99 ? 'new' : r.volOiRatio.toFixed(1) + '×'}</td>
+          <td class="right">${fmtN(r.notional)}</td>
+        </tr>`;
+      }
+      html += `</tbody></table>
+        <div style="margin-top:8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">● ITM · ○ OTM · unusual = V/OI ≥ 2× · sorted by notional</div>`;
+    }
+
+    document.getElementById('unusual-content').innerHTML = html;
+    const tag = document.querySelector('#card-unusual .mock-tag');
+    if (tag) tag.textContent = 'Yahoo · 15min delay · V/OI calc';
+    state.data.unusualOptions = top;
+  } catch (e) {
+    document.getElementById('unusual-content').innerHTML =
+      `<div style="color:var(--ink-3);font-size:12px;padding:8px 0;">Options unavailable: ${e.message}</div>`;
   }
-  html += `</tbody></table>
-    <div style="margin-top:10px;font-family:JetBrains Mono;font-size:10px;color:var(--ink-3);">Today + last 5 sessions; volume/OI ratio &gt; 5× = unusual</div>`;
-  document.getElementById('unusual-content').innerHTML = html;
 }
 
 function renderDarkPool(ticker) {
