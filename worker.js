@@ -955,92 +955,66 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
   return json({ stocks, analysisLoading: needsAnalysis.length > 0, ts: Date.now() }, 200, origin);
 }
 
-/* Returns today's closing auction window (3:55–4:05pm ET) as UTC ISO strings. */
-function getAuctionWindow() {
-  const now = new Date();
-  // Today's date in ET (en-CA gives YYYY-MM-DD)
-  const etDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(now);
-  // Determine UTC offset: EDT = 4, EST = 5
-  const nyHour = parseInt(
-    new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', hour12: false })
-      .formatToParts(now).find(p => p.type === 'hour').value
-  );
-  const offset = ((now.getUTCHours() - nyHour) + 24) % 24; // 4 or 5
-  const tzStr  = offset === 4 ? '-04:00' : '-05:00';
-  return {
-    start: `${etDate}T15:55:00${tzStr}`,
-    end:   `${etDate}T16:05:00${tzStr}`,
-    date:  etDate,
-  };
-}
-
 async function handleWatchlistAuction(symbols, origin, env, ctx) {
-  if (!env?.ALPACA_KEY || !env?.ALPACA_SECRET) {
-    return err('Alpaca keys required for auction data', 400, origin);
-  }
-
-  const tickers = symbols.split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 25);
+  const tickers = symbols.split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 30);
   if (!tickers.length) return err('symbols required', 400, origin);
 
-  const { start, end, date } = getAuctionWindow();
-  const cacheKey = `auction:${date}:${tickers.slice().sort().join(',')}`;
+  const etDate   = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+  const cacheKey = `auction:${etDate}:${tickers.slice().sort().join(',')}`;
 
   try {
     const cached = await env?.REC_LOG?.get(cacheKey, 'json');
-    if (cached && Date.now() - cached.ts < 72_000_000) return json(cached, 200, origin); // 20h — persists to next morning
+    if (cached && Date.now() - cached.ts < 72_000_000) return json(cached, 200, origin);
   } catch (_) {}
 
-  // Only fetch if the auction window has closed (end time is in the past)
-  const endMs = new Date(end).getTime();
-  if (endMs > Date.now()) {
-    return json({ auction: {}, window: { start, end, date }, pending: true, ts: Date.now() }, 200, origin);
+  // Return early if market hasn't closed yet (before 4:01pm ET)
+  const nowParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(new Date());
+  const etH = parseInt(nowParts.find(p => p.type === 'hour').value);
+  const etM = parseInt(nowParts.find(p => p.type === 'minute').value);
+  if (etH < 16 || (etH === 16 && etM < 1)) {
+    return json({ auction: {}, pending: true, ts: Date.now() }, 200, origin);
   }
 
-  const BLOCK_MIN = 500; // ≥500 shares = institutional-sized print
-  const auction   = {};
+  const auction = {};
 
-  for (let i = 0; i < tickers.length; i += 4) {
+  for (let i = 0; i < tickers.length; i += 5) {
     await Promise.allSettled(
-      tickers.slice(i, i + 4).map(async ticker => {
+      tickers.slice(i, i + 5).map(async ticker => {
         try {
-          const qs    = new URLSearchParams({ start, end, limit: '10000', feed: 'sip', sort: 'asc' });
-          const data  = await alpacaFetch(`/v2/stocks/${ticker}/trades?${qs}`, env);
-          const trades = data.trades || [];
+          const data = await yahoo(
+            `/v8/finance/chart/${ticker}`,
+            '?range=1d&interval=1m&includePrePost=true',
+          );
+          const result = data?.chart?.result?.[0];
+          if (!result) return;
 
-          let buyShares = 0, sellShares = 0, unkShares = 0;
-          let buyNotional = 0, sellNotional = 0;
-          const blocks = [];
+          const meta       = result.meta       || {};
+          const timestamps = result.timestamp  || [];
+          const q          = result.indicators?.quote?.[0] || {};
+          const closes  = q.close  || [];
+          const volumes = q.volume || [];
+          const opens   = q.open   || [];
 
-          for (const t of trades) {
-            const shares   = t.s || 0;
-            const notional = shares * (t.p || 0);
-            const side     = t.tks || 'U';
+          const regularClose = meta.regularMarketPrice ?? meta.chartPreviousClose ?? null;
+          const closeTs      = meta.regularMarketTime  ?? null; // Unix secs, end of regular session
+          if (regularClose == null || closeTs == null) return;
 
-            if      (side === 'B') { buyShares  += shares; buyNotional  += notional; }
-            else if (side === 'S') { sellShares += shares; sellNotional += notional; }
-            else                   { unkShares  += shares; }
-
-            if (shares >= BLOCK_MIN) {
-              const isMOC = (t.c || []).some(c => c === 'C' || c === '6'); // closing print flag
-              blocks.push({
-                tET:      new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(t.t)),
-                side,
-                size:     shares,
-                price:    t.p,
-                notional: Math.round(notional),
-                isMOC,
-              });
-            }
+          // First bar strictly after the regular session close timestamp
+          let ahIdx = -1;
+          for (let j = 0; j < timestamps.length; j++) {
+            if (timestamps[j] > closeTs) { ahIdx = j; break; }
           }
+          if (ahIdx === -1) return;
 
-          auction[ticker] = {
-            buyShares, sellShares, unkShares,
-            buyNotional:  Math.round(buyNotional),
-            sellNotional: Math.round(sellNotional),
-            tradeCount:   trades.length,
-            blocks:       blocks.sort((a, b) => b.notional - a.notional).slice(0, 15),
-            blockCount:   blocks.length,
-          };
+          const ahVol    = volumes[ahIdx] ?? 0;
+          const ahOpen   = opens[ahIdx]   ?? null;
+          const ahClose  = closes[ahIdx]  ?? null;
+          const ahChg    = ahClose != null ? Math.round((ahClose - regularClose) * 100) / 100 : null;
+          const ahChgPct = ahClose != null ? Math.round((ahClose - regularClose) / regularClose * 10000) / 100 : null;
+
+          auction[ticker] = { regularClose, ahVol, ahOpen, ahClose, ahChg, ahChgPct };
         } catch (e) {
           console.error(`[auction] ${ticker}:`, e.message);
         }
@@ -1048,9 +1022,9 @@ async function handleWatchlistAuction(symbols, origin, env, ctx) {
     );
   }
 
-  const result = { auction, window: { start, end, date }, ts: Date.now() };
+  const result = { auction, pending: false, ts: Date.now() };
   if (ctx) ctx.waitUntil(
-    env?.REC_LOG?.put(cacheKey, JSON.stringify(result), { expirationTtl: 72000 }).catch(() => {}) // 20h
+    env?.REC_LOG?.put(cacheKey, JSON.stringify(result), { expirationTtl: 72000 }).catch(() => {})
   );
   return json(result, 200, origin);
 }
