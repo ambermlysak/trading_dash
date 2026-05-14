@@ -170,7 +170,8 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 
 /* Watchlist table */
 .wl-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
-.wl-table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; table-layout: fixed; }
+.wl-table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; table-layout: auto; }
+#tab-watchlist .main { max-width: none; }
 .wl-table thead th {
   padding: 10px 12px; text-align: left; font-size: 9px; font-family: var(--mono);
   font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-3);
@@ -425,25 +426,8 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     <div class="wl-table-wrap">
       <table class="wl-table">
         <colgroup>
-          <col style="width:36px">
-          <col style="width:70px">
-          <col style="width:82px">
-          <col style="width:74px">
-          <col style="width:150px">
-          <col style="width:150px">
-          <col style="width:150px">
-          <col style="width:86px">
-          <col style="width:56px">
-          <col style="width:64px">
-          <col style="width:74px">
-          <col style="width:84px">
-          <col style="width:120px">
-          <col style="width:78px">
-          <col style="width:78px">
-          <col style="width:144px">
-          <col style="width:164px">
-          <col style="width:92px">
-          <col style="width:114px">
+          <col><col><col><col><col><col><col><col><col><col>
+          <col><col><col><col><col><col><col><col><col>
         </colgroup>
         <thead>
           <tr>
