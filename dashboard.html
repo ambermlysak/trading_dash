@@ -293,6 +293,29 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .options-unusual-row { display: grid; grid-template-columns: 44px 44px 60px 1fr 1fr 1fr; gap: 4px; font-family: var(--mono); font-size: 11px; padding: 4px 0; border-bottom: 1px solid var(--line-soft); align-items: center; }
 .options-unusual-row:last-child { border-bottom: none; }
 .options-narrative { font-size: 12px; color: var(--ink-2); line-height: 1.6; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
+
+/* Auction column (3:55–4:05pm ET block trades) */
+.flow-wrap { min-width: 90px; }
+.flow-bar { height: 4px; background: var(--bg-3); border-radius: 2px; overflow: hidden; margin-bottom: 4px; display: flex; }
+.flow-bar-buy  { background: var(--bull); height: 100%; }
+.flow-bar-sell { background: var(--bear); height: 100%; flex: 1; }
+.flow-nums { font-family: var(--mono); font-size: 10px; display: flex; gap: 5px; align-items: center; }
+.flow-bull { color: var(--bull); }
+.flow-bear { color: var(--bear); }
+.flow-pct  { color: var(--ink-3); font-size: 9px; }
+.flow-blocks { font-family: var(--mono); font-size: 9px; color: var(--amber); margin-top: 2px; }
+
+/* Expanded auction block trades */
+.auction-blocks { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
+.auction-blocks-head { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+.auction-block-row { display: grid; grid-template-columns: 60px 42px 76px 76px 76px 44px; gap: 8px; font-family: var(--mono); font-size: 11px; padding: 4px 0; border-bottom: 1px solid var(--line-soft); align-items: center; }
+.auction-block-row:last-child { border-bottom: none; }
+.auction-side-b { color: var(--bull); font-weight: 600; }
+.auction-side-s { color: var(--bear); font-weight: 600; }
+.auction-side-u { color: var(--ink-3); }
+.auction-time { color: var(--ink-3); }
+.auction-notional { color: var(--amber); }
+.auction-moc { font-size: 9px; background: var(--cyan-soft); color: var(--cyan); padding: 1px 5px; border-radius: 3px; }
 </style>
 </head>
 <body>
@@ -414,6 +437,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
           <col style="width:64px">
           <col style="width:74px">
           <col style="width:84px">
+          <col style="width:120px">
           <col style="width:78px">
           <col style="width:78px">
           <col style="width:144px">
@@ -435,6 +459,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
             <th data-sort="pe">P/E</th>
             <th data-sort="shortPct">Short %</th>
             <th data-sort="volume">Volume</th>
+            <th title="Block trades ≥500 shares · 3:55–4:05pm ET · Alpaca SIP · click row to expand">Auction</th>
             <th data-sort="resist">Resist</th>
             <th data-sort="support">Support</th>
             <th>Target L/M/H</th>
@@ -444,7 +469,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
           </tr>
         </thead>
         <tbody id="wl-tbody">
-          <tr><td colspan="18" class="loading" style="padding:24px">Loading watchlist…</td></tr>
+          <tr><td colspan="19" class="loading" style="padding:24px">Loading watchlist…</td></tr>
         </tbody>
       </table>
     </div>
@@ -481,6 +506,7 @@ const WL_KEY = 'trading_dash_watchlist';
 let sortCol = 'symbol', sortAsc = true;
 let expandedTicker = null;
 let wlData = {};
+let auctionData = {};
 let wlLoading = false;
 let analysisRefreshTimer = null;
 
@@ -673,6 +699,7 @@ function saveWatchlist(tickers) {
 async function loadWatchlistBatch() {
   if (wlLoading) return;
   wlLoading = true;
+  auctionData = {};
 
   // Cancel any pending auto-retry from a previous analysis-loading cycle
   if (analysisRefreshTimer) { clearTimeout(analysisRefreshTimer); analysisRefreshTimer = null; }
@@ -681,7 +708,7 @@ async function loadWatchlistBatch() {
   btn.disabled = true;
   btn.textContent = '↺ Loading…';
   document.getElementById('wl-tbody').innerHTML =
-    '<tr><td colspan="18" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
+    '<tr><td colspan="19" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
   document.getElementById('wl-status').textContent = 'Fetching…';
 
   try {
@@ -709,11 +736,12 @@ async function loadWatchlistBatch() {
       if (banner) banner.style.display = 'none';
     }
     renderWatchlist();
+    loadWatchlistAuction(); // fire-and-forget — fills Auction column after main data renders
   } catch (e) {
     console.error('[watchlist]', e.message);
     document.getElementById('wl-status').textContent = 'Error — ' + e.message;
     document.getElementById('wl-tbody').innerHTML =
-      '<tr><td colspan="18" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
+      '<tr><td colspan="19" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
   } finally {
     wlLoading = false;
     btn.disabled = false;
@@ -767,6 +795,18 @@ function renderWatchlist() {
       <td class="mono">${s.pe != null ? fmt(s.pe, 1) : '—'}</td>
       <td class="mono">${s.shortPct != null ? fmt(s.shortPct, 1) + '%' : '—'}</td>
       <td class="mono">${fmtVol(s.volume)}</td>
+      <td>${(function() {
+        const a = auctionData[s.symbol];
+        if (!a) return '<span style="color:var(--ink-3);font-family:var(--mono);font-size:10px">—</span>';
+        const ct = a.buyShares + a.sellShares;
+        const buyPct = ct > 0 ? Math.round(a.buyShares / ct * 100) : 50;
+        const blockLbl = a.blockCount > 0 ? `<div class="flow-blocks">${a.blockCount} block${a.blockCount !== 1 ? 's' : ''}</div>` : '';
+        return `<div class="flow-wrap">
+          <div class="flow-bar"><div class="flow-bar-buy" style="width:${buyPct}%"></div><div class="flow-bar-sell"></div></div>
+          <div class="flow-nums"><span class="flow-bull">↑${fmtVol(a.buyShares)}</span><span class="flow-bear">↓${fmtVol(a.sellShares)}</span><span class="flow-pct">${buyPct}%</span></div>
+          ${blockLbl}
+        </div>`;
+      })()}</td>
       <td class="mono">${s.resist  != null ? fmt(s.resist)  : '—'}</td>
       <td class="mono">${s.support != null ? fmt(s.support) : '—'}</td>
       <td class="mono" style="font-size:11px">${targets}</td>
@@ -776,23 +816,78 @@ function renderWatchlist() {
     </tr>`;
 
     // Expanded row
-    if (expandedTicker === s.symbol && s.summary) {
+    const auc = auctionData[s.symbol];
+    if (expandedTicker === s.symbol && (s.summary || auc)) {
+      // Block trades section
+      let blocksHtml = '';
+      if (auc) {
+        const fmtN = n => n >= 1e9 ? '$' + (n/1e9).toFixed(1) + 'B' : n >= 1e6 ? '$' + (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? '$' + (n/1e3).toFixed(0) + 'K' : '$' + n;
+        const totalClassified = auc.buyShares + auc.sellShares;
+        const buyPct = totalClassified > 0 ? Math.round(auc.buyShares / totalClassified * 100) : null;
+        const summaryLine = totalClassified > 0
+          ? `${fmtVol(auc.buyShares)} buy / ${fmtVol(auc.sellShares)} sell${buyPct != null ? ' · ' + buyPct + '% buy-side' : ''}${auc.unkShares > 0 ? ' · ' + fmtVol(auc.unkShares) + ' unclassified' : ''} · ${auc.tradeCount.toLocaleString()} total prints`
+          : 'No trade data available for this window.';
+
+        let rowsHtml = '';
+        if (auc.blocks?.length) {
+          rowsHtml = auc.blocks.map(b => {
+            const sideCls = b.side === 'B' ? 'auction-side-b' : b.side === 'S' ? 'auction-side-s' : 'auction-side-u';
+            const sideLabel = b.side === 'B' ? 'BUY' : b.side === 'S' ? 'SELL' : 'UNK';
+            const mocBadge = b.isMOC ? '<span class="auction-moc">MOC</span>' : '';
+            return `<div class="auction-block-row">
+              <span class="auction-time">${esc(b.tET)}</span>
+              <span class="${sideCls}">${sideLabel}</span>
+              <span style="color:var(--ink-0)">${b.size.toLocaleString()}</span>
+              <span style="color:var(--ink-1)">$${fmt(b.price)}</span>
+              <span class="auction-notional">${fmtN(b.notional)}</span>
+              ${mocBadge}
+            </div>`;
+          }).join('');
+        } else {
+          rowsHtml = `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3)">No block prints ≥500 shares in window.</div>`;
+        }
+
+        blocksHtml = `<div class="auction-blocks">
+          <div class="auction-blocks-head">3:55–4:05pm Closing Auction · Block Prints ≥500 shares</div>
+          <div style="font-family:var(--mono);font-size:10px;color:var(--ink-2);margin-bottom:10px">${summaryLine}</div>
+          ${rowsHtml}
+        </div>`;
+      }
+
       html += `<tr class="expand-row">
-        <td colspan="18">
+        <td colspan="19">
           <div class="expand-content">
-            <div class="expand-summary">${esc(s.summary)}</div>
+            ${s.summary ? `<div class="expand-summary">${esc(s.summary)}</div>` : ''}
             <div class="expand-meta">
               ${s.analysisTs ? `<div class="expand-pill">Analysis: <span>${new Date(s.analysisTs).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span></div>` : ''}
               ${s.sector ? `<div class="expand-pill">Sector: <span>${esc(s.sector)}</span></div>` : ''}
               ${s.pe != null ? `<div class="expand-pill">P/E: <span>${fmt(s.pe, 1)}</span></div>` : ''}
               ${s.targetMean != null ? `<div class="expand-pill">Analyst target: <span>$${fmt(s.targetMean)}</span></div>` : ''}
             </div>
+            ${blocksHtml}
           </div>
         </td>
       </tr>`;
     }
   }
-  tbody.innerHTML = html || '<tr><td colspan="18" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
+  tbody.innerHTML = html || '<tr><td colspan="19" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
+}
+
+/* ─── Closing auction block trades ─── */
+async function loadWatchlistAuction() {
+  const tickers = getWatchlist();
+  if (!tickers.length) return;
+  try {
+    const CHUNK = 12;
+    for (let i = 0; i < tickers.length; i += CHUNK) {
+      const chunk = tickers.slice(i, i + CHUNK);
+      const data = await apiFetch('/watchlist/auction?symbols=' + chunk.join(','), { cache: 'no-store' });
+      Object.assign(auctionData, data.auction || {});
+    }
+    renderWatchlist();
+  } catch (e) {
+    console.error('[auction]', e.message);
+  }
 }
 
 /* ─── Rating badge ─── */
