@@ -650,8 +650,8 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     <!-- 3. SHORT INTEREST -->
     <div class="card col-6" id="card-short">
       <div class="card-header">
-        <div class="card-title"><span class="num">03</span>Short Interest · 6mo MoM</div>
-        <span class="mock-tag" id="short-tag">FINRA biweekly · upgrade: Ortex</span>
+        <div class="card-title"><span class="num">03</span>Short Interest</div>
+        <span class="mock-tag" id="short-tag">Yahoo · FINRA biweekly</span>
       </div>
       <div id="short-content"></div>
     </div>
@@ -1406,38 +1406,44 @@ function renderInsider(quote) {
   state.data.insider = { netShares: npsa.netInfoShares?.raw, buys: npsa.buyInfoCount?.raw, sells: npsa.sellInfoCount?.raw, txnCount: txns.length };
 }
 
-function renderShortInterest(ticker, lastPrice) {
-  const data = mockShortInterest(ticker, lastPrice);
-  const max = Math.max(...data.map(d => d.si));
+function renderShortInterest(quote) {
+  const stats     = quote.defaultKeyStatistics || {};
+  const siRaw     = stats.shortPercentOfFloat?.raw;   // decimal e.g. 0.011 = 1.1%
+  const dtc       = stats.shortRatio?.raw;            // days to cover
+  const shares    = stats.sharesShort?.raw;
+  const sharesPM  = stats.sharesShortPriorMonth?.raw;
+  const reportTs  = stats.dateShortInterest?.raw;     // unix seconds
 
-  const w = 360, h = 140, pad = 28;
-  const barW = (w - pad*2) / data.length - 8;
-  const yScale = (v) => h - pad - ((v / max) * (h - pad*2));
-  const lastIdx = data.length - 1;
-  const trend = data[lastIdx].si > data[0].si ? '↑' : '↓';
-  const trendCls = data[lastIdx].si > data[0].si ? 'bear' : 'bull'; // rising SI = bearish
+  const siPct     = siRaw != null ? (siRaw * 100).toFixed(1) : null;
+  const siColor   = siRaw == null ? 'var(--ink-0)' : siRaw > 0.20 ? 'var(--bear)' : siRaw > 0.10 ? 'var(--amber)' : 'var(--ink-0)';
 
-  let svg = `<svg viewBox="0 0 ${w} ${h}" class="mini-chart-tall" preserveAspectRatio="none">`;
-  data.forEach((d, i) => {
-    const x = pad + i * ((w - pad*2) / data.length) + 4;
-    const y = yScale(d.si);
-    const barH = h - pad - y;
-    const isLast = i === lastIdx;
-    svg += `<rect x="${x}" y="${y}" width="${barW}" height="${barH}" fill="${isLast ? '#f25f5c' : '#3a3a4a'}" rx="2"/>`;
-    svg += `<text x="${x + barW/2}" y="${y - 6}" text-anchor="middle" font-family="JetBrains Mono" font-size="10" fill="#888591">${d.si}%</text>`;
-    svg += `<text x="${x + barW/2}" y="${h - 8}" text-anchor="middle" font-family="JetBrains Mono" font-size="9" fill="#5a5862">${d.month}</text>`;
-  });
-  svg += `</svg>`;
+  let momHtml = '';
+  if (shares != null && sharesPM != null && sharesPM > 0) {
+    const momPct = ((shares - sharesPM) / sharesPM) * 100;
+    const cls    = momPct > 1 ? 'bear' : momPct < -1 ? 'bull' : '';
+    momHtml = `<div style="margin-left:auto;font-family:var(--mono);font-size:11px;" class="${cls}">${momPct >= 0 ? '↑ +' : '↓ '}${Math.abs(momPct).toFixed(1)}% MoM</div>`;
+  }
+
+  const stat = (label, val) => `
+    <div>
+      <div style="font-size:9px;color:var(--ink-3);font-family:var(--mono);letter-spacing:0.06em;text-transform:uppercase;margin-bottom:3px;">${label}</div>
+      <div style="font-family:var(--mono);font-size:15px;color:var(--ink-0);">${val}</div>
+    </div>`;
 
   document.getElementById('short-content').innerHTML = `
-    <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:6px;">
-      <div style="font-family:JetBrains Mono;font-size:24px;font-weight:600;color:var(--ink-0);">${data[lastIdx].si}%</div>
-      <div style="font-family:JetBrains Mono;font-size:11px;color:var(--ink-2);">of float</div>
-      <div style="margin-left:auto;font-family:JetBrains Mono;font-size:12px;" class="${trendCls}">${trend} ${Math.abs(data[lastIdx].si - data[0].si).toFixed(1)}pp / 6mo</div>
+    <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:16px;">
+      <div style="font-family:var(--mono);font-size:32px;font-weight:600;color:${siColor};">${siPct != null ? siPct + '%' : '—'}</div>
+      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-2);">of float</div>
+      ${momHtml}
     </div>
-    <div style="font-family:JetBrains Mono;font-size:11px;color:var(--ink-2);margin-bottom:6px;">Days-to-cover: ${data[lastIdx].dtc}</div>
-    ${svg}`;
-  state.data.shortInterest = data[lastIdx];
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+      ${stat('Days to Cover',  dtc     != null ? dtc.toFixed(1)   : '—')}
+      ${stat('Shares Short',   shares  != null ? fmt.big(shares)  : '—')}
+      ${stat('Prior Month',    sharesPM != null ? fmt.big(sharesPM) : '—')}
+      ${stat('Report Date',    reportTs != null ? fmt.date(reportTs) : '—')}
+    </div>`;
+
+  state.data.shortInterest = { si: siPct != null ? +siPct : null, dtc: dtc ?? null };
 }
 
 function renderUnusualOptions(ticker, lastPrice) {
@@ -1893,7 +1899,7 @@ async function loadTicker(ticker) {
     renderAnalyst(quote, lastPrice);
     renderFundamentals(quote);
     renderInsider(quote);
-    renderShortInterest(state.ticker, lastPrice);
+    renderShortInterest(quote);
     renderUnusualOptions(state.ticker, lastPrice);
     renderDarkPool(state.ticker);
     renderSuperInvestors(state.ticker);
