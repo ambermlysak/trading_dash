@@ -1360,6 +1360,23 @@ export default {
           if (sub === 'movers')   return await handleMarketMovers(origin, env);
           if (sub === 'ipos')     return await handleMarketIPOs(origin, env);
           return err('unknown market route', 404, origin);
+        case 'analysis':
+          if (!sub) return err('ticker required', 400, origin);
+          if (request.method === 'GET') {
+            const cached = await env?.REC_LOG?.get(`analysis:${sub.toUpperCase()}`, 'json');
+            return cached ? json(cached, 200, origin) : err('not found', 404, origin);
+          }
+          if (request.method === 'POST') {
+            const body = await request.json().catch(() => null);
+            if (!body) return err('invalid json', 400, origin);
+            await env?.REC_LOG?.put(
+              `analysis:${sub.toUpperCase()}`,
+              JSON.stringify({ ...body, ts: Date.now() }),
+              { expirationTtl: 172800 },
+            );
+            return json({ ok: true }, 200, origin);
+          }
+          return err('method not allowed', 405, origin);
         case 'watchlist':
           if (sub === 'batch') return await handleWatchlistBatch(
             url.searchParams.get('symbols') || '', origin, env, ctx,

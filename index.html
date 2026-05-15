@@ -1836,6 +1836,10 @@ Return STRICT JSON (no markdown fences, no preamble) with keys:
 {
   "rating": "BUY" | "HOLD" | "SELL",
   "confidence": 0–100 integer,
+  "trend": "<10-word current trend description>",
+  "pattern": "<chart pattern name, e.g. Bull flag, Double bottom>",
+  "action": "<actionable phrase, e.g. Buy dips to $85, Hold above $200>",
+  "summary": "<2-sentence trader summary>",
   "factors": {
     "technical":   { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on the technical picture" },
     "fundamental": { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on valuation and fundamentals" },
@@ -1861,6 +1865,14 @@ Score interpretation: 0=very bearish, 50=neutral, 100=very bullish.`;
     text = text.replace(/```(?:json)?\s*/g, '').trim();
     const result = JSON.parse(text);
     renderSynthesis(result, lastPrice);
+    // Save to KV so WL shows the same rating
+    try {
+      await api('/analysis/' + ticker, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(result),
+      });
+    } catch (e) { console.warn('analysis cache write failed', e); }
     // forward-log
     try {
       await logRec({ ticker, rating: result.rating, confidence: result.confidence, price: lastPrice, factors: result.factors });
@@ -1870,6 +1882,31 @@ Score interpretation: 0=very bearish, 50=neutral, 100=very bullish.`;
     console.error('Synthesis failed', e);
     document.getElementById('synth-narrative').innerHTML = `<p style="color:var(--bear);">Synthesis failed: ${e.message}. Check Worker logs and ANTHROPIC_API_KEY binding.</p>`;
   }
+}
+
+async function loadCachedSynthesis(ticker, lastPrice) {
+  try {
+    const cached = await api('/analysis/' + ticker);
+    if (!cached || cached.error || !cached.ts) return false;
+    const ageMs = Date.now() - cached.ts;
+    if (ageMs > 43_200_000) return false; // older than 12h — let live synthesis run
+    renderSynthesis(cached, lastPrice);
+    // Show a "cached" badge with age + refresh link
+    const ageStr = ageMs < 3_600_000
+      ? Math.round(ageMs / 60_000) + 'm ago'
+      : Math.round(ageMs / 3_600_000) + 'h ago';
+    const badge = document.createElement('div');
+    badge.id = 'synth-cache-badge';
+    badge.style.cssText = 'font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:8px;';
+    badge.innerHTML = `Cached · ${ageStr} · <a href="#" id="synth-refresh-link" style="color:var(--cyan);text-decoration:none;">Refresh</a>`;
+    document.getElementById('synth-narrative').after(badge);
+    document.getElementById('synth-refresh-link').addEventListener('click', e => {
+      e.preventDefault();
+      badge.remove();
+      synthesize(ticker, lastPrice);
+    });
+    return true;
+  } catch (_) { return false; }
 }
 
 function renderSynthesis(r, lastPrice) {
@@ -2051,8 +2088,9 @@ async function loadTicker(ticker) {
     renderNews(newsResp);
     renderTrack((trackResp.entries || []));
 
-    // Async: synthesize with Claude (may take a few seconds)
-    synthesize(state.ticker, lastPrice);
+    // Show cached synthesis immediately if fresh; otherwise run live
+    const hadCache = await loadCachedSynthesis(state.ticker, lastPrice);
+    if (!hadCache) synthesize(state.ticker, lastPrice);
   } catch (e) {
     console.error(e);
     document.getElementById('hero-name').textContent = `Error: ${e.message}`;
