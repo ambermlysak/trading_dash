@@ -1137,7 +1137,68 @@ async function handleWeekAhead(origin, env) {
     if (cached && Date.now() - cached.ts < 64_800_000) return json(cached, 200, origin);
   } catch (_) {}
 
-  // Gather news for context
+  // --- Date range: next Mon–Fri in PT ---
+  const now    = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+  const today  = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  const daysToMon = now.getDay() === 0 ? 1 : 8 - now.getDay();
+  const mon = new Date(now); mon.setDate(now.getDate() + daysToMon);
+  const fri = new Date(mon); fri.setDate(mon.getDate() + 4);
+  const pad  = n => String(n).padStart(2, '0');
+  const iso  = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const monIso = iso(mon);
+  const friIso = iso(fri);
+  const weekOf = `${mon.toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}–${fri.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
+
+  // --- Fetch verified earnings dates from Yahoo for a broad set of major tickers ---
+  // 40 tickers max — keeps total subrequests (earnings + crumb + news + Claude) under 50
+  const EARNINGS_WATCH = [
+    // Watchlist core (22)
+    'PLTR','NVDA','AMD','AAPL','AMZN','GOOGL','QUBT','TWLO','NOW','TSM',
+    'MU','APP','CRCL','CRWV','MRK','UNH','TSLA','PANW','RDDT','CAVA','JPM','HOOD',
+    // High-impact additions (18)
+    'MSFT','META','NFLX','ORCL','CRM',   // major tech
+    'HD','WMT','TGT','COST','LOW',        // retail (HD, WMT move markets)
+    'GS','MS','BAC','WFC',                // major banks
+    'LLY','PFE',                          // pharma
+    'BA','XOM',                           // industrial / energy
+  ];
+
+  await getYahooCrumb(env).catch(() => {});
+  const confirmedEarnings = [];
+  const CHUNK = 8;
+  for (let i = 0; i < EARNINGS_WATCH.length; i += CHUNK) {
+    const batch = EARNINGS_WATCH.slice(i, i + CHUNK);
+    const results = await Promise.allSettled(
+      batch.map(t => yahooAuth(`/v10/finance/quoteSummary/${t}`, '?modules=calendarEvents', env)),
+    );
+    for (let j = 0; j < batch.length; j++) {
+      if (results[j].status !== 'fulfilled') continue;
+      const r     = results[j].value?.quoteSummary?.result?.[0];
+      const dates = r?.calendarEvents?.earnings?.earningsDate || [];
+      for (const ep of dates) {
+        const fmt = ep.fmt ?? iso(new Date((ep.raw ?? ep) * 1000));
+        if (fmt >= monIso && fmt <= friIso) {
+          const d = new Date((ep.raw ?? ep) * 1000);
+          confirmedEarnings.push({
+            ticker:  batch[j],
+            isoDate: fmt,
+            label:   d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', timeZone: 'UTC' }),
+          });
+          break;
+        }
+      }
+    }
+  }
+
+  const earningsBlock = confirmedEarnings.length
+    ? 'CONFIRMED EARNINGS from Yahoo Finance — use these exact dates, do NOT alter or add others:\n' +
+      confirmedEarnings
+        .sort((a, b) => a.isoDate.localeCompare(b.isoDate))
+        .map(e => `• ${e.ticker}: ${e.label}`)
+        .join('\n')
+    : 'No confirmed earnings from the monitored ticker list fall within this week.';
+
+  // --- Gather news for macro / geopolitical context ---
   let newsLines = '';
   try {
     if (env?.ALPACA_KEY && env?.ALPACA_SECRET) {
@@ -1155,27 +1216,19 @@ async function handleWeekAhead(origin, env) {
     }
   } catch (_) {}
 
-  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-  const today = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: 'America/Los_Angeles' });
-  // Next Mon–Fri
-  const daysToMon = now.getDay() === 0 ? 1 : 8 - now.getDay();
-  const mon = new Date(now); mon.setDate(now.getDate() + daysToMon);
-  const fri = new Date(mon); fri.setDate(mon.getDate() + 4);
-  const weekOf = `${mon.toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}–${fri.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
-
   const prompt = `You are a professional stock market strategist. Today is ${today}.
 
-RECENT HEADLINES:
+${earningsBlock}
+
+RECENT HEADLINES (for macro/geopolitical context):
 ${newsLines || 'Not available'}
 
 Generate a "Week Ahead" preview for the trading week of ${weekOf}.
 
-Cover these event types where relevant:
-- Earnings: major large-cap or market-moving reports (include ticker in title)
-- Fed: FOMC meetings, Fed chair or governor speeches, rate decisions
-- Economic: non-farm payrolls, CPI, PPI, retail sales, GDP, jobless claims, consumer confidence, housing data
-- Geopolitical: elections, trade policy, sanctions, conflicts with market implications
-- Macro: Treasury auctions, options expiration, index rebalances, any other systemic events
+STRICT RULES:
+1. Earnings events: ONLY include tickers from the CONFIRMED EARNINGS list above. Use the exact dates given. Do NOT add earnings for any company not listed.
+2. Fed / Economic / Geopolitical / Macro events: use your knowledge of the scheduled economic calendar and current events. You may estimate dates for these.
+3. Each Earnings title must include the full company name and ticker symbol.
 
 Return ONLY valid JSON (no markdown):
 {
@@ -1193,11 +1246,11 @@ Return ONLY valid JSON (no markdown):
   ]
 }
 
-Include 6–10 events. Order chronologically Mon→Fri. Be specific: name companies and data releases. If you are uncertain of an exact date, give your best estimate but keep it realistic.`;
+Include 6–10 events total. Order chronologically Mon→Fri.`;
 
   let result;
   try {
-    const text    = await workerClaude(prompt, env, 1400);
+    const text    = await workerClaude(prompt, env, 2000);
     const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
     result = JSON.parse(cleaned);
   } catch (e) {
