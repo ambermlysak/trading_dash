@@ -427,7 +427,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <table class="wl-table">
         <colgroup>
           <col><col><col><col><col><col><col><col><col><col>
-          <col><col><col><col><col><col><col><col><col>
+          <col><col><col><col><col><col><col><col><col><col>
         </colgroup>
         <thead>
           <tr>
@@ -447,13 +447,14 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
             <th data-sort="resist">Resist</th>
             <th data-sort="support">Support</th>
             <th>Target L/M/H</th>
+            <th data-sort="upside">Upside</th>
             <th>52W Range</th>
             <th data-sort="daysToEarnings">Earnings</th>
             <th data-sort="sector">Sector</th>
           </tr>
         </thead>
         <tbody id="wl-tbody">
-          <tr><td colspan="19" class="loading" style="padding:24px">Loading watchlist…</td></tr>
+          <tr><td colspan="20" class="loading" style="padding:24px">Loading watchlist…</td></tr>
         </tbody>
       </table>
     </div>
@@ -692,7 +693,7 @@ async function loadWatchlistBatch() {
   btn.disabled = true;
   btn.textContent = '↺ Loading…';
   document.getElementById('wl-tbody').innerHTML =
-    '<tr><td colspan="19" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
+    '<tr><td colspan="20" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
   document.getElementById('wl-status').textContent = 'Fetching…';
 
   try {
@@ -725,7 +726,7 @@ async function loadWatchlistBatch() {
     console.error('[watchlist]', e.message);
     document.getElementById('wl-status').textContent = 'Error — ' + e.message;
     document.getElementById('wl-tbody').innerHTML =
-      '<tr><td colspan="19" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
+      '<tr><td colspan="20" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
   } finally {
     wlLoading = false;
     btn.disabled = false;
@@ -737,7 +738,13 @@ async function loadWatchlistBatch() {
 function renderWatchlist() {
   const tickers = getWatchlist();
   const rows = tickers
-    .map(t => wlData[t] ? { ...wlData[t], symbol: t } : { symbol: t })
+    .map(t => {
+      const d = wlData[t] ? { ...wlData[t], symbol: t } : { symbol: t };
+      d.upside = (d.price != null && d.targetMean != null)
+        ? Math.round((d.targetMean - d.price) / d.price * 10000) / 100
+        : null;
+      return d;
+    })
     .sort((a, b) => {
       const av = a[sortCol] ?? (typeof b[sortCol] === 'string' ? '' : Infinity);
       const bv = b[sortCol] ?? (typeof a[sortCol] === 'string' ? '' : Infinity);
@@ -796,6 +803,7 @@ function renderWatchlist() {
       <td class="mono">${s.resist  != null ? fmt(s.resist)  : '—'}</td>
       <td class="mono">${s.support != null ? fmt(s.support) : '—'}</td>
       <td class="mono" style="font-size:11px">${targets}</td>
+      <td class="${clsChg(s.upside)}">${s.upside != null ? fmtPct(s.upside) : '—'}</td>
       <td>${rangeHtml}</td>
       <td class="${earningsSoon ? 'earnings-cell' : 'mono'}">${earningsSoon ? '⚠ ' : ''}${esc(s.earningsDate || '—')}</td>
       <td class="sector">${esc(s.sector || '—')}</td>
@@ -825,7 +833,7 @@ function renderWatchlist() {
       }
 
       html += `<tr class="expand-row">
-        <td colspan="19">
+        <td colspan="20">
           <div class="expand-content">
             ${s.summary ? `<div class="expand-summary">${esc(s.summary)}</div>` : ''}
             <div class="expand-meta">
@@ -840,7 +848,7 @@ function renderWatchlist() {
       </tr>`;
     }
   }
-  tbody.innerHTML = html || '<tr><td colspan="19" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
+  tbody.innerHTML = html || '<tr><td colspan="20" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
 }
 
 /* ─── Closing auction block trades ─── */
