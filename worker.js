@@ -1368,6 +1368,18 @@ export default {
             url.searchParams.get('symbols') || '', origin, env, ctx,
           );
           return err('unknown watchlist route', 404, origin);
+        case 'admin':
+          if (sub === 'refresh-daily' && request.method === 'POST') {
+            const adminToken = await env?.REC_LOG?.get('admin:token');
+            const auth = request.headers.get('Authorization') || '';
+            if (!adminToken || auth !== `Bearer ${adminToken}`) {
+              return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+            }
+            try { await env?.REC_LOG?.delete('daily:snapshot'); } catch (_) {}
+            await generateDailySnapshot(env);
+            return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+          }
+          return err('unknown admin route', 404, origin);
         default:         return err('unknown route', 404, origin);
       }
     } catch (e) {
