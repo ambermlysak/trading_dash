@@ -1510,6 +1510,10 @@ export default {
             );
             return json({ ok: true }, 200, origin);
           }
+          if (request.method === 'DELETE') {
+            await env?.REC_LOG?.delete(`analysis:${sub.toUpperCase()}`);
+            return json({ ok: true }, 200, origin);
+          }
           return err('method not allowed', 405, origin);
         case 'watchlist':
           if (sub === 'batch') return await handleWatchlistBatch(

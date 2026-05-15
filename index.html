@@ -2089,8 +2089,9 @@ async function loadTicker(ticker) {
     renderTrack((trackResp.entries || []));
 
     // Show cached synthesis immediately if fresh; otherwise run live
-    const hadCache = await loadCachedSynthesis(state.ticker, lastPrice);
-    if (!hadCache) synthesize(state.ticker, lastPrice);
+    // Use local `ticker` (not state.ticker) — state.ticker may have changed if user navigated mid-load
+    const hadCache = await loadCachedSynthesis(ticker, lastPrice);
+    if (!hadCache) synthesize(ticker, lastPrice);
   } catch (e) {
     console.error(e);
     document.getElementById('hero-name').textContent = `Error: ${e.message}`;
