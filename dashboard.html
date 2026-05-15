@@ -256,6 +256,37 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .eod-body { font-size: 13px; color: var(--ink-2); line-height: 1.6; }
 .eod-ts { font-size: 10px; color: var(--ink-3); font-family: var(--mono); margin-top: 8px; }
 
+/* Week Ahead card */
+.week-ahead-card {
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: 10px;
+  padding: 22px 28px; margin-bottom: 24px; display: none;
+}
+.week-ahead-card.visible { display: block; }
+.week-ahead-header { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.week-ahead-badge { font-size: 9px; font-family: var(--mono); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; padding: 3px 8px; border-radius: 3px; background: rgba(180,142,173,0.15); color: var(--violet); }
+.week-ahead-title { font-family: var(--serif); font-size: 16px; font-weight: 300; color: var(--ink-0); font-style: italic; }
+.week-ahead-overview { font-size: 13px; color: var(--ink-2); line-height: 1.6; margin-bottom: 18px; }
+.wa-events { display: flex; flex-direction: column; }
+.wa-event { display: grid; grid-template-columns: 68px 1fr auto; align-items: start; gap: 16px; padding: 11px 0; border-bottom: 1px solid var(--line-soft); }
+.wa-event:last-child { border-bottom: none; }
+.wa-date { display: flex; flex-direction: column; gap: 2px; padding-top: 1px; }
+.wa-day  { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; }
+.wa-date-str { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--ink-2); }
+.wa-body { display: flex; flex-direction: column; gap: 4px; }
+.wa-type { font-size: 9px; font-family: var(--mono); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; padding: 2px 6px; border-radius: 3px; align-self: flex-start; }
+.wa-type.Earnings     { background: rgba(180,142,173,0.15); color: var(--violet); }
+.wa-type.Fed          { background: var(--amber-soft);       color: var(--amber);  }
+.wa-type.Economic     { background: var(--cyan-soft);        color: var(--cyan);   }
+.wa-type.Geopolitical { background: var(--bear-soft);        color: var(--bear);   }
+.wa-type.Macro        { background: var(--bull-soft);        color: var(--bull);   }
+.wa-event-title { font-size: 13px; font-weight: 600; color: var(--ink-0); line-height: 1.3; }
+.wa-event-note  { font-size: 12px; color: var(--ink-2); line-height: 1.5; }
+.wa-impact { font-family: var(--mono); font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; padding: 3px 7px; border-radius: 3px; white-space: nowrap; align-self: flex-start; margin-top: 2px; }
+.wa-impact.HIGH   { background: var(--amber-soft); color: var(--amber); }
+.wa-impact.MEDIUM { background: var(--cyan-soft);  color: var(--cyan);  }
+.wa-impact.LOW    { background: var(--bg-3);        color: var(--ink-3); }
+.wa-disclaimer { font-size: 10px; color: var(--ink-3); font-family: var(--mono); margin-top: 14px; }
+
 /* IPO status badge */
 .ipo-status { font-size: 9px; font-family: var(--mono); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 5px; border-radius: 3px; }
 .ipo-status.upcoming { background: var(--bull-soft);  color: var(--bull); }
@@ -354,6 +385,16 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       </div>
       <div class="eod-body" id="eod-body"></div>
       <div class="eod-ts" id="eod-ts"></div>
+    </div>
+
+    <div class="week-ahead-card" id="week-ahead-card">
+      <div class="week-ahead-header">
+        <span class="week-ahead-badge">Week Ahead</span>
+        <div class="week-ahead-title" id="wa-title"></div>
+      </div>
+      <div class="week-ahead-overview" id="wa-overview"></div>
+      <div class="wa-events" id="wa-events"></div>
+      <div class="wa-disclaimer">* Earnings dates are estimates — confirm with company IR. Economic calendar subject to revision.</div>
     </div>
 
     <div class="section-head">Market Intelligence</div>
@@ -618,6 +659,39 @@ async function loadDailySnapshot() {
   } catch (e) {
     console.error('[daily]', e.message);
     document.getElementById('headline-text').textContent = 'Could not load daily briefing.';
+  }
+}
+
+/* ─── Week Ahead (Fridays only) ─── */
+async function loadWeekAhead() {
+  if (new Date().getDay() !== 5) return;
+  const card = document.getElementById('week-ahead-card');
+  card.classList.add('visible');
+  document.getElementById('wa-overview').textContent = 'Generating week-ahead preview…';
+  try {
+    const data = await apiFetch('/market/week-ahead');
+    document.getElementById('wa-title').textContent = data.weekOf || '';
+    document.getElementById('wa-overview').textContent = data.overview || '';
+    const VALID_TYPES = new Set(['Earnings','Fed','Economic','Geopolitical','Macro']);
+    document.getElementById('wa-events').innerHTML = (data.events || []).map(ev => {
+      const type = VALID_TYPES.has(ev.type) ? ev.type : 'Macro';
+      const impact = ['HIGH','MEDIUM','LOW'].includes(ev.impact) ? ev.impact : 'LOW';
+      return `<div class="wa-event">
+        <div class="wa-date">
+          <span class="wa-day">${esc(ev.day || '')}</span>
+          <span class="wa-date-str">${esc(ev.date || '')}</span>
+        </div>
+        <div class="wa-body">
+          <span class="wa-type ${type}">${esc(ev.type || '')}</span>
+          <div class="wa-event-title">${esc(ev.title || '')}</div>
+          <div class="wa-event-note">${esc(ev.note || '')}</div>
+        </div>
+        <span class="wa-impact ${impact}">${impact}</span>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    console.error('[week-ahead]', e.message);
+    document.getElementById('wa-overview').textContent = 'Preview unavailable.';
   }
 }
 
@@ -1160,6 +1234,7 @@ async function init() {
     loadDailySnapshot(),
     loadMovers(),
     loadIPOs(),
+    loadWeekAhead(),
   ]);
 
   // Auto-refresh

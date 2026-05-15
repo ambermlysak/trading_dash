@@ -1130,6 +1130,86 @@ Return ONLY valid JSON (no markdown):
   }
 }
 
+/* ── Week Ahead (Friday only, 18h KV cache) ── */
+async function handleWeekAhead(origin, env) {
+  try {
+    const cached = await env?.REC_LOG?.get('market:week-ahead', 'json');
+    if (cached && Date.now() - cached.ts < 64_800_000) return json(cached, 200, origin);
+  } catch (_) {}
+
+  // Gather news for context
+  let newsLines = '';
+  try {
+    if (env?.ALPACA_KEY && env?.ALPACA_SECRET) {
+      const data = await alpacaFetch('/v1beta1/news?limit=20&sort=desc', env);
+      newsLines = (data.news || []).slice(0, 15).map(n => `• ${n.headline}`).join('\n');
+    } else {
+      const r = await fetch(
+        'https://query2.finance.yahoo.com/v1/finance/search?q=stock+market+week+ahead&quotesCount=0&newsCount=15',
+        { headers: YAHOO_HEADERS },
+      );
+      if (r.ok) {
+        const d = await r.json();
+        newsLines = (d.news || []).slice(0, 15).map(n => `• ${n.title}`).join('\n');
+      }
+    }
+  } catch (_) {}
+
+  const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+  const today = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: 'America/Los_Angeles' });
+  // Next Mon–Fri
+  const daysToMon = now.getDay() === 0 ? 1 : 8 - now.getDay();
+  const mon = new Date(now); mon.setDate(now.getDate() + daysToMon);
+  const fri = new Date(mon); fri.setDate(mon.getDate() + 4);
+  const weekOf = `${mon.toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}–${fri.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
+
+  const prompt = `You are a professional stock market strategist. Today is ${today}.
+
+RECENT HEADLINES:
+${newsLines || 'Not available'}
+
+Generate a "Week Ahead" preview for the trading week of ${weekOf}.
+
+Cover these event types where relevant:
+- Earnings: major large-cap or market-moving reports (include ticker in title)
+- Fed: FOMC meetings, Fed chair or governor speeches, rate decisions
+- Economic: non-farm payrolls, CPI, PPI, retail sales, GDP, jobless claims, consumer confidence, housing data
+- Geopolitical: elections, trade policy, sanctions, conflicts with market implications
+- Macro: Treasury auctions, options expiration, index rebalances, any other systemic events
+
+Return ONLY valid JSON (no markdown):
+{
+  "weekOf": "${weekOf}",
+  "overview": "2-sentence macro setup and dominant themes for the week",
+  "events": [
+    {
+      "day": "Mon",
+      "date": "May 19",
+      "type": "Earnings|Fed|Economic|Geopolitical|Macro",
+      "title": "Concise event title",
+      "impact": "HIGH|MEDIUM|LOW",
+      "note": "1-2 sentences on what to watch and expected market impact"
+    }
+  ]
+}
+
+Include 6–10 events. Order chronologically Mon→Fri. Be specific: name companies and data releases. If you are uncertain of an exact date, give your best estimate but keep it realistic.`;
+
+  let result;
+  try {
+    const text    = await workerClaude(prompt, env, 1400);
+    const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    result = JSON.parse(cleaned);
+  } catch (e) {
+    console.error('[week-ahead] failed:', e.message);
+    return err('generation failed', 500, origin);
+  }
+
+  const payload = { ...result, ts: Date.now() };
+  try { await env?.REC_LOG?.put('market:week-ahead', JSON.stringify(payload), { expirationTtl: 64800 }); } catch (_) {}
+  return json(payload, 200, origin);
+}
+
 /* ── Cron: daily snapshot ── */
 async function generateDailySnapshot(env) {
   // Dedup: skip if already generated in the last 2 hours
@@ -1356,9 +1436,10 @@ export default {
         case 'track':    return await handleTrack(sub, env, origin);
         case 'daily':    return await handleDailyGet(origin, env, ctx);
         case 'market':
-          if (sub === 'snapshot') return await handleMarketSnapshot(origin, env);
-          if (sub === 'movers')   return await handleMarketMovers(origin, env);
-          if (sub === 'ipos')     return await handleMarketIPOs(origin, env);
+          if (sub === 'snapshot')    return await handleMarketSnapshot(origin, env);
+          if (sub === 'movers')      return await handleMarketMovers(origin, env);
+          if (sub === 'ipos')        return await handleMarketIPOs(origin, env);
+          if (sub === 'week-ahead')  return await handleWeekAhead(origin, env);
           return err('unknown market route', 404, origin);
         case 'analysis':
           if (!sub) return err('ticker required', 400, origin);
