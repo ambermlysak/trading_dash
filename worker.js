@@ -369,11 +369,11 @@ async function handleChart(ticker, params, origin) {
   return json(data, 200, origin);
 }
 
-async function handleOptions(ticker, params, origin) {
+async function handleOptions(ticker, params, origin, env) {
   const date   = params.get('date');
   const search = date ? `?date=${date}` : '';
   try {
-    const data = await yahoo(`/v7/finance/options/${ticker}`, search);
+    const data = await yahooAuth(`/v7/finance/options/${ticker}`, search, env);
     return json(data, 200, origin);
   } catch (e) {
     // Ticker may have no listed options — return empty chain instead of 500
@@ -397,13 +397,16 @@ async function handleOptionsRecap(params, origin, env, ctx) {
   }
 
   // Fetch nearest-expiration chain for each symbol in batches of 5
+  // yahooAuth provides the crumb+cookie that Yahoo v7 now requires
   const rawResults = [];
   for (let i = 0; i < symbols.length; i += 5) {
     const batch = await Promise.allSettled(
-      symbols.slice(i, i + 5).map(sym => yahoo(`/v7/finance/options/${sym}`, '')),
+      symbols.slice(i, i + 5).map(sym => yahooAuth(`/v7/finance/options/${sym}`, '', env)),
     );
     rawResults.push(...batch);
   }
+  const failCount = rawResults.filter(r => r.status === 'rejected').length;
+  if (failCount > 0) console.warn(`[options recap] ${failCount}/${symbols.length} chains failed`);
 
   const fmtNotional = n => n >= 1e6 ? '$' + (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? '$' + (n/1e3).toFixed(0) + 'K' : '$' + n;
 
@@ -1480,7 +1483,7 @@ export default {
         case 'chart':    return await handleChart(sub, url.searchParams, origin);
         case 'options':
           if (sub === 'recap') return await handleOptionsRecap(url.searchParams, origin, env, ctx);
-          return await handleOptions(sub, url.searchParams, origin);
+          return await handleOptions(sub, url.searchParams, origin, env);
         case 'search':   return await handleSearch(url.searchParams.get('q') || '', origin);
         case 'news':     return await handleNews(sub, origin, env);
         case 'peers':    return await handlePeers(sub, origin);
