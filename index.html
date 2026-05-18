@@ -1864,7 +1864,11 @@ Score interpretation: 0=very bearish, 50=neutral, 100=very bullish.`;
     }
     text = text.replace(/```(?:json)?\s*/g, '').trim();
     const result = JSON.parse(text);
+    // Only render if user hasn't navigated away to a different ticker mid-flight
+    if (ticker !== state.ticker) return;
     renderSynthesis(result, lastPrice);
+    const _badge = document.getElementById('synth-cache-badge');
+    if (_badge) _badge.remove();
     // Save to KV so WL shows the same rating
     try {
       await api('/analysis/' + ticker, {
@@ -1891,20 +1895,15 @@ async function loadCachedSynthesis(ticker, lastPrice) {
     const ageMs = Date.now() - cached.ts;
     if (ageMs > 43_200_000) return false; // older than 12h — let live synthesis run
     renderSynthesis(cached, lastPrice);
-    // Show a "cached" badge with age + refresh link
+    // Show a badge indicating cached data is displayed while fresh synthesis loads
     const ageStr = ageMs < 3_600_000
       ? Math.round(ageMs / 60_000) + 'm ago'
       : Math.round(ageMs / 3_600_000) + 'h ago';
     const badge = document.createElement('div');
     badge.id = 'synth-cache-badge';
     badge.style.cssText = 'font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:8px;';
-    badge.innerHTML = `Cached · ${ageStr} · <a href="#" id="synth-refresh-link" style="color:var(--cyan);text-decoration:none;">Refresh</a>`;
+    badge.textContent = `Cached · ${ageStr} · refreshing…`;
     document.getElementById('synth-narrative').after(badge);
-    document.getElementById('synth-refresh-link').addEventListener('click', e => {
-      e.preventDefault();
-      badge.remove();
-      synthesize(ticker, lastPrice);
-    });
     return true;
   } catch (_) { return false; }
 }
@@ -2035,6 +2034,9 @@ function renderFactorPanels(factors) {
 async function loadTicker(ticker) {
   state.ticker = ticker.toUpperCase();
   document.getElementById('hero-name').textContent = 'Loading...';
+  // Clear synthesis leftovers from any previous ticker
+  const _oldBadge = document.getElementById('synth-cache-badge');
+  if (_oldBadge) _oldBadge.remove();
 
   try {
     // Parallel fetch
@@ -2088,10 +2090,12 @@ async function loadTicker(ticker) {
     renderNews(newsResp);
     renderTrack((trackResp.entries || []));
 
-    // Show cached synthesis immediately if fresh; otherwise run live
-    // Use local `ticker` (not state.ticker) — state.ticker may have changed if user navigated mid-load
-    const hadCache = await loadCachedSynthesis(ticker, lastPrice);
-    if (!hadCache) synthesize(ticker, lastPrice);
+    // Show cached synthesis immediately as a placeholder, then always run fresh synthesis.
+    // loadCachedSynthesis is fire-and-forget (KV read, fast); synthesize runs in parallel (Claude API, slow).
+    // When synthesize resolves it overwrites the placeholder and removes the cache badge.
+    // Use local `ticker` (not state.ticker) — state.ticker may have changed if user navigated mid-load.
+    loadCachedSynthesis(ticker, lastPrice);
+    synthesize(ticker, lastPrice);
   } catch (e) {
     console.error(e);
     document.getElementById('hero-name').textContent = `Error: ${e.message}`;
