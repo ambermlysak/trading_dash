@@ -908,12 +908,13 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
           if (highs.length  >= 5)  ({ support, resist } = computeSR(highs, lows));
         }
 
-        let pe = null, targetLow = null, targetMean = null, targetHigh = null;
+        let pe = null, forwardPE = null, targetLow = null, targetMean = null, targetHigh = null;
         let shortPct = null, earningsDate = null, daysToEarnings = null, sector = null;
 
         if (fundRes.status === 'fulfilled') {
           const r = fundRes.value?.quoteSummary?.result?.[0] || {};
-          pe         = r.summaryDetail?.trailingPE?.raw ?? r.defaultKeyStatistics?.forwardPE?.raw ?? null;
+          pe         = r.summaryDetail?.trailingPE?.raw ?? null;
+          forwardPE  = r.defaultKeyStatistics?.forwardPE?.raw ?? null;
           targetLow  = r.financialData?.targetLowPrice?.raw ?? null;
           targetMean = r.financialData?.targetMeanPrice?.raw ?? null;
           targetHigh = r.financialData?.targetHighPrice?.raw ?? null;
@@ -953,7 +954,8 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
           price,
           changePct,
           volume,
-          pe:         pe     != null ? Math.round(pe     * 10) / 10 : null,
+          pe:         pe        != null ? Math.round(pe        * 10) / 10 : null,
+          forwardPE:  forwardPE != null ? Math.round(forwardPE * 10) / 10 : null,
           sector,
           w52High,
           w52Low,

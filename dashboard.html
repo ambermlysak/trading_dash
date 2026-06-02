@@ -522,7 +522,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <table class="wl-table">
         <colgroup>
           <col><col><col><col><col><col><col><col><col><col>
-          <col><col><col><col><col><col><col><col><col><col>
+          <col><col><col><col><col><col><col><col><col><col><col>
         </colgroup>
         <thead>
           <tr>
@@ -536,6 +536,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
             <th data-sort="rating">Rating</th>
             <th data-sort="rsi">RSI</th>
             <th data-sort="pe">P/E</th>
+            <th data-sort="forwardPE">Fwd P/E</th>
             <th data-sort="shortPct">Short %</th>
             <th data-sort="volume">Volume</th>
             <th title="First AH bar · 4:00pm ET · Yahoo 1-min · vol + price vs regular close · click row to expand">AH Open</th>
@@ -931,6 +932,7 @@ function renderWatchlist() {
       <td class="rating-cell">${ratingBadge(s.rating, s.confidence)}</td>
       <td class="${clsRsi(s.rsi)}">${s.rsi != null ? s.rsi : '—'}</td>
       <td class="mono">${s.pe != null ? fmt(s.pe, 1) : '—'}</td>
+      <td class="mono">${s.forwardPE != null ? fmt(s.forwardPE, 1) : '—'}</td>
       <td class="mono">${s.shortPct != null ? fmt(s.shortPct, 1) + '%' : '—'}</td>
       <td class="mono">${fmtVol(s.volume)}</td>
       <td>${(function() {
