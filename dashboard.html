@@ -397,6 +397,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
   <nav class="tabs">
     <button class="tab-btn active" data-tab="market">Market</button>
     <button class="tab-btn" data-tab="watchlist">Watchlist</button>
+    <button class="tab-btn" data-tab="sectors">Sectors</button>
     <button class="tab-btn" data-tab="options">Options</button>
   </nav>
   <div class="topbar-right"><span id="clock"></span></div>
@@ -439,19 +440,6 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     <div class="section-head">Market Intelligence</div>
     <div class="news-grid" id="news-grid">
       <!-- populated by JS -->
-    </div>
-
-    <div class="sectors-section" id="sectors-section">
-      <div class="sectors-header">
-        <div class="section-head" style="margin-bottom:0">Sector Updates</div>
-        <div style="display:flex;align-items:center;gap:12px">
-          <span class="sectors-ts" id="sectors-ts"></span>
-          <button class="sectors-refresh-btn" id="sectors-refresh-btn">↺ Refresh</button>
-        </div>
-      </div>
-      <div class="sectors-grid" id="sectors-grid">
-        <div class="loading" style="grid-column:1/-1">Loading sector data…</div>
-      </div>
     </div>
 
     <div class="bottom-row">
@@ -550,6 +538,25 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
           <tr><td colspan="20" class="loading" style="padding:24px">Loading watchlist…</td></tr>
         </tbody>
       </table>
+    </div>
+  </div>
+</div>
+
+<!-- Sectors tab -->
+<div class="tab-panel" id="tab-sectors">
+  <div class="main">
+    <div class="sectors-section">
+      <div class="sectors-header">
+        <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">Sector Updates</div>
+        <div style="display:flex;align-items:center;gap:12px">
+          <span class="sectors-ts" id="sectors-ts"></span>
+          <button class="sectors-refresh-btn" id="sectors-refresh-btn">↺ Refresh</button>
+        </div>
+      </div>
+      <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:18px">All 11 SPDR sectors · ETF % change + top opportunity &amp; avoid · updated every 4h · no penny stocks</div>
+      <div class="sectors-grid" id="sectors-grid">
+        <div class="loading" style="grid-column:1/-1">Click the Sectors tab to load data.</div>
+      </div>
     </div>
   </div>
 </div>
@@ -1041,6 +1048,8 @@ function switchTab(tab) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tab));
   if (tab === 'watchlist' && Object.keys(wlData).length === 0) loadWatchlistBatch();
+  if (tab === 'sectors'   && document.getElementById('sectors-grid').children.length <= 1 &&
+      !document.getElementById('sectors-grid').querySelector('.sector-card')) loadSectors();
   if (tab === 'options'   && !optionsData) loadOptionsRecap();
 }
 
@@ -1355,7 +1364,6 @@ async function init() {
     loadMovers(),
     loadIPOs(),
     loadWeekAhead(),
-    loadSectors(),
   ]);
 
   // Auto-refresh
