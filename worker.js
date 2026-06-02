@@ -462,7 +462,7 @@ async function handleOptionsRecap(params, origin, env, ctx) {
         const mid = c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : c.lastPrice ?? 0;
         const notional = Math.round(vol * mid * 100);
         const voi = oi > 0 ? vol / oi : (vol > 0 ? 99 : 0);
-        if (vol >= 100 && voi >= 2 && notional > 0)
+        if (vol >= 100 && voi >= 2 && notional > 0 && (expDte == null || expDte >= 5))
           unusual.push({ type: 'CALL', strike: c.strike, dte: expDte, vol, oi, volOiRatio: +voi.toFixed(1), notional });
       }
       for (const p of (exp.puts || [])) {
@@ -473,7 +473,7 @@ async function handleOptionsRecap(params, origin, env, ctx) {
         const mid = p.bid > 0 && p.ask > 0 ? (p.bid + p.ask) / 2 : p.lastPrice ?? 0;
         const notional = Math.round(vol * mid * 100);
         const voi = oi > 0 ? vol / oi : (vol > 0 ? 99 : 0);
-        if (vol >= 100 && voi >= 2 && notional > 0)
+        if (vol >= 100 && voi >= 2 && notional > 0 && (expDte == null || expDte >= 5))
           unusual.push({ type: 'PUT', strike: p.strike, dte: expDte, vol, oi, volOiRatio: +voi.toFixed(1), notional });
       }
     }
@@ -498,7 +498,7 @@ async function handleOptionsRecap(params, origin, env, ctx) {
         (top ? ` | unusual: ${top}` : '');
     }).join('\n');
 
-    const prompt = `You are an options market analyst. Review today's options flow for this watchlist (nearest expiration, 15-min delay):
+    const prompt = `You are an options market analyst. Review today's options flow for this watchlist (nearest expiration, 15-min delay). Unusual activity already filtered to DTE ≥ 5:
 
 ${lines}
 
@@ -507,12 +507,23 @@ Return ONLY valid JSON (no markdown):
   "overall": "2-sentence summary of collective options tone and any cross-ticker themes",
   "tickers": {
     "SYMBOL": "2-3 sentences: where call/put activity concentrated, what unusual prints imply, near-term directional read from the flow"
+  },
+  "strategies": {
+    "SYMBOL": [
+      {
+        "name": "Strategy name (e.g. Long Call, Bull Call Spread, Cash-Secured Put, Covered Call, Long Put, Iron Condor, Bear Put Spread)",
+        "strikes": "Strike or strikes (e.g. $150 or $150/$160 spread)",
+        "expiration": "Expiration date (e.g. Jun 20 '25)",
+        "confidence": 75,
+        "rationale": "1 sentence on why this strategy fits the current flow and price action"
+      }
+    ]
   }
 }
-Only include ticker keys that appear in the data above. Be specific about strikes and implications.`;
+Only include ticker keys that appear in the data above. Max 2 strategies per ticker. Confidence is 0–100. Match strategy direction to flow signal: bullish flow → call strategies, bearish → put strategies, neutral/high IV → spreads or condors. Be specific about strikes relative to current price.`;
 
     try {
-      const text    = await workerClaude(prompt, env, 1500);
+      const text    = await workerClaude(prompt, env, 2500);
       const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
       synthesis = JSON.parse(cleaned);
     } catch (e) {

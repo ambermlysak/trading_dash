@@ -365,6 +365,20 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .options-unusual-row:last-child { border-bottom: none; }
 .options-narrative { font-size: 12px; color: var(--ink-2); line-height: 1.6; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
 
+/* Recommended strategies */
+.options-strat-head { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; border-top: 1px solid var(--line-soft); padding-top: 12px; margin-top: 4px; margin-bottom: 6px; }
+.options-strat-row { padding: 7px 0; border-bottom: 1px solid var(--line-soft); }
+.options-strat-row:last-child { border-bottom: none; }
+.options-strat-name { font-size: 12px; font-weight: 600; color: var(--ink-0); margin-bottom: 4px; }
+.options-strat-meta { display: flex; gap: 10px; align-items: center; margin-bottom: 3px; flex-wrap: wrap; }
+.options-strat-strike { font-family: var(--mono); font-size: 11px; color: var(--cyan); }
+.options-strat-exp { font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
+.options-strat-conf { font-family: var(--mono); font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 3px; }
+.options-strat-conf.high { background: var(--bull-soft);  color: var(--bull);   }
+.options-strat-conf.mid  { background: var(--amber-soft); color: var(--amber);  }
+.options-strat-conf.low  { background: var(--bg-3);       color: var(--ink-3);  }
+.options-strat-rationale { font-size: 11px; color: var(--ink-2); line-height: 1.45; }
+
 /* Auction column (3:55–4:05pm ET block trades) */
 .flow-wrap { min-width: 90px; }
 .flow-bar { height: 4px; background: var(--bg-3); border-radius: 2px; overflow: hidden; margin-bottom: 4px; display: flex; }
@@ -1210,6 +1224,25 @@ async function loadOptionsRecap(forceRefresh = false) {
   }
 }
 
+function renderStrategies(strats) {
+  if (!strats?.length) return '';
+  let html = '<div class="options-strat-head">Recommended Strategies</div>';
+  for (const s of strats.slice(0, 2)) {
+    const conf    = typeof s.confidence === 'number' ? s.confidence : 0;
+    const confCls = conf >= 70 ? 'high' : conf >= 50 ? 'mid' : 'low';
+    html += `<div class="options-strat-row">
+      <div class="options-strat-name">${esc(s.name || '')}</div>
+      <div class="options-strat-meta">
+        <span class="options-strat-strike">${esc(s.strikes || '')}</span>
+        <span class="options-strat-exp">${esc(s.expiration || '')}</span>
+        <span class="options-strat-conf ${confCls}">${conf}% confidence</span>
+      </div>
+      <div class="options-strat-rationale">${esc(s.rationale || '')}</div>
+    </div>`;
+  }
+  return html;
+}
+
 function renderOptionsRecap(data) {
   const { tickers, synthesis, ts } = data;
   const tsStr = ts ? new Date(ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' }) : '';
@@ -1238,7 +1271,7 @@ function renderOptionsRecap(data) {
 
     let unusualHtml = '';
     if (t.unusual?.length) {
-      unusualHtml = `<div class="options-unusual-head">Unusual Activity</div>`;
+      unusualHtml = `<div class="options-unusual-head">Unusual Activity <span style="color:var(--ink-3);font-size:9px;font-weight:400">(DTE ≥ 5)</span></div>`;
       for (const u of t.unusual) {
         const cls = u.type === 'CALL' ? 'up' : 'dn';
         unusualHtml += `<div class="options-unusual-row">
@@ -1272,6 +1305,7 @@ function renderOptionsRecap(data) {
       </div>
       ${unusualHtml}
       ${narrative ? `<div class="options-narrative">${esc(narrative)}</div>` : ''}
+      ${renderStrategies(synthesis?.strategies?.[t.symbol])}
     </div>`;
   }
   html += '</div>';
