@@ -1409,6 +1409,27 @@ async function init() {
     loadMarketStrip();
   }, 300_000);
   setInterval(loadDailySnapshot, 600_000);
+
+  // Fire a targeted refresh 30 min after market close (4:30pm ET) on weekdays
+  schedulePostMarketRefresh();
+}
+
+function schedulePostMarketRefresh() {
+  const now = new Date();
+  const etNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const day = etNow.getDay(); // 0=Sun, 6=Sat
+  if (day === 0 || day === 6) return; // skip weekends
+
+  const target = new Date(etNow);
+  target.setHours(16, 30, 0, 0); // 4:30pm ET today
+
+  const msUntil = target - etNow;
+  if (msUntil <= 0 || msUntil > 8 * 3600 * 1000) return; // already past, or more than 8h away
+
+  setTimeout(() => {
+    loadMovers();
+    loadMarketStrip();
+  }, msUntil);
 }
 
 init();
