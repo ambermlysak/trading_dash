@@ -62,6 +62,7 @@ GET  /api/market/movers           Pre-market / day gainers + losers (≥±10%)
 GET  /api/market/ipos             Upcoming IPO calendar (12h KV cache)
 GET  /api/watchlist/batch         Bulk fundamentals + RSI + Claude analysis
 GET  /api/daily                   Daily Claude synthesis (served from KV)
+GET  /api/market/sectors          Sector summaries + top opportunity/avoid per sector (4h KV cache)
 ```
 
 **Yahoo crumb auth:** Yahoo v10 requires a session crumb. `getYahooCrumb()` tries two strategies (direct user-agent endpoint, then HTML stream scan), caches in memory + KV (`yahoo:crumb`, 50-min TTL), and deduplicates concurrent fetches via `_crumbInflight` promise. On 401/403 it invalidates and retries once.
@@ -78,6 +79,7 @@ daily:eod          — 1:15pm cron EOD summary
 analysis:{TICKER}  — on-demand per-ticker Claude analysis
 fund:{TICKER}      — Yahoo fundamentals cache (6h TTL)
 market:ipos        — IPO calendar (12h TTL)
+market:sectors     — Sector summaries + picks (4h TTL)
 rec:{TICKER}       — recommendation history (up to 500 entries)
 ```
 

@@ -292,6 +292,45 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .ipo-status.upcoming { background: var(--bull-soft);  color: var(--bull); }
 .ipo-status.filed    { background: var(--amber-soft); color: var(--amber); }
 
+/* Sector Updates */
+.sectors-section { margin-bottom: 28px; }
+.sectors-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+.sectors-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+@media (max-width: 1400px) { .sectors-grid { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 1000px) { .sectors-grid { grid-template-columns: repeat(2, 1fr); } }
+.sector-card {
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: 8px;
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 10px;
+}
+.sector-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sector-name { font-size: 12px; font-weight: 600; color: var(--ink-0); }
+.sector-etf-badge {
+  font-family: var(--mono); font-size: 9px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.04em; padding: 2px 6px; border-radius: 3px;
+  background: var(--bg-3); color: var(--ink-2);
+}
+.sector-chg { font-family: var(--mono); font-size: 12px; font-weight: 600; }
+.sector-chg.up { color: var(--bull); }
+.sector-chg.dn { color: var(--bear); }
+.sector-chg.flat { color: var(--ink-3); }
+.sector-summary { font-size: 11px; color: var(--ink-2); line-height: 1.5; }
+.sector-picks { display: flex; flex-direction: column; gap: 6px; }
+.sector-pick { border-radius: 5px; padding: 8px 10px; }
+.sector-pick.opp  { background: var(--bull-soft);  border: 1px solid rgba(35,209,139,0.18); }
+.sector-pick.avoid{ background: var(--bear-soft);  border: 1px solid rgba(242,95,92,0.18); }
+.sector-pick-label { font-size: 9px; font-family: var(--mono); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
+.sector-pick.opp   .sector-pick-label { color: var(--bull); }
+.sector-pick.avoid .sector-pick-label { color: var(--bear); }
+.sector-pick-ticker { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--ink-0); margin-bottom: 2px; }
+.sector-pick-reason { font-size: 10px; color: var(--ink-2); line-height: 1.4; }
+.sectors-ts { font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+.sectors-refresh-btn {
+  padding: 5px 12px; border-radius: 5px; border: 1px solid var(--line);
+  background: transparent; color: var(--ink-2); font-family: var(--sans);
+  font-size: 11px; cursor: pointer; transition: all 0.15s;
+}
+.sectors-refresh-btn:hover { border-color: var(--cyan); color: var(--ink-0); }
+
 /* Analysis loading banner */
 .analysis-banner {
   background: var(--amber-soft); border: 1px solid rgba(244,183,64,0.25);
@@ -400,6 +439,19 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     <div class="section-head">Market Intelligence</div>
     <div class="news-grid" id="news-grid">
       <!-- populated by JS -->
+    </div>
+
+    <div class="sectors-section" id="sectors-section">
+      <div class="sectors-header">
+        <div class="section-head" style="margin-bottom:0">Sector Updates</div>
+        <div style="display:flex;align-items:center;gap:12px">
+          <span class="sectors-ts" id="sectors-ts"></span>
+          <button class="sectors-refresh-btn" id="sectors-refresh-btn">↺ Refresh</button>
+        </div>
+      </div>
+      <div class="sectors-grid" id="sectors-grid">
+        <div class="loading" style="grid-column:1/-1">Loading sector data…</div>
+      </div>
     </div>
 
     <div class="bottom-row">
@@ -1219,6 +1271,74 @@ function renderOptionsRecap(data) {
 
 document.getElementById('options-refresh-btn').addEventListener('click', () => loadOptionsRecap(true));
 
+/* ─── Sectors ─── */
+let sectorsLoading = false;
+
+async function loadSectors(force = false) {
+  if (sectorsLoading) return;
+  sectorsLoading = true;
+  const btn = document.getElementById('sectors-refresh-btn');
+  btn.disabled = true;
+  btn.textContent = '↺ Loading…';
+  const grid = document.getElementById('sectors-grid');
+
+  try {
+    const url = '/market/sectors' + (force ? '?refresh=1' : '');
+    const data = await apiFetch(url);
+
+    if (data.ts) {
+      const d = new Date(data.ts);
+      document.getElementById('sectors-ts').textContent =
+        'As of ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+    }
+
+    const sectors = data.sectors || [];
+    if (!sectors.length) {
+      grid.innerHTML = '<div class="loading" style="grid-column:1/-1">No sector data available.</div>';
+      return;
+    }
+
+    grid.innerHTML = sectors.map(s => {
+      const chgPct  = s.changePct;
+      const chgCls  = chgPct > 0 ? 'up' : chgPct < 0 ? 'dn' : 'flat';
+      const chgStr  = chgPct != null ? (chgPct >= 0 ? '+' : '') + chgPct.toFixed(2) + '%' : '—';
+      const oppTicker = s.opportunity?.ticker ? `<a href="${EQUITY_URL}?ticker=${encodeURIComponent(s.opportunity.ticker)}" style="color:inherit;text-decoration:none">${esc(s.opportunity.ticker)}</a>` : '—';
+      const avdTicker = s.avoid?.ticker       ? `<a href="${EQUITY_URL}?ticker=${encodeURIComponent(s.avoid.ticker)}"       style="color:inherit;text-decoration:none">${esc(s.avoid.ticker)}</a>`       : '—';
+      return `<div class="sector-card">
+        <div class="sector-card-head">
+          <span class="sector-name">${esc(s.sector)}</span>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span class="sector-etf-badge">${esc(s.etf)}</span>
+            <span class="sector-chg ${chgCls}">${chgStr}</span>
+          </div>
+        </div>
+        <div class="sector-summary">${esc(s.summary || '')}</div>
+        <div class="sector-picks">
+          ${s.opportunity ? `<div class="sector-pick opp">
+            <div class="sector-pick-label">Opportunity</div>
+            <div class="sector-pick-ticker">${oppTicker}</div>
+            <div class="sector-pick-reason">${esc(s.opportunity.reason || '')}</div>
+          </div>` : ''}
+          ${s.avoid ? `<div class="sector-pick avoid">
+            <div class="sector-pick-label">Avoid</div>
+            <div class="sector-pick-ticker">${avdTicker}</div>
+            <div class="sector-pick-reason">${esc(s.avoid.reason || '')}</div>
+          </div>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+  } catch (e) {
+    console.error('[sectors]', e.message);
+    grid.innerHTML = '<div class="loading" style="grid-column:1/-1;color:var(--bear)">Failed to load sector data.</div>';
+  } finally {
+    sectorsLoading = false;
+    btn.disabled = false;
+    btn.textContent = '↺ Refresh';
+  }
+}
+
+document.getElementById('sectors-refresh-btn').addEventListener('click', () => loadSectors(true));
+
 /* ─── Init ─── */
 async function init() {
   tickClock();
@@ -1235,6 +1355,7 @@ async function init() {
     loadMovers(),
     loadIPOs(),
     loadWeekAhead(),
+    loadSectors(),
   ]);
 
   // Auto-refresh

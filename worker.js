@@ -55,6 +55,34 @@ const DEFAULT_WATCHLIST = [
   'MU','APP','CRCL','CRWV','MRK','UNH','TSLA','PANW','RDDT','CAVA','JPM','HOOD',
 ];
 
+const SECTOR_ETFS = {
+  'XLK':  'Technology',
+  'XLF':  'Financials',
+  'XLE':  'Energy',
+  'XLV':  'Health Care',
+  'XLY':  'Consumer Discretionary',
+  'XLP':  'Consumer Staples',
+  'XLI':  'Industrials',
+  'XLB':  'Materials',
+  'XLRE': 'Real Estate',
+  'XLC':  'Communication Services',
+  'XLU':  'Utilities',
+};
+
+const SECTOR_STOCKS = {
+  'Technology':             ['NVDA', 'AAPL', 'MSFT'],
+  'Financials':             ['JPM',  'GS',   'BAC'],
+  'Energy':                 ['XOM',  'CVX',  'COP'],
+  'Health Care':            ['UNH',  'LLY',  'MRK'],
+  'Consumer Discretionary': ['AMZN', 'TSLA', 'HD'],
+  'Consumer Staples':       ['WMT',  'COST', 'PG'],
+  'Industrials':            ['CAT',  'BA',   'HON'],
+  'Materials':              ['LIN',  'FCX',  'NEM'],
+  'Real Estate':            ['PLD',  'AMT',  'SPG'],
+  'Communication Services': ['META', 'GOOGL','NFLX'],
+  'Utilities':              ['NEE',  'DUK',  'SO'],
+};
+
 /* ── CORS ── */
 function isAllowedOrigin(origin) {
   if (!origin || origin === 'null') return true;
@@ -1455,6 +1483,128 @@ Write a concise end-of-day market summary as valid JSON (no markdown):
   console.log('[cron] eod summary saved');
 }
 
+/* ── Sector Updates ── */
+async function handleMarketSectors(origin, env, ctx, params) {
+  const KV_KEY = 'market:sectors';
+  const TTL    = 14_400_000; // 4 hours
+  const force  = params?.get('refresh') === '1';
+
+  if (!force) {
+    try {
+      const cached = await env?.REC_LOG?.get(KV_KEY, 'json');
+      if (cached && Date.now() - cached.ts < TTL) return json(cached, 200, origin);
+    } catch (_) {}
+  }
+
+  const etfTickers   = Object.keys(SECTOR_ETFS);
+  const stockTickers = [...new Set(Object.values(SECTOR_STOCKS).flat())];
+  const allTickers   = [...etfTickers, ...stockTickers];
+
+  const results = await Promise.allSettled(
+    allTickers.map(t => yahoo(`/v8/finance/chart/${encodeURIComponent(t)}`, '?range=1d&interval=1d')),
+  );
+
+  const priceMap = {};
+  allTickers.forEach((t, i) => {
+    if (results[i].status !== 'fulfilled') return;
+    const meta      = results[i].value?.chart?.result?.[0]?.meta || {};
+    const price     = meta.regularMarketPrice ?? null;
+    const prev      = meta.chartPreviousClose ?? meta.previousClose ?? null;
+    const changePct = price != null && prev != null
+      ? Math.round((price - prev) / prev * 10000) / 100
+      : null;
+    priceMap[t] = { price, changePct };
+  });
+
+  // News for context
+  let newsLines = '';
+  try {
+    if (env?.ALPACA_KEY && env?.ALPACA_SECRET) {
+      const data = await alpacaFetch('/v1beta1/news?limit=15&sort=desc', env);
+      newsLines = (data.news || []).slice(0, 10).map(n => `• ${n.headline}`).join('\n');
+    } else {
+      const r = await fetch(
+        'https://query2.finance.yahoo.com/v1/finance/search?q=market+sector&quotesCount=0&newsCount=10',
+        { headers: YAHOO_HEADERS },
+      );
+      if (r.ok) {
+        const d = await r.json();
+        newsLines = (d.news || []).slice(0, 10).map(n => `• ${n.title}`).join('\n');
+      }
+    }
+  } catch (_) {}
+
+  const sectorLines = etfTickers.map(etf => {
+    const sector    = SECTOR_ETFS[etf];
+    const etfData   = priceMap[etf];
+    const etfPct    = etfData?.changePct != null ? `${etfData.changePct >= 0 ? '+' : ''}${etfData.changePct}%` : 'N/A';
+    const stocksStr = (SECTOR_STOCKS[sector] || []).map(sym => {
+      const d = priceMap[sym];
+      if (!d || d.price == null) return null;
+      const pct = d.changePct != null ? `${d.changePct >= 0 ? '+' : ''}${d.changePct}%` : 'N/A';
+      return `${sym} $${d.price.toFixed(2)} (${pct})`;
+    }).filter(Boolean).join(', ');
+    return `${sector} [${etf} ${etfPct}]: ${stocksStr || 'no data'}`;
+  }).join('\n');
+
+  const today = new Date().toLocaleDateString('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric',
+    timeZone: 'America/Los_Angeles',
+  });
+
+  const prompt = `You are a professional equity market analyst. Today is ${today}.
+
+SECTOR PERFORMANCE (ETF % change today, key constituents):
+${sectorLines}
+
+RECENT NEWS:
+${newsLines || 'Not available'}
+
+For each of the 11 sectors, write a brief update for traders. Rules:
+- Never pick penny stocks (under $5 price).
+- Only recommend well-known, liquid large/mid-cap stocks.
+- Opportunity and avoid picks should reflect today's specific conditions.
+- You may pick stocks outside the listed constituents if better suited.
+
+Return ONLY valid JSON (no markdown fences):
+{
+  "sectors": [
+    {
+      "sector": "Technology",
+      "etf": "XLK",
+      "summary": "1-2 sentence sector context for today's session",
+      "opportunity": { "ticker": "SYMBOL", "reason": "1-2 sentences on why this is the top near-term opportunity" },
+      "avoid": { "ticker": "SYMBOL", "reason": "1-2 sentences on why to avoid or short this today" }
+    }
+  ]
+}
+
+Include all 11 sectors in order: Technology, Financials, Energy, Health Care, Consumer Discretionary, Consumer Staples, Industrials, Materials, Real Estate, Communication Services, Utilities.`;
+
+  let sectorData;
+  try {
+    const text    = await workerClaude(prompt, env, 3500);
+    const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    sectorData = JSON.parse(cleaned);
+    if (sectorData.sectors) {
+      sectorData.sectors = sectorData.sectors.map(s => ({
+        ...s,
+        changePct: priceMap[s.etf]?.changePct ?? null,
+        price:     priceMap[s.etf]?.price     ?? null,
+      }));
+    }
+  } catch (e) {
+    console.error('[sectors] generation failed:', e.message);
+    return err('sector generation failed', 500, origin);
+  }
+
+  const result = { ...sectorData, ts: Date.now() };
+  if (ctx) ctx.waitUntil(
+    env?.REC_LOG?.put(KV_KEY, JSON.stringify(result), { expirationTtl: 14400 }).catch(() => {}),
+  );
+  return json(result, 200, origin);
+}
+
 /* ── Main fetch handler ── */
 export default {
   async fetch(request, env, ctx) {
@@ -1496,6 +1646,7 @@ export default {
           if (sub === 'movers')      return await handleMarketMovers(origin, env);
           if (sub === 'ipos')        return await handleMarketIPOs(origin, env);
           if (sub === 'week-ahead')  return await handleWeekAhead(origin, env);
+          if (sub === 'sectors')    return await handleMarketSectors(origin, env, ctx, url.searchParams);
           return err('unknown market route', 404, origin);
         case 'analysis':
           if (!sub) return err('ticker required', 400, origin);
