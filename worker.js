@@ -1095,7 +1095,13 @@ async function handleDailyGet(origin, env, ctx) {
       }
     }
 
-    if (snapshot) return json({ ...snapshot, eod: eod || null, eodLoading }, 200, origin);
+    if (snapshot) {
+      // If snapshot is stale (>12h old), the cron may have missed — regenerate in background
+      if (ctx && env?.ANTHROPIC_API_KEY && Date.now() - (snapshot.ts || 0) > 43_200_000) {
+        ctx.waitUntil(generateDailySnapshot(env));
+      }
+      return json({ ...snapshot, eod: eod || null, eodLoading }, 200, origin);
+    }
   } catch (_) {}
 
   // No morning snapshot — kick off generation
