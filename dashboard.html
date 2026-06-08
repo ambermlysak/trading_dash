@@ -342,6 +342,54 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 
+/* Scanner tab */
+.scan-presets { display: flex; gap: 6px; margin-bottom: 14px; }
+.scan-preset {
+  font-family: var(--mono); font-size: 11px; color: var(--ink-2);
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 14px; cursor: pointer; transition: all 0.12s;
+}
+.scan-preset:hover { color: var(--ink-1); border-color: var(--line); background: var(--bg-2); }
+.scan-preset.active { color: var(--bg-0); background: var(--cyan); border-color: var(--cyan); font-weight: 600; }
+.scan-legend { display: flex; align-items: center; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+.scan-pill {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.03em; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 4px; color: var(--ink-3); border: 1px solid var(--line);
+}
+.scan-pill.on { color: var(--cyan); border-color: rgba(94,197,234,0.35); }
+.scan-table { width: 100%; border-collapse: collapse; font-size: 12px; white-space: nowrap; }
+.scan-table thead th {
+  font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase;
+  letter-spacing: 0.05em; padding: 8px 12px; text-align: right; border-bottom: 1px solid var(--line);
+}
+.scan-table thead th:first-child, .scan-table thead th.lft { text-align: left; }
+.scan-table tbody tr { border-bottom: 1px solid var(--line-soft); transition: background 0.1s; }
+.scan-table tbody tr:hover { background: var(--bg-2); }
+.scan-table td { padding: 10px 12px; color: var(--ink-1); text-align: right; vertical-align: middle; }
+.scan-table td.lft { text-align: left; }
+.scan-table td.ticker-cell { font-family: var(--mono); font-weight: 600; color: var(--cyan); font-size: 13px; }
+.scan-table td.ticker-cell a { color: inherit; text-decoration: none; }
+.scan-table td.ticker-cell a:hover { text-decoration: underline; color: var(--ink-0); }
+.scan-table td.mono { font-family: var(--mono); }
+.scan-table td.up { color: var(--bull); font-family: var(--mono); }
+.scan-table td.dn { color: var(--bear); font-family: var(--mono); }
+.scan-table td.hot { color: var(--amber); font-family: var(--mono); font-weight: 600; }
+.scan-table td.catalyst-cell { text-align: left; color: var(--ink-2); font-size: 11px; white-space: normal; max-width: 240px; }
+.scan-table td.catalyst-cell.none { color: var(--ink-3); font-style: italic; }
+.scan-score { display: inline-flex; align-items: center; gap: 6px; justify-content: flex-end; }
+.scan-score-num { font-family: var(--mono); font-weight: 600; }
+.scan-pillars { display: inline-flex; gap: 2px; }
+.scan-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--line); }
+.scan-dot.met { background: var(--bull); }
+.scan-badge {
+  font-family: var(--mono); font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 600;
+}
+.scan-badge.b5 { background: rgba(35,209,139,0.18); color: var(--bull); }
+.scan-badge.b4 { background: rgba(244,183,64,0.18); color: var(--amber); }
+.scan-badge.b3 { background: rgba(94,197,234,0.14); color: var(--cyan); }
+.scan-badge.lo { background: var(--bg-2); color: var(--ink-3); }
+.scan-float-unknown { color: var(--violet); }
+
 /* Options recap tab */
 .options-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
 .options-synthesis { background: var(--bg-1); border: 1px solid var(--line); border-radius: 10px; padding: 18px 24px; margin-bottom: 24px; }
@@ -410,6 +458,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
   <div class="brand">Trading <span>Dashboard</span></div>
   <nav class="tabs">
     <button class="tab-btn active" data-tab="market">Market</button>
+    <button class="tab-btn" data-tab="scanner">Scanner</button>
     <button class="tab-btn" data-tab="watchlist">Watchlist</button>
     <button class="tab-btn" data-tab="sectors">Sectors</button>
     <button class="tab-btn" data-tab="options">Options</button>
@@ -572,6 +621,41 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <div class="sectors-grid" id="sectors-grid">
         <div class="loading" style="grid-column:1/-1">Click the Sectors tab to load data.</div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Scanner tab -->
+<div class="tab-panel" id="tab-scanner">
+  <div class="main" style="max-width:none">
+    <div class="options-header">
+      <div>
+        <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">Day-Trading Scanner</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Warrior "5 Pillars" momentum · low-float small caps · $5–$20 · major exchanges only · no penny/OTC</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <span class="sectors-ts" id="scanner-ts"></span>
+        <button class="wl-btn refresh" id="scanner-refresh-btn">↺ Refresh</button>
+      </div>
+    </div>
+
+    <div class="scan-presets" id="scanner-presets">
+      <button class="scan-preset active" data-preset="momentum">Momentum / HOD</button>
+      <button class="scan-preset" data-preset="premarket">Pre-Market Gappers</button>
+      <button class="scan-preset" data-preset="all">All Movers</button>
+    </div>
+
+    <div class="scan-legend">
+      <span class="scan-pill on">RVOL ≥ 5×</span>
+      <span class="scan-pill on">% Chg ≥ 10</span>
+      <span class="scan-pill on">Catalyst</span>
+      <span class="scan-pill on">$5–$20</span>
+      <span class="scan-pill on">Float &lt; 20M</span>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:auto">Catalyst = AI-inferred from news · not a verified feed</span>
+    </div>
+
+    <div id="scanner-content">
+      <div class="loading" style="padding:40px;text-align:center;">Click the Scanner tab to load momentum candidates.</div>
     </div>
   </div>
 </div>
@@ -1067,6 +1151,7 @@ function switchTab(tab) {
   if (tab === 'sectors'   && document.getElementById('sectors-grid').children.length <= 1 &&
       !document.getElementById('sectors-grid').querySelector('.sector-card')) loadSectors();
   if (tab === 'options'   && !optionsData) loadOptionsRecap();
+  if (tab === 'scanner'   && !scannerData) loadScanner();
 }
 
 /* ─── Sorting ─── */
@@ -1383,6 +1468,100 @@ async function loadSectors(force = false) {
 }
 
 document.getElementById('sectors-refresh-btn').addEventListener('click', () => loadSectors(true));
+
+/* ─── Scanner ─── */
+let scannerData = null;
+let scannerLoading = false;
+let scannerPreset = 'momentum';
+
+function fmtFloat(n) {
+  if (n == null) return '<span class="scan-float-unknown">n/a</span>';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(0) + 'K';
+  return String(n);
+}
+
+function scanBadge(count) {
+  if (count >= 5) return '<span class="scan-badge b5">5/5</span>';
+  if (count === 4) return '<span class="scan-badge b4">4/5</span>';
+  if (count === 3) return '<span class="scan-badge b3">3/5</span>';
+  return `<span class="scan-badge lo">${count}/5</span>`;
+}
+
+function renderScanner(data) {
+  const el = document.getElementById('scanner-content');
+  const rows = data.results || [];
+  if (!rows.length) {
+    el.innerHTML = '<div class="loading" style="padding:40px;text-align:center;">No candidates match the 5-Pillar filters right now. Momentum names appear during market hours — try the All Movers preset or check back at the open.</div>';
+    return;
+  }
+  const body = rows.map(r => {
+    const pct     = r.pct;
+    const pctCls  = pct == null ? 'mono' : pct >= 15 ? 'hot' : pct > 0 ? 'up' : 'dn';
+    const pctStr  = pct != null ? (pct >= 0 ? '+' : '') + pct.toFixed(1) + '%' : '—';
+    const rvolCls = r.rvol != null && r.rvol >= 5 ? 'hot' : 'mono';
+    const rvolStr = r.rvol != null ? r.rvol.toFixed(1) + '×' : '—';
+    const p = r.pillars || {};
+    const dots = ['rvol','change','catalyst','price','float']
+      .map(k => `<span class="scan-dot ${p[k] ? 'met' : ''}" title="${k}"></span>`).join('');
+    const cat = r.catalyst
+      ? `<td class="catalyst-cell lft">${esc(r.catalyst)}</td>`
+      : '<td class="catalyst-cell lft none">no clear catalyst</td>';
+    return `<tr>
+      <td class="ticker-cell lft"><a href="${EQUITY_URL}?ticker=${encodeURIComponent(r.ticker)}">${esc(r.ticker)}</a></td>
+      <td class="mono">$${r.price != null ? r.price.toFixed(2) : '—'}</td>
+      <td class="${pctCls}">${pctStr}</td>
+      <td class="${rvolCls}">${rvolStr}</td>
+      <td class="mono">${fmtFloat(r.float)}</td>
+      ${cat}
+      <td><span class="scan-score"><span class="scan-pillars">${dots}</span>${scanBadge(r.pillarCount)}<span class="scan-score-num">${r.score}</span></span></td>
+    </tr>`;
+  }).join('');
+
+  el.innerHTML = `<div class="wl-table-wrap"><table class="scan-table">
+    <thead><tr>
+      <th class="lft">Ticker</th><th>Price</th><th>% Chg</th><th>RVOL</th><th>Float</th>
+      <th class="lft">Catalyst</th><th>5 Pillars · Score</th>
+    </tr></thead>
+    <tbody>${body}</tbody>
+  </table></div>`;
+}
+
+async function loadScanner(preset) {
+  if (scannerLoading) return;
+  if (preset) scannerPreset = preset;
+  scannerLoading = true;
+  const btn = document.getElementById('scanner-refresh-btn');
+  btn.disabled = true; btn.textContent = '↺ Loading…';
+  const el = document.getElementById('scanner-content');
+  el.innerHTML = '<div class="loading" style="padding:40px;text-align:center;">Sweeping momentum candidates &amp; tagging catalysts…</div>';
+
+  try {
+    const data = await apiFetch('/market/scanner?preset=' + encodeURIComponent(scannerPreset));
+    scannerData = data;
+    if (data.ts) {
+      const d = new Date(data.ts);
+      document.getElementById('scanner-ts').textContent =
+        'As of ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+    }
+    renderScanner(data);
+  } catch (e) {
+    console.error('[scanner]', e.message);
+    el.innerHTML = '<div class="loading" style="padding:40px;text-align:center;color:var(--bear)">Failed to load scanner. Try Refresh.</div>';
+  } finally {
+    scannerLoading = false;
+    btn.disabled = false; btn.textContent = '↺ Refresh';
+  }
+}
+
+document.getElementById('scanner-refresh-btn').addEventListener('click', () => loadScanner());
+document.querySelectorAll('.scan-preset').forEach(b => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('.scan-preset').forEach(x => x.classList.toggle('active', x === b));
+    loadScanner(b.dataset.preset);
+  });
+});
 
 /* ─── Init ─── */
 async function init() {

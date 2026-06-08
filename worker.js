@@ -13,6 +13,7 @@
  *   GET  /api/track/:ticker              → Read rating history from KV
  *   GET  /api/market/snapshot            → Index + futures + commodities + bonds strip
  *   GET  /api/market/movers              → Pre-market / day gainers + losers
+ *   GET  /api/market/scanner?preset=     → Day-trading momentum scanner (5 Pillars)
  *   GET  /api/market/ipos                → Upcoming IPO calendar (12h KV cache)
  *   GET  /api/watchlist/batch?symbols=   → Bulk fundamentals + RSI + Claude analysis
  *   GET  /api/daily                      → Daily Claude synthesis (6am PT cron)
@@ -756,6 +757,249 @@ async function handleMarketMovers(origin, env) {
     postLosers:  applyFilter(postMovers, false),
     ts: Date.now(),
   }, 200, origin);
+}
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Day-Trading Momentum Scanner  (Warrior Trading "5 Pillars" methodology)
+ *
+ * Surfaces low-float small-cap momentum names — the kind Ross Cameron trades.
+ * Pillars (all small-cap momentum, NOT large caps):
+ *   1. Relative Volume   ≥ 5×   (today's volume ÷ 10-day avg)
+ *   2. Daily % change    ≥ +10% (≥ +15% = "on fire")
+ *   3. News catalyst             (AI-tagged from the news feed)
+ *   4. Price             $5–$20  (hard filter — excludes sub-$5 pennies)
+ *   5. Float             < 20M shares
+ * Hard filters: major US exchange only (no OTC / pink sheets), price $5–$20.
+ *
+ * Two-stage pipeline:
+ *   Stage 1 — candidate sweep via Yahoo custom screener (+ predefined fallback)
+ *   Stage 2 — per-candidate enrichment: float, RVOL, then one batched Claude
+ *             call to tag catalysts. Scored 0–100 against the 5 pillars.
+ * Cached 90s in KV (scanner:{preset}) to respect upstream rate limits.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+// Major US exchange codes to KEEP — everything else (PNK/OTC/pink) is dropped.
+const SCANNER_MAJOR_EXCHANGES = new Set(['NMS', 'NGM', 'NCM', 'NYQ', 'ASE', 'PCX', 'BTS', 'BATS']);
+
+const SCANNER_PRESETS = {
+  // Pre-market gappers — looser gap, the Gap & Go candidate list.
+  premarket: { minPct: 4,  floatCap: 20_000_000, minPrice: 5, maxPrice: 20, minVol: 50_000  },
+  // Live momentum / high-of-day — the prime 9:30–12:00 window.
+  momentum:  { minPct: 10, floatCap: 20_000_000, minPrice: 5, maxPrice: 20, minVol: 100_000 },
+  // All movers — no float cap, looser net for manual review.
+  all:       { minPct: 10, floatCap: Infinity,   minPrice: 5, maxPrice: 20, minVol: 100_000 },
+};
+
+// Yahoo custom screener (POST, crumb-authed). Returns candidate quotes or [].
+async function yahooScreenerPOST(cfg, env) {
+  const body = {
+    size: 50,
+    offset: 0,
+    sortField: 'percentchange',
+    sortType: 'DESC',
+    quoteType: 'EQUITY',
+    query: {
+      operator: 'AND',
+      operands: [
+        { operator: 'eq', operands: ['region', 'us'] },
+        { operator: 'gt', operands: ['percentchange', cfg.minPct] },
+        { operator: 'gt', operands: ['intradayprice', cfg.minPrice] },
+        { operator: 'lt', operands: ['intradayprice', cfg.maxPrice] },
+        { operator: 'gt', operands: ['dayvolume', cfg.minVol] },
+      ],
+    },
+    userId: '',
+    userIdType: 'guid',
+  };
+
+  const make = async (crumb, cookie) => {
+    const headers = { ...YAHOO_HEADERS, 'Content-Type': 'application/json' };
+    if (cookie) headers['Cookie'] = cookie;
+    return fetch(
+      `https://query2.finance.yahoo.com/v1/finance/screener?crumb=${encodeURIComponent(crumb)}&formatted=true&lang=en-US&region=US`,
+      { method: 'POST', headers, body: JSON.stringify(body) },
+    );
+  };
+
+  try {
+    let { crumb, cookie } = await getYahooCrumb(env);
+    let r = await make(crumb, cookie);
+    if (r.status === 401 || r.status === 403) {
+      _crumbCache = null;
+      ({ crumb, cookie } = await getYahooCrumb(env));
+      r = await make(crumb, cookie);
+    }
+    if (!r.ok) return [];
+    const d = await r.json();
+    return d?.finance?.result?.[0]?.quotes || [];
+  } catch (_) {
+    return [];
+  }
+}
+
+// Map a raw Yahoo screener quote → normalized candidate (or null to drop).
+function scannerNormalize(q) {
+  const num = (v) => (v && typeof v === 'object' ? (v.raw ?? null) : (v ?? null));
+  const price     = num(q.regularMarketPrice);
+  const changePct = num(q.regularMarketChangePercent);
+  const preChg    = num(q.preMarketChangePercent);
+  const volume    = num(q.regularMarketVolume);
+  const avgVol    = num(q.averageDailyVolume10Day) ?? num(q.averageDailyVolume3Month);
+  const exchange  = q.exchange || '';
+  if (!q.symbol || price == null) return null;
+  // Drop OTC / pink sheets — keep only recognised major US exchanges.
+  if (exchange && !SCANNER_MAJOR_EXCHANGES.has(exchange)) return null;
+  return {
+    ticker:    q.symbol,
+    price:     Math.round(price * 100) / 100,
+    changePct: changePct != null ? Math.round(changePct * 100) / 100 : null,
+    preChg:    preChg    != null ? Math.round(preChg    * 100) / 100 : null,
+    volume,
+    avgVol,
+    rvol:      avgVol ? Math.round(volume / avgVol * 10) / 10 : null,
+    float:     null,      // filled in stage 2
+    catalyst:  null,      // filled in stage 2
+  };
+}
+
+async function handleScanner(searchParams, origin, env, ctx) {
+  const preset = SCANNER_PRESETS[searchParams.get('preset')] ? searchParams.get('preset') : 'momentum';
+  const cfg    = SCANNER_PRESETS[preset];
+  const KV_KEY = `scanner:${preset}`;
+  const TTL    = 90_000; // 90s
+
+  // Serve fresh KV cache
+  try {
+    const cached = await env?.REC_LOG?.get(KV_KEY, 'json');
+    if (cached && Date.now() - (cached.ts || 0) < TTL) {
+      return json({ ...cached, cached: true }, 200, origin);
+    }
+  } catch (_) {}
+
+  // ── Stage 1: candidate sweep ──
+  let raw = await yahooScreenerPOST(cfg, env);
+
+  // Fallback: predefined day_gainers screener (no float/RVOL guarantees but robust)
+  if (!raw.length) {
+    try {
+      const r = await fetch(
+        'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=day_gainers&count=50',
+        { headers: YAHOO_HEADERS },
+      );
+      if (r.ok) raw = (await r.json())?.finance?.result?.[0]?.quotes || [];
+    } catch (_) {}
+  }
+
+  // Normalize, drop OTC, apply hard price + %change filters
+  let candidates = raw
+    .map(scannerNormalize)
+    .filter(Boolean)
+    .filter(c => c.price >= cfg.minPrice && c.price <= cfg.maxPrice)
+    .filter(c => {
+      const pct = preset === 'premarket' ? (c.preChg ?? c.changePct) : c.changePct;
+      return pct != null && pct >= cfg.minPct;
+    })
+    .sort((a, b) => (b.changePct ?? 0) - (a.changePct ?? 0))
+    .slice(0, 15); // cap enrichment cost
+
+  // ── Stage 2: enrich float + RVOL via quoteSummary ──
+  await Promise.allSettled(candidates.map(async (c) => {
+    try {
+      const r = await yahooAuth(
+        `/v10/finance/quoteSummary/${c.ticker}`,
+        '?modules=defaultKeyStatistics,price,summaryDetail',
+        env,
+      );
+      const m = r?.quoteSummary?.result?.[0] || {};
+      const float = m.defaultKeyStatistics?.floatShares?.raw
+                 ?? m.defaultKeyStatistics?.sharesOutstanding?.raw ?? null;
+      if (float != null) c.float = float;
+      // Backfill RVOL if the screener didn't carry avg volume
+      if (c.rvol == null) {
+        const vol = m.price?.regularMarketVolume?.raw ?? c.volume;
+        const avg = m.summaryDetail?.averageDailyVolume10Day?.raw
+                 ?? m.summaryDetail?.averageVolume?.raw ?? null;
+        if (vol && avg) c.rvol = Math.round(vol / avg * 10) / 10;
+      }
+    } catch (_) {}
+  }));
+
+  // Apply float cap (drop names above the cap; keep unknown-float names flagged)
+  candidates = candidates.filter(c => c.float == null || c.float <= cfg.floatCap);
+
+  // ── Stage 2b: AI-tag catalysts (one batched Claude call) ──
+  if (candidates.length && env?.ANTHROPIC_API_KEY) {
+    try {
+      // Pull a headline for each candidate in parallel
+      const heads = await Promise.allSettled(candidates.map(async (c) => {
+        if (env?.ALPACA_KEY && env?.ALPACA_SECRET) {
+          const d = await alpacaFetch(`/v1beta1/news?symbols=${c.ticker}&limit=2&sort=desc`, env);
+          const n = d.news?.[0];
+          return n ? `${c.ticker}: ${n.headline}` : `${c.ticker}: (no recent headline)`;
+        }
+        return `${c.ticker}: (no recent headline)`;
+      }));
+      const lines = heads.map(h => h.status === 'fulfilled' ? h.value : null).filter(Boolean);
+
+      if (lines.length) {
+        const prompt = `You are a day-trading desk analyst. For each ticker below, give the single most likely intraday CATALYST in 3-6 words (e.g. "Q2 earnings beat + raise", "FDA Phase 3 win", "secondary offering", "analyst upgrade"). If the headline shows no real catalyst, return null.\nReturn ONLY a JSON object mapping ticker → catalyst string or null.\n\n${lines.join('\n')}`;
+        const cr = await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify({
+            model: CLAUDE_MODEL,
+            max_tokens: 500,
+            messages: [{ role: 'user', content: prompt }],
+          }),
+        });
+        if (cr.ok) {
+          const cd = await cr.json();
+          const txt = cd?.content?.[0]?.text || '';
+          const match = txt.match(/\{[\s\S]*\}/);
+          if (match) {
+            const tags = JSON.parse(match[0]);
+            for (const c of candidates) {
+              const t = tags[c.ticker];
+              if (t && typeof t === 'string' && t.toLowerCase() !== 'null') c.catalyst = t;
+            }
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  // ── Stage 3: 5-pillar scoring ──
+  const scored = candidates.map((c) => {
+    const pct = preset === 'premarket' ? (c.preChg ?? c.changePct) : c.changePct;
+    const pillars = {
+      rvol:     c.rvol != null && c.rvol >= 5,
+      change:   pct   != null && pct  >= 10,
+      catalyst: !!c.catalyst,
+      price:    c.price >= 5 && c.price <= 20,           // always true post-filter
+      float:    c.float != null && c.float < cfg.floatCap,
+    };
+    // Continuous score for ranking (price pillar is a given, so weight the other 4)
+    let score = 0;
+    score += Math.min(c.rvol ?? 0, 10) / 10 * 30;        // RVOL up to 30
+    score += Math.min(Math.max(pct ?? 0, 0), 30) / 30 * 25; // %chg up to 25
+    score += c.catalyst ? 25 : 0;                        // catalyst 25
+    score += c.float != null ? (c.float < 5e6 ? 20 : c.float < 10e6 ? 16 : c.float < 20e6 ? 10 : 4) : 6; // float up to 20
+    return {
+      ...c,
+      pct,
+      pillars,
+      pillarCount: Object.values(pillars).filter(Boolean).length,
+      score: Math.round(score),
+    };
+  }).sort((a, b) => b.score - a.score);
+
+  const payload = { preset, count: scored.length, results: scored, ts: Date.now() };
+  try { await env?.REC_LOG?.put(KV_KEY, JSON.stringify(payload), { expirationTtl: 300 }); } catch (_) {}
+  return json(payload, 200, origin);
 }
 
 async function handleMarketIPOs(origin, env) {
@@ -1666,6 +1910,7 @@ export default {
           if (sub === 'ipos')        return await handleMarketIPOs(origin, env);
           if (sub === 'week-ahead')  return await handleWeekAhead(origin, env);
           if (sub === 'sectors')    return await handleMarketSectors(origin, env, ctx, url.searchParams);
+          if (sub === 'scanner')    return await handleScanner(url.searchParams, origin, env, ctx);
           return err('unknown market route', 404, origin);
         case 'analysis':
           if (!sub) return err('ticker required', 400, origin);
