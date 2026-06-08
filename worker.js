@@ -851,6 +851,8 @@ function scannerNormalize(q) {
   if (exchange && !SCANNER_MAJOR_EXCHANGES.has(exchange)) return null;
   return {
     ticker:    q.symbol,
+    name:      q.shortName || q.longName || '',  // may be refined in stage 2
+    sector:    null,      // filled in stage 2
     price:     Math.round(price * 100) / 100,
     changePct: changePct != null ? Math.round(changePct * 100) / 100 : null,
     preChg:    preChg    != null ? Math.round(preChg    * 100) / 100 : null,
@@ -907,13 +909,16 @@ async function handleScanner(searchParams, origin, env, ctx) {
     try {
       const r = await yahooAuth(
         `/v10/finance/quoteSummary/${c.ticker}`,
-        '?modules=defaultKeyStatistics,price,summaryDetail',
+        '?modules=defaultKeyStatistics,price,summaryDetail,assetProfile',
         env,
       );
       const m = r?.quoteSummary?.result?.[0] || {};
       const float = m.defaultKeyStatistics?.floatShares?.raw
                  ?? m.defaultKeyStatistics?.sharesOutstanding?.raw ?? null;
       if (float != null) c.float = float;
+      const name = m.price?.longName || m.price?.shortName;
+      if (name) c.name = name;
+      c.sector = m.assetProfile?.sector ?? c.sector;
       // Backfill RVOL if the screener didn't carry avg volume
       if (c.rvol == null) {
         const vol = m.price?.regularMarketVolume?.raw ?? c.volume;

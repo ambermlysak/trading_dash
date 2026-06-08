@@ -374,6 +374,8 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .scan-table td.up { color: var(--bull); font-family: var(--mono); }
 .scan-table td.dn { color: var(--bear); font-family: var(--mono); }
 .scan-table td.hot { color: var(--amber); font-family: var(--mono); font-weight: 600; }
+.scan-table td.name-cell { color: var(--ink-1); font-size: 11px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+.scan-table td.sector-cell { color: var(--ink-2); font-size: 11px; }
 .scan-table td.catalyst-cell { text-align: left; color: var(--ink-2); font-size: 11px; white-space: normal; max-width: 240px; }
 .scan-table td.catalyst-cell.none { color: var(--ink-3); font-style: italic; }
 .scan-score { display: inline-flex; align-items: center; gap: 6px; justify-content: flex-end; }
@@ -1510,6 +1512,8 @@ function renderScanner(data) {
       : '<td class="catalyst-cell lft none">no clear catalyst</td>';
     return `<tr>
       <td class="ticker-cell lft"><a href="${EQUITY_URL}?ticker=${encodeURIComponent(r.ticker)}">${esc(r.ticker)}</a></td>
+      <td class="lft name-cell">${esc(r.name || '—')}</td>
+      <td class="lft sector-cell">${esc(r.sector || '—')}</td>
       <td class="mono">$${r.price != null ? r.price.toFixed(2) : '—'}</td>
       <td class="${pctCls}">${pctStr}</td>
       <td class="${rvolCls}">${rvolStr}</td>
@@ -1521,7 +1525,7 @@ function renderScanner(data) {
 
   el.innerHTML = `<div class="wl-table-wrap"><table class="scan-table">
     <thead><tr>
-      <th class="lft">Ticker</th><th>Price</th><th>% Chg</th><th>RVOL</th><th>Float</th>
+      <th class="lft">Ticker</th><th class="lft">Company</th><th class="lft">Sector</th><th>Price</th><th>% Chg</th><th>RVOL</th><th>Float</th>
       <th class="lft">Catalyst</th><th>5 Pillars · Score</th>
     </tr></thead>
     <tbody>${body}</tbody>
