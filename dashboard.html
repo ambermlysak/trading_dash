@@ -1434,8 +1434,8 @@ async function loadSectors(force = false) {
       const chgPct  = s.changePct;
       const chgCls  = chgPct > 0 ? 'up' : chgPct < 0 ? 'dn' : 'flat';
       const chgStr  = chgPct != null ? (chgPct >= 0 ? '+' : '') + chgPct.toFixed(2) + '%' : '—';
-      const oppTicker = s.opportunity?.ticker ? `<a href="${EQUITY_URL}?ticker=${encodeURIComponent(s.opportunity.ticker)}" style="color:inherit;text-decoration:none">${esc(s.opportunity.ticker)}</a>` : '—';
-      const avdTicker = s.avoid?.ticker       ? `<a href="${EQUITY_URL}?ticker=${encodeURIComponent(s.avoid.ticker)}"       style="color:inherit;text-decoration:none">${esc(s.avoid.ticker)}</a>`       : '—';
+      const oppTicker = s.opportunity?.ticker ? `<a href="${EQUITY_URL}?t=${encodeURIComponent(s.opportunity.ticker)}" style="color:inherit;text-decoration:none">${esc(s.opportunity.ticker)}</a>` : '—';
+      const avdTicker = s.avoid?.ticker       ? `<a href="${EQUITY_URL}?t=${encodeURIComponent(s.avoid.ticker)}"       style="color:inherit;text-decoration:none">${esc(s.avoid.ticker)}</a>`       : '—';
       return `<div class="sector-card">
         <div class="sector-card-head">
           <span class="sector-name">${esc(s.sector)}</span>
@@ -1511,7 +1511,7 @@ function renderScanner(data) {
       ? `<td class="catalyst-cell lft">${esc(r.catalyst)}</td>`
       : '<td class="catalyst-cell lft none">no clear catalyst</td>';
     return `<tr>
-      <td class="ticker-cell lft"><a href="${EQUITY_URL}?ticker=${encodeURIComponent(r.ticker)}">${esc(r.ticker)}</a></td>
+      <td class="ticker-cell lft"><a href="${EQUITY_URL}?t=${encodeURIComponent(r.ticker)}">${esc(r.ticker)}</a></td>
       <td class="lft name-cell">${esc(r.name || '—')}</td>
       <td class="lft sector-cell">${esc(r.sector || '—')}</td>
       <td class="mono">$${r.price != null ? r.price.toFixed(2) : '—'}</td>
