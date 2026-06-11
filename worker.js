@@ -762,14 +762,17 @@ async function handleMarketMovers(origin, env) {
 /* ───────────────────────────────────────────────────────────────────────────
  * Day-Trading Momentum Scanner  (Warrior Trading "5 Pillars" methodology)
  *
- * Surfaces low-float small-cap momentum names — the kind Ross Cameron trades.
- * Pillars (all small-cap momentum, NOT large caps):
- *   1. Relative Volume   ≥ 5×   (today's volume ÷ 10-day avg)
- *   2. Daily % change    ≥ +10% (≥ +15% = "on fire")
- *   3. News catalyst             (AI-tagged from the news feed)
- *   4. Price             $5–$20  (hard filter — excludes sub-$5 pennies)
- *   5. Float             < 20M shares
- * Hard filters: major US exchange only (no OTC / pink sheets), price $5–$20.
+ * Mirrors Warrior Trading's "Most Active Stocks" watch list: surface every
+ * active intraday mover, excluding only sub-$2 penny stocks and OTC/pink sheets.
+ * The 5 Pillars are scored/ranked — they are NOT all hard gates, so higher-
+ * priced and larger-float active names still appear (just lower-scored):
+ *   1. Relative Volume   ≥ 5×   (today's volume ÷ 10-day avg)   — scoring
+ *   2. Daily % change    ≥ +10% (≥ +15% = "on fire")            — scoring
+ *   3. News catalyst             (AI-tagged from the news feed)  — scoring
+ *   4. Price             ≥ $2    (hard filter — excludes pennies)
+ *   5. Float             < 20M shares                            — scoring
+ * Hard filters ONLY: major US exchange (no OTC / pink), price ≥ $2, and a
+ * small candidate-net floor on % change + volume to keep flat names out.
  *
  * Two-stage pipeline:
  *   Stage 1 — candidate sweep via Yahoo custom screener (+ predefined fallback)
@@ -781,13 +784,20 @@ async function handleMarketMovers(origin, env) {
 // Major US exchange codes to KEEP — everything else (PNK/OTC/pink) is dropped.
 const SCANNER_MAJOR_EXCHANGES = new Set(['NMS', 'NGM', 'NCM', 'NYQ', 'ASE', 'PCX', 'BTS', 'BATS']);
 
+// Pillar thresholds used for SCORING (not hard filters).
+const SCANNER_GAP_PILLAR   = 10;          // % change at/above this lights the "change" pillar
+const SCANNER_FLOAT_PILLAR = 20_000_000;  // float below this lights the "float" pillar
+
+// Penny-stock floor — anything under this price is excluded (hard filter).
+// minPct here is the candidate-net floor (keeps flat names out), NOT the 10%
+// momentum rule, which is scored via SCANNER_GAP_PILLAR. maxPrice null = no cap.
 const SCANNER_PRESETS = {
-  // Pre-market gappers — looser gap, the Gap & Go candidate list.
-  premarket: { minPct: 4,  floatCap: 20_000_000, minPrice: 5, maxPrice: 20, minVol: 50_000  },
+  // Pre-market gappers — the Gap & Go candidate list.
+  premarket: { minPct: 2, minPrice: 2, maxPrice: null, minVol: 50_000  },
   // Live momentum / high-of-day — the prime 9:30–12:00 window.
-  momentum:  { minPct: 10, floatCap: 20_000_000, minPrice: 5, maxPrice: 20, minVol: 100_000 },
-  // All movers — no float cap, looser net for manual review.
-  all:       { minPct: 10, floatCap: Infinity,   minPrice: 5, maxPrice: 20, minVol: 100_000 },
+  momentum:  { minPct: 3, minPrice: 2, maxPrice: null, minVol: 100_000 },
+  // All movers — widest net for manual review.
+  all:       { minPct: 1, minPrice: 2, maxPrice: null, minVol: 100_000 },
 };
 
 // Yahoo custom screener (POST, crumb-authed). Returns candidate quotes or [].
@@ -804,7 +814,8 @@ async function yahooScreenerPOST(cfg, env) {
         { operator: 'eq', operands: ['region', 'us'] },
         { operator: 'gt', operands: ['percentchange', cfg.minPct] },
         { operator: 'gt', operands: ['intradayprice', cfg.minPrice] },
-        { operator: 'lt', operands: ['intradayprice', cfg.maxPrice] },
+        // Upper price bound only when the preset caps it (default: no cap).
+        ...(cfg.maxPrice != null ? [{ operator: 'lt', operands: ['intradayprice', cfg.maxPrice] }] : []),
         { operator: 'gt', operands: ['dayvolume', cfg.minVol] },
       ],
     },
@@ -892,11 +903,12 @@ async function handleScanner(searchParams, origin, env, ctx) {
     } catch (_) {}
   }
 
-  // Normalize, drop OTC, apply hard price + %change filters
+  // Normalize, drop OTC, exclude sub-$2 pennies (and any preset price cap),
+  // keep a small candidate-net floor on % change to drop flat names.
   let candidates = raw
     .map(scannerNormalize)
     .filter(Boolean)
-    .filter(c => c.price >= cfg.minPrice && c.price <= cfg.maxPrice)
+    .filter(c => c.price >= cfg.minPrice && (cfg.maxPrice == null || c.price <= cfg.maxPrice))
     .filter(c => {
       const pct = preset === 'premarket' ? (c.preChg ?? c.changePct) : c.changePct;
       return pct != null && pct >= cfg.minPct;
@@ -929,8 +941,7 @@ async function handleScanner(searchParams, origin, env, ctx) {
     } catch (_) {}
   }));
 
-  // Apply float cap (drop names above the cap; keep unknown-float names flagged)
-  candidates = candidates.filter(c => c.float == null || c.float <= cfg.floatCap);
+  // Float is scored, not gated — high-float active names stay in the list.
 
   // ── Stage 2b: AI-tag catalysts (one batched Claude call) ──
   if (candidates.length && env?.ANTHROPIC_API_KEY) {
@@ -982,10 +993,10 @@ async function handleScanner(searchParams, origin, env, ctx) {
     const pct = preset === 'premarket' ? (c.preChg ?? c.changePct) : c.changePct;
     const pillars = {
       rvol:     c.rvol != null && c.rvol >= 5,
-      change:   pct   != null && pct  >= 10,
+      change:   pct   != null && pct  >= SCANNER_GAP_PILLAR,
       catalyst: !!c.catalyst,
-      price:    c.price >= 5 && c.price <= 20,           // always true post-filter
-      float:    c.float != null && c.float < cfg.floatCap,
+      price:    c.price >= cfg.minPrice,                 // always true post-filter
+      float:    c.float != null && c.float < SCANNER_FLOAT_PILLAR,
     };
     // Continuous score for ranking (price pillar is a given, so weight the other 4)
     let score = 0;

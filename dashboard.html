@@ -633,7 +633,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     <div class="options-header">
       <div>
         <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">Day-Trading Scanner</div>
-        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Warrior "5 Pillars" momentum · low-float small caps · $5–$20 · major exchanges only · no penny/OTC</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Warrior "Most Active" momentum · every active mover ≥ $2 · major exchanges only · no penny/OTC · ranked by 5 Pillars</div>
       </div>
       <div style="display:flex;align-items:center;gap:12px">
         <span class="sectors-ts" id="scanner-ts"></span>
@@ -648,12 +648,12 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     </div>
 
     <div class="scan-legend">
-      <span class="scan-pill on">RVOL ≥ 5×</span>
-      <span class="scan-pill on">% Chg ≥ 10</span>
-      <span class="scan-pill on">Catalyst</span>
-      <span class="scan-pill on">$5–$20</span>
-      <span class="scan-pill on">Float &lt; 20M</span>
-      <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:auto">Catalyst = AI-inferred from news · not a verified feed</span>
+      <span class="scan-pill on">Price ≥ $2</span>
+      <span class="scan-pill">RVOL ≥ 5×</span>
+      <span class="scan-pill">% Chg ≥ 10</span>
+      <span class="scan-pill">Catalyst</span>
+      <span class="scan-pill">Float &lt; 20M</span>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:auto">Price ≥ $2 is the only hard filter · the other 4 pillars rank the list · Catalyst = AI-inferred from news</span>
     </div>
 
     <div id="scanner-content">
@@ -1495,7 +1495,7 @@ function renderScanner(data) {
   const el = document.getElementById('scanner-content');
   const rows = data.results || [];
   if (!rows.length) {
-    el.innerHTML = '<div class="loading" style="padding:40px;text-align:center;">No candidates match the 5-Pillar filters right now. Momentum names appear during market hours — try the All Movers preset or check back at the open.</div>';
+    el.innerHTML = '<div class="loading" style="padding:40px;text-align:center;">No active movers right now. Names appear during market hours — try the All Movers preset or check back at the open.</div>';
     return;
   }
   const body = rows.map(r => {
