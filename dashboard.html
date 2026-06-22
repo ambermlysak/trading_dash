@@ -914,6 +914,21 @@ function getWatchlist() {
 }
 function saveWatchlist(tickers) {
   localStorage.setItem(WL_KEY, JSON.stringify(tickers));
+  syncWatchlistToServer(tickers);
+}
+
+// Push the watchlist to the Worker so the 6am cron refreshes analysis
+// (trend/pattern/action/rating) for exactly the tickers on this tab.
+let wlSyncTimer = null;
+function syncWatchlistToServer(tickers) {
+  clearTimeout(wlSyncTimer);
+  wlSyncTimer = setTimeout(() => {
+    fetch(API_BASE + '/watchlist/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tickers: tickers || getWatchlist() }),
+    }).catch(e => console.error('[wl-sync]', e.message));
+  }, 800); // debounce rapid add/remove edits
 }
 
 /* ─── Watchlist data ─── */
@@ -934,6 +949,7 @@ async function loadWatchlistBatch() {
 
   try {
     const tickers = getWatchlist();
+    syncWatchlistToServer(tickers); // keep the cron's copy in sync with this tab
     const CHUNK = 15;
     const allStocks = {};
     let anyAnalysisLoading = false;

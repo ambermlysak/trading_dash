@@ -1155,6 +1155,18 @@ async function handleMarketIPOs(origin, env) {
   return json(result, 200, origin);
 }
 
+// Persist the user's watchlist so the 6am cron can refresh analysis for exactly
+// the tickers on their Watchlist tab (not just the static default list).
+async function handleWatchlistSave(request, origin, env) {
+  const body = await request.json().catch(() => null);
+  const tickers = Array.isArray(body?.tickers)
+    ? [...new Set(body.tickers.map(t => String(t).trim().toUpperCase()).filter(Boolean))].slice(0, 60)
+    : null;
+  if (!tickers || !tickers.length) return err('tickers required', 400, origin);
+  await env?.REC_LOG?.put('watchlist:tickers', JSON.stringify(tickers));
+  return json({ ok: true, count: tickers.length }, 200, origin);
+}
+
 async function handleWatchlistBatch(symbols, origin, env, ctx) {
   const tickers = symbols.split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 30);
   if (!tickers.length) return err('symbols required', 400, origin);
@@ -1707,42 +1719,38 @@ Return ONLY valid JSON, no markdown fences.`;
     console.error('[cron] snapshot generation failed:', e.message);
   }
 
-  // Only cache a snapshot that actually has content. On failure, preserve any
+  // Cache the headline snapshot only if it has content. On failure, preserve any
   // existing complete snapshot rather than overwriting it with an empty shell
   // (and leave the cache "incomplete" so handleDailyGet retries on next visit).
+  // NOTE: a headline failure must NOT abort the watchlist/sector refresh below.
   const hasContent = snapshot && ((snapshot.newsCards?.length || 0) > 0 || snapshot.opportunity);
-  if (!hasContent) {
+  if (hasContent) {
+    await env?.REC_LOG?.put(
+      'daily:snapshot',
+      JSON.stringify({ ...snapshot, ts: Date.now() }),
+      { expirationTtl: 172800 },
+    );
+    console.log('[cron] daily snapshot saved');
+  } else {
     const existingComplete = existingSnapshot &&
       ((existingSnapshot.newsCards?.length || 0) > 0 || existingSnapshot.opportunity);
     if (existingComplete) {
-      console.warn('[cron] generation failed — keeping prior complete snapshot');
-      return;
+      console.warn('[cron] headline generation failed — keeping prior complete snapshot');
+    } else {
+      // Nothing usable anywhere: write a minimal headline so the page isn't broken,
+      // but with ts=0 so handleDailyGet treats it as stale and keeps retrying.
+      await env?.REC_LOG?.put(
+        'daily:snapshot',
+        JSON.stringify({ headline: `Market update for ${today}`, newsCards: [], opportunity: null, avoid: null, ts: 0 }),
+        { expirationTtl: 172800 },
+      );
+      console.warn('[cron] headline generation failed and no prior snapshot — wrote stale placeholder');
     }
-    // Nothing usable anywhere: write a minimal headline so the page isn't broken,
-    // but with ts=0 so handleDailyGet treats it as stale and keeps retrying.
-    await env?.REC_LOG?.put(
-      'daily:snapshot',
-      JSON.stringify({ headline: `Market update for ${today}`, newsCards: [], opportunity: null, avoid: null, ts: 0 }),
-      { expirationTtl: 172800 },
-    );
-    console.warn('[cron] generation failed and no prior snapshot — wrote stale placeholder');
-    return;
   }
 
-  await env?.REC_LOG?.put(
-    'daily:snapshot',
-    JSON.stringify({ ...snapshot, ts: Date.now() }),
-    { expirationTtl: 172800 },
-  );
-  console.log('[cron] daily snapshot saved');
-
-  // Refresh per-ticker Claude analysis in batches of 5
-  for (let i = 0; i < DEFAULT_WATCHLIST.length; i += 5) {
-    await Promise.allSettled(
-      DEFAULT_WATCHLIST.slice(i, i + 5).map(t => refreshTickerAnalysis(t, env)),
-    );
-  }
-  console.log('[cron] ticker analyses refreshed');
+  // Refresh trend/pattern/action/rating for every Watchlist-tab ticker so the
+  // columns are current each morning without the user clicking into each stock.
+  await refreshWatchlistAnalyses(env);
 
   // Pre-warm sector intelligence so the Market tab loads instantly in the morning
   // instead of forcing the first visitor through a ~50s cold-cache regeneration.
@@ -1752,6 +1760,29 @@ Return ONLY valid JSON, no markdown fences.`;
   } catch (e) {
     console.error('[cron] sectors pre-warm error:', e.message);
   }
+}
+
+/* ── Cron: refresh per-ticker watchlist analysis ──
+   Uses the user's persisted watchlist (saved from the dashboard) unioned with
+   DEFAULT_WATCHLIST so the morning briefing's opportunity/avoid picks are always
+   covered too. Each ticker is written to analysis:{TICKER} for the batch endpoint
+   to serve, so trend/pattern/action/rating render instantly on page load. */
+async function refreshWatchlistAnalyses(env) {
+  let tickers = [...DEFAULT_WATCHLIST];
+  try {
+    const saved = await env?.REC_LOG?.get('watchlist:tickers', 'json');
+    if (Array.isArray(saved) && saved.length) {
+      tickers = [...new Set([...saved, ...DEFAULT_WATCHLIST].map(t => String(t).toUpperCase()))];
+    }
+  } catch (_) {}
+  tickers = tickers.slice(0, 60); // safety cap on subrequest volume
+
+  for (let i = 0; i < tickers.length; i += 5) {
+    await Promise.allSettled(
+      tickers.slice(i, i + 5).map(t => refreshTickerAnalysis(t, env)),
+    );
+  }
+  console.log(`[cron] ${tickers.length} watchlist analyses refreshed`);
 }
 
 /* ── Cron: end-of-day summary (1:15pm PT, ~15 min after market close) ── */
@@ -2043,6 +2074,7 @@ export default {
           if (sub === 'auction') return await handleWatchlistAuction(
             url.searchParams.get('symbols') || '', origin, env, ctx,
           );
+          if (sub === 'save' && request.method === 'POST') return await handleWatchlistSave(request, origin, env);
           return err('unknown watchlist route', 404, origin);
         case 'admin':
           if (sub === 'refresh-daily' && request.method === 'POST') {
