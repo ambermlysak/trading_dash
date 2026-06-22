@@ -747,6 +747,8 @@ async function loadDailySnapshot() {
     const data = await apiFetch('/daily');
     if (data.loading) {
       document.getElementById('headline-text').textContent = 'Morning briefing is being prepared… check back shortly.';
+      // The worker kicks off generation on this request; poll until it's ready.
+      setTimeout(loadDailySnapshot, 30000);
       return;
     }
 

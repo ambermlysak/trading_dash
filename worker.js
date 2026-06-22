@@ -309,26 +309,60 @@ function computeSR(highs, lows) {
   };
 }
 
-/* ── Worker-side Claude call ── */
+/* ── Worker-side Claude call ──
+   Retries transient failures (429 rate limit, 5xx overload) with backoff.
+   A single un-retried hiccup during the 6am cron used to wipe out the daily
+   briefing, sector intelligence, and watchlist signals for the whole day. */
 async function workerClaude(prompt, env, maxTokens = 400) {
   if (!env?.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not set');
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type':      'application/json',
-      'x-api-key':         env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model:      CLAUDE_MODEL,
-      max_tokens: maxTokens,
-      messages:   [{ role: 'user', content: prompt }],
-    }),
-  });
-  if (!r.ok) throw new Error(`Claude ${r.status}`);
-  const d = await r.json();
-  return d.content?.[0]?.text?.trim() || '';
+
+  const MAX_ATTEMPTS = 4;
+  let lastErr = 'unknown';
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let r;
+    try {
+      r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type':      'application/json',
+          'x-api-key':         env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model:      CLAUDE_MODEL,
+          max_tokens: maxTokens,
+          messages:   [{ role: 'user', content: prompt }],
+        }),
+      });
+    } catch (e) {
+      // Network-level failure — retry
+      lastErr = `network ${e.message}`;
+      if (attempt < MAX_ATTEMPTS) { await sleep(backoffMs(attempt)); continue; }
+      throw new Error(`Claude ${lastErr}`);
+    }
+
+    if (r.ok) {
+      const d = await r.json();
+      return d.content?.[0]?.text?.trim() || '';
+    }
+
+    // Retry only transient statuses; fail fast on 4xx client errors (bad key, bad request)
+    const retryable = r.status === 429 || r.status >= 500;
+    const detail = await r.text().catch(() => '');
+    lastErr = `${r.status}${detail ? ' ' + detail.slice(0, 200) : ''}`;
+    if (retryable && attempt < MAX_ATTEMPTS) {
+      await sleep(backoffMs(attempt));
+      continue;
+    }
+    throw new Error(`Claude ${lastErr}`);
+  }
+  throw new Error(`Claude ${lastErr}`);
 }
+
+const sleep = ms => new Promise(res => setTimeout(res, ms));
+// 0.8s, 2s, 5s (+ jitter) — keeps total wait well under cron/subrequest limits
+const backoffMs = attempt => Math.min(5000, 800 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 300);
 
 /* ── Existing route handlers ── */
 
@@ -1356,11 +1390,17 @@ async function handleDailyGet(origin, env, ctx) {
     }
 
     if (snapshot) {
-      // If snapshot is stale (>12h old), the cron may have missed — regenerate in background
-      if (ctx && env?.ANTHROPIC_API_KEY && Date.now() - (snapshot.ts || 0) > 43_200_000) {
+      const isComplete = (snapshot.newsCards?.length || 0) > 0 || snapshot.opportunity;
+      const isStale    = Date.now() - (snapshot.ts || 0) > 43_200_000;
+      // Regenerate in background if the cron missed (stale) OR left an empty/failed
+      // snapshot (incomplete) — the latter recovers a blank briefing on first visit.
+      if (ctx && env?.ANTHROPIC_API_KEY && (isStale || !isComplete)) {
         ctx.waitUntil(generateDailySnapshot(env));
       }
-      return json({ ...snapshot, eod: eod || null, eodLoading }, 200, origin);
+      // Signal "still preparing" when there's nothing useful yet, so the UI shows a
+      // friendly loading state instead of an empty briefing.
+      const loading = !isComplete;
+      return json({ ...snapshot, eod: eod || null, eodLoading, loading }, 200, origin);
     }
   } catch (_) {}
 
@@ -1575,10 +1615,15 @@ Include 6–10 events total. Order chronologically Mon→Fri.`;
 
 /* ── Cron: daily snapshot ── */
 async function generateDailySnapshot(env) {
-  // Dedup: skip if already generated in the last 2 hours
+  // Dedup: skip only if a *complete* snapshot was generated in the last 2 hours.
+  // A previously-cached empty fallback (Claude failed) must NOT block a retry,
+  // otherwise one 6am hiccup leaves the briefing blank until tomorrow.
+  let existingSnapshot = null;
   try {
-    const existing = await env?.REC_LOG?.get('daily:snapshot', 'json');
-    if (existing && Date.now() - existing.ts < 7_200_000) {
+    existingSnapshot = await env?.REC_LOG?.get('daily:snapshot', 'json');
+    const isComplete = existingSnapshot &&
+      ((existingSnapshot.newsCards?.length || 0) > 0 || existingSnapshot.opportunity);
+    if (existingSnapshot && isComplete && Date.now() - existingSnapshot.ts < 7_200_000) {
       console.log('[cron] snapshot fresh, skipping');
       return;
     }
@@ -1653,14 +1698,35 @@ Generate a morning market briefing as valid JSON with exactly these fields:
 newsCards must have exactly 8 items. For opportunity and avoid, choose from: ${DEFAULT_WATCHLIST.join(', ')}.
 Return ONLY valid JSON, no markdown fences.`;
 
-  let snapshot;
+  let snapshot = null;
   try {
-    const text    = await workerClaude(prompt, env, 1500);
+    const text    = await workerClaude(prompt, env, 2200);
     const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
     snapshot = JSON.parse(cleaned);
   } catch (e) {
-    console.error('[cron] snapshot parse failed:', e.message);
-    snapshot = { headline: `Market update for ${today}`, newsCards: [], opportunity: null, avoid: null };
+    console.error('[cron] snapshot generation failed:', e.message);
+  }
+
+  // Only cache a snapshot that actually has content. On failure, preserve any
+  // existing complete snapshot rather than overwriting it with an empty shell
+  // (and leave the cache "incomplete" so handleDailyGet retries on next visit).
+  const hasContent = snapshot && ((snapshot.newsCards?.length || 0) > 0 || snapshot.opportunity);
+  if (!hasContent) {
+    const existingComplete = existingSnapshot &&
+      ((existingSnapshot.newsCards?.length || 0) > 0 || existingSnapshot.opportunity);
+    if (existingComplete) {
+      console.warn('[cron] generation failed — keeping prior complete snapshot');
+      return;
+    }
+    // Nothing usable anywhere: write a minimal headline so the page isn't broken,
+    // but with ts=0 so handleDailyGet treats it as stale and keeps retrying.
+    await env?.REC_LOG?.put(
+      'daily:snapshot',
+      JSON.stringify({ headline: `Market update for ${today}`, newsCards: [], opportunity: null, avoid: null, ts: 0 }),
+      { expirationTtl: 172800 },
+    );
+    console.warn('[cron] generation failed and no prior snapshot — wrote stale placeholder');
+    return;
   }
 
   await env?.REC_LOG?.put(
@@ -1677,6 +1743,15 @@ Return ONLY valid JSON, no markdown fences.`;
     );
   }
   console.log('[cron] ticker analyses refreshed');
+
+  // Pre-warm sector intelligence so the Market tab loads instantly in the morning
+  // instead of forcing the first visitor through a ~50s cold-cache regeneration.
+  try {
+    const sectors = await generateSectors(env);
+    console.log(sectors ? '[cron] sectors pre-warmed' : '[cron] sectors pre-warm failed');
+  } catch (e) {
+    console.error('[cron] sectors pre-warm error:', e.message);
+  }
 }
 
 /* ── Cron: end-of-day summary (1:15pm PT, ~15 min after market close) ── */
@@ -1763,18 +1838,27 @@ Write a concise end-of-day market summary as valid JSON (no markdown):
 }
 
 /* ── Sector Updates ── */
+const SECTORS_KV_KEY = 'market:sectors';
+const SECTORS_TTL    = 14_400_000; // 4 hours
+
 async function handleMarketSectors(origin, env, ctx, params) {
-  const KV_KEY = 'market:sectors';
-  const TTL    = 14_400_000; // 4 hours
-  const force  = params?.get('refresh') === '1';
+  const force = params?.get('refresh') === '1';
 
   if (!force) {
     try {
-      const cached = await env?.REC_LOG?.get(KV_KEY, 'json');
-      if (cached && Date.now() - cached.ts < TTL) return json(cached, 200, origin);
+      const cached = await env?.REC_LOG?.get(SECTORS_KV_KEY, 'json');
+      if (cached && Date.now() - cached.ts < SECTORS_TTL) return json(cached, 200, origin);
     } catch (_) {}
   }
 
+  const result = await generateSectors(env);
+  if (!result) return err('sector generation failed', 500, origin);
+  return json(result, 200, origin);
+}
+
+// Builds sector intelligence, writes it to KV, and returns the result object
+// (or null on failure). Used by the lazy request path and the morning cron warm-up.
+async function generateSectors(env) {
   const etfTickers   = Object.keys(SECTOR_ETFS);
   const stockTickers = [...new Set(Object.values(SECTOR_STOCKS).flat())];
   const allTickers   = [...etfTickers, ...stockTickers];
@@ -1874,14 +1958,17 @@ Include all 11 sectors in order: Technology, Financials, Energy, Health Care, Co
     }
   } catch (e) {
     console.error('[sectors] generation failed:', e.message);
-    return err('sector generation failed', 500, origin);
+    return null;
+  }
+
+  if (!sectorData?.sectors?.length) {
+    console.error('[sectors] generation produced no sectors');
+    return null;
   }
 
   const result = { ...sectorData, ts: Date.now() };
-  if (ctx) ctx.waitUntil(
-    env?.REC_LOG?.put(KV_KEY, JSON.stringify(result), { expirationTtl: 14400 }).catch(() => {}),
-  );
-  return json(result, 200, origin);
+  await env?.REC_LOG?.put(SECTORS_KV_KEY, JSON.stringify(result), { expirationTtl: 14400 }).catch(() => {});
+  return result;
 }
 
 /* ── Main fetch handler ── */
