@@ -273,6 +273,43 @@ body::after {
 }
 .chart-btn:hover { color: var(--ink-0); border-color: var(--ink-3); }
 .chart-btn.active { background: var(--bg-3); color: var(--cyan); border-color: var(--cyan); }
+.pattern-toggle { margin-left: auto; }
+.pattern-toggle.active { color: var(--amber); border-color: var(--amber); background: var(--bg-3); }
+
+/* ------- Detected chart patterns ------- */
+.pattern-panel { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.pattern-panel:empty { display: none; }
+.pat-head { display: flex; align-items: center; justify-content: space-between; }
+.pat-head-title { font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
+.pat-list { display: flex; flex-direction: column; gap: 8px; }
+.pat-card {
+  display: flex; gap: 10px; align-items: flex-start;
+  background: var(--bg-1); border: 1px solid var(--line); border-left-width: 3px;
+  border-radius: 4px; padding: 9px 12px;
+}
+.pat-card.bullish { border-left-color: var(--bull); }
+.pat-card.bearish { border-left-color: var(--bear); }
+.pat-card.neutral { border-left-color: var(--amber); }
+.pat-swatch { width: 9px; height: 9px; border-radius: 2px; margin-top: 4px; flex: 0 0 auto; }
+.pat-body { flex: 1; min-width: 0; }
+.pat-name { font-family: var(--sans); font-size: 13px; font-weight: 600; color: var(--ink-0); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pat-bias { font-family: var(--mono); font-size: 9px; padding: 2px 6px; border-radius: 3px; letter-spacing: 0.05em; text-transform: uppercase; font-weight: 600; }
+.pat-bias.bullish { background: var(--bull-soft); color: var(--bull); }
+.pat-bias.bearish { background: var(--bear-soft); color: var(--bear); }
+.pat-bias.neutral { background: var(--bg-3); color: var(--amber); }
+.pat-status { font-family: var(--mono); font-size: 9px; color: var(--ink-3); border: 1px solid var(--line); padding: 1px 6px; border-radius: 3px; letter-spacing: 0.04em; text-transform: uppercase; }
+.pat-status.confirmed { color: var(--cyan); border-color: var(--cyan); }
+.pat-note { font-family: var(--sans); font-size: 12px; color: var(--ink-2); margin-top: 3px; line-height: 1.45; }
+.pat-metrics { font-family: var(--mono); font-size: 11px; color: var(--ink-3); margin-top: 4px; display: flex; gap: 14px; flex-wrap: wrap; }
+.pat-metrics b { color: var(--ink-1); font-weight: 500; }
+.pat-empty { font-family: var(--mono); font-size: 11px; color: var(--ink-3); padding: 6px 2px; }
+.pat-ref-toggle { background: none; border: none; color: var(--ink-3); font-family: var(--mono); font-size: 10px; cursor: pointer; letter-spacing: 0.04em; }
+.pat-ref-toggle:hover { color: var(--cyan); }
+.pat-ref { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); line-height: 1.7; margin-top: 2px; columns: 2; }
+.pat-ref b { color: var(--ink-2); font-weight: 500; }
+.pat-ref .b-bull { color: var(--bull); }
+.pat-ref .b-bear { color: var(--bear); }
+.pat-ref .b-neu { color: var(--amber); }
 
 /* ------- Indicators panel ------- */
 .indicators { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1px; background: var(--line-soft); margin-top: 14px; }
@@ -607,13 +644,15 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
         </div>
         <div class="chart-controls">
           <button class="chart-btn" data-range="5d">5D</button>
-          <button class="chart-btn active" data-range="3mo">3M</button>
-          <button class="chart-btn" data-range="6mo">6M</button>
+          <button class="chart-btn" data-range="3mo">3M</button>
+          <button class="chart-btn active" data-range="6mo">6M</button>
           <button class="chart-btn" data-range="1y">1Y</button>
           <button class="chart-btn" data-range="5y">5Y</button>
+          <button class="chart-btn pattern-toggle active" id="pattern-toggle" title="Auto-detect chart patterns">◇ Patterns</button>
         </div>
       </div>
       <div id="chart" class="chart-wrap"></div>
+      <div id="pattern-panel" class="pattern-panel"></div>
       <div class="indicators" id="indicators"></div>
     </div>
 
@@ -748,8 +787,9 @@ const USE_LOCAL_FALLBACK = false;
 
 const state = {
   ticker: 'PLTR',
-  range: '3mo',
+  range: '6mo',
   data: {},
+  showPatterns: true,
 };
 
 /* ============================================================
@@ -773,6 +813,9 @@ const fetchTrack   = (t) => api(`/track/${t}`);
 /* ============================================================
    FORMATTING
    ============================================================ */
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
 const fmt = {
   price: (v) => v == null ? '—' : v >= 1000 ? v.toFixed(0) : v.toFixed(2),
   pct:   (v, d=2) => v == null ? '—' : (v >= 0 ? '+' : '') + (v).toFixed(d) + '%',
@@ -858,6 +901,404 @@ function bollinger(closes, period = 20, mult = 2) {
   return { mid: m, upper, lower };
 }
 
+/* ============================================================
+   CHART PATTERN RECOGNITION (computed client-side from OHLC)
+   ------------------------------------------------------------
+   Detects classic price patterns from swing pivots + trendline
+   geometry, scores them, draws the geometry on the chart, and
+   calls out the clearest signals. Reference library below.
+   ============================================================ */
+const PATTERN_LIBRARY = [
+  // Reversal
+  { name: 'Double Top', bias: 'bearish' },
+  { name: 'Double Bottom', bias: 'bullish' },
+  { name: 'Triple Top', bias: 'bearish' },
+  { name: 'Triple Bottom', bias: 'bullish' },
+  { name: 'Head & Shoulders', bias: 'bearish' },
+  { name: 'Inverse Head & Shoulders', bias: 'bullish' },
+  { name: 'Rising Wedge', bias: 'bearish' },
+  { name: 'Falling Wedge', bias: 'bullish' },
+  { name: 'Rounding Top', bias: 'bearish' },
+  { name: 'Rounding Bottom', bias: 'bullish' },
+  // Continuation
+  { name: 'Bull Flag', bias: 'bullish' },
+  { name: 'Bear Flag', bias: 'bearish' },
+  { name: 'Bullish Pennant', bias: 'bullish' },
+  { name: 'Bearish Pennant', bias: 'bearish' },
+  { name: 'Ascending Triangle', bias: 'bullish' },
+  { name: 'Descending Triangle', bias: 'bearish' },
+  { name: 'Symmetrical Triangle', bias: 'neutral' },
+  { name: 'Ascending Channel', bias: 'bullish' },
+  { name: 'Descending Channel', bias: 'bearish' },
+  { name: 'Rectangle / Range', bias: 'neutral' },
+  { name: 'Cup & Handle', bias: 'bullish' },
+];
+
+const PAT_COLORS = {
+  bullish: '#23d18b',
+  bearish: '#f25f5c',
+  neutral: '#f4b740',
+};
+
+// Least-squares line fit over [{x,y}] points → { slope, intercept, at(x) }
+function lineFit(pts) {
+  const n = pts.length;
+  let sx = 0, sy = 0, sxy = 0, sxx = 0;
+  for (const p of pts) { sx += p.x; sy += p.y; sxy += p.x * p.y; sxx += p.x * p.x; }
+  const d = n * sxx - sx * sx;
+  const slope = d ? (n * sxy - sx * sy) / d : 0;
+  const intercept = (sy - slope * sx) / n;
+  return { slope, intercept, at: (x) => slope * x + intercept };
+}
+
+// Fractal swing pivots, collapsed into a strictly alternating H/L zigzag
+function swingPivots(H, L, k) {
+  const raw = [];
+  for (let i = k; i < H.length - k; i++) {
+    let isHigh = true, isLow = true;
+    for (let j = i - k; j <= i + k && (isHigh || isLow); j++) {
+      if (j === i) continue;
+      if (H[j] > H[i]) isHigh = false;
+      if (L[j] < L[i]) isLow = false;
+    }
+    if (isHigh) raw.push({ idx: i, price: H[i], type: 'H' });
+    if (isLow)  raw.push({ idx: i, price: L[i], type: 'L' });
+  }
+  raw.sort((a, b) => a.idx - b.idx || (a.type === 'H' ? -1 : 1));
+  const piv = [];
+  for (const p of raw) {
+    const last = piv[piv.length - 1];
+    if (!last) { piv.push(p); continue; }
+    if (last.type === p.type) {
+      if (p.type === 'H' ? p.price > last.price : p.price < last.price) piv[piv.length - 1] = p;
+    } else piv.push(p);
+  }
+  return piv;
+}
+
+// Normalized trend slope (fraction of price per bar) over the window ending at endIdx.
+// Used to require a prior up/down trend so range oscillation isn't read as a reversal.
+function priorTrend(C, endIdx, win) {
+  const from = Math.max(0, endIdx - win);
+  if (endIdx - from < 5) return 0;
+  const pts = [];
+  for (let i = from; i <= endIdx; i++) pts.push({ x: i, y: C[i] });
+  const f = lineFit(pts);
+  return (f.at(endIdx) - f.at(from)) / (endIdx - from) / (C[endIdx] || 1);
+}
+const TREND_GATE = 0.0012; // ≈ 3% over 25 bars
+
+// A genuine top/bottom prints a fresh extreme vs the prior bars; uniform range
+// oscillation does not — this is what separates a reversal from sideways chop.
+function isFreshHigh(H, idx, look, margin = 0.005) {
+  const from = Math.max(0, idx - look);
+  if (idx - from < 5) return false;
+  let m = -Infinity;
+  for (let i = from; i < idx; i++) m = Math.max(m, H[i]);
+  return H[idx] > m * (1 + margin);
+}
+function isFreshLow(L, idx, look, margin = 0.005) {
+  const from = Math.max(0, idx - look);
+  if (idx - from < 5) return false;
+  let m = Infinity;
+  for (let i = from; i < idx; i++) m = Math.min(m, L[i]);
+  return L[idx] < m * (1 - margin);
+}
+
+// Detect every recognizable pattern in the series; returns scored, sorted list.
+function detectPatterns(T, O, H, L, C, V) {
+  const n = C.length;
+  if (n < 30) return [];
+  const price = C[n - 1];
+  const k = Math.max(2, Math.min(8, Math.round(n / 40)));
+  const piv = swingPivots(H, L, k);
+  const out = [];
+  const seg = (i1, p1, i2, p2) => ({ i1, p1, i2, p2 });
+  const lastIdx = n - 1;
+
+  // ---- Reversal patterns from the pivot sequence ----
+  // Double / Triple tops & bottoms, Head & Shoulders (and inverses)
+  for (let i = piv.length - 1; i >= 2; i--) {
+    const a = piv[i], b = piv[i - 1], c = piv[i - 2];
+
+    // Double Top:  H · L · H  with twin peaks
+    if (a.type === 'H' && b.type === 'L' && c.type === 'H') {
+      const peak = (a.price + c.price) / 2;
+      const sym = Math.abs(a.price - c.price) / peak;
+      const height = (peak - b.price) / peak;
+      if (sym < 0.04 && height > 0.04 && a.idx > n - Math.min(n, 90) &&
+          priorTrend(C, c.idx, 25) > TREND_GATE && isFreshHigh(H, c.idx, 30)) {
+        const neck = b.price;
+        const confirmed = price < neck;
+        out.push({
+          name: 'Double Top', bias: 'bearish', confirmed,
+          startIdx: c.idx, endIdx: a.idx,
+          lines: [seg(c.idx, neck, lastIdx, neck)],
+          markers: [{ idx: c.idx, price: c.price }, { idx: a.idx, price: a.price }],
+          neckline: neck, target: neck - (peak - neck),
+          score: 0.6 + (1 - sym / 0.04) * 0.2 + (confirmed ? 0.2 : 0),
+          recency: a.idx,
+          note: confirmed
+            ? `Twin peaks near $${peak.toFixed(2)}; neckline $${neck.toFixed(2)} broken — reversal confirmed.`
+            : `Twin peaks near $${peak.toFixed(2)}; a close below the $${neck.toFixed(2)} neckline confirms the breakdown.`,
+        });
+      }
+    }
+    // Double Bottom:  L · H · L
+    if (a.type === 'L' && b.type === 'H' && c.type === 'L') {
+      const trough = (a.price + c.price) / 2;
+      const sym = Math.abs(a.price - c.price) / trough;
+      const height = (b.price - trough) / trough;
+      if (sym < 0.04 && height > 0.04 && a.idx > n - Math.min(n, 90) &&
+          priorTrend(C, c.idx, 25) < -TREND_GATE && isFreshLow(L, c.idx, 30)) {
+        const neck = b.price;
+        const confirmed = price > neck;
+        out.push({
+          name: 'Double Bottom', bias: 'bullish', confirmed,
+          startIdx: c.idx, endIdx: a.idx,
+          lines: [seg(c.idx, neck, lastIdx, neck)],
+          markers: [{ idx: c.idx, price: c.price }, { idx: a.idx, price: a.price }],
+          neckline: neck, target: neck + (neck - trough),
+          score: 0.6 + (1 - sym / 0.04) * 0.2 + (confirmed ? 0.2 : 0),
+          recency: a.idx,
+          note: confirmed
+            ? `Twin troughs near $${trough.toFixed(2)}; neckline $${neck.toFixed(2)} broken — reversal confirmed.`
+            : `Twin troughs near $${trough.toFixed(2)}; a close above the $${neck.toFixed(2)} neckline confirms the breakout.`,
+        });
+      }
+    }
+  }
+
+  // Head & Shoulders / Inverse:  five pivots  S · t · Head · t · S
+  for (let i = piv.length - 1; i >= 4; i--) {
+    const p = piv.slice(i - 4, i + 1);
+    const [s1, v1, head, v2, s2] = p;
+    if (s1.type === 'H' && head.type === 'H' && s2.type === 'H' && v1.type === 'L' && v2.type === 'L') {
+      const shoulder = (s1.price + s2.price) / 2;
+      const symShoulder = Math.abs(s1.price - s2.price) / shoulder;
+      const neckTilt = Math.abs(v1.price - v2.price) / ((v1.price + v2.price) / 2);
+      if (head.price > s1.price && head.price > s2.price && symShoulder < 0.06 && neckTilt < 0.08 &&
+          (head.price - shoulder) / shoulder > 0.03 && s2.idx > n - Math.min(n, 110) &&
+          priorTrend(C, s1.idx, 25) > TREND_GATE) {
+        const neckFit = lineFit([{ x: v1.idx, y: v1.price }, { x: v2.idx, y: v2.price }]);
+        const neckNow = neckFit.at(lastIdx);
+        const confirmed = price < neckNow;
+        out.push({
+          name: 'Head & Shoulders', bias: 'bearish', confirmed,
+          startIdx: s1.idx, endIdx: s2.idx,
+          lines: [seg(v1.idx, v1.price, lastIdx, neckNow)],
+          markers: [{ idx: s1.idx, price: s1.price }, { idx: head.idx, price: head.price }, { idx: s2.idx, price: s2.price }],
+          neckline: neckNow, target: neckNow - (head.price - neckNow),
+          score: 0.7 + (1 - symShoulder / 0.06) * 0.2 + (confirmed ? 0.15 : 0),
+          recency: s2.idx,
+          note: confirmed
+            ? `Head at $${head.price.toFixed(2)} between level shoulders; neckline broken — bearish reversal confirmed.`
+            : `Head at $${head.price.toFixed(2)} between level shoulders; break below ~$${neckNow.toFixed(2)} neckline confirms.`,
+        });
+      }
+    }
+    if (s1.type === 'L' && head.type === 'L' && s2.type === 'L' && v1.type === 'H' && v2.type === 'H') {
+      const shoulder = (s1.price + s2.price) / 2;
+      const symShoulder = Math.abs(s1.price - s2.price) / shoulder;
+      const neckTilt = Math.abs(v1.price - v2.price) / ((v1.price + v2.price) / 2);
+      if (head.price < s1.price && head.price < s2.price && symShoulder < 0.06 && neckTilt < 0.08 &&
+          (shoulder - head.price) / shoulder > 0.03 && s2.idx > n - Math.min(n, 110) &&
+          priorTrend(C, s1.idx, 25) < -TREND_GATE) {
+        const neckFit = lineFit([{ x: v1.idx, y: v1.price }, { x: v2.idx, y: v2.price }]);
+        const neckNow = neckFit.at(lastIdx);
+        const confirmed = price > neckNow;
+        out.push({
+          name: 'Inverse Head & Shoulders', bias: 'bullish', confirmed,
+          startIdx: s1.idx, endIdx: s2.idx,
+          lines: [seg(v1.idx, v1.price, lastIdx, neckNow)],
+          markers: [{ idx: s1.idx, price: s1.price }, { idx: head.idx, price: head.price }, { idx: s2.idx, price: s2.price }],
+          neckline: neckNow, target: neckNow + (neckNow - head.price),
+          score: 0.7 + (1 - symShoulder / 0.06) * 0.2 + (confirmed ? 0.15 : 0),
+          recency: s2.idx,
+          note: confirmed
+            ? `Head at $${head.price.toFixed(2)} between level shoulders; neckline broken — bullish reversal confirmed.`
+            : `Head at $${head.price.toFixed(2)} between level shoulders; break above ~$${neckNow.toFixed(2)} neckline confirms.`,
+        });
+      }
+    }
+  }
+
+  // Triple Top / Bottom:  three level peaks/troughs (H L H L H or inverse)
+  for (let i = piv.length - 1; i >= 4; i--) {
+    const p = piv.slice(i - 4, i + 1);
+    const [a, b, c, d, e] = p;
+    const isTop = a.type === 'H' && c.type === 'H' && e.type === 'H' && b.type === 'L' && d.type === 'L';
+    const isBot = a.type === 'L' && c.type === 'L' && e.type === 'L' && b.type === 'H' && d.type === 'H';
+    if (isTop || isBot) {
+      const lv = (a.price + c.price + e.price) / 3;
+      const spread = (Math.max(a.price, c.price, e.price) - Math.min(a.price, c.price, e.price)) / lv;
+      const neck = isTop ? Math.min(b.price, d.price) : Math.max(b.price, d.price);
+      const trendOk = isTop
+        ? priorTrend(C, a.idx, 25) > TREND_GATE && isFreshHigh(H, a.idx, 30)
+        : priorTrend(C, a.idx, 25) < -TREND_GATE && isFreshLow(L, a.idx, 30);
+      if (spread < 0.05 && Math.abs(lv - neck) / lv > 0.035 && e.idx > n - Math.min(n, 120) && trendOk) {
+        const confirmed = isTop ? price < neck : price > neck;
+        out.push({
+          name: isTop ? 'Triple Top' : 'Triple Bottom',
+          bias: isTop ? 'bearish' : 'bullish', confirmed,
+          startIdx: a.idx, endIdx: e.idx,
+          lines: [seg(a.idx, neck, lastIdx, neck)],
+          markers: [a, c, e].map(x => ({ idx: x.idx, price: x.price })),
+          neckline: neck, target: isTop ? neck - (lv - neck) : neck + (neck - lv),
+          score: 0.72 + (confirmed ? 0.15 : 0),
+          recency: e.idx,
+          note: `Three ${isTop ? 'rejections near' : 'tests of'} $${lv.toFixed(2)}; ${confirmed ? 'neckline broken — confirmed.' : `watch $${neck.toFixed(2)} for the break.`}`,
+        });
+      }
+    }
+  }
+
+  // ---- Trendline geometry over the recent consolidation window ----
+  const tl = detectTrendlinePattern(piv, H, L, C, lastIdx, n);
+  if (tl) out.push(tl);
+
+  // ---- Flags & pennants (pole + tight counter-trend consolidation) ----
+  const flag = detectFlagPennant(O, H, L, C, n, lastIdx);
+  if (flag) out.push(flag);
+
+  // Keep only patterns that are still actionable today: recent enough, with a
+  // sane neckline/target near the current price. This drops months-old formations
+  // (e.g. a neckline far below price after a big run) and degenerate extrapolations.
+  const recencyCut = n - Math.round(n * 0.5);
+  const relevant = out.filter(p => {
+    if (p.endIdx < recencyCut) return false;
+    if (p.target != null && (p.target <= 0 || Math.abs(p.target - price) / price > 0.6)) return false;
+    if (p.neckline != null && (p.neckline <= 0 || Math.abs(p.neckline - price) / price > 0.30)) return false;
+    return true;
+  });
+
+  // De-dup by name (keep highest score), then sort by score, then recency
+  const best = {};
+  for (const pat of relevant) {
+    if (!best[pat.name] || pat.score > best[pat.name].score) best[pat.name] = pat;
+  }
+  return Object.values(best).sort((a, b) => (b.score - a.score) || (b.recency - a.recency));
+}
+
+// Classify the recent range via least-squares trendlines on swing highs & lows:
+// triangles, wedges, channels, and rectangles.
+function detectTrendlinePattern(piv, H, L, C, lastIdx, n) {
+  const winLen = Math.min(70, Math.max(25, Math.round(n * 0.45)));
+  const winStart = Math.max(0, n - winLen);
+  const hs = piv.filter(p => p.type === 'H' && p.idx >= winStart);
+  const ls = piv.filter(p => p.type === 'L' && p.idx >= winStart);
+  if (hs.length < 2 || ls.length < 2) return null;
+
+  const up = lineFit(hs.map(p => ({ x: p.idx, y: p.price })));
+  const lo = lineFit(ls.map(p => ({ x: p.idx, y: p.price })));
+  const x0 = winStart, x1 = lastIdx;
+  const uy0 = up.at(x0), uy1 = up.at(x1), ly0 = lo.at(x0), ly1 = lo.at(x1);
+  const wStart = uy0 - ly0, wEnd = uy1 - ly1;
+  if (wStart <= 0 || wEnd <= 0) return null;
+
+  const price = C[lastIdx];
+  const su = (uy1 - uy0) / (x1 - x0) / price; // fractional slope per bar
+  const sl = (ly1 - ly0) / (x1 - x0) / price;
+  const FLAT = 0.0009;          // |slope| below this ≈ horizontal
+  const converging = wEnd < wStart * 0.72;
+  const parallel = Math.abs(wEnd - wStart) < wStart * 0.33;
+  const lines = [
+    { i1: x0, p1: uy0, i2: x1, p2: uy1 },
+    { i1: x0, p1: ly0, i2: x1, p2: ly1 },
+  ];
+  const base = { startIdx: winStart, endIdx: lastIdx, lines, recency: lastIdx, score: 0.5, target: null };
+
+  let name, bias, note;
+  if (converging && Math.abs(su) < FLAT && sl > FLAT) {
+    name = 'Ascending Triangle'; bias = 'bullish';
+    note = `Flat resistance near $${uy1.toFixed(2)} with rising support — buyers stepping up; breakout favors upside.`;
+    base.target = uy1 + wStart;
+  } else if (converging && Math.abs(sl) < FLAT && su < -FLAT) {
+    name = 'Descending Triangle'; bias = 'bearish';
+    note = `Flat support near $${ly1.toFixed(2)} with falling resistance — sellers pressing; breakdown favors downside.`;
+    base.target = ly1 - wStart;
+  } else if (converging && su < -FLAT && sl > FLAT) {
+    name = 'Symmetrical Triangle'; bias = 'neutral';
+    note = `Lower highs and higher lows coiling toward an apex near $${((uy1 + ly1) / 2).toFixed(2)} — expect an expansion move on the break.`;
+  } else if (converging && su > FLAT && sl > FLAT) {
+    name = 'Rising Wedge'; bias = 'bearish';
+    note = `Both trendlines rising but converging — momentum fading; rising wedges typically resolve lower.`;
+    base.target = ly1 - wStart * 0.5;
+  } else if (converging && su < -FLAT && sl < -FLAT) {
+    name = 'Falling Wedge'; bias = 'bullish';
+    note = `Both trendlines falling but converging — selling exhausting; falling wedges typically resolve higher.`;
+    base.target = uy1 + wStart * 0.5;
+  } else if (parallel && su > FLAT && sl > FLAT) {
+    name = 'Ascending Channel'; bias = 'bullish';
+    note = `Higher highs and higher lows in a parallel uptrend channel; buy near $${ly1.toFixed(2)} support, watch $${uy1.toFixed(2)} resistance.`;
+  } else if (parallel && su < -FLAT && sl < -FLAT) {
+    name = 'Descending Channel'; bias = 'bearish';
+    note = `Lower highs and lower lows in a parallel downtrend channel; resistance near $${uy1.toFixed(2)}, support near $${ly1.toFixed(2)}.`;
+  } else if (parallel && Math.abs(su) < FLAT && Math.abs(sl) < FLAT) {
+    name = 'Rectangle / Range'; bias = 'neutral';
+    note = `Sideways range between $${ly1.toFixed(2)} support and $${uy1.toFixed(2)} resistance; trade the edges until a breakout.`;
+  } else {
+    return null;
+  }
+  // Confidence scales with how many pivots anchor each line and how clean the fit is
+  const anchor = Math.min(1, (hs.length + ls.length) / 6);
+  return { name, bias, confirmed: false, ...base, score: 0.5 + anchor * 0.25, note };
+}
+
+// Pole (sharp directional thrust) followed by a tight counter-trend drift →
+// flag; converging drift → pennant. Scans candidate window sizes and keeps the
+// best-formed candidate, since real flags vary in length.
+function detectFlagPennant(O, H, L, C, n, lastIdx) {
+  let best = null;
+  for (const consoLen of [6, 8, 10, 13, 16]) {
+    for (const poleLen of [8, 12, 16, 20]) {
+      if (n < consoLen + poleLen + 5) continue;
+      const cStart = n - consoLen;
+      const pStart = cStart - poleLen;
+      const poleRet = (C[cStart - 1] - C[pStart]) / C[pStart];
+      if (Math.abs(poleRet) < 0.14) continue;
+
+      const cHigh = Math.max(...H.slice(cStart));
+      const cLow  = Math.min(...L.slice(cStart));
+      const cRange = (cHigh - cLow) / C[cStart];
+      if (cRange > 0.16) continue; // consolidation too loose to be a flag
+
+      const cFit = lineFit(C.slice(cStart).map((y, i) => ({ x: cStart + i, y })));
+      const cSlope = (cFit.at(lastIdx) - cFit.at(cStart)) / C[cStart];
+      // Flag should drift against (or sideways to) the pole
+      if (poleRet > 0 && cSlope > 0.03) continue;
+      if (poleRet < 0 && cSlope < -0.03) continue;
+
+      const hsW = [], lsW = [];
+      for (let i = cStart; i <= lastIdx; i++) { hsW.push({ x: i, y: H[i] }); lsW.push({ x: i, y: L[i] }); }
+      const upW = lineFit(hsW), loW = lineFit(lsW);
+      const wStart = upW.at(cStart) - loW.at(cStart);
+      const wEnd = upW.at(lastIdx) - loW.at(lastIdx);
+      const converging = wEnd < wStart * 0.7;
+      const lines = [
+        { i1: cStart, p1: upW.at(cStart), i2: lastIdx, p2: upW.at(lastIdx) },
+        { i1: cStart, p1: loW.at(cStart), i2: lastIdx, p2: loW.at(lastIdx) },
+      ];
+      // Tighter consolidation = cleaner flag; prefer the strongest pole
+      const score = 0.55 + Math.min(0.2, Math.abs(poleRet)) + (0.06 - Math.min(0.06, cRange / 2));
+      if (best && score <= best.score) continue;
+
+      const bull = poleRet > 0;
+      const pole = Math.abs(C[cStart - 1] - C[pStart]);
+      const tgt = bull ? C[lastIdx] + pole : C[lastIdx] - pole;
+      best = {
+        name: bull ? (converging ? 'Bullish Pennant' : 'Bull Flag')
+                   : (converging ? 'Bearish Pennant' : 'Bear Flag'),
+        bias: bull ? 'bullish' : 'bearish', confirmed: false,
+        startIdx: pStart, endIdx: lastIdx, lines, recency: lastIdx,
+        target: tgt, score,
+        note: `Sharp ${poleRet > 0 ? '+' : ''}${(poleRet * 100).toFixed(0)}% pole then a tight ${converging ? 'converging pennant' : 'flag'} — ${bull ? 'bullish' : 'bearish'} continuation; measured move ≈ $${tgt.toFixed(2)}.`,
+      };
+    }
+  }
+  return best;
+}
+
 function stochastic(highs, lows, closes, kPeriod = 14, dPeriod = 3) {
   const k = [];
   for (let i = 0; i < closes.length; i++) {
@@ -932,6 +1373,7 @@ function realizedVol(closes, period = 20) {
    CHART
    ============================================================ */
 let chart, candleSeries, volSeries, sma20Series, sma50Series, sma200Series, bbUSeries, bbLSeries, projectionSeries;
+let patternSeriesPool = [];   // overlay line series for drawn pattern geometry
 
 function initChart() {
   const el = document.getElementById('chart');
@@ -1010,7 +1452,119 @@ function renderChart(timestamps, opens, highs, lows, closes, volumes) {
   }
   projectionSeries.setData(proj);
 
+  // Auto-detect and draw chart patterns from the daily OHLC
+  state.data.chartTimestamps = timestamps;
+  state.data.patterns = detectPatterns(timestamps, opens, highs, lows, closes, volumes);
+  applyPatterns(timestamps);
+
   chart.timeScale().fitContent();
+}
+
+/* ── Draw detected patterns on the chart + render the callout panel ── */
+function clearPatternOverlays() {
+  for (const s of patternSeriesPool) { try { chart.removeSeries(s); } catch (_) {} }
+  patternSeriesPool = [];
+  if (candleSeries) candleSeries.setMarkers([]);
+}
+
+function applyPatterns(timestamps) {
+  clearPatternOverlays();
+  const panel = document.getElementById('pattern-panel');
+  const patterns = state.data.patterns || [];
+
+  if (!state.showPatterns) {
+    if (panel) panel.innerHTML = '';
+    return;
+  }
+
+  // Draw geometry for the top patterns only (keeps the chart readable)
+  const drawn = patterns.slice(0, 2);
+  const tAt = (i) => timestamps[Math.max(0, Math.min(timestamps.length - 1, Math.round(i)))];
+  const markers = [];
+  for (const pat of drawn) {
+    const color = PAT_COLORS[pat.bias] || PAT_COLORS.neutral;
+    for (const ln of (pat.lines || [])) {
+      const s = chart.addLineSeries({
+        color, lineWidth: 2, lineStyle: 2,
+        priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+      });
+      // 2-point segments draw as straight trendlines
+      const pts = [{ time: tAt(ln.i1), value: ln.p1 }, { time: tAt(ln.i2), value: ln.p2 }]
+        .sort((a, b) => a.time - b.time);
+      s.setData(pts);
+      patternSeriesPool.push(s);
+    }
+    for (const m of (pat.markers || [])) {
+      markers.push({
+        time: tAt(m.idx),
+        position: pat.bias === 'bullish' ? 'belowBar' : 'aboveBar',
+        color, shape: pat.bias === 'bullish' ? 'arrowUp' : pat.bias === 'bearish' ? 'arrowDown' : 'circle',
+      });
+    }
+    // Pattern name label anchored at the right edge of the formation
+    markers.push({
+      time: tAt(pat.endIdx),
+      position: pat.bias === 'bullish' ? 'belowBar' : 'aboveBar',
+      color, shape: 'square', text: pat.name,
+    });
+  }
+  if (markers.length) {
+    // LightweightCharts requires markers sorted ascending by time
+    markers.sort((a, b) => a.time - b.time);
+    candleSeries.setMarkers(markers);
+  }
+
+  renderPatternPanel(patterns);
+}
+
+function renderPatternPanel(patterns) {
+  const panel = document.getElementById('pattern-panel');
+  if (!panel) return;
+  const refRows = PATTERN_LIBRARY.map(p => {
+    const cls = p.bias === 'bullish' ? 'b-bull' : p.bias === 'bearish' ? 'b-bear' : 'b-neu';
+    const glyph = p.bias === 'bullish' ? '▲' : p.bias === 'bearish' ? '▼' : '◆';
+    return `<span class="${cls}">${glyph}</span> ${p.name}<br>`;
+  }).join('');
+
+  let cards;
+  if (!patterns.length) {
+    cards = '<div class="pat-empty">No high-confidence chart patterns in this timeframe. Try 6M or 1Y.</div>';
+  } else {
+    cards = patterns.slice(0, 4).map(pat => {
+      const color = PAT_COLORS[pat.bias] || PAT_COLORS.neutral;
+      const status = pat.confirmed ? '<span class="pat-status confirmed">Confirmed</span>'
+                    : (pat.neckline != null ? '<span class="pat-status">Forming</span>' : '');
+      const metrics = [];
+      if (pat.neckline != null) metrics.push(`<span>Neckline <b>$${pat.neckline.toFixed(2)}</b></span>`);
+      if (pat.target != null)   metrics.push(`<span>Target <b>$${pat.target.toFixed(2)}</b></span>`);
+      metrics.push(`<span>Confidence <b>${Math.round(Math.min(0.99, pat.score) * 100)}%</b></span>`);
+      return `<div class="pat-card ${pat.bias}">
+        <div class="pat-swatch" style="background:${color}"></div>
+        <div class="pat-body">
+          <div class="pat-name">${esc(pat.name)}
+            <span class="pat-bias ${pat.bias}">${pat.bias}</span>${status}</div>
+          <div class="pat-note">${esc(pat.note || '')}</div>
+          <div class="pat-metrics">${metrics.join('')}</div>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  panel.innerHTML = `
+    <div class="pat-head">
+      <span class="pat-head-title">◇ Auto-Detected Patterns</span>
+      <button class="pat-ref-toggle" id="pat-ref-toggle">Pattern library ▾</button>
+    </div>
+    <div class="pat-list">${cards}</div>
+    <div class="pat-ref" id="pat-ref" style="display:none">${refRows}</div>`;
+
+  const refBtn = document.getElementById('pat-ref-toggle');
+  if (refBtn) refBtn.addEventListener('click', () => {
+    const r = document.getElementById('pat-ref');
+    const open = r.style.display === 'none';
+    r.style.display = open ? '' : 'none';
+    refBtn.textContent = open ? 'Pattern library ▴' : 'Pattern library ▾';
+  });
 }
 
 /* ============================================================
@@ -2147,9 +2701,9 @@ document.addEventListener('click', (e) => {
 /* ============================================================
    CHART RANGE BUTTONS
    ============================================================ */
-document.querySelectorAll('.chart-btn').forEach(btn => {
+document.querySelectorAll('.chart-btn[data-range]').forEach(btn => {
   btn.addEventListener('click', async () => {
-    document.querySelectorAll('.chart-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.chart-btn[data-range]').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     state.range = btn.dataset.range;
     const interval = state.range === '5d' ? '15m' : state.range === '5y' ? '1wk' : '1d';
@@ -2171,6 +2725,13 @@ document.querySelectorAll('.chart-btn').forEach(btn => {
       );
     } catch (e) { console.error(e); }
   });
+});
+
+// Patterns on/off toggle — redraws overlays without refetching
+document.getElementById('pattern-toggle').addEventListener('click', () => {
+  state.showPatterns = !state.showPatterns;
+  document.getElementById('pattern-toggle').classList.toggle('active', state.showPatterns);
+  applyPatterns(state.data.chartTimestamps || []);
 });
 
 /* ============================================================
