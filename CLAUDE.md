@@ -75,6 +75,7 @@ GET  /api/market/sectors          Sector summaries + top opportunity/avoid per s
 ```
 yahoo:crumb        — Yahoo session crumb (50-min TTL)
 daily:snapshot     — 6am cron Claude synthesis
+daily:midday       — 11:30am cron midday pulse (narrative, topics, tomorrow, trades, bigMovers)
 daily:eod          — 1:15pm cron EOD summary
 analysis:{TICKER}  — on-demand per-ticker Claude analysis
 fund:{TICKER}      — Yahoo fundamentals cache (6h TTL)
@@ -83,7 +84,7 @@ market:sectors     — Sector summaries + picks (4h TTL)
 rec:{TICKER}       — recommendation history (up to 500 entries)
 ```
 
-**Cron triggers** fire at 6am PT (both UTC-7 and UTC-8 variants) and 1:15pm PT for EOD. Each uses a KV timestamp check with a 2-hour dedup window to avoid double-runs.
+**Cron triggers** fire at 6am PT (morning briefing), 11:30am PT (midday pulse), and 1:15pm PT (EOD summary) — each with both UTC-7 and UTC-8 variants. Each uses a KV timestamp check with a 2-hour dedup window to avoid double-runs.
 
 ### Frontends
 

@@ -16,7 +16,7 @@
  *   GET  /api/market/scanner?preset=     → Day-trading momentum scanner (5 Pillars)
  *   GET  /api/market/ipos                → Upcoming IPO calendar (12h KV cache)
  *   GET  /api/watchlist/batch?symbols=   → Bulk fundamentals + RSI + Claude analysis
- *   GET  /api/daily                      → Daily Claude synthesis (6am PT cron)
+ *   GET  /api/daily                      → Daily Claude synthesis (6am PT cron) + midday pulse (11:30am PT) + EOD
  *
  * Required secrets (npx wrangler secret put <NAME>):
  *   ANTHROPIC_API_KEY  ALPACA_KEY  ALPACA_SECRET
@@ -1381,24 +1381,35 @@ async function handleWatchlistAuction(symbols, origin, env, ctx) {
 
 async function handleDailyGet(origin, env, ctx) {
   try {
-    const [snapshotRes, eodRes] = await Promise.allSettled([
+    const [snapshotRes, eodRes, middayRes] = await Promise.allSettled([
       env?.REC_LOG?.get('daily:snapshot', 'json'),
       env?.REC_LOG?.get('daily:eod', 'json'),
+      env?.REC_LOG?.get('daily:midday', 'json'),
     ]);
     const snapshot = snapshotRes.status === 'fulfilled' ? snapshotRes.value : null;
     const eod      = eodRes.status === 'fulfilled' ? eodRes.value : null;
+    const midday   = middayRes.status === 'fulfilled' ? middayRes.value : null;
+
+    const ptNow     = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+    const isWeekday = ptNow.getDay() >= 1 && ptNow.getDay() <= 5;
+    const minsPT    = ptNow.getHours() * 60 + ptNow.getMinutes();
 
     // Auto-trigger EOD generation if market is closed, data is missing, and we have API access
     let eodLoading = false;
     if (!eod && ctx && env?.ANTHROPIC_API_KEY) {
-      const ptNow    = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-      const isWeekday = ptNow.getDay() >= 1 && ptNow.getDay() <= 5;
-      const minsPT    = ptNow.getHours() * 60 + ptNow.getMinutes();
       // Market closes at 1pm PT; allow generation from 1pm through midnight
       if (isWeekday && minsPT >= 780) {
         ctx.waitUntil(generateEODSummary(env));
         eodLoading = true;
       }
+    }
+
+    // Auto-trigger midday pulse if the 11:30am cron missed. Only from 11:30am PT
+    // onward — the morning cron clears daily:midday so it never shows stale data.
+    let middayLoading = false;
+    if (!midday && ctx && env?.ANTHROPIC_API_KEY && isWeekday && minsPT >= 690) {
+      ctx.waitUntil(generateMiddaySnapshot(env));
+      middayLoading = true;
     }
 
     if (snapshot) {
@@ -1412,7 +1423,7 @@ async function handleDailyGet(origin, env, ctx) {
       // Signal "still preparing" when there's nothing useful yet, so the UI shows a
       // friendly loading state instead of an empty briefing.
       const loading = !isComplete;
-      return json({ ...snapshot, eod: eod || null, eodLoading, loading }, 200, origin);
+      return json({ ...snapshot, eod: eod || null, eodLoading, midday: midday || null, middayLoading, loading }, 200, origin);
     }
   } catch (_) {}
 
@@ -1641,8 +1652,9 @@ async function generateDailySnapshot(env) {
     }
   } catch (_) {}
 
-  // Clear yesterday's EOD so pre-market context takes over
+  // Clear yesterday's EOD and midday pulse so pre-market context takes over
   try { await env?.REC_LOG?.delete('daily:eod'); } catch (_) {}
+  try { await env?.REC_LOG?.delete('daily:midday'); } catch (_) {}
 
   // Gather macro news
   let newsLines = '';
@@ -1866,6 +1878,201 @@ Write a concise end-of-day market summary as valid JSON (no markdown):
     { expirationTtl: 86400 },
   );
   console.log('[cron] eod summary saved');
+}
+
+/* ── Cron: midday market pulse (11:30am PT) ──
+   Narrative of what has moved the market so far today, dynamic topic cards,
+   next-trading-day events, trade ideas by style (day/swing/options/long-term)
+   drawn from the watchlist, and big movers (≥10% + volume) regardless of
+   watchlist status. Served via /api/daily as `midday`. */
+async function generateMiddaySnapshot(env) {
+  // Dedup: skip only if a complete midday pulse was generated in the last 2 hours
+  // (the DST cron pair means both UTC variants fire ~1h apart).
+  try {
+    const existing = await env?.REC_LOG?.get('daily:midday', 'json');
+    if (existing && existing.narrative && Date.now() - existing.ts < 7_200_000) {
+      console.log('[cron] midday fresh, skipping');
+      return;
+    }
+  } catch (_) {}
+
+  await getYahooCrumb(env).catch(() => {});
+
+  // ── Intraday index / futures / commodities context ──
+  let marketLines = '';
+  try {
+    const tickers = Object.keys(SNAPSHOT_SYMBOLS);
+    const results = await Promise.allSettled(
+      tickers.map(t => yahoo(`/v8/finance/chart/${encodeURIComponent(t)}`, '?range=1d&interval=1d')),
+    );
+    marketLines = tickers.map((t, i) => {
+      if (results[i].status !== 'fulfilled') return null;
+      const meta  = results[i].value?.chart?.result?.[0]?.meta || {};
+      const price = meta.regularMarketPrice;
+      const prev  = meta.chartPreviousClose ?? meta.previousClose;
+      if (price == null || prev == null) return null;
+      const chg = ((price - prev) / prev * 100).toFixed(2);
+      return `${SNAPSHOT_SYMBOLS[t]}: ${price.toFixed(2)} (${chg >= 0 ? '+' : ''}${chg}%)`;
+    }).filter(Boolean).join('\n');
+  } catch (_) {}
+
+  // ── Big movers: ≥±10% on real volume, watchlist or not ──
+  // Yahoo predefined screeners carry regularMarketVolume, so one pass gets both.
+  const bigMovers = [];
+  try {
+    const [gr, lr] = await Promise.allSettled([
+      fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=day_gainers&count=25', { headers: YAHOO_HEADERS }),
+      fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=day_losers&count=25',  { headers: YAHOO_HEADERS }),
+    ]);
+    for (const res of [gr, lr]) {
+      if (res.status !== 'fulfilled' || !res.value.ok) continue;
+      const d = await res.value.json();
+      for (const q of (d.finance?.result?.[0]?.quotes || [])) {
+        const pct = q.regularMarketChangePercent?.raw ?? null;
+        const vol = q.regularMarketVolume?.raw ?? null;
+        const price = q.regularMarketPrice?.raw ?? null;
+        if (pct == null || Math.abs(pct) < 10) continue;
+        if (vol == null || vol < 1_000_000) continue; // require real volume behind the move
+        bigMovers.push({
+          ticker:    q.symbol,
+          name:      q.shortName || q.longName || '',
+          price:     price != null ? Math.round(price * 100) / 100 : null,
+          changePct: Math.round(pct * 100) / 100,
+          volume:    vol,
+        });
+      }
+    }
+    bigMovers.sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct));
+  } catch (e) {
+    console.error('[midday] movers failed:', e.message);
+  }
+
+  // ── Watchlist intraday state + confirmed earnings for the next trading day ──
+  let tickers = [...DEFAULT_WATCHLIST];
+  try {
+    const saved = await env?.REC_LOG?.get('watchlist:tickers', 'json');
+    if (Array.isArray(saved) && saved.length) {
+      tickers = [...new Set([...saved, ...DEFAULT_WATCHLIST].map(t => String(t).toUpperCase()))];
+    }
+  } catch (_) {}
+  tickers = tickers.slice(0, 25); // subrequest budget: one quoteSummary each
+
+  // Next trading day (PT): skip weekends
+  const ptNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+  const nextDay = new Date(ptNow);
+  do { nextDay.setDate(nextDay.getDate() + 1); } while (nextDay.getDay() === 0 || nextDay.getDay() === 6);
+  const pad = n => String(n).padStart(2, '0');
+  const nextIso = `${nextDay.getFullYear()}-${pad(nextDay.getMonth() + 1)}-${pad(nextDay.getDate())}`;
+  const nextLabel = nextDay.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+
+  const wlLines = [];
+  const confirmedEarnings = [];
+  const CHUNK = 5;
+  for (let i = 0; i < tickers.length; i += CHUNK) {
+    const batch = tickers.slice(i, i + CHUNK);
+    const results = await Promise.allSettled(
+      batch.map(t => yahooAuth(`/v10/finance/quoteSummary/${t}`, '?modules=price,calendarEvents', env)),
+    );
+    for (let j = 0; j < batch.length; j++) {
+      if (results[j].status !== 'fulfilled') continue;
+      const r   = results[j].value?.quoteSummary?.result?.[0] || {};
+      const p   = r.price || {};
+      const price = p.regularMarketPrice?.raw ?? null;
+      const pct   = p.regularMarketChangePercent?.raw != null
+        ? Math.round(p.regularMarketChangePercent.raw * 10000) / 100 : null;
+      const vol   = p.regularMarketVolume?.raw ?? null;
+      if (price != null) {
+        wlLines.push(`${batch[j]} $${price.toFixed(2)} (${pct != null ? (pct >= 0 ? '+' : '') + pct + '%' : 'N/A'})` +
+          (vol != null ? ` vol ${(vol / 1e6).toFixed(1)}M` : ''));
+      }
+      for (const ep of (r.calendarEvents?.earnings?.earningsDate || [])) {
+        const fmt = ep.fmt ?? null;
+        if (fmt === nextIso) { confirmedEarnings.push(batch[j]); break; }
+      }
+    }
+  }
+
+  // ── News headlines for narrative context ──
+  let newsLines = '';
+  try {
+    if (env?.ALPACA_KEY && env?.ALPACA_SECRET) {
+      const data = await alpacaFetch('/v1beta1/news?limit=20&sort=desc', env);
+      newsLines = (data.news || []).slice(0, 15).map(n => `• ${n.headline}`).join('\n');
+    } else {
+      const r = await fetch(
+        'https://query2.finance.yahoo.com/v1/finance/search?q=stock+market+today&quotesCount=0&newsCount=15',
+        { headers: YAHOO_HEADERS },
+      );
+      if (r.ok) {
+        const d = await r.json();
+        newsLines = (d.news || []).slice(0, 15).map(n => `• ${n.title}`).join('\n');
+      }
+    }
+  } catch (_) {}
+
+  const dateStr = ptNow.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+
+  const moverLines = bigMovers.slice(0, 15).map(m =>
+    `${m.ticker} $${m.price ?? '?'} (${m.changePct >= 0 ? '+' : ''}${m.changePct}%) vol ${(m.volume / 1e6).toFixed(1)}M${m.name ? ` — ${m.name}` : ''}`,
+  ).join('\n');
+
+  const prompt = `You are a professional market analyst. It is 11:30am PT (2:30pm ET) on ${dateStr}. US markets have about 90 minutes left in the regular session.
+
+INTRADAY MARKET DATA:
+${marketLines || 'Not available'}
+
+BIG MOVERS TODAY (≥10% move on ≥1M shares):
+${moverLines || 'None flagged'}
+
+WATCHLIST (price, % change, volume today):
+${wlLines.join('\n') || 'Not available'}
+
+CONFIRMED EARNINGS for ${nextLabel} (from Yahoo Finance — the ONLY tickers you may cite for earnings tomorrow):
+${confirmedEarnings.length ? confirmedEarnings.join(', ') : 'None from the watchlist'}
+
+TODAY'S HEADLINES:
+${newsLines || 'Not available'}
+
+Generate a midday market pulse as valid JSON (no markdown fences):
+{
+  "headline": "One-sentence summary of what has moved the market so far today (max 120 chars)",
+  "narrative": "3-4 sentences: what is driving today's tape — sector rotation, breadth, macro catalysts, notable reversals or momentum shifts since the open.",
+  "topics": [
+    { "title": "short title", "body": "2-sentence analysis of this theme's role in today's session", "tag": "Macro|Fed|Sector|Geopolitical|Earnings" }
+  ],
+  "tomorrow": [
+    { "title": "Concise event title", "type": "Earnings|Fed|Economic|Geopolitical|Macro", "impact": "HIGH|MEDIUM|LOW", "note": "1 sentence on what to watch" }
+  ],
+  "trades": {
+    "day": [ { "ticker": "SYM", "reason": "1 sentence tied to today's price action and volume" } ],
+    "swing": [ { "ticker": "SYM", "reason": "1 sentence on the multi-day setup" } ],
+    "options": [ { "ticker": "SYM", "strategy": "e.g. Bull call spread, Cash-secured put", "reason": "1 sentence" } ],
+    "longTerm": [ { "ticker": "SYM", "reason": "1 sentence on why today's action creates a long-term entry" } ]
+  }
+}
+
+RULES:
+- topics: 3-5 cards, only themes actually moving today's market. Vary tags as appropriate.
+- tomorrow: 3-6 events for ${nextLabel} (the next trading day). For Earnings events use ONLY the confirmed list above; for Fed/CPI/economic-calendar/geopolitical events use your knowledge of the scheduled calendar.
+- trades: 1-2 ideas per style. day/swing/options/longTerm tickers must come from the WATCHLIST above, chosen on today's specific price action (momentum, pullbacks to support, unusual volume, oversold bounces). If no watchlist name fits a style, return an empty array for it.
+Return ONLY valid JSON.`;
+
+  let midday = null;
+  try {
+    const text    = await workerClaude(prompt, env, 2500);
+    const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    midday = JSON.parse(cleaned);
+  } catch (e) {
+    console.error('[cron] midday generation failed:', e.message);
+    return;
+  }
+
+  await env?.REC_LOG?.put(
+    'daily:midday',
+    JSON.stringify({ ...midday, bigMovers: bigMovers.slice(0, 12), ts: Date.now() }),
+    { expirationTtl: 86400 },
+  );
+  console.log('[cron] midday pulse saved');
 }
 
 /* ── Sector Updates ── */
@@ -2100,6 +2307,9 @@ export default {
     // EOD crons fire at 20:15 or 21:15 UTC (1:15pm PDT / PST)
     if (event.cron === '15 20 * * 1-5' || event.cron === '15 21 * * 1-5') {
       ctx.waitUntil(generateEODSummary(env));
+    // Midday crons fire at 18:30 or 19:30 UTC (11:30am PDT / PST)
+    } else if (event.cron === '30 18 * * 1-5' || event.cron === '30 19 * * 1-5') {
+      ctx.waitUntil(generateMiddaySnapshot(env));
     } else {
       ctx.waitUntil(generateDailySnapshot(env));
     }

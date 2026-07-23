@@ -256,6 +256,53 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .eod-body { font-size: 13px; color: var(--ink-2); line-height: 1.6; }
 .eod-ts { font-size: 10px; color: var(--ink-3); font-family: var(--mono); margin-top: 8px; }
 
+/* Midday Pulse card */
+.midday-card {
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: 10px;
+  padding: 22px 28px; margin-bottom: 24px; display: none;
+}
+.midday-card.visible { display: block; }
+.midday-header { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.midday-badge { font-size: 9px; font-family: var(--mono); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; padding: 3px 8px; border-radius: 3px; background: var(--amber-soft); color: var(--amber); }
+.midday-headline { font-family: var(--serif); font-size: 16px; font-weight: 300; color: var(--ink-0); font-style: italic; }
+.midday-ts { font-size: 10px; color: var(--ink-3); font-family: var(--mono); margin-left: auto; white-space: nowrap; }
+.midday-narrative { font-size: 13px; color: var(--ink-2); line-height: 1.6; margin-bottom: 18px; }
+.midday-sub { font-size: 10px; color: var(--ink-3); font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.06em; margin: 18px 0 10px; }
+.midday-topics { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+.midday-movers { display: flex; flex-wrap: wrap; gap: 8px; }
+.midday-mover {
+  display: flex; align-items: baseline; gap: 8px;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 6px;
+  padding: 7px 12px; text-decoration: none; transition: border-color 0.15s;
+}
+.midday-mover:hover { border-color: var(--cyan); }
+.midday-mover-ticker { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--cyan); }
+.midday-mover-chg { font-family: var(--mono); font-size: 11px; font-weight: 600; }
+.midday-mover-vol { font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+.midday-trades { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+@media (max-width: 1200px) { .midday-trades { grid-template-columns: repeat(2, 1fr); } }
+.midday-trade-col { background: var(--bg-2); border: 1px solid var(--line-soft); border-radius: 6px; padding: 12px 14px; }
+.midday-trade-label { font-size: 9px; font-family: var(--mono); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+.midday-trade-label.day      { color: var(--amber);  }
+.midday-trade-label.swing    { color: var(--cyan);   }
+.midday-trade-label.options  { color: var(--violet); }
+.midday-trade-label.longterm { color: var(--bull);   }
+.midday-trade-item { padding: 6px 0; border-top: 1px solid var(--line-soft); }
+.midday-trade-item:first-of-type { border-top: none; padding-top: 0; }
+.midday-trade-ticker { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--ink-0); }
+.midday-trade-ticker a { color: var(--cyan); text-decoration: none; }
+.midday-trade-ticker a:hover { text-decoration: underline; color: var(--ink-0); }
+.midday-trade-strategy { font-family: var(--mono); font-size: 10px; color: var(--violet); margin-left: 6px; }
+.midday-trade-reason { font-size: 11px; color: var(--ink-2); line-height: 1.4; margin-top: 2px; }
+.midday-trade-empty { font-size: 11px; color: var(--ink-3); font-style: italic; }
+.midday-tomorrow { display: flex; flex-direction: column; }
+.midday-tmrw-row { display: grid; grid-template-columns: auto 1fr auto; align-items: start; gap: 14px; padding: 9px 0; border-bottom: 1px solid var(--line-soft); }
+.midday-tmrw-row:last-child { border-bottom: none; }
+.midday-tmrw-body { display: flex; flex-direction: column; gap: 3px; }
+.midday-tmrw-title { font-size: 13px; font-weight: 600; color: var(--ink-0); line-height: 1.3; }
+.midday-tmrw-note { font-size: 12px; color: var(--ink-2); line-height: 1.5; }
+.midday-disclaimer { font-size: 10px; color: var(--ink-3); font-family: var(--mono); margin-top: 14px; }
+
 /* Week Ahead card */
 .week-ahead-card {
   background: var(--bg-1); border: 1px solid var(--line); border-radius: 10px;
@@ -490,6 +537,32 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       </div>
       <div class="eod-body" id="eod-body"></div>
       <div class="eod-ts" id="eod-ts"></div>
+    </div>
+
+    <div class="midday-card" id="midday-card">
+      <div class="midday-header">
+        <span class="midday-badge">Midday Pulse · 11:30am PT</span>
+        <div class="midday-headline" id="midday-headline"></div>
+        <div class="midday-ts" id="midday-ts"></div>
+      </div>
+      <div class="midday-narrative" id="midday-narrative"></div>
+      <div id="midday-topics-wrap" style="display:none">
+        <div class="midday-sub">What's Moving</div>
+        <div class="midday-topics" id="midday-topics"></div>
+      </div>
+      <div id="midday-movers-wrap" style="display:none">
+        <div class="midday-sub">Big Movers · ≥10% on ≥1M shares · all listed stocks</div>
+        <div class="midday-movers" id="midday-movers"></div>
+      </div>
+      <div id="midday-trades-wrap" style="display:none">
+        <div class="midday-sub">Trade Ideas From Today's Price Action · watchlist only</div>
+        <div class="midday-trades" id="midday-trades"></div>
+      </div>
+      <div id="midday-tomorrow-wrap" style="display:none">
+        <div class="midday-sub" id="midday-tomorrow-head">On Deck Tomorrow</div>
+        <div class="midday-tomorrow" id="midday-tomorrow"></div>
+        <div class="midday-disclaimer">* Earnings sourced from Yahoo Finance confirmed dates. Fed / economic events are calendar estimates — verify with official sources. Not financial advice.</div>
+      </div>
     </div>
 
     <div class="week-ahead-card" id="week-ahead-card">
@@ -789,6 +862,8 @@ async function loadDailySnapshot() {
       setTimeout(loadDailySnapshot, 35000);
     }
 
+    renderMidday(data);
+
     // News cards
     const cards = data.newsCards || [];
     document.getElementById('news-grid').innerHTML = cards.map(c => {
@@ -822,6 +897,106 @@ async function loadDailySnapshot() {
     console.error('[daily]', e.message);
     document.getElementById('headline-text').textContent = 'Could not load daily briefing.';
   }
+}
+
+/* ─── Midday Pulse (11:30am PT cron, served via /api/daily) ─── */
+let middayRetryTimer = null;
+
+function renderMidday(data) {
+  const card = document.getElementById('midday-card');
+  const m = data.midday;
+
+  if (!m) {
+    if (data.middayLoading) {
+      // Cron missed — the worker is generating now; poll until it lands.
+      card.classList.add('visible');
+      document.getElementById('midday-headline').textContent = 'Generating midday market pulse…';
+      document.getElementById('midday-narrative').textContent = 'Claude is analyzing the session so far. This takes about 30 seconds.';
+      for (const id of ['midday-topics-wrap','midday-movers-wrap','midday-trades-wrap','midday-tomorrow-wrap']) {
+        document.getElementById(id).style.display = 'none';
+      }
+      if (!middayRetryTimer) {
+        middayRetryTimer = setTimeout(() => { middayRetryTimer = null; loadDailySnapshot(); }, 45000);
+      }
+    } else {
+      card.classList.remove('visible'); // before 11:30am PT / weekend — nothing to show
+    }
+    return;
+  }
+
+  card.classList.add('visible');
+  document.getElementById('midday-headline').textContent = m.headline || '';
+  document.getElementById('midday-narrative').textContent = m.narrative || '';
+  if (m.ts) {
+    const d = new Date(m.ts);
+    document.getElementById('midday-ts').textContent = 'As of ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+  }
+
+  // Dynamic topic cards
+  const topics = m.topics || [];
+  document.getElementById('midday-topics-wrap').style.display = topics.length ? '' : 'none';
+  document.getElementById('midday-topics').innerHTML = topics.map(t => {
+    const tag = (t.tag || 'Macro').replace(/\s+/g, '');
+    return `<div class="news-card">
+      <div class="news-tag ${esc(tag)}">${esc(t.tag || 'Macro')}</div>
+      <div class="news-title">${esc(t.title || '')}</div>
+      <div class="news-body">${esc(t.body || '')}</div>
+    </div>`;
+  }).join('');
+
+  // Big movers (volume-backed, watchlist or not)
+  const movers = m.bigMovers || [];
+  document.getElementById('midday-movers-wrap').style.display = movers.length ? '' : 'none';
+  document.getElementById('midday-movers').innerHTML = movers.map(mv => {
+    const cls = mv.changePct > 0 ? 'up' : 'dn';
+    return `<a class="midday-mover" href="${EQUITY_URL}?t=${encodeURIComponent(mv.ticker)}" title="${esc(mv.name || '')}">
+      <span class="midday-mover-ticker">${esc(mv.ticker)}</span>
+      <span class="midday-mover-chg ${cls}" style="color:var(--${mv.changePct > 0 ? 'bull' : 'bear'})">${fmtPct(mv.changePct)}</span>
+      <span class="midday-mover-vol">${fmtVol(mv.volume)}</span>
+    </a>`;
+  }).join('');
+
+  // Trade ideas by style
+  const trades = m.trades || {};
+  const groups = [
+    ['day',      'Day Trade',  'day'],
+    ['swing',    'Swing',      'swing'],
+    ['options',  'Options',    'options'],
+    ['longTerm', 'Long-Term',  'longterm'],
+  ];
+  const anyTrades = groups.some(([k]) => (trades[k] || []).length);
+  document.getElementById('midday-trades-wrap').style.display = anyTrades ? '' : 'none';
+  document.getElementById('midday-trades').innerHTML = groups.map(([key, label, cls]) => {
+    const items = trades[key] || [];
+    const body = items.length
+      ? items.map(it => `<div class="midday-trade-item">
+          <span class="midday-trade-ticker"><a href="${EQUITY_URL}?t=${encodeURIComponent(it.ticker || '')}">${esc(it.ticker || '')}</a></span>
+          ${it.strategy ? `<span class="midday-trade-strategy">${esc(it.strategy)}</span>` : ''}
+          <div class="midday-trade-reason">${esc(it.reason || '')}</div>
+        </div>`).join('')
+      : '<div class="midday-trade-empty">No setup today.</div>';
+    return `<div class="midday-trade-col">
+      <div class="midday-trade-label ${cls}">${label}</div>
+      ${body}
+    </div>`;
+  }).join('');
+
+  // Tomorrow's events
+  const tomorrow = m.tomorrow || [];
+  const VALID_TYPES = new Set(['Earnings','Fed','Economic','Geopolitical','Macro']);
+  document.getElementById('midday-tomorrow-wrap').style.display = tomorrow.length ? '' : 'none';
+  document.getElementById('midday-tomorrow').innerHTML = tomorrow.map(ev => {
+    const type   = VALID_TYPES.has(ev.type) ? ev.type : 'Macro';
+    const impact = ['HIGH','MEDIUM','LOW'].includes(ev.impact) ? ev.impact : 'LOW';
+    return `<div class="midday-tmrw-row">
+      <span class="wa-type ${type}">${esc(ev.type || '')}</span>
+      <div class="midday-tmrw-body">
+        <div class="midday-tmrw-title">${esc(ev.title || '')}</div>
+        <div class="midday-tmrw-note">${esc(ev.note || '')}</div>
+      </div>
+      <span class="wa-impact ${impact}">${impact}</span>
+    </div>`;
+  }).join('');
 }
 
 /* ─── Week Ahead (Fridays only) ─── */
