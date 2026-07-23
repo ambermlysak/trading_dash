@@ -263,9 +263,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 }
 .midday-card.visible { display: block; }
 .midday-header { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
-.midday-badge { font-size: 9px; font-family: var(--mono); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; padding: 3px 8px; border-radius: 3px; background: var(--amber-soft); color: var(--amber); }
-.midday-headline { font-family: var(--serif); font-size: 16px; font-weight: 300; color: var(--ink-0); font-style: italic; }
-.midday-ts { font-size: 10px; color: var(--ink-3); font-family: var(--mono); margin-left: auto; white-space: nowrap; }
+.midday-headline { font-family: var(--serif); font-size: 18px; font-weight: 300; color: var(--ink-0); font-style: italic; line-height: 1.35; }
 .midday-narrative { font-size: 13px; color: var(--ink-2); line-height: 1.6; margin-bottom: 18px; }
 .midday-sub { font-size: 10px; color: var(--ink-3); font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.06em; margin: 18px 0 10px; }
 .midday-topics { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
@@ -507,6 +505,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
   <div class="brand">Trading <span>Dashboard</span></div>
   <nav class="tabs">
     <button class="tab-btn active" data-tab="market">Market</button>
+    <button class="tab-btn" data-tab="midday">Midday</button>
     <button class="tab-btn" data-tab="scanner">Scanner</button>
     <button class="tab-btn" data-tab="watchlist">Watchlist</button>
     <button class="tab-btn" data-tab="sectors">Sectors</button>
@@ -537,32 +536,6 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       </div>
       <div class="eod-body" id="eod-body"></div>
       <div class="eod-ts" id="eod-ts"></div>
-    </div>
-
-    <div class="midday-card" id="midday-card">
-      <div class="midday-header">
-        <span class="midday-badge">Midday Pulse · 11:30am PT</span>
-        <div class="midday-headline" id="midday-headline"></div>
-        <div class="midday-ts" id="midday-ts"></div>
-      </div>
-      <div class="midday-narrative" id="midday-narrative"></div>
-      <div id="midday-topics-wrap" style="display:none">
-        <div class="midday-sub">What's Moving</div>
-        <div class="midday-topics" id="midday-topics"></div>
-      </div>
-      <div id="midday-movers-wrap" style="display:none">
-        <div class="midday-sub">Big Movers · ≥10% on ≥1M shares · all listed stocks</div>
-        <div class="midday-movers" id="midday-movers"></div>
-      </div>
-      <div id="midday-trades-wrap" style="display:none">
-        <div class="midday-sub">Trade Ideas From Today's Price Action · watchlist only</div>
-        <div class="midday-trades" id="midday-trades"></div>
-      </div>
-      <div id="midday-tomorrow-wrap" style="display:none">
-        <div class="midday-sub" id="midday-tomorrow-head">On Deck Tomorrow</div>
-        <div class="midday-tomorrow" id="midday-tomorrow"></div>
-        <div class="midday-disclaimer">* Earnings sourced from Yahoo Finance confirmed dates. Fed / economic events are calendar estimates — verify with official sources. Not financial advice.</div>
-      </div>
     </div>
 
     <div class="week-ahead-card" id="week-ahead-card">
@@ -625,6 +598,45 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
         <div class="reco-cards" id="reco-cards">
           <div class="loading">Loading…</div>
         </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Midday tab -->
+<div class="tab-panel" id="tab-midday">
+  <div class="main">
+    <div class="options-header">
+      <div>
+        <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">Midday Pulse</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Generated each trading day at 11:30am PT · session narrative · next-day events · trade ideas · big movers</div>
+      </div>
+      <span class="sectors-ts" id="midday-ts"></span>
+    </div>
+
+    <div id="midday-empty" class="loading" style="padding:40px;text-align:center">Midday Pulse is generated each trading day at 11:30am PT. Check back after 11:30am.</div>
+
+    <div class="midday-card" id="midday-card">
+      <div class="midday-header">
+        <div class="midday-headline" id="midday-headline"></div>
+      </div>
+      <div class="midday-narrative" id="midday-narrative"></div>
+      <div id="midday-topics-wrap" style="display:none">
+        <div class="midday-sub">What's Moving</div>
+        <div class="midday-topics" id="midday-topics"></div>
+      </div>
+      <div id="midday-movers-wrap" style="display:none">
+        <div class="midday-sub">Big Movers · ≥10% on ≥1M shares · all listed stocks</div>
+        <div class="midday-movers" id="midday-movers"></div>
+      </div>
+      <div id="midday-trades-wrap" style="display:none">
+        <div class="midday-sub">Trade Ideas From Today's Price Action · watchlist only</div>
+        <div class="midday-trades" id="midday-trades"></div>
+      </div>
+      <div id="midday-tomorrow-wrap" style="display:none">
+        <div class="midday-sub" id="midday-tomorrow-head">On Deck Tomorrow</div>
+        <div class="midday-tomorrow" id="midday-tomorrow"></div>
+        <div class="midday-disclaimer">* Earnings sourced from Yahoo Finance confirmed dates. Fed / economic events are calendar estimates — verify with official sources. Not financial advice.</div>
       </div>
     </div>
   </div>
@@ -903,33 +915,33 @@ async function loadDailySnapshot() {
 let middayRetryTimer = null;
 
 function renderMidday(data) {
-  const card = document.getElementById('midday-card');
+  const card  = document.getElementById('midday-card');
+  const empty = document.getElementById('midday-empty');
   const m = data.midday;
 
   if (!m) {
+    card.classList.remove('visible');
+    empty.style.display = '';
     if (data.middayLoading) {
       // Cron missed — the worker is generating now; poll until it lands.
-      card.classList.add('visible');
-      document.getElementById('midday-headline').textContent = 'Generating midday market pulse…';
-      document.getElementById('midday-narrative').textContent = 'Claude is analyzing the session so far. This takes about 30 seconds.';
-      for (const id of ['midday-topics-wrap','midday-movers-wrap','midday-trades-wrap','midday-tomorrow-wrap']) {
-        document.getElementById(id).style.display = 'none';
-      }
+      empty.textContent = 'Generating today\'s midday pulse — Claude is analyzing the session so far. This takes about a minute.';
       if (!middayRetryTimer) {
         middayRetryTimer = setTimeout(() => { middayRetryTimer = null; loadDailySnapshot(); }, 45000);
       }
     } else {
-      card.classList.remove('visible'); // before 11:30am PT / weekend — nothing to show
+      empty.textContent = 'Midday Pulse is generated each trading day at 11:30am PT. Check back after 11:30am.';
     }
+    document.getElementById('midday-ts').textContent = '';
     return;
   }
 
+  empty.style.display = 'none';
   card.classList.add('visible');
   document.getElementById('midday-headline').textContent = m.headline || '';
   document.getElementById('midday-narrative').textContent = m.narrative || '';
   if (m.ts) {
     const d = new Date(m.ts);
-    document.getElementById('midday-ts').textContent = 'As of ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+    document.getElementById('midday-ts').textContent = 'Generated ' + d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' · ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
   }
 
   // Dynamic topic cards
@@ -1766,8 +1778,9 @@ async function init() {
   setInterval(tickClock, 1000);
   initColumnResize();
 
-  // Support deep-linking: dashboard.html#watchlist opens the watchlist tab directly
-  if (location.hash === '#watchlist') switchTab('watchlist');
+  // Support deep-linking: dashboard.html#watchlist (or #midday etc.) opens that tab directly
+  const hashTab = location.hash.slice(1);
+  if (hashTab && document.getElementById('tab-' + hashTab)) switchTab(hashTab);
 
   // Market data
   await Promise.allSettled([
