@@ -2294,6 +2294,19 @@ export default {
             await generateDailySnapshot(env);
             return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
           }
+          if (sub === 'refresh-midday' && request.method === 'POST') {
+            const adminToken = await env?.REC_LOG?.get('admin:token');
+            const auth = request.headers.get('Authorization') || '';
+            if (!adminToken || auth !== `Bearer ${adminToken}`) {
+              return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+            }
+            // Await synchronously: the pipeline exceeds the ~30s fetch-context
+            // waitUntil budget, so a fire-and-forget refresh would be killed mid-run.
+            try { await env?.REC_LOG?.delete('daily:midday'); } catch (_) {}
+            await generateMiddaySnapshot(env);
+            const saved = await env?.REC_LOG?.get('daily:midday', 'json');
+            return new Response(JSON.stringify({ ok: !!saved }), { headers: { 'Content-Type': 'application/json' } });
+          }
           return err('unknown admin route', 404, origin);
         default:         return err('unknown route', 404, origin);
       }
@@ -2311,8 +2324,8 @@ export default {
     const h = pt.getHours(), m = pt.getMinutes();
     if (h === 6 && m < 30) {
       ctx.waitUntil(generateDailySnapshot(env));       // 6:00am PT morning briefing
-    } else if (h === 11 && m >= 30) {
-      ctx.waitUntil(generateMiddaySnapshot(env));      // 11:30am PT midday pulse
+    } else if ((h === 11 && m >= 30) || h === 12) {
+      ctx.waitUntil(generateMiddaySnapshot(env));      // 11:30am PT midday pulse (retries to 1pm; KV dedup skips once complete)
     } else if (h === 13 && m >= 15 && m < 45) {
       ctx.waitUntil(generateEODSummary(env));          // 1:15pm PT EOD summary
     }
