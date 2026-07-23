@@ -84,7 +84,7 @@ market:sectors     — Sector summaries + picks (4h TTL)
 rec:{TICKER}       — recommendation history (up to 500 entries)
 ```
 
-**Cron triggers** fire at 6am PT (morning briefing), 11:30am PT (midday pulse), and 1:15pm PT (EOD summary) — each with both UTC-7 and UTC-8 variants. Each uses a KV timestamp check with a 2-hour dedup window to avoid double-runs.
+**Cron trigger:** a single `*/15 13-22 * * 1-5` UTC cron; `scheduled()` dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), and EOD summary (1:15pm PT). Each job uses a KV timestamp check with a 2-hour dedup window to avoid double-runs.
 
 ### Frontends
 
