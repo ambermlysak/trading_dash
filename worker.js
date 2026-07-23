@@ -2304,14 +2304,17 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    // EOD crons fire at 20:15 or 21:15 UTC (1:15pm PDT / PST)
-    if (event.cron === '15 20 * * 1-5' || event.cron === '15 21 * * 1-5') {
-      ctx.waitUntil(generateEODSummary(env));
-    // Midday crons fire at 18:30 or 19:30 UTC (11:30am PDT / PST)
-    } else if (event.cron === '30 18 * * 1-5' || event.cron === '30 19 * * 1-5') {
-      ctx.waitUntil(generateMiddaySnapshot(env));
-    } else {
-      ctx.waitUntil(generateDailySnapshot(env));
+    // One */15 cron covers all jobs (plan limit: 5 triggers). Dispatch on
+    // Pacific wall-clock time so DST needs no separate UTC schedules; each
+    // generator's own KV dedup prevents double-runs across adjacent firings.
+    const pt = new Date(new Date(event.scheduledTime).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+    const h = pt.getHours(), m = pt.getMinutes();
+    if (h === 6 && m < 30) {
+      ctx.waitUntil(generateDailySnapshot(env));       // 6:00am PT morning briefing
+    } else if (h === 11 && m >= 30) {
+      ctx.waitUntil(generateMiddaySnapshot(env));      // 11:30am PT midday pulse
+    } else if (h === 13 && m >= 15 && m < 45) {
+      ctx.waitUntil(generateEODSummary(env));          // 1:15pm PT EOD summary
     }
   },
 };
