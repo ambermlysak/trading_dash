@@ -912,8 +912,6 @@ async function loadDailySnapshot() {
 }
 
 /* ─── Midday Pulse (11:30am PT cron, served via /api/daily) ─── */
-let middayRetryTimer = null;
-
 function renderMidday(data) {
   const card  = document.getElementById('midday-card');
   const empty = document.getElementById('midday-empty');
@@ -922,14 +920,17 @@ function renderMidday(data) {
   if (!m) {
     card.classList.remove('visible');
     empty.style.display = '';
+    // No aggressive polling here — the page already re-fetches /api/daily every
+    // 10 minutes, and generation happens server-side on the cron schedule.
     if (data.middayLoading) {
-      // Cron missed — the worker is generating now; poll until it lands.
-      empty.textContent = 'Generating today\'s midday pulse — Claude is analyzing the session so far. This takes about a minute.';
-      if (!middayRetryTimer) {
-        middayRetryTimer = setTimeout(() => { middayRetryTimer = null; loadDailySnapshot(); }, 45000);
-      }
+      empty.textContent = 'Today\'s midday pulse is being generated (cron retries through 1pm PT). This page refreshes automatically every 10 minutes.';
     } else {
-      empty.textContent = 'Midday Pulse is generated each trading day at 11:30am PT. Check back after 11:30am.';
+      const pt = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+      const isWeekday = pt.getDay() >= 1 && pt.getDay() <= 5;
+      const mins = pt.getHours() * 60 + pt.getMinutes();
+      empty.textContent = isWeekday && mins >= 800
+        ? 'Today\'s midday pulse could not be generated. It will be available again after tomorrow\'s 11:30am PT run.'
+        : 'Midday Pulse is generated each trading day at 11:30am PT. Check back after 11:30am.';
     }
     document.getElementById('midday-ts').textContent = '';
     return;

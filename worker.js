@@ -1404,13 +1404,13 @@ async function handleDailyGet(origin, env, ctx) {
       }
     }
 
-    // Auto-trigger midday pulse if the 11:30am cron missed. Only from 11:30am PT
-    // onward — the morning cron clears daily:midday so it never shows stale data.
-    let middayLoading = false;
-    if (!midday && ctx && env?.ANTHROPIC_API_KEY && isWeekday && minsPT >= 690) {
-      ctx.waitUntil(generateMiddaySnapshot(env));
-      middayLoading = true;
-    }
+    // No fetch-path self-heal for the midday pulse: the pipeline (~50s) outruns
+    // the ~30s fetch-context waitUntil budget, so a trigger here can never
+    // complete — it only burns Yahoo quota and a billed Claude call per page
+    // poll. The cron retries every 15 min from 11:30am to 1pm PT instead, and
+    // POST /api/admin/refresh-midday covers manual regeneration. middayLoading
+    // just tells the UI a cron run is still expected shortly.
+    const middayLoading = !midday && isWeekday && minsPT >= 690 && minsPT < 800;
 
     if (snapshot) {
       const isComplete = (snapshot.newsCards?.length || 0) > 0 || snapshot.opportunity;
