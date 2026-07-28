@@ -1243,10 +1243,15 @@ function renderWatchlist() {
       return d;
     })
     .sort((a, b) => {
-      const av = a[sortCol] ?? (typeof b[sortCol] === 'string' ? '' : Infinity);
-      const bv = b[sortCol] ?? (typeof a[sortCol] === 'string' ? '' : Infinity);
+      const av = a[sortCol], bv = b[sortCol];
+      // Rows missing the sorted value always sink to the bottom, either
+      // direction — otherwise they crowd out the signal on a descending sort.
+      if (av == null || bv == null) return av == null && bv == null ? 0 : av == null ? 1 : -1;
+      if (typeof av === 'string' || typeof bv === 'string') {
+        const as = String(av), bs = String(bv);
+        return sortAsc ? as.localeCompare(bs) : bs.localeCompare(as);
+      }
       if (av === bv) return 0;
-      if (typeof av === 'string') return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
       return sortAsc ? av - bv : bv - av;
     });
 
