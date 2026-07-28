@@ -1216,6 +1216,7 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
 
         let pe = null, forwardPE = null, targetLow = null, targetMean = null, targetHigh = null;
         let shortPct = null, earningsDate = null, daysToEarnings = null, sector = null;
+        let sma50 = null, sma200 = null;
 
         if (fundRes.status === 'fulfilled') {
           const r = fundRes.value?.quoteSummary?.result?.[0] || {};
@@ -1226,6 +1227,10 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
           targetHigh = r.financialData?.targetHighPrice?.raw ?? null;
           shortPct   = r.defaultKeyStatistics?.shortPercentOfFloat?.raw ?? null;
           sector     = r.assetProfile?.sector ?? null;
+          // Yahoo's 50/200-day averages are simple moving averages of daily closes
+          // through the prior close (today's in-progress bar is excluded).
+          sma50      = r.summaryDetail?.fiftyDayAverage?.raw ?? null;
+          sma200     = r.summaryDetail?.twoHundredDayAverage?.raw ?? null;
 
           // Use quoteSummary price module for authoritative 1-day values
           const qPrice   = r.price?.regularMarketPrice?.raw ?? null;
@@ -1271,6 +1276,11 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
           shortPct:   shortPct   != null ? Math.round(shortPct   * 10000) / 100 : null,
           earningsDate,
           daysToEarnings,
+          sma50:    sma50  != null ? Math.round(sma50  * 100) / 100 : null,
+          sma200:   sma200 != null ? Math.round(sma200 * 100) / 100 : null,
+          pctVs50:  price != null && sma50  ? Math.round((price - sma50)  / sma50  * 10000) / 100 : null,
+          pctVs200: price != null && sma200 ? Math.round((price - sma200) / sma200 * 10000) / 100 : null,
+          smaSpread: sma50 != null && sma200 ? Math.round((sma50 - sma200) / sma200 * 10000) / 100 : null,
           rsi,
           support,
           resist,

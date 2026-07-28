@@ -657,8 +657,8 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     <div class="wl-table-wrap">
       <table class="wl-table">
         <colgroup>
-          <col><col><col><col><col><col><col><col><col><col>
-          <col><col><col><col><col><col><col><col><col><col><col>
+          <col><col><col><col><col><col><col><col><col><col><col><col>
+          <col><col><col><col><col><col><col><col><col><col><col><col>
         </colgroup>
         <thead>
           <tr>
@@ -670,6 +670,9 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
             <th data-sort="pattern">Pattern</th>
             <th data-sort="action">Action</th>
             <th data-sort="rating">Rating</th>
+            <th data-sort="pctVs50"   title="Current price vs the 50-day simple moving average">vs 50D</th>
+            <th data-sort="pctVs200"  title="Current price vs the 200-day simple moving average">vs 200D</th>
+            <th data-sort="smaSpread" title="50-day SMA above or below the 200-day SMA (golden / death cross)">50D vs 200D</th>
             <th data-sort="rsi">RSI</th>
             <th data-sort="pe">P/E</th>
             <th data-sort="forwardPE">Fwd P/E</th>
@@ -686,7 +689,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
           </tr>
         </thead>
         <tbody id="wl-tbody">
-          <tr><td colspan="20" class="loading" style="padding:24px">Loading watchlist…</td></tr>
+          <tr><td colspan="24" class="loading" style="padding:24px">Loading watchlist…</td></tr>
         </tbody>
       </table>
     </div>
@@ -1132,7 +1135,7 @@ async function loadWatchlistBatch() {
   btn.disabled = true;
   btn.textContent = '↺ Loading…';
   document.getElementById('wl-tbody').innerHTML =
-    '<tr><td colspan="20" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
+    '<tr><td colspan="24" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
   document.getElementById('wl-status').textContent = 'Fetching…';
 
   try {
@@ -1166,7 +1169,7 @@ async function loadWatchlistBatch() {
     console.error('[watchlist]', e.message);
     document.getElementById('wl-status').textContent = 'Error — ' + e.message;
     document.getElementById('wl-tbody').innerHTML =
-      '<tr><td colspan="20" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
+      '<tr><td colspan="24" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
   } finally {
     wlLoading = false;
     btn.disabled = false;
@@ -1222,6 +1225,11 @@ function renderWatchlist() {
       <td class="ai-cell" data-full="${esc(s.pattern || '')}">${esc(s.pattern || '—')}</td>
       <td class="ai-cell" data-full="${esc(s.action || '')}">${esc(s.action || '—')}</td>
       <td class="rating-cell">${ratingBadge(s.rating, s.confidence)}</td>
+      <td class="${clsChg(s.pctVs50)}"${s.sma50  != null ? ` title="50D SMA $${fmt(s.sma50)}"`  : ''}>${fmtPct(s.pctVs50)}</td>
+      <td class="${clsChg(s.pctVs200)}"${s.sma200 != null ? ` title="200D SMA $${fmt(s.sma200)}"` : ''}>${fmtPct(s.pctVs200)}</td>
+      <td class="${clsChg(s.smaSpread)}"${s.smaSpread != null ? ` title="50D $${fmt(s.sma50)} vs 200D $${fmt(s.sma200)} (${fmtPct(s.smaSpread)})"` : ''}>${
+        s.smaSpread == null ? '—' : s.smaSpread > 0 ? '▲ Above' : s.smaSpread < 0 ? '▼ Below' : 'Even'
+      }</td>
       <td class="${clsRsi(s.rsi)}">${s.rsi != null ? s.rsi : '—'}</td>
       <td class="mono">${s.pe != null ? fmt(s.pe, 1) : '—'}</td>
       <td class="mono">${s.forwardPE != null ? fmt(s.forwardPE, 1) : '—'}</td>
@@ -1274,7 +1282,7 @@ function renderWatchlist() {
       }
 
       html += `<tr class="expand-row">
-        <td colspan="20">
+        <td colspan="24">
           <div class="expand-content">
             ${s.summary ? `<div class="expand-summary">${esc(s.summary)}</div>` : ''}
             <div class="expand-meta">
@@ -1289,7 +1297,7 @@ function renderWatchlist() {
       </tr>`;
     }
   }
-  tbody.innerHTML = html || '<tr><td colspan="20" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
+  tbody.innerHTML = html || '<tr><td colspan="24" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
 }
 
 /* ─── Closing auction block trades ─── */
