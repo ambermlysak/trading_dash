@@ -14,6 +14,9 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   analysis:{TICKER}   — per-ticker Claude analysis (trend, pattern, action, summary)
 #   fund:{TICKER}       — per-ticker Yahoo fundamentals cache (6h TTL)
 #   market:ipos         — IPO calendar cache (12h TTL)
+#   market:goldencross  — golden-cross setups (1h TTL)
+#   scanner:{preset}    — day-trading scanner results (90s TTL)
+#   watchlist:tickers   — saved watchlist; also seeds scan universes
 #   rec:{TICKER}        — recommendation history
 
 [triggers]

@@ -60,10 +60,29 @@ GET  /api/track/:ticker           Read rating history from KV
 GET  /api/market/snapshot         Index + futures + commodities strip
 GET  /api/market/movers           Pre-market / day gainers + losers (≥±10%)
 GET  /api/market/ipos             Upcoming IPO calendar (12h KV cache)
-GET  /api/watchlist/batch         Bulk fundamentals + RSI + Claude analysis
+GET  /api/watchlist/batch         Bulk fundamentals + RSI + SMA/EMA cross + Claude analysis
 GET  /api/daily                   Daily Claude synthesis (served from KV)
 GET  /api/market/sectors          Sector summaries + top opportunity/avoid per sector (4h KV cache)
+GET  /api/market/scanner?preset=  Day-trading momentum scanner (5 Pillars, 90s KV cache)
+GET  /api/market/golden-cross     Names set up for a golden cross (1h KV cache)
 ```
+
+**Moving averages:** the watchlist's `vs 50D` / `vs 200D` / `50D vs 200D` columns use Yahoo's
+`summaryDetail.fiftyDayAverage` / `twoHundredDayAverage` — simple moving averages of daily closes
+through the *prior* close. The `Golden X` / `Death X` columns and the golden-cross scanner use
+**exponential** moving averages computed in the Worker by `emaCrossState()`.
+
+**EMA cross (`emaCrossState`):** EMAs are seeded with an SMA of the first `period` closes and
+smoothed forward, so EMA200 needs a long runway before the seed washes out. Callers pass ~3y of
+daily closes (~750 bars), leaving the seed ~0.4% weight and EMA200 within ~0.01% of a fully
+converged value. Symbols with fewer than 450 bars return `null` rather than an unreliable value.
+A *setup* means the fast EMA is within `EMA_CROSS_NEAR_PCT` (5%) of the slow EMA **and** trending
+into the cross; `EMA_CROSS_SLOPE_BARS` (5) sessions define the slope.
+
+**Multi-symbol closes (`yahooSparkCloses`):** Yahoo v7 `spark` returns close-only series for up to
+**20 symbols per request** and needs no crumb, so a 250-name EMA sweep costs ~13 subrequests
+instead of 250. Results key off `item.symbol` — the response order does not match the request
+order, and unknown/delisted symbols are silently absent.
 
 **Yahoo crumb auth:** Yahoo v10 requires a session crumb. `getYahooCrumb()` tries two strategies (direct user-agent endpoint, then HTML stream scan), caches in memory + KV (`yahoo:crumb`, 50-min TTL), and deduplicates concurrent fetches via `_crumbInflight` promise. On 401/403 it invalidates and retries once.
 
@@ -81,6 +100,9 @@ analysis:{TICKER}  — on-demand per-ticker Claude analysis
 fund:{TICKER}      — Yahoo fundamentals cache (6h TTL)
 market:ipos        — IPO calendar (12h TTL)
 market:sectors     — Sector summaries + picks (4h TTL)
+market:goldencross — Golden-cross setups (1h TTL)
+scanner:{preset}   — Day-trading scanner results (90s TTL)
+watchlist:tickers  — Saved watchlist, pushed by the dashboard; also seeds scan universes
 rec:{TICKER}       — recommendation history (up to 500 entries)
 ```
 
@@ -89,6 +111,11 @@ rec:{TICKER}       — recommendation history (up to 500 entries)
 ### Frontends
 
 `dashboard.html` — macro landing view: market strip, AI headline, news cards, pre/post-market movers, watchlist, IPO calendar. The Midday Pulse (11:30am PT synthesis) lives on its own tab (`#tab-midday`, deep-linkable via `dashboard.html#midday`).
+
+The Scanner tab hosts four presets. Three (Momentum, Pre-Market Gappers, All Movers) hit
+`/api/market/scanner` and share `renderScanner()`; the Golden Cross Setup preset hits
+`/api/market/golden-cross` and uses `renderGoldenCross()`. `loadScanner()` branches on the preset
+to pick the endpoint, renderer, header copy, and legend.
 
 `index.html` — per-ticker research page with 16 sections (price/SMA, performance, catalysts, short interest, insider trades, unusual options, dark pool, trade signals, option strategies, analyst targets, 13F holdings, technicals, sentiment, fundamentals, AI synthesis, recommendation history).
 
