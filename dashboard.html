@@ -193,6 +193,13 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .wl-table td.mono { font-family: var(--mono); }
 .wl-table td.up { color: var(--bull); font-family: var(--mono); }
 .wl-table td.dn { color: var(--bear); font-family: var(--mono); }
+/* EMA golden / death cross state */
+.wl-table td.x-cell { font-family: var(--mono); white-space: nowrap; }
+.wl-table td.x-active-g { color: var(--bull); }
+.wl-table td.x-active-d { color: var(--bear); }
+.wl-table td.x-setup { color: var(--amber); font-weight: 500; }
+.wl-table td.x-near { color: var(--ink-2); }
+.wl-table td.x-far { color: var(--ink-3); }
 .wl-table td.rsi-ob { color: var(--bear); font-family: var(--mono); }
 .wl-table td.rsi-os { color: var(--bull); font-family: var(--mono); }
 .wl-table td.rsi-neutral { color: var(--ink-1); font-family: var(--mono); }
@@ -657,8 +664,8 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     <div class="wl-table-wrap">
       <table class="wl-table">
         <colgroup>
-          <col><col><col><col><col><col><col><col><col><col><col><col>
-          <col><col><col><col><col><col><col><col><col><col><col><col>
+          <col><col><col><col><col><col><col><col><col><col><col><col><col>
+          <col><col><col><col><col><col><col><col><col><col><col><col><col>
         </colgroup>
         <thead>
           <tr>
@@ -673,6 +680,8 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
             <th data-sort="pctVs50"   title="Current price vs the 50-day simple moving average">vs 50D</th>
             <th data-sort="pctVs200"  title="Current price vs the 200-day simple moving average">vs 200D</th>
             <th data-sort="smaSpread" title="50-day SMA above or below the 200-day SMA (golden / death cross)">50D vs 200D</th>
+            <th data-sort="goldenRank" title="Golden cross on EMA: 50-day EMA crossing above the 200-day EMA. Setup = below, rising, within 5%.">Golden X</th>
+            <th data-sort="deathRank"  title="Death cross on EMA: 50-day EMA crossing below the 200-day EMA. Setup = above, falling, within 5%.">Death X</th>
             <th data-sort="rsi">RSI</th>
             <th data-sort="pe">P/E</th>
             <th data-sort="forwardPE">Fwd P/E</th>
@@ -689,7 +698,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
           </tr>
         </thead>
         <tbody id="wl-tbody">
-          <tr><td colspan="24" class="loading" style="padding:24px">Loading watchlist…</td></tr>
+          <tr><td colspan="26" class="loading" style="padding:24px">Loading watchlist…</td></tr>
         </tbody>
       </table>
     </div>
@@ -720,8 +729,8 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
   <div class="main" style="max-width:none">
     <div class="options-header">
       <div>
-        <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">Day-Trading Scanner</div>
-        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Warrior "Most Active" momentum · every active mover ≥ $2 · major exchanges only · no penny/OTC · ranked by 5 Pillars</div>
+        <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);" id="scanner-title">Day-Trading Scanner</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;" id="scanner-sub">Warrior "Most Active" momentum · every active mover ≥ $2 · major exchanges only · no penny/OTC · ranked by 5 Pillars</div>
       </div>
       <div style="display:flex;align-items:center;gap:12px">
         <span class="sectors-ts" id="scanner-ts"></span>
@@ -733,9 +742,17 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <button class="scan-preset active" data-preset="momentum">Momentum / HOD</button>
       <button class="scan-preset" data-preset="premarket">Pre-Market Gappers</button>
       <button class="scan-preset" data-preset="all">All Movers</button>
+      <button class="scan-preset" data-preset="goldencross">Golden Cross Setup</button>
     </div>
 
-    <div class="scan-legend">
+    <div class="scan-legend" id="scanner-legend-golden" style="display:none">
+      <span class="scan-pill on">50D EMA &lt; 200D EMA</span>
+      <span class="scan-pill on">50D EMA rising</span>
+      <span class="scan-pill on">Within 5% of crossing</span>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:auto">All three are hard filters · EMAs from 3y of daily closes · sorted closest-to-cross first</span>
+    </div>
+
+    <div class="scan-legend" id="scanner-legend-momentum">
       <span class="scan-pill on">Price ≥ $2</span>
       <span class="scan-pill">RVOL ≥ 5×</span>
       <span class="scan-pill">% Chg ≥ 10</span>
@@ -796,6 +813,43 @@ const fmtVol = (v) => {
 };
 const clsChg = (n) => n == null ? '' : n > 0 ? 'up' : n < 0 ? 'dn' : '';
 const clsRsi = (r) => r == null ? 'rsi-neutral' : r > 70 ? 'rsi-ob' : r < 30 ? 'rsi-os' : 'rsi-neutral';
+
+/* EMA golden / death cross cell.
+ * kind 'golden' → 50-day EMA crossing ABOVE the 200-day; 'death' → crossing BELOW.
+ * Active = formation already in effect · Setup = within 5% and trending into it
+ * · Near = within 5% but not trending · otherwise the gap is too wide to matter. */
+function crossCell(s, kind) {
+  if (s.emaSpread == null || s.ema50 == null || s.ema200 == null) {
+    return '<td class="x-cell x-far">—</td>';
+  }
+  const golden = kind === 'golden';
+  const active = golden ? s.emaSpread > 0 : s.emaSpread < 0;
+  const setup  = golden ? s.goldenSetup : s.deathSetup;
+  const gap    = s.emaGap;
+
+  const side = s.emaSpread >= 0 ? 'above' : 'below';
+  const eta  = s.emaBarsToCross != null
+    ? ` · est. ${s.emaBarsToCross} session${s.emaBarsToCross === 1 ? '' : 's'} to cross`
+    : '';
+  const tip = `50D EMA $${fmt(s.ema50)} vs 200D EMA $${fmt(s.ema200)} — ${fmt(gap)}% ${side}`
+            + ` · 50D EMA ${fmtPct(s.emaSlope)} over 5 sessions${eta}`;
+
+  let cls, txt;
+  if (active) {
+    cls = golden ? 'x-active-g' : 'x-active-d';
+    txt = `● Active ${fmt(gap, 1)}%`;
+  } else if (setup) {
+    cls = 'x-setup';
+    txt = `◆ Setup ${fmt(gap, 1)}%`;
+  } else if (gap <= 5) {
+    cls = 'x-near';
+    txt = `○ Near ${fmt(gap, 1)}%`;
+  } else {
+    cls = 'x-far';
+    txt = `${fmt(gap, 1)}% off`;
+  }
+  return `<td class="x-cell ${cls}" title="${esc(tip)}">${txt}</td>`;
+}
 
 async function apiFetch(path, opts = {}) {
   const r = await fetch(API_BASE + path, opts);
@@ -1135,7 +1189,7 @@ async function loadWatchlistBatch() {
   btn.disabled = true;
   btn.textContent = '↺ Loading…';
   document.getElementById('wl-tbody').innerHTML =
-    '<tr><td colspan="24" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
+    '<tr><td colspan="26" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
   document.getElementById('wl-status').textContent = 'Fetching…';
 
   try {
@@ -1169,7 +1223,7 @@ async function loadWatchlistBatch() {
     console.error('[watchlist]', e.message);
     document.getElementById('wl-status').textContent = 'Error — ' + e.message;
     document.getElementById('wl-tbody').innerHTML =
-      '<tr><td colspan="24" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
+      '<tr><td colspan="26" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
   } finally {
     wlLoading = false;
     btn.disabled = false;
@@ -1230,6 +1284,8 @@ function renderWatchlist() {
       <td class="${clsChg(s.smaSpread)}"${s.smaSpread != null ? ` title="50D $${fmt(s.sma50)} vs 200D $${fmt(s.sma200)} (${fmtPct(s.smaSpread)})"` : ''}>${
         s.smaSpread == null ? '—' : s.smaSpread > 0 ? '▲ Above' : s.smaSpread < 0 ? '▼ Below' : 'Even'
       }</td>
+      ${crossCell(s, 'golden')}
+      ${crossCell(s, 'death')}
       <td class="${clsRsi(s.rsi)}">${s.rsi != null ? s.rsi : '—'}</td>
       <td class="mono">${s.pe != null ? fmt(s.pe, 1) : '—'}</td>
       <td class="mono">${s.forwardPE != null ? fmt(s.forwardPE, 1) : '—'}</td>
@@ -1282,7 +1338,7 @@ function renderWatchlist() {
       }
 
       html += `<tr class="expand-row">
-        <td colspan="24">
+        <td colspan="26">
           <div class="expand-content">
             ${s.summary ? `<div class="expand-summary">${esc(s.summary)}</div>` : ''}
             <div class="expand-meta">
@@ -1297,7 +1353,7 @@ function renderWatchlist() {
       </tr>`;
     }
   }
-  tbody.innerHTML = html || '<tr><td colspan="24" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
+  tbody.innerHTML = html || '<tr><td colspan="26" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
 }
 
 /* ─── Closing auction block trades ─── */
@@ -1746,24 +1802,97 @@ function renderScanner(data) {
   </table></div>`;
 }
 
+/* Golden-cross setup: 50D EMA below the 200D EMA, rising, within 5% of crossing. */
+function renderGoldenCross(data) {
+  const el = document.getElementById('scanner-content');
+  const rows = data.results || [];
+  if (!rows.length) {
+    el.innerHTML = `<div class="loading" style="padding:40px;text-align:center;">No names are set up for a golden cross right now — ${data.evaluated || 0} scanned.</div>`;
+    return;
+  }
+  const body = rows.map(r => {
+    // Gap bar: full = at the 5% edge, empty = crossing now.
+    const pct = Math.max(2, Math.min(100, r.gap / (data.nearPct || 5) * 100));
+    const eta = r.barsToCross != null
+      ? `<span class="mono">${r.barsToCross}</span> <span style="color:var(--ink-3);font-size:10px">session${r.barsToCross === 1 ? '' : 's'}</span>`
+      : '<span style="color:var(--ink-3)">—</span>';
+    return `<tr>
+      <td class="ticker-cell lft"><a href="${EQUITY_URL}?t=${encodeURIComponent(r.ticker)}">${esc(r.ticker)}</a></td>
+      <td class="mono">$${fmt(r.price)}</td>
+      <td class="mono">$${fmt(r.ema50)}</td>
+      <td class="mono">$${fmt(r.ema200)}</td>
+      <td>
+        <div class="range-bar-wrap" title="${fmt(r.gap)}% below the 200-day EMA">
+          <div class="range-bar"><div class="range-bar-fill" style="width:${pct.toFixed(1)}%;background:var(--amber)"></div></div>
+          <div class="range-labels"><span style="color:var(--amber)">${fmt(r.gap)}%</span><span>${data.nearPct || 5}%</span></div>
+        </div>
+      </td>
+      <td class="up">${fmtPct(r.slope)}</td>
+      <td>${eta}</td>
+    </tr>`;
+  }).join('');
+
+  el.innerHTML = `<div class="wl-table-wrap"><table class="scan-table">
+    <thead><tr>
+      <th class="lft">Ticker</th>
+      <th>Price</th>
+      <th title="50-day exponential moving average">50D EMA</th>
+      <th title="200-day exponential moving average">200D EMA</th>
+      <th title="How far the 50D EMA sits below the 200D EMA, against the 5% threshold">Gap to Cross</th>
+      <th title="Change in the 50D EMA over the last 5 sessions — must be positive">50D EMA Slope</th>
+      <th title="Projected sessions until the cross at the current rate of convergence — an estimate, not a forecast">Est. to Cross</th>
+    </tr></thead>
+    <tbody>${body}</tbody>
+  </table>
+  <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);padding:10px 2px">
+    ${rows.length} setup${rows.length === 1 ? '' : 's'} from ${data.evaluated} names scanned
+    (${data.universe} in universe${data.skipped ? `, ${data.skipped} skipped for short history` : ''})
+    · universe = most valuable US equities over $5 with &gt;1M avg daily volume, plus your watchlist
+    · cached up to 1h
+  </div></div>`;
+}
+
+const SCANNER_COPY = {
+  goldencross: {
+    title: 'Golden Cross Scanner',
+    sub: '50-day EMA below the 200-day EMA, rising, and within 5% of crossing above · large-cap liquid universe + your watchlist',
+    loading: 'Computing 50/200-day EMAs across the universe…',
+  },
+  _default: {
+    title: 'Day-Trading Scanner',
+    sub: 'Warrior "Most Active" momentum · every active mover ≥ $2 · major exchanges only · no penny/OTC · ranked by 5 Pillars',
+    loading: 'Sweeping momentum candidates &amp; tagging catalysts…',
+  },
+};
+
 async function loadScanner(preset) {
   if (scannerLoading) return;
   if (preset) scannerPreset = preset;
+  const isGolden = scannerPreset === 'goldencross';
+  const copy = SCANNER_COPY[scannerPreset] || SCANNER_COPY._default;
+
+  document.getElementById('scanner-title').textContent = copy.title;
+  document.getElementById('scanner-sub').textContent = copy.sub;
+  document.getElementById('scanner-legend-golden').style.display = isGolden ? '' : 'none';
+  document.getElementById('scanner-legend-momentum').style.display = isGolden ? 'none' : '';
+
   scannerLoading = true;
   const btn = document.getElementById('scanner-refresh-btn');
   btn.disabled = true; btn.textContent = '↺ Loading…';
   const el = document.getElementById('scanner-content');
-  el.innerHTML = '<div class="loading" style="padding:40px;text-align:center;">Sweeping momentum candidates &amp; tagging catalysts…</div>';
+  el.innerHTML = `<div class="loading" style="padding:40px;text-align:center;">${copy.loading}</div>`;
 
   try {
-    const data = await apiFetch('/market/scanner?preset=' + encodeURIComponent(scannerPreset));
+    const data = isGolden
+      ? await apiFetch('/market/golden-cross')
+      : await apiFetch('/market/scanner?preset=' + encodeURIComponent(scannerPreset));
     scannerData = data;
     if (data.ts) {
       const d = new Date(data.ts);
       document.getElementById('scanner-ts').textContent =
         'As of ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
     }
-    renderScanner(data);
+    if (isGolden) renderGoldenCross(data); else renderScanner(data);
   } catch (e) {
     console.error('[scanner]', e.message);
     el.innerHTML = '<div class="loading" style="padding:40px;text-align:center;color:var(--bear)">Failed to load scanner. Try Refresh.</div>';

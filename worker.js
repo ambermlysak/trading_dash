@@ -309,6 +309,102 @@ function computeSR(highs, lows) {
   };
 }
 
+/* ── EMA cross analysis (golden / death cross) ───────────────────────────────
+ * Seeded with the SMA of the first `period` closes, then smoothed forward.
+ * Callers feed ~3y of daily closes: EMA200 needs a long runway before the seed
+ * washes out. At 750 bars the seed carries ~0.4% weight, putting EMA200 within
+ * ~0.01% of a fully-converged value — well inside the 5% proximity threshold.
+ * ─────────────────────────────────────────────────────────────────────────── */
+const EMA_CROSS_NEAR_PCT = 5;   // "about to cross" band, in % of the slower EMA
+const EMA_CROSS_SLOPE_BARS = 5; // sessions used to measure EMA50 direction
+
+function emaSeries(values, period) {
+  if (!Array.isArray(values) || values.length < period) return null;
+  const k = 2 / (period + 1);
+  const out = new Array(values.length).fill(null);
+  let ema = 0;
+  for (let i = 0; i < period; i++) ema += values[i];
+  ema /= period;
+  out[period - 1] = ema;
+  for (let i = period; i < values.length; i++) {
+    ema = values[i] * k + ema * (1 - k);
+    out[i] = ema;
+  }
+  return out;
+}
+
+/* Returns null when history is too short to trust EMA200.
+ * spread > 0 → EMA50 above EMA200 (golden cross in effect)
+ * spread < 0 → EMA50 below EMA200 (death cross in effect) */
+function emaCrossState(closes, fast = 50, slow = 200) {
+  const vals = (closes || []).filter(v => v != null && isFinite(v));
+  // Require real smoothing runway past the EMA200 seed, not just `slow` bars.
+  if (vals.length < slow + 250) return null;
+
+  const sf = emaSeries(vals, fast);
+  const ss = emaSeries(vals, slow);
+  if (!sf || !ss) return null;
+
+  const n = vals.length;
+  const back = EMA_CROSS_SLOPE_BARS;
+  const emaFast = sf[n - 1], emaSlow = ss[n - 1];
+  const prevFast = sf[n - 1 - back], prevSlow = ss[n - 1 - back];
+  if (!emaFast || !emaSlow || !prevFast || !prevSlow) return null;
+
+  const r2 = v => Math.round(v * 100) / 100;
+  const spread     = (emaFast - emaSlow) / emaSlow * 100;
+  const prevSpread = (prevFast - prevSlow) / prevSlow * 100;
+  const gap        = Math.abs(spread);
+  const fastSlope  = (emaFast - prevFast) / prevFast * 100;
+
+  // Projected sessions to the cross, from the recent rate of spread convergence.
+  // Only meaningful while the spread is actually moving toward zero.
+  const closingPerBar = (Math.abs(prevSpread) - gap) / back;
+  const barsToCross = closingPerBar > 0.0001 ? Math.round(gap / closingPerBar) : null;
+
+  const near   = gap <= EMA_CROSS_NEAR_PCT;
+  const golden = spread > 0;
+
+  return {
+    ema50:  r2(emaFast),
+    ema200: r2(emaSlow),
+    spread: r2(spread),
+    gap:    r2(gap),
+    slope:  Math.round(fastSlope * 1000) / 1000,
+    barsToCross: barsToCross != null && barsToCross <= 400 ? barsToCross : null,
+    // Approaching a golden cross: below, rising, and inside the band.
+    goldenSetup: !golden && fastSlope > 0 && near,
+    // Approaching a death cross: above, falling, and inside the band.
+    deathSetup:   golden && fastSlope < 0 && near,
+    near,
+  };
+}
+
+/* Yahoo v7 spark: close-only series for many symbols per request (max 20).
+ * Far cheaper than one v8 chart call per symbol. Returns Map<symbol, closes[]>.
+ * Unknown/delisted symbols are simply absent from the response. */
+async function yahooSparkCloses(symbols, range = '3y', concurrency = 4) {
+  const out = new Map();
+  const chunks = [];
+  for (let i = 0; i < symbols.length; i += 20) chunks.push(symbols.slice(i, i + 20));
+
+  for (let i = 0; i < chunks.length; i += concurrency) {
+    await Promise.allSettled(chunks.slice(i, i + concurrency).map(async (chunk) => {
+      const url = `https://query1.finance.yahoo.com/v7/finance/spark`
+                + `?symbols=${chunk.map(encodeURIComponent).join(',')}&range=${range}&interval=1d`;
+      const r = await fetch(url, { headers: YAHOO_HEADERS });
+      if (!r.ok) throw new Error(`spark ${r.status}`);
+      const d = await r.json();
+      for (const item of (d?.spark?.result || [])) {
+        const closes = item?.response?.[0]?.indicators?.quote?.[0]?.close;
+        // Keep only the numbers — the raw response is dropped on the next tick.
+        if (Array.isArray(closes)) out.set(item.symbol, closes.filter(v => v != null));
+      }
+    }));
+  }
+  return out;
+}
+
 /* ── Worker-side Claude call ──
    Retries transient failures (429 rate limit, 5xx overload) with backoff.
    A single un-retried hiccup during the 6am cron used to wipe out the daily
@@ -1052,6 +1148,140 @@ async function handleScanner(searchParams, origin, env, ctx) {
   return json(payload, 200, origin);
 }
 
+/* ── Golden-cross scanner ────────────────────────────────────────────────────
+ * Surfaces names where the 50-day EMA sits BELOW the 200-day EMA but is RISING
+ * and within EMA_CROSS_NEAR_PCT of crossing above it.
+ *
+ * Universe: the most valuable liquid US equities (screener, market-cap sorted),
+ * unioned with the saved watchlist so the user's own names are always covered.
+ * A golden cross is a slow structural signal, so the result is cached 1h.
+ * ─────────────────────────────────────────────────────────────────────────── */
+const GOLDEN_UNIVERSE_SIZE = 250;
+
+async function goldenCrossUniverse(env) {
+  const symbols = new Set();
+  let source = 'screener';
+
+  // Primary: crumb-authed custom screener — liquid, market-cap ranked.
+  try {
+    const body = {
+      size: GOLDEN_UNIVERSE_SIZE, offset: 0,
+      sortField: 'intradaymarketcap', sortType: 'DESC', quoteType: 'EQUITY',
+      query: {
+        operator: 'AND',
+        operands: [
+          { operator: 'eq', operands: ['region', 'us'] },
+          { operator: 'gt', operands: ['intradayprice', 5] },
+          { operator: 'gt', operands: ['avgdailyvol3m', 1_000_000] },
+        ],
+      },
+      userId: '', userIdType: 'guid',
+    };
+    const make = async (crumb, cookie) => {
+      const headers = { ...YAHOO_HEADERS, 'Content-Type': 'application/json' };
+      if (cookie) headers['Cookie'] = cookie;
+      return fetch(
+        `https://query2.finance.yahoo.com/v1/finance/screener?crumb=${encodeURIComponent(crumb)}&formatted=true&lang=en-US&region=US`,
+        { method: 'POST', headers, body: JSON.stringify(body) },
+      );
+    };
+    let { crumb, cookie } = await getYahooCrumb(env);
+    let r = await make(crumb, cookie);
+    if (r.status === 401 || r.status === 403) {
+      _crumbCache = null;
+      ({ crumb, cookie } = await getYahooCrumb(env));
+      r = await make(crumb, cookie);
+    }
+    if (r.ok) {
+      const d = await r.json();
+      for (const q of (d?.finance?.result?.[0]?.quotes || [])) {
+        if (q.symbol && (!q.exchange || SCANNER_MAJOR_EXCHANGES.has(q.exchange))) symbols.add(q.symbol);
+      }
+    }
+  } catch (_) {}
+
+  // Fallback: predefined most-actives (no crumb required).
+  if (symbols.size < 50) {
+    source = symbols.size ? 'screener+actives' : 'most_actives';
+    try {
+      const r = await fetch(
+        'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=most_actives&count=250',
+        { headers: YAHOO_HEADERS },
+      );
+      if (r.ok) {
+        const d = await r.json();
+        for (const q of (d?.finance?.result?.[0]?.quotes || [])) {
+          if (q.symbol && (!q.exchange || SCANNER_MAJOR_EXCHANGES.has(q.exchange))) symbols.add(q.symbol);
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Always include the saved watchlist.
+  let watchlistCount = 0;
+  try {
+    const wl = await env?.REC_LOG?.get('watchlist:tickers', 'json');
+    if (Array.isArray(wl)) { wl.forEach(t => symbols.add(t)); watchlistCount = wl.length; }
+  } catch (_) {}
+
+  // Drop non-equity share classes spark handles poorly (warrants, units, rights).
+  const list = [...symbols].filter(s => /^[A-Z][A-Z.-]{0,6}$/.test(s) && !/[.-](WS|U|R|RT)$/.test(s));
+  return { symbols: list, source, watchlistCount };
+}
+
+async function handleGoldenCross(origin, env) {
+  const KV_KEY = 'market:goldencross';
+  const TTL = 3_600_000; // 1h — EMA crosses move on a daily timescale
+
+  try {
+    const cached = await env?.REC_LOG?.get(KV_KEY, 'json');
+    if (cached && Date.now() - (cached.ts || 0) < TTL) {
+      return json({ ...cached, cached: true }, 200, origin);
+    }
+  } catch (_) {}
+
+  const { symbols, source, watchlistCount } = await goldenCrossUniverse(env);
+  if (!symbols.length) return err('universe unavailable', 502, origin);
+
+  const closesBySymbol = await yahooSparkCloses(symbols, '3y');
+
+  const results = [];
+  let evaluated = 0, skipped = 0;
+  for (const [symbol, closes] of closesBySymbol) {
+    const st = emaCrossState(closes);
+    if (!st) { skipped++; continue; }
+    evaluated++;
+    if (!st.goldenSetup) continue;
+    results.push({
+      ticker: symbol,
+      price:  Math.round(closes[closes.length - 1] * 100) / 100,
+      ema50:  st.ema50,
+      ema200: st.ema200,
+      gap:    st.gap,        // % below the 200-day EMA
+      slope:  st.slope,      // 5-session EMA50 change, %
+      barsToCross: st.barsToCross,
+    });
+  }
+
+  // Closest to crossing first; break ties on the stronger upward slope.
+  results.sort((a, b) => a.gap - b.gap || b.slope - a.slope);
+
+  const payload = {
+    results,
+    count: results.length,
+    universe: symbols.length,
+    evaluated,
+    skipped,
+    source,
+    watchlistCount,
+    nearPct: EMA_CROSS_NEAR_PCT,
+    slopeBars: EMA_CROSS_SLOPE_BARS,
+    ts: Date.now(),
+  };
+  try { await env?.REC_LOG?.put(KV_KEY, JSON.stringify(payload), { expirationTtl: 7200 }); } catch (_) {}
+  return json(payload, 200, origin);
+}
+
 async function handleMarketIPOs(origin, env) {
   const KV_KEY = 'market:ipos';
   const TTL    = 43_200_000; // 12 hours
@@ -1173,6 +1403,10 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
 
   // Pre-warm the crumb once so all parallel Yahoo v10 calls share it
   await getYahooCrumb(env).catch(() => {});
+
+  // Golden/death cross needs ~3y of closes — one spark call per 20 tickers,
+  // fired now and merged in after the per-ticker work below.
+  const emaClosesPromise = yahooSparkCloses(tickers, '3y').catch(() => new Map());
 
   const stocks = {};
 
@@ -1297,6 +1531,31 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
         stocks[ticker] = { symbol: ticker, error: e.message };
       }
     }));
+  }
+
+  // Merge EMA golden/death cross state. Tickers with too little history keep
+  // nulls, which the UI renders as "—" rather than a misleading state.
+  try {
+    const closesBySymbol = await emaClosesPromise;
+    for (const t of tickers) {
+      const s = stocks[t];
+      if (!s || s.error) continue;
+      const st = emaCrossState(closesBySymbol.get(t));
+      if (!st) continue;
+      s.ema50       = st.ema50;
+      s.ema200      = st.ema200;
+      s.emaSpread   = st.spread;
+      s.emaGap      = st.gap;
+      s.emaSlope    = st.slope;
+      s.emaBarsToCross = st.barsToCross;
+      s.goldenSetup = st.goldenSetup;
+      s.deathSetup  = st.deathSetup;
+      // Sort keys: higher = closer to (or already in) that formation.
+      s.goldenRank  = st.spread;
+      s.deathRank   = -st.spread;
+    }
+  } catch (e) {
+    console.error('[watchlist] ema cross:', e.message);
   }
 
   // Fire on-demand Claude analysis for tickers that have no cached entry.
@@ -2262,6 +2521,7 @@ export default {
           if (sub === 'week-ahead')  return await handleWeekAhead(origin, env);
           if (sub === 'sectors')    return await handleMarketSectors(origin, env, ctx, url.searchParams);
           if (sub === 'scanner')    return await handleScanner(url.searchParams, origin, env, ctx);
+          if (sub === 'golden-cross') return await handleGoldenCross(origin, env);
           return err('unknown market route', 404, origin);
         case 'analysis':
           if (!sub) return err('ticker required', 400, origin);
