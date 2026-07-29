@@ -359,6 +359,81 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
 .catalyst-title { font-size: 13px; color: var(--ink-1); line-height: 1.4; }
 .catalyst-note { display: block; font-size: 11px; color: var(--ink-3); line-height: 1.4; margin-top: 3px; }
 .catalyst-empty { font-size: 12px; color: var(--ink-3); padding: 8px 0; }
+
+/* ------- Earnings analysis (expands under Catalysts) ------- */
+.earn-btn {
+  width: 100%; margin-top: 14px; padding: 9px 12px;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  background: transparent; border: 1px solid var(--line); border-radius: 3px;
+  color: var(--ink-1); font-family: var(--mono); font-size: 11px;
+  letter-spacing: 0.07em; text-transform: uppercase; cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.earn-btn:hover:not(:disabled) { color: var(--ink-0); border-color: var(--cyan); }
+.earn-btn:disabled { opacity: 0.55; cursor: default; }
+.earn-btn.open { color: var(--cyan); border-color: var(--cyan); background: var(--bg-3); }
+.earn-caret { font-size: 9px; transition: transform 0.2s; }
+.earn-btn.open .earn-caret { transform: rotate(180deg); }
+
+.earn-panel { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
+.earn-panel[hidden] { display: none; }
+.earn-loading, .earn-error { font-family: var(--mono); font-size: 11px; color: var(--ink-3); padding: 6px 0; }
+.earn-error { color: var(--bear); }
+
+.earn-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.earn-quarter { font-family: var(--mono); font-size: 11px; color: var(--cyan); letter-spacing: 0.05em; }
+.earn-when { font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+.earn-verdict {
+  font-family: var(--mono); font-size: 9px; font-weight: 600; padding: 2px 7px;
+  border-radius: 3px; letter-spacing: 0.07em; text-transform: uppercase;
+}
+.earn-verdict.beat  { background: var(--bull-soft); color: var(--bull); }
+.earn-verdict.miss  { background: var(--bear-soft); color: var(--bear); }
+.earn-verdict.mixed { background: var(--bg-3);      color: var(--amber); }
+.earn-headline { font-size: 13px; color: var(--ink-0); line-height: 1.5; margin-bottom: 12px; }
+
+.earn-section { margin-top: 14px; }
+.earn-section-title {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.09em;
+  text-transform: uppercase; color: var(--ink-3); margin-bottom: 7px;
+}
+.earn-score { display: flex; flex-wrap: wrap; gap: 6px; }
+.earn-score-cell {
+  background: var(--bg-1); border: 1px solid var(--line); border-left-width: 3px;
+  border-radius: 4px; padding: 7px 10px; flex: 1 1 auto; min-width: 130px;
+}
+.earn-score-cell.beat { border-left-color: var(--bull); }
+.earn-score-cell.miss { border-left-color: var(--bear); }
+.earn-score-cell.inline, .earn-score-cell.na { border-left-color: var(--ink-3); }
+.earn-score-metric { font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); letter-spacing: 0.06em; text-transform: uppercase; }
+.earn-score-actual { font-family: var(--mono); font-size: 14px; color: var(--ink-0); margin-top: 2px; }
+.earn-score-est { font-family: var(--mono); font-size: 10px; color: var(--ink-3); margin-top: 1px; }
+
+.earn-react { display: grid; grid-template-columns: repeat(auto-fit, minmax(74px, 1fr)); gap: 1px; background: var(--line-soft); }
+.earn-react-cell { background: var(--bg-1); padding: 7px 9px; }
+.earn-react-label { font-family: var(--mono); font-size: 9px; color: var(--ink-3); letter-spacing: 0.05em; text-transform: uppercase; }
+.earn-react-val { font-family: var(--mono); font-size: 13px; margin-top: 3px; color: var(--ink-1); }
+.earn-react-val.bull { color: var(--bull); }
+.earn-react-val.bear { color: var(--bear); }
+.earn-react-note { font-family: var(--mono); font-size: 10px; color: var(--ink-3); margin-top: 6px; line-height: 1.5; }
+
+.earn-bullets { list-style: none; display: flex; flex-direction: column; gap: 7px; }
+.earn-bullets li { font-size: 12.5px; color: var(--ink-1); line-height: 1.5; padding-left: 13px; position: relative; }
+.earn-bullets li::before { content: '▪'; position: absolute; left: 0; color: var(--cyan); font-size: 10px; top: 1px; }
+
+.earn-quote { background: var(--bg-1); border: 1px solid var(--line); border-left: 3px solid var(--amber); border-radius: 4px; padding: 8px 11px; margin-bottom: 7px; }
+.earn-quote-theme { font-size: 12px; font-weight: 600; color: var(--ink-0); }
+.earn-quote-detail { font-size: 12px; color: var(--ink-2); line-height: 1.5; margin-top: 3px; }
+.earn-quote-source { font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); margin-top: 5px; letter-spacing: 0.04em; }
+.earn-unavailable {
+  font-size: 12px; color: var(--ink-2); line-height: 1.5;
+  background: var(--bg-1); border: 1px solid var(--line); border-left: 3px solid var(--violet);
+  border-radius: 4px; padding: 8px 11px;
+}
+.earn-unavailable b { color: var(--violet); font-weight: 600; }
+
+.earn-prose { font-size: 12.5px; color: var(--ink-1); line-height: 1.6; }
+.earn-foot { font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); margin-top: 14px; padding-top: 9px; border-top: 1px solid var(--line-soft); line-height: 1.6; }
 .catalyst-impact { font-family: var(--mono); font-size: 9px; padding: 2px 6px; border-radius: 3px; letter-spacing: 0.06em; text-transform: uppercase; height: fit-content; }
 .catalyst-impact.high { background: var(--bear-soft); color: var(--bear); }
 .catalyst-impact.med { background: var(--amber-soft); color: var(--amber); }
@@ -636,6 +711,11 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
         <div class="card-meta" id="catalysts-meta"></div>
       </div>
       <div class="catalyst-list" id="catalyst-list"></div>
+      <button class="earn-btn" id="earn-btn" type="button" aria-expanded="false" aria-controls="earn-panel">
+        <span id="earn-btn-label">Analyze Earnings</span>
+        <span class="earn-caret" aria-hidden="true">▾</span>
+      </button>
+      <div class="earn-panel" id="earn-panel" hidden></div>
     </div>
 
     <!-- 11. TECHNICAL: PRICE CHART (large) -->
@@ -1784,6 +1864,156 @@ async function renderCatalysts(quote) {
   `).join('') : '<div class="catalyst-empty">No scheduled catalysts found.</div>';
 }
 
+/* ------- Earnings analysis -------
+   Button-triggered only. The Worker caches each result for 12h, so a repeat
+   click is cheap, but nothing here may run automatically on page load. */
+const earnState = { ticker: null, data: null, loading: false };
+
+function resetEarnings() {
+  earnState.ticker = null; earnState.data = null; earnState.loading = false;
+  const btn = document.getElementById('earn-btn');
+  const panel = document.getElementById('earn-panel');
+  if (!btn || !panel) return;
+  btn.classList.remove('open');
+  btn.disabled = false;
+  btn.setAttribute('aria-expanded', 'false');
+  document.getElementById('earn-btn-label').textContent = 'Analyze Earnings';
+  panel.hidden = true;
+  panel.innerHTML = '';
+}
+
+async function toggleEarnings() {
+  const btn   = document.getElementById('earn-btn');
+  const panel = document.getElementById('earn-panel');
+  const label = document.getElementById('earn-btn-label');
+  if (earnState.loading) return;
+
+  // Already loaded for this ticker — just collapse/expand, no refetch.
+  if (earnState.data && earnState.ticker === state.ticker) {
+    const opening = panel.hidden;
+    panel.hidden = !opening;
+    btn.classList.toggle('open', opening);
+    btn.setAttribute('aria-expanded', String(opening));
+    label.textContent = opening ? 'Hide Earnings Analysis' : 'Analyze Earnings';
+    return;
+  }
+
+  const ticker = state.ticker;
+  earnState.loading = true;
+  btn.disabled = true;
+  btn.classList.add('open');
+  btn.setAttribute('aria-expanded', 'true');
+  label.textContent = 'Analyzing…';
+  panel.hidden = false;
+  panel.innerHTML = `<div class="earn-loading">Pulling the last report, measuring the price reaction, and reading coverage from the report window…</div>`;
+
+  try {
+    const data = await api(`/earnings/${encodeURIComponent(ticker)}`);
+    if (ticker !== state.ticker) return; // user navigated away mid-flight
+    if (!data.analysis) throw new Error(data.error || 'No earnings analysis available for this symbol.');
+    earnState.ticker = ticker;
+    earnState.data = data;
+    renderEarnings(data);
+    label.textContent = 'Hide Earnings Analysis';
+  } catch (e) {
+    if (ticker !== state.ticker) return;
+    panel.innerHTML = `<div class="earn-error">Earnings analysis failed: ${esc(e.message)}</div>`;
+    label.textContent = 'Retry Earnings Analysis';
+  } finally {
+    earnState.loading = false;
+    btn.disabled = false;
+  }
+}
+
+function renderEarnings({ facts, analysis, ts, cached }) {
+  const signed = (v, d = 1) => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(d) + '%';
+  const dir    = (v) => v == null ? '' : v >= 0 ? 'bull' : 'bear';
+  const rx     = facts.reaction;
+
+  const scorecard = analysis.scorecard.length ? `
+    <div class="earn-section">
+      <div class="earn-section-title">Scorecard</div>
+      <div class="earn-score">
+        ${analysis.scorecard.map(s => {
+          const res = String(s.result || 'na').toLowerCase().replace('/', '');
+          return `<div class="earn-score-cell ${esc(res)}">
+            <div class="earn-score-metric">${esc(s.metric || '—')}</div>
+            <div class="earn-score-actual">${esc(s.actual ?? '—')}</div>
+            <div class="earn-score-est">vs ${esc(s.estimate ?? '—')} est · ${esc(s.result ?? '—')}</div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>` : '';
+
+  const reaction = rx ? `
+    <div class="earn-section">
+      <div class="earn-section-title">Price reaction</div>
+      <div class="earn-react">
+        <div class="earn-react-cell"><div class="earn-react-label">Gap</div><div class="earn-react-val ${dir(rx.openGapPct)}">${signed(rx.openGapPct)}</div></div>
+        <div class="earn-react-cell"><div class="earn-react-label">Session</div><div class="earn-react-val ${dir(rx.day1Pct)}">${signed(rx.day1Pct)}</div></div>
+        <div class="earn-react-cell"><div class="earn-react-label">5 sessions</div><div class="earn-react-val ${dir(rx.day5Pct)}">${signed(rx.day5Pct)}</div></div>
+        <div class="earn-react-cell"><div class="earn-react-label">Since</div><div class="earn-react-val ${dir(rx.sinceReportPct)}">${signed(rx.sinceReportPct)}</div></div>
+        <div class="earn-react-cell"><div class="earn-react-label">Volume</div><div class="earn-react-val">${rx.volumeVsAvg != null ? rx.volumeVsAvg + '×' : '—'}</div></div>
+      </div>
+      <div class="earn-react-note">Measured on ${esc(rx.reactionDate)} — the ${esc(rx.timing)} — against the $${rx.priorClose} close before the print.${rx.isPartial ? ' That session is still in progress, so the move is live and volume is not yet comparable.' : ''}</div>
+    </div>` : '';
+
+  const highlights = analysis.highlights.length ? `
+    <div class="earn-section">
+      <div class="earn-section-title">Highlights</div>
+      <ul class="earn-bullets">${analysis.highlights.map(h => `<li>${esc(h)}</li>`).join('')}</ul>
+    </div>` : '';
+
+  // Be explicit about why commentary is missing — an empty section reads like a
+  // failure, and a fabricated one would be far worse.
+  const NO_COMMENTARY = {
+    'no-archive': 'No news archive is configured on this deployment, so coverage from that date could not be retrieved. Setting <b>ALPACA_KEY</b> / <b>ALPACA_SECRET</b> unlocks the archive and this section for past quarters.',
+    'no-report-date': 'The report date could not be established for this symbol, so no coverage window could be searched.',
+    'none-found': 'No coverage was published in the days around this report.',
+  };
+  const commentary = `
+    <div class="earn-section">
+      <div class="earn-section-title">Commentary around the call</div>
+      ${analysis.callCommentary.length
+        ? analysis.callCommentary.map(c => `
+          <div class="earn-quote">
+            <div class="earn-quote-theme">${esc(c.theme || '—')}</div>
+            <div class="earn-quote-detail">${esc(c.detail)}</div>
+            <div class="earn-quote-source">${esc(c.source)}</div>
+          </div>`).join('')
+        : `<div class="earn-unavailable">${NO_COMMENTARY[facts.newsStatus] || NO_COMMENTARY['none-found']}</div>`}
+    </div>`;
+
+  const priceAction = analysis.priceAction ? `
+    <div class="earn-section">
+      <div class="earn-section-title">What moved the stock</div>
+      <div class="earn-prose">${esc(analysis.priceAction)}</div>
+    </div>` : '';
+
+  const watch = analysis.watchNext.length ? `
+    <div class="earn-section">
+      <div class="earn-section-title">Watch into the next report</div>
+      <ul class="earn-bullets">${analysis.watchNext.map(w => `<li>${esc(w)}</li>`).join('')}</ul>
+    </div>` : '';
+
+  const age = ts ? Math.round((Date.now() - ts) / 60000) : null;
+  const ageStr = age == null ? '' : age < 1 ? 'just now' : age < 60 ? `${age}m ago` : `${Math.round(age / 60)}h ago`;
+  const verdict = String(analysis.verdict || '').toLowerCase();
+
+  document.getElementById('earn-panel').innerHTML = `
+    <div class="earn-head">
+      <span class="earn-quarter">${esc(analysis.quarter || 'Last quarter')}</span>
+      ${verdict ? `<span class="earn-verdict ${esc(verdict)}">${esc(analysis.verdict)}</span>` : ''}
+      ${facts.reportDate ? `<span class="earn-when">reported ${fmt.dateLongIso(facts.reportDate)}</span>` : ''}
+    </div>
+    ${analysis.headline ? `<div class="earn-headline">${esc(analysis.headline)}</div>` : ''}
+    ${scorecard}${reaction}${highlights}${commentary}${priceAction}${watch}
+    <div class="earn-foot">
+      Figures: Yahoo Finance · price reaction computed from daily bars${facts.newsSource ? ` · coverage: ${esc(facts.newsSource)}` : ''} · synthesis: Claude<br>
+      Report date via ${esc(facts.dateSource || 'unknown source')}${ageStr ? ` · generated ${ageStr}${cached ? ' (cached)' : ''}` : ''}
+    </div>`;
+}
+
 function renderIndicators(highs, lows, closes, volumes) {
   const lastClose = closes.at(-1);
   const r = rsi(closes).at(-1);
@@ -2621,6 +2851,7 @@ async function loadTicker(ticker) {
   // Clear synthesis leftovers from any previous ticker
   const _oldBadge = document.getElementById('synth-cache-badge');
   if (_oldBadge) _oldBadge.remove();
+  resetEarnings();
 
   try {
     // Parallel fetch
@@ -2756,6 +2987,10 @@ document.querySelectorAll('.chart-btn[data-range]').forEach(btn => {
     } catch (e) { console.error(e); }
   });
 });
+
+// Earnings analysis — user-triggered only (each click can cost a Claude call
+// on a cache miss, so this must never be wired to page load)
+document.getElementById('earn-btn').addEventListener('click', toggleEarnings);
 
 // Patterns on/off toggle — redraws overlays without refetching
 document.getElementById('pattern-toggle').addEventListener('click', () => {

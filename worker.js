@@ -16,6 +16,7 @@
  *   GET  /api/market/scanner?preset=     → Day-trading momentum scanner (5 Pillars)
  *   GET  /api/market/ipos                → Upcoming IPO calendar (12h KV cache)
  *   GET  /api/market/econ-calendar?limit → Next FOMC / CPI events (static official schedule)
+ *   GET  /api/earnings/:ticker           → Last report: numbers, price reaction, call coverage (12h KV)
  *   GET  /api/watchlist/batch?symbols=   → Bulk fundamentals + RSI + Claude analysis
  *   GET  /api/daily                      → Daily Claude synthesis (6am PT cron) + midday pulse (11:30am PT) + EOD
  *
@@ -1925,6 +1926,384 @@ function handleEconCalendar(params, origin) {
   }, 200, origin);
 }
 
+/* ── Earnings analysis ───────────────────────────────────────────────────────
+ * User-triggered from the "Analyze Earnings" button on the research page, then
+ * cached 12h in KV so repeat clicks and other viewers do not re-bill Claude.
+ * Never call this from a polling path — see the credit-burn note on the daily
+ * self-heal.
+ *
+ * There is no transcript feed in this stack (Yahoo/Alpaca do not carry them), so
+ * "call commentary" is reconstructed from news published in the days around the
+ * report. The prompt forbids inventing quotes, and the payload reports which
+ * source the commentary came from so the UI can label it honestly.
+ */
+const EARNINGS_TTL = 43_200_000; // 12h
+
+/** Daily bars as [{iso, open, close, volume}], oldest first. */
+function chartDailyBars(chart) {
+  const res = chart?.chart?.result?.[0];
+  const ts  = res?.timestamp || [];
+  const q   = res?.indicators?.quote?.[0] || {};
+  const out = [];
+  for (let i = 0; i < ts.length; i++) {
+    if (q.close?.[i] == null) continue;
+    out.push({
+      iso:    new Date(ts[i] * 1000).toISOString().slice(0, 10),
+      open:   q.open?.[i] ?? null,
+      close:  q.close[i],
+      volume: q.volume?.[i] ?? null,
+    });
+  }
+  return out;
+}
+
+/**
+ * Measure how the tape absorbed a print.
+ *
+ * Yahoo does not reliably say whether a report landed before the open or after
+ * the close, so rather than trust a timestamp we test both the report session
+ * and the one after it and keep whichever moved more — that is the session that
+ * actually traded the news.
+ */
+function earningsReaction(bars, reportIso) {
+  const idx = bars.findIndex(b => b.iso >= reportIso);
+  if (idx <= 0) return null;
+
+  const candidates = [idx, idx + 1].filter(i => i < bars.length && i > 0);
+  let best = null;
+  for (const i of candidates) {
+    const prev = bars[i - 1];
+    const move = (bars[i].close - prev.close) / prev.close * 100;
+    if (!best || Math.abs(move) > Math.abs(best.move)) best = { i, move, prev };
+  }
+  if (!best) return null;
+
+  const bar   = bars[best.i];
+  const prior = best.prev;
+  const pct   = (v) => v == null ? null : Math.round(v * 100) / 100;
+
+  // Average volume over the 30 sessions before the print, for a relative read.
+  const preVols = bars.slice(Math.max(0, best.i - 31), best.i - 1).map(b => b.volume).filter(v => v != null);
+  const avgVol  = preVols.length ? preVols.reduce((a, b) => a + b, 0) / preVols.length : null;
+
+  const after5 = bars[best.i + 5];
+  const latest = bars[bars.length - 1];
+
+  // A report that landed today is still being traded — the bar is partial, so
+  // its volume is not comparable to completed sessions.
+  const isPartial = bar.iso === etToday();
+
+  return {
+    reportDate:   reportIso,
+    reactionDate: bar.iso,
+    // Compare dates, not indices: a missing bar for the report date would make
+    // index equality claim "same session" for a later date.
+    timing: bar.iso === reportIso ? 'same session as the report date' : 'session after the report date',
+    isPartial,
+    priorClose:   pct(prior.close),
+    reactionClose: pct(bar.close),
+    openGapPct:   bar.open != null ? pct((bar.open - prior.close) / prior.close * 100) : null,
+    day1Pct:      pct(best.move),
+    day5Pct:      after5 ? pct((after5.close - prior.close) / prior.close * 100) : null,
+    sinceReportPct: pct((latest.close - prior.close) / prior.close * 100),
+    volumeVsAvg:  !isPartial && avgVol && bar.volume ? Math.round(bar.volume / avgVol * 10) / 10 : null,
+    sessionsSince: bars.length - 1 - best.i,
+  };
+}
+
+/** Pull everything factual we can about the most recent completed report. */
+async function gatherEarningsFacts(sym, env) {
+  const modules = 'earnings,earningsHistory,earningsTrend,calendarEvents,price,summaryDetail,financialData';
+  const [sumRes, chartRes] = await Promise.allSettled([
+    yahooAuth(`/v10/finance/quoteSummary/${sym}`, `?modules=${modules}`, env),
+    yahoo(`/v8/finance/chart/${sym}`, '?range=1y&interval=1d'),
+  ]);
+
+  if (sumRes.status !== 'fulfilled') {
+    console.error(`[earnings] quoteSummary failed for ${sym}:`, sumRes.reason?.message);
+  }
+  const r = sumRes.status === 'fulfilled' ? (sumRes.value?.quoteSummary?.result?.[0] || {}) : {};
+  const bars = chartRes.status === 'fulfilled' ? chartDailyBars(chartRes.value) : [];
+
+  const num = (v) => v?.raw ?? (typeof v === 'number' ? v : null);
+  const today = etToday();
+
+  // ── Which report are we analysing? ──
+  // Yahoo splits these: `earningsDate` is normally the *next* scheduled report,
+  // while `earningsCallDate` is when the last call actually happened — that is
+  // the one we want. Take the most recent past date across both, and only fall
+  // back to gap-detection if neither carries a past date.
+  const cal = r.calendarEvents?.earnings || {};
+  const toIso = (e) => e?.fmt ?? (num(e) != null ? new Date(num(e) * 1000).toISOString().slice(0, 10) : null);
+  const callDates = (cal.earningsCallDate || []).map(toIso).filter(Boolean);
+  const dateDates = (cal.earningsDate || []).map(toIso).filter(Boolean);
+  const pastDates = [...callDates, ...dateDates].filter(d => d <= today).sort();
+
+  let reportIso  = pastDates.length ? pastDates[pastDates.length - 1] : null;
+  let dateSource = reportIso
+    ? (callDates.includes(reportIso) ? 'Yahoo earnings call date' : 'Yahoo earnings calendar')
+    : null;
+
+  // EPS is conventionally quoted to two decimals; Yahoo's consensus carries far
+  // more precision than that ("0.34634"), which reads like false accuracy when
+  // the model echoes it back.
+  const eps = (v) => v == null ? null : Math.round(v * 100) / 100;
+  const history = (r.earningsHistory?.history || []).map(h => ({
+    quarter:     h.quarter?.fmt ?? null,
+    epsActual:   eps(num(h.epsActual)),
+    epsEstimate: eps(num(h.epsEstimate)),
+    surprisePct: num(h.surprisePercent) != null ? Math.round(num(h.surprisePercent) * 1000) / 10 : null,
+  })).filter(h => h.quarter);
+  history.sort((a, b) => a.quarter.localeCompare(b.quarter));
+
+  if (!reportIso && history.length && bars.length) {
+    const qEnd = history[history.length - 1].quarter;
+    const from = isoAddDays(qEnd, 7), to = isoAddDays(qEnd, 70);
+    let best = null;
+    for (let i = 1; i < bars.length; i++) {
+      if (bars[i].iso < from || bars[i].iso > to) continue;
+      const gap = Math.abs((bars[i].close - bars[i - 1].close) / bars[i - 1].close);
+      if (!best || gap > best.gap) best = { gap, iso: bars[i].iso };
+    }
+    if (best) {
+      reportIso  = best.iso;
+      dateSource = 'inferred from the largest post-quarter price gap (Yahoo carried no past report date)';
+    }
+  }
+
+  const reaction = reportIso && bars.length ? earningsReaction(bars, reportIso) : null;
+
+  // ── News from the report window — the only place call commentary can come from ──
+  //
+  // Alpaca carries a searchable news archive, so with keys configured this works
+  // for any past quarter. Without them we fall back to Yahoo search, which only
+  // returns the latest ~20 items and cannot be queried by date — so coverage is
+  // recoverable for a fresh report and simply gone for an older one. Report which
+  // case we are in rather than substituting today's unrelated headlines.
+  let news = [];
+  let newsStatus = 'none-found';
+  const windowFrom = reportIso ? isoAddDays(reportIso, -1) : null;
+  const windowTo   = reportIso ? isoAddDays(reportIso, 5) : null;
+  const hasAlpaca  = Boolean(env?.ALPACA_KEY && env?.ALPACA_SECRET);
+
+  if (reportIso) {
+    if (hasAlpaca) {
+      try {
+        const d = await alpacaFetch(
+          `/v1beta1/news?symbols=${sym}&start=${windowFrom}T00:00:00Z&end=${windowTo}T00:00:00Z` +
+          '&limit=30&sort=asc&include_content=false', env,
+        );
+        news = (d.news || []).map(n => ({
+          date:    n.created_at?.slice(0, 10) ?? null,
+          source:  n.source ?? null,
+          title:   n.headline ?? '',
+          summary: (n.summary || '').replace(/\s+/g, ' ').slice(0, 400),
+        })).filter(n => n.title);
+      } catch (e) {
+        console.error(`[earnings] Alpaca news failed for ${sym}:`, e.message);
+      }
+    }
+    if (!news.length) {
+      try {
+        const resp = await fetch(
+          `https://query2.finance.yahoo.com/v1/finance/search?q=${sym}&quotesCount=0&newsCount=20`,
+          { headers: YAHOO_HEADERS },
+        );
+        if (resp.ok) {
+          const d = await resp.json();
+          news = (d.news || []).map(n => ({
+            date:    n.providerPublishTime ? new Date(n.providerPublishTime * 1000).toISOString().slice(0, 10) : null,
+            source:  n.publisher ?? null,
+            title:   n.title ?? '',
+            summary: '',
+          })).filter(n => n.title && n.date && n.date >= windowFrom && n.date <= windowTo);
+        }
+      } catch (_) {}
+    }
+    if (news.length) newsStatus = 'ok';
+    else if (!hasAlpaca) newsStatus = 'no-archive';
+  } else {
+    newsStatus = 'no-report-date';
+  }
+
+  const t0 = (r.earningsTrend?.trend || []).find(t => t.period === '0q') || {};
+  const t1 = (r.earningsTrend?.trend || []).find(t => t.period === '+1q') || {};
+
+  return {
+    ticker:     sym,
+    company:    r.price?.longName ?? r.price?.shortName ?? sym,
+    reportDate: reportIso,
+    dateSource,
+    history:    history.slice(-4),
+    revenue:    (r.earnings?.financialsChart?.quarterly || []).map(q => ({
+      quarter: q.date ?? null, revenue: num(q.revenue), earnings: num(q.earnings),
+    })).filter(q => q.quarter),
+    nextQuarter: {
+      epsEstimate:      eps(num(t1.earningsEstimate?.avg)),
+      revenueEstimate:  num(t1.revenueEstimate?.avg),
+      epsRevisedUp:     num(t1.epsRevisions?.upLast30days),
+      epsRevisedDown:   num(t1.epsRevisions?.downLast30days),
+      growthPct:        num(t1.growth) != null ? Math.round(num(t1.growth) * 1000) / 10 : null,
+    },
+    currentQuarter: {
+      epsEstimate: eps(num(t0.earningsEstimate?.avg)),
+      growthPct:   num(t0.growth) != null ? Math.round(num(t0.growth) * 1000) / 10 : null,
+    },
+    profile: {
+      marketCap:      num(r.price?.marketCap),
+      trailingPE:     num(r.summaryDetail?.trailingPE),
+      forwardPE:      num(r.summaryDetail?.forwardPE),
+      profitMargin:   num(r.financialData?.profitMargins) != null ? Math.round(num(r.financialData.profitMargins) * 1000) / 10 : null,
+      revenueGrowth:  num(r.financialData?.revenueGrowth) != null ? Math.round(num(r.financialData.revenueGrowth) * 1000) / 10 : null,
+      targetMean:     num(r.financialData?.targetMeanPrice),
+      currentPrice:   num(r.price?.regularMarketPrice),
+    },
+    reaction,
+    news,
+    newsStatus,
+    newsWindow: reportIso ? { from: windowFrom, to: windowTo } : null,
+    newsSource: news.length ? (hasAlpaca ? 'Alpaca news wire' : 'Yahoo Finance news') : null,
+  };
+}
+
+async function handleEarningsAnalysis(ticker, params, origin, env, ctx) {
+  if (!ticker) return err('ticker required', 400, origin);
+  const sym   = ticker.toUpperCase();
+  const force = params?.get('refresh') === '1';
+  const key   = `earnings:${sym}`;
+
+  if (!force) {
+    try {
+      const cached = await env?.REC_LOG?.get(key, 'json');
+      if (cached && Date.now() - cached.ts < EARNINGS_TTL) {
+        return json({ ...cached, cached: true }, 200, origin);
+      }
+    } catch (_) {}
+  }
+
+  if (!env?.ANTHROPIC_API_KEY) return err('ANTHROPIC_API_KEY not configured', 500, origin);
+
+  let facts;
+  try {
+    facts = await gatherEarningsFacts(sym, env);
+  } catch (e) {
+    console.error(`[earnings] data gather failed for ${sym}:`, e.message);
+    return err('could not load earnings data', 502, origin);
+  }
+
+  // ?facts=1 returns the gathered data without spending a Claude call — for
+  // checking what the upstreams actually returned.
+  if (params?.get('facts') === '1') {
+    return json({ ticker: sym, facts, analysis: null, factsOnly: true, ts: Date.now() }, 200, origin);
+  }
+
+  if (!facts.reportDate && !facts.history.length) {
+    return json({
+      ticker: sym, facts, analysis: null,
+      error: 'No earnings history available for this symbol.',
+      ts: Date.now(),
+    }, 200, origin);
+  }
+
+  const histLines = facts.history.map(h =>
+    `• ${h.quarter}: EPS ${h.epsActual ?? '?'} vs ${h.epsEstimate ?? '?'} est` +
+    (h.surprisePct != null ? ` (${h.surprisePct > 0 ? '+' : ''}${h.surprisePct}% surprise)` : '')).join('\n');
+
+  const revLines = facts.revenue.slice(-4).map(q =>
+    `• ${q.quarter}: revenue ${q.revenue != null ? '$' + (q.revenue / 1e9).toFixed(2) + 'B' : '?'}` +
+    `, earnings ${q.earnings != null ? '$' + (q.earnings / 1e9).toFixed(2) + 'B' : '?'}`).join('\n');
+
+  const rx = facts.reaction;
+  const rxBlock = rx ? [
+    `Report date: ${rx.reportDate} (${facts.dateSource})`,
+    `Session that traded the print: ${rx.reactionDate} (${rx.timing})`,
+    `Close before the print: $${rx.priorClose}`,
+    rx.openGapPct != null ? `Opening gap: ${rx.openGapPct > 0 ? '+' : ''}${rx.openGapPct}%` : null,
+    `Move that session: ${rx.day1Pct > 0 ? '+' : ''}${rx.day1Pct}% (${rx.isPartial ? 'last trade' : 'closed'} $${rx.reactionClose})`,
+    rx.isPartial ? 'NOTE: that session is still in progress — the move is live and incomplete, and session volume is not yet comparable to completed days. Describe it as the move so far, not a settled outcome.' : null,
+    rx.volumeVsAvg != null ? `Volume: ${rx.volumeVsAvg}× the prior 30-session average` : null,
+    rx.day5Pct != null ? `Five sessions later: ${rx.day5Pct > 0 ? '+' : ''}${rx.day5Pct}% vs the pre-print close` : null,
+    `As of the latest close (${rx.sessionsSince} sessions on): ${rx.sinceReportPct > 0 ? '+' : ''}${rx.sinceReportPct}% vs the pre-print close`,
+  ].filter(Boolean).join('\n') : 'Price reaction could not be measured — no usable report date.';
+
+  const NEWS_EMPTY = {
+    'no-archive':     'NONE AVAILABLE. This deployment has no news archive configured, so coverage from that date could not be retrieved. No commentary exists for you to summarise.',
+    'no-report-date': 'NONE AVAILABLE. The report date could not be established, so no coverage window could be searched.',
+    'none-found':     'NONE AVAILABLE. No coverage was published in the searched window.',
+  };
+  const newsBlock = facts.news.length
+    ? facts.news.map(n => `• [${n.date}${n.source ? ' · ' + n.source : ''}] ${n.title}${n.summary ? ` — ${n.summary}` : ''}`).join('\n')
+    : (NEWS_EMPTY[facts.newsStatus] || NEWS_EMPTY['none-found']);
+
+  const prompt = `You are an equity research analyst. Summarise the most recent earnings report for ${facts.company} (${sym}) for a trader who wants to know what happened and why the stock moved.
+
+EPS HISTORY (most recent last):
+${histLines || 'Not available'}
+
+QUARTERLY REVENUE / EARNINGS:
+${revLines || 'Not available'}
+
+PRICE REACTION (measured from daily bars):
+${rxBlock}
+
+FORWARD ESTIMATES:
+• Current quarter: EPS est ${facts.currentQuarter.epsEstimate ?? '?'}, growth ${facts.currentQuarter.growthPct ?? '?'}%
+• Next quarter: EPS est ${facts.nextQuarter.epsEstimate ?? '?'}, growth ${facts.nextQuarter.growthPct ?? '?'}%, analyst revisions last 30d: ${facts.nextQuarter.epsRevisedUp ?? 0} up / ${facts.nextQuarter.epsRevisedDown ?? 0} down
+
+CONTEXT: market cap ${facts.profile.marketCap ? '$' + (facts.profile.marketCap / 1e9).toFixed(1) + 'B' : '?'}, trailing P/E ${facts.profile.trailingPE?.toFixed(1) ?? '?'}, forward P/E ${facts.profile.forwardPE?.toFixed(1) ?? '?'}, profit margin ${facts.profile.profitMargin ?? '?'}%, revenue growth ${facts.profile.revenueGrowth ?? '?'}%, price $${facts.profile.currentPrice ?? '?'}, mean analyst target $${facts.profile.targetMean ?? '?'}
+
+NEWS PUBLISHED AROUND THE REPORT${facts.newsWindow ? ` (window ${facts.newsWindow.from} → ${facts.newsWindow.to}${facts.newsSource ? ', via ' + facts.newsSource : ''})` : ''}:
+${newsBlock}
+
+Return ONLY valid JSON (no markdown fences):
+{
+  "quarter": "which quarter this report covered, e.g. Q2 FY2026",
+  "verdict": "BEAT" | "MISS" | "MIXED",
+  "headline": "one sentence, max 130 chars, on what the print did to the stock",
+  "scorecard": [ { "metric": "EPS", "actual": "$1.42", "estimate": "$1.30", "result": "beat" | "miss" | "inline" } ],
+  "highlights": [ "3-5 bullets of the most important context from the numbers — growth, margins, segment or guidance detail" ],
+  "callCommentary": [ { "theme": "short label", "detail": "what management or coverage said", "source": "publication name" } ],
+  "priceAction": "2-3 sentences explaining the move: what the market rewarded or punished, and whether it held",
+  "watchNext": [ "2-3 forward-looking items for the next report" ]
+}
+
+CRITICAL RULES:
+- Every number you cite must come from the data above. Do not estimate or recall figures from training data.
+- callCommentary must be grounded ONLY in the NEWS block above, with "source" naming the publication it came from. Never invent or paraphrase a quote that is not in that block. If the news block contains no management commentary or guidance detail, return an empty array — an empty array is the correct answer, not a reason to improvise.
+- scorecard: every entry needs both an actual and an estimate drawn from the data above. If a metric has no estimate in the data, set "estimate" to "not available" and "result" to "n/a" — never call something a beat or a miss without an estimate to compare it against. Reported revenue is listed above without a consensus figure, so it can never be scored as a beat or miss.
+- If the price reaction could not be measured, say so plainly in priceAction rather than guessing.`;
+
+  let analysis = null;
+  try {
+    const text    = await workerClaude(prompt, env, 1800);
+    const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    analysis = JSON.parse(cleaned);
+  } catch (e) {
+    console.error(`[earnings] analysis failed for ${sym}:`, e.message);
+    return err('analysis generation failed', 502, origin);
+  }
+
+  // Enforce the rules the prompt asks for rather than trusting them. A metric
+  // with no consensus figure cannot be a beat or a miss — the model gets this
+  // right most of the time, and this makes it right every time.
+  const arr = (v) => Array.isArray(v) ? v : [];
+  const MISSING = /^(not available|n\/?a|none|unknown|—|-|\?|)$/i;
+  analysis.scorecard = arr(analysis.scorecard).map(s => {
+    const estimate = String(s?.estimate ?? '').trim();
+    return MISSING.test(estimate)
+      ? { ...s, estimate: 'not available', result: 'n/a' }
+      : s;
+  });
+  analysis.highlights     = arr(analysis.highlights);
+  analysis.watchNext      = arr(analysis.watchNext);
+  // Commentary must be attributable; drop anything that lost its source.
+  analysis.callCommentary = arr(analysis.callCommentary).filter(c => c?.detail && c?.source);
+
+  const payload = { ticker: sym, facts, analysis, ts: Date.now() };
+  try { await env?.REC_LOG?.put(key, JSON.stringify(payload), { expirationTtl: 172800 }); } catch (_) {}
+  return json(payload, 200, origin);
+}
+
 /* ── Week Ahead (Friday only, 18h KV cache) ── */
 async function handleWeekAhead(origin, env) {
   try {
@@ -2690,6 +3069,7 @@ export default {
         case 'claude':   return await handleClaude(request, env, origin);
         case 'log-rec':  return await handleLogRec(request, env, origin);
         case 'track':    return await handleTrack(sub, env, origin);
+        case 'earnings': return await handleEarningsAnalysis(sub, url.searchParams, origin, env, ctx);
         case 'daily':    return await handleDailyGet(origin, env, ctx);
         case 'market':
           if (sub === 'snapshot')    return await handleMarketSnapshot(origin, env);

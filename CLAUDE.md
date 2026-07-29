@@ -66,7 +66,32 @@ GET  /api/market/sectors          Sector summaries + top opportunity/avoid per s
 GET  /api/market/scanner?preset=  Day-trading momentum scanner (5 Pillars, 90s KV cache)
 GET  /api/market/golden-cross     Names set up for a golden cross (1h KV cache)
 GET  /api/market/econ-calendar    Next FOMC / CPI events from the official schedule
+GET  /api/earnings/:ticker        Last report: numbers, price reaction, call coverage (12h KV)
 ```
+
+**Earnings analysis (`/api/earnings/:ticker`):** powers the "Analyze Earnings" button under Catalysts
+on `index.html`. Gathers EPS history, quarterly revenue, forward estimates and revisions, a price
+reaction measured from daily bars, and news from the report window, then runs one Claude synthesis
+cached 12h in KV. **Button-triggered only** — never wire it to page load (see the credit-burn note
+under KV keys). `?refresh=1` forces regeneration; `?facts=1` returns the gathered data without
+spending a Claude call, which is the cheap way to debug upstream data.
+
+Details worth knowing:
+- **Report date** comes from Yahoo's `calendarEvents.earnings.earningsCallDate` — `earningsDate` is
+  normally the *next* scheduled report, not the last one. If neither carries a past date, the date is
+  inferred from the largest post-quarter price gap and `dateSource` says so.
+- **Which session traded the print** is resolved by testing the report date and the following
+  session and keeping the larger move, since Yahoo does not reliably flag before-open vs after-close.
+  A report that landed today sets `isPartial`, which suppresses the volume ratio (a partial bar is
+  not comparable to completed sessions).
+- **Call commentary has no transcript feed.** It is reconstructed from news in the report window and
+  each item carries its source. Without `ALPACA_KEY`/`ALPACA_SECRET` the only source is Yahoo search,
+  which returns ~20 recent items and cannot be queried by date — so commentary is available for a
+  fresh report and simply absent for an older one. `newsStatus` (`ok` / `no-archive` / `none-found` /
+  `no-report-date`) drives what the UI says, and the prompt is told to return an empty array rather
+  than invent a quote. Setting the Alpaca secrets unlocks the archive for past quarters.
+- Scorecard rows are sanitised server-side: a metric with no consensus figure is forced to `n/a`
+  rather than trusting the model not to call it a beat.
 
 **Economic calendar (`FOMC_MEETINGS` / `CPI_RELEASES`):** the single source of truth for macro
 event dates, hand-maintained near the top of `worker.js` from
@@ -109,6 +134,7 @@ daily:snapshot     — 6am cron Claude synthesis
 daily:midday       — 11:30am cron midday pulse (narrative, topics, tomorrow, trades, bigMovers)
 daily:eod          — 1:15pm cron EOD summary
 analysis:{TICKER}  — on-demand per-ticker Claude analysis
+earnings:{TICKER}  — earnings analysis for the last report (12h TTL)
 fund:{TICKER}      — Yahoo fundamentals cache (6h TTL)
 market:ipos        — IPO calendar (12h TTL)
 market:sectors     — Sector summaries + picks (4h TTL)
@@ -130,6 +156,10 @@ The Scanner tab hosts four presets. Three (Momentum, Pre-Market Gappers, All Mov
 to pick the endpoint, renderer, header copy, and legend.
 
 `index.html` — per-ticker research page with 16 sections (price/SMA, performance, catalysts, short interest, insider trades, unusual options, dark pool, trade signals, option strategies, analyst targets, 13F holdings, technicals, sentiment, fundamentals, AI synthesis, recommendation history).
+
+The Catalysts card carries an "Analyze Earnings" button that expands an inline panel
+(`renderEarnings()`, backed by `/api/earnings/:ticker`). It fetches once per ticker and then just
+toggles, and `resetEarnings()` clears it on ticker change.
 
 All technical indicators (RSI, MACD, Bollinger, EMA crossovers, support/resistance) are computed client-side from Yahoo OHLCV. Chart rendering uses TradingView Lightweight Charts.
 
