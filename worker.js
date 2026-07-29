@@ -15,6 +15,7 @@
  *   GET  /api/market/movers              → Pre-market / day gainers + losers
  *   GET  /api/market/scanner?preset=     → Day-trading momentum scanner (5 Pillars)
  *   GET  /api/market/ipos                → Upcoming IPO calendar (12h KV cache)
+ *   GET  /api/market/econ-calendar?limit → Next FOMC / CPI events (static official schedule)
  *   GET  /api/watchlist/batch?symbols=   → Bulk fundamentals + RSI + Claude analysis
  *   GET  /api/daily                      → Daily Claude synthesis (6am PT cron) + midday pulse (11:30am PT) + EOD
  *
@@ -83,6 +84,136 @@ const SECTOR_STOCKS = {
   'Communication Services': ['META', 'GOOGL','NFLX'],
   'Utilities':              ['NEE',  'DUK',  'SO'],
 };
+
+/* ── Economic calendar ────────────────────────────────────────────────────────
+ * Hand-maintained from the official sources. This is the ONLY place macro event
+ * dates are allowed to come from — never let Claude infer them from memory, or
+ * it will emit dates from its training cutoff (that bug shipped an "FOMC in 7
+ * days" catalyst on every ticker page regardless of the real schedule).
+ *
+ * FOMC:  https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+ * CPI:   https://www.bls.gov/schedule/news_release/cpi.htm
+ *
+ * Refresh when ECON_CALENDAR_THROUGH is within a few months: the Fed publishes
+ * two years ahead each summer, BLS publishes the next year each fall.
+ */
+const ECON_CALENDAR_THROUGH = '2027-12-08'; // last date covered by the tables below
+
+// Two-day meetings; the rate decision lands at 2:00pm ET on the second day.
+// sep = meeting also publishes the Summary of Economic Projections ("dot plot").
+const FOMC_MEETINGS = [
+  { start: '2026-01-27', end: '2026-01-28', sep: false },
+  { start: '2026-03-17', end: '2026-03-18', sep: true  },
+  { start: '2026-04-28', end: '2026-04-29', sep: false },
+  { start: '2026-06-16', end: '2026-06-17', sep: true  },
+  { start: '2026-07-28', end: '2026-07-29', sep: false },
+  { start: '2026-09-15', end: '2026-09-16', sep: true  },
+  { start: '2026-10-27', end: '2026-10-28', sep: false },
+  { start: '2026-12-08', end: '2026-12-09', sep: true  },
+  { start: '2027-01-26', end: '2027-01-27', sep: false },
+  { start: '2027-03-16', end: '2027-03-17', sep: true  },
+  { start: '2027-04-27', end: '2027-04-28', sep: false },
+  { start: '2027-06-08', end: '2027-06-09', sep: true  },
+  { start: '2027-07-27', end: '2027-07-28', sep: false },
+  { start: '2027-09-14', end: '2027-09-15', sep: true  },
+  { start: '2027-10-26', end: '2027-10-27', sep: false },
+  { start: '2027-12-07', end: '2027-12-08', sep: true  },
+];
+
+// BLS Consumer Price Index, 8:30am ET. `ref` is the month the print covers.
+const CPI_RELEASES = [
+  { date: '2026-08-12', ref: 'July 2026' },
+  { date: '2026-09-11', ref: 'August 2026' },
+  { date: '2026-10-14', ref: 'September 2026' },
+  { date: '2026-11-10', ref: 'October 2026' },
+  { date: '2026-12-10', ref: 'November 2026' },
+];
+
+/** Today in US Eastern (market) time as an ISO `YYYY-MM-DD` string. */
+const etToday = () =>
+  new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+
+/** Format an ISO date without letting the local timezone shift the day. */
+function isoLabel(isoDate, opts = {}) {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString('en-US', {
+    timeZone: 'UTC', month: 'short', day: 'numeric', ...opts,
+  });
+}
+
+/** Add `days` to an ISO date, returning a new ISO date. */
+function isoAddDays(isoDate, days) {
+  const [y, m, d] = isoDate.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + days));
+  return dt.toISOString().slice(0, 10);
+}
+
+/** "Jul 28–29" for a same-month meeting, "Apr 28–May 1" when it straddles months. */
+function isoRangeLabel(startIso, endIso) {
+  const sameMonth = startIso.slice(0, 7) === endIso.slice(0, 7);
+  const end = sameMonth ? String(Number(endIso.slice(8, 10))) : isoLabel(endIso);
+  return `${isoLabel(startIso)}–${end}`;
+}
+
+/**
+ * Every known macro event as a flat, date-sorted list.
+ * ISO dates compare correctly as strings, so callers can filter with < / >.
+ */
+function econCalendar() {
+  const events = [];
+
+  for (const m of FOMC_MEETINGS) {
+    const range = isoRangeLabel(m.start, m.end);
+    events.push({
+      date:   m.end,
+      type:   'Fed',
+      impact: 'HIGH',
+      title:  'FOMC rate decision',
+      note:   `2:00pm ET statement plus Chair press conference, closing the ${range} meeting.` +
+              (m.sep ? ' Includes the Summary of Economic Projections (dot plot).' : ''),
+    });
+    // Minutes are released three weeks after the policy decision, by Fed rule.
+    events.push({
+      date:   isoAddDays(m.end, 21),
+      type:   'Fed',
+      impact: 'MEDIUM',
+      title:  'FOMC minutes',
+      note:   `2:00pm ET release of minutes from the ${range} meeting.`,
+    });
+  }
+
+  for (const c of CPI_RELEASES) {
+    events.push({
+      date:   c.date,
+      type:   'Economic',
+      impact: 'HIGH',
+      title:  `CPI report · ${c.ref}`,
+      note:   `8:30am ET. Headline and core inflation for ${c.ref}.`,
+    });
+  }
+
+  return events.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+/** Macro events falling within [startIso, endIso] inclusive. */
+function econEventsBetween(startIso, endIso) {
+  return econCalendar().filter(e => e.date >= startIso && e.date <= endIso);
+}
+
+/** The next `limit` macro events on or after `fromIso` (defaults to today ET). */
+function econEventsAhead(limit = 5, fromIso = etToday()) {
+  return econCalendar().filter(e => e.date >= fromIso).slice(0, limit);
+}
+
+/**
+ * Render events as prompt lines. Returns '' when there are none so callers can
+ * fall back to explicit "no scheduled events" wording rather than an empty list.
+ */
+function econPromptLines(events) {
+  return events
+    .map(e => `• ${isoLabel(e.date, { weekday: 'short', year: 'numeric' })} — ${e.title} [${e.type}, ${e.impact}]: ${e.note}`)
+    .join('\n');
+}
 
 /* ── CORS ── */
 function isAllowedOrigin(origin) {
@@ -1772,6 +1903,28 @@ Return ONLY valid JSON (no markdown):
   }
 }
 
+/* ── Economic calendar endpoint ──
+ * Static table lookup — no upstream fetch, no KV, so it is always in sync with
+ * the same source the Claude prompts use. `stale` warns the frontend when the
+ * hand-maintained tables are running out of runway.
+ */
+function handleEconCalendar(params, origin) {
+  const limit  = Math.min(Math.max(parseInt(params.get('limit') || '6', 10) || 6, 1), 25);
+  const today  = etToday();
+  const events = econEventsAhead(limit, today).map(e => ({
+    ...e,
+    label: isoLabel(e.date, { weekday: 'short', year: 'numeric' }),
+  }));
+
+  return json({
+    events,
+    asOf:  today,
+    through: ECON_CALENDAR_THROUGH,
+    stale: today > ECON_CALENDAR_THROUGH || events.length < limit,
+    ts:    Date.now(),
+  }, 200, origin);
+}
+
 /* ── Week Ahead (Friday only, 18h KV cache) ── */
 async function handleWeekAhead(origin, env) {
   try {
@@ -1858,9 +2011,17 @@ async function handleWeekAhead(origin, env) {
     }
   } catch (_) {}
 
+  const weekEcon = econEventsBetween(monIso, friIso);
+  const econBlock = weekEcon.length
+    ? 'CONFIRMED MACRO CALENDAR for this week (official Fed / BLS schedule — use these exact dates, do NOT alter or add others):\n' +
+      econPromptLines(weekEcon)
+    : 'No FOMC or CPI events fall within this week. Do NOT invent any.';
+
   const prompt = `You are a professional stock market strategist. Today is ${today}.
 
 ${earningsBlock}
+
+${econBlock}
 
 RECENT HEADLINES (for macro/geopolitical context):
 ${newsLines || 'Not available'}
@@ -1869,8 +2030,9 @@ Generate a "Week Ahead" preview for the trading week of ${weekOf}.
 
 STRICT RULES:
 1. Earnings events: ONLY include tickers from the CONFIRMED EARNINGS list above. Use the exact dates given. Do NOT add earnings for any company not listed.
-2. Fed / Economic / Geopolitical / Macro events: use your knowledge of the scheduled economic calendar and current events. You may estimate dates for these.
-3. Each Earnings title must include the full company name and ticker symbol.
+2. Fed and scheduled-economic-data events (FOMC decisions, FOMC minutes, CPI): ONLY include events from the CONFIRMED MACRO CALENDAR above, using the exact dates given. Never state or estimate a date for an FOMC meeting or CPI print from memory — your training data is out of date and those dates would be wrong.
+3. Geopolitical / Macro events may be drawn from the headlines above, but describe them as ongoing themes rather than assigning them a specific scheduled date you cannot verify.
+4. Each Earnings title must include the full company name and ticker symbol.
 
 Return ONLY valid JSON (no markdown):
 {
@@ -1974,6 +2136,9 @@ ${marketLines || 'Not available'}
 RECENT NEWS HEADLINES:
 ${newsLines || 'Not available'}
 
+UPCOMING MACRO CALENDAR (official Fed / BLS schedule — the only source for these dates):
+${econPromptLines(econEventsAhead(4)) || 'Nothing scheduled in the tracked calendar.'}
+
 Generate a morning market briefing as valid JSON with exactly these fields:
 {
   "headline": "One-sentence market summary (max 120 chars)",
@@ -1989,6 +2154,7 @@ Generate a morning market briefing as valid JSON with exactly these fields:
 }
 
 newsCards must have exactly 8 items. For opportunity and avoid, choose from: ${DEFAULT_WATCHLIST.join(', ')}.
+If you reference an FOMC meeting or CPI release, use ONLY the macro calendar above — never a date recalled from training data.
 Return ONLY valid JSON, no markdown fences.`;
 
   let snapshot = null;
@@ -2125,11 +2291,16 @@ ${marketLines || 'Not available'}
 TODAY'S NEWS:
 ${newsLines || 'Not available'}
 
+UPCOMING MACRO CALENDAR (official Fed / BLS schedule — the only source for these dates):
+${econPromptLines(econEventsAhead(4)) || 'Nothing scheduled in the tracked calendar.'}
+
 Write a concise end-of-day market summary as valid JSON (no markdown):
 {
   "headline": "One-sentence session summary (max 120 chars)",
   "body": "3-4 sentences: overall session character, key sector rotation or notable movers, what the close sets up for tomorrow."
-}`;
+}
+
+If you reference an FOMC meeting or CPI release, use ONLY the macro calendar above — never a date recalled from training data.`;
 
   let eod;
   try {
@@ -2299,6 +2470,12 @@ ${wlLines.join('\n') || 'Not available'}
 CONFIRMED EARNINGS for ${nextLabel} (from Yahoo Finance — the ONLY tickers you may cite for earnings tomorrow):
 ${confirmedEarnings.length ? confirmedEarnings.join(', ') : 'None from the watchlist'}
 
+CONFIRMED MACRO CALENDAR for ${nextLabel} (official Fed / BLS schedule — the ONLY Fed/economic events you may cite for tomorrow):
+${econPromptLines(econEventsBetween(nextIso, nextIso)) || 'No FOMC or CPI events scheduled for tomorrow.'}
+
+MACRO CALENDAR still ahead (context only — do NOT list these as tomorrow's events):
+${econPromptLines(econEventsAhead(4, isoAddDays(nextIso, 1))) || 'Nothing scheduled in the tracked calendar.'}
+
 TODAY'S HEADLINES:
 ${newsLines || 'Not available'}
 
@@ -2322,7 +2499,7 @@ Generate a midday market pulse as valid JSON (no markdown fences):
 
 RULES:
 - topics: 3-5 cards, only themes actually moving today's market. Vary tags as appropriate.
-- tomorrow: 3-6 events for ${nextLabel} (the next trading day). For Earnings events use ONLY the confirmed list above; for Fed/CPI/economic-calendar/geopolitical events use your knowledge of the scheduled calendar.
+- tomorrow: 3-6 events for ${nextLabel} (the next trading day). For Earnings events use ONLY the confirmed list above. For Fed/CPI/economic-calendar events use ONLY the confirmed macro calendar above — never date an FOMC meeting or CPI print from memory, your training data is out of date. If neither list has enough entries, fill the remainder with Macro/Geopolitical themes drawn from today's headlines, phrased as ongoing themes without invented dates.
 - trades: 1-2 ideas per style. day/swing/options/longTerm tickers must come from the WATCHLIST above, chosen on today's specific price action (momentum, pullbacks to support, unusual volume, oversold bounces). If no watchlist name fits a style, return an empty array for it.
 Return ONLY valid JSON.`;
 
@@ -2522,6 +2699,7 @@ export default {
           if (sub === 'sectors')    return await handleMarketSectors(origin, env, ctx, url.searchParams);
           if (sub === 'scanner')    return await handleScanner(url.searchParams, origin, env, ctx);
           if (sub === 'golden-cross') return await handleGoldenCross(origin, env);
+          if (sub === 'econ-calendar') return handleEconCalendar(url.searchParams, origin);
           return err('unknown market route', 404, origin);
         case 'analysis':
           if (!sub) return err('ticker required', 400, origin);

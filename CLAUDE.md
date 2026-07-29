@@ -65,7 +65,19 @@ GET  /api/daily                   Daily Claude synthesis (served from KV)
 GET  /api/market/sectors          Sector summaries + top opportunity/avoid per sector (4h KV cache)
 GET  /api/market/scanner?preset=  Day-trading momentum scanner (5 Pillars, 90s KV cache)
 GET  /api/market/golden-cross     Names set up for a golden cross (1h KV cache)
+GET  /api/market/econ-calendar    Next FOMC / CPI events from the official schedule
 ```
+
+**Economic calendar (`FOMC_MEETINGS` / `CPI_RELEASES`):** the single source of truth for macro
+event dates, hand-maintained near the top of `worker.js` from
+[federalreserve.gov](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm) and
+[bls.gov](https://www.bls.gov/schedule/news_release/cpi.htm). **Never let Claude date an FOMC
+meeting or CPI print from memory** — it answers from its training cutoff and silently ships a wrong
+date. Every prompt that can mention macro timing (morning briefing, midday pulse, EOD, week ahead)
+is fed `econPromptLines()` and told to use only those dates; `index.html` pulls the same table via
+`/api/market/econ-calendar`. FOMC minutes are derived as decision day + 21 days per Fed practice.
+Refresh the tables when `ECON_CALENDAR_THROUGH` gets close — the endpoint reports `stale: true`
+once the runway runs short.
 
 **Moving averages:** the watchlist's `vs 50D` / `vs 200D` / `50D vs 200D` columns use Yahoo's
 `summaryDetail.fiftyDayAverage` / `twoHundredDayAverage` — simple moving averages of daily closes

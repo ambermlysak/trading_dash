@@ -357,6 +357,8 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
 .catalyst-item:last-child { border-bottom: none; }
 .catalyst-date { font-family: var(--mono); font-size: 11px; color: var(--cyan); letter-spacing: 0.04em; }
 .catalyst-title { font-size: 13px; color: var(--ink-1); line-height: 1.4; }
+.catalyst-note { display: block; font-size: 11px; color: var(--ink-3); line-height: 1.4; margin-top: 3px; }
+.catalyst-empty { font-size: 12px; color: var(--ink-3); padding: 8px 0; }
 .catalyst-impact { font-family: var(--mono); font-size: 9px; padding: 2px 6px; border-radius: 3px; letter-spacing: 0.06em; text-transform: uppercase; height: fit-content; }
 .catalyst-impact.high { background: var(--bear-soft); color: var(--bear); }
 .catalyst-impact.med { background: var(--amber-soft); color: var(--amber); }
@@ -829,7 +831,15 @@ const fmt = {
     return v.toString();
   },
   date: (ts) => ts == null ? '—' : new Date(ts*1000).toLocaleDateString('en-US', {month:'short', day:'numeric'}),
-  dateLong: (ts) => ts == null ? '—' : new Date(ts*1000).toLocaleDateString('en-US', {month:'short', day:'numeric', year:'2-digit'}),
+  // Calendar dates (earnings, ex-dividend, macro events) are day-granularity, and
+  // Yahoo stamps them at UTC midnight — rendering those in local time shows the
+  // previous day anywhere west of UTC. Format in UTC so the day never shifts.
+  dateLong: (ts) => ts == null ? '—' : new Date(ts*1000).toLocaleDateString('en-US', {timeZone:'UTC', month:'short', day:'numeric', year:'2-digit'}),
+  dateLongIso: (iso) => {
+    if (!iso) return '—';
+    const [y, m, d] = iso.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString('en-US', {timeZone:'UTC', month:'short', day:'numeric', year:'2-digit'});
+  },
 };
 
 /* ============================================================
@@ -1710,15 +1720,20 @@ function renderPerformance(closes, timestamps, lastPrice) {
   smaRow.innerHTML = pill('SMA 20', s20) + pill('SMA 50', s50) + pill('SMA 200', s200);
 }
 
-function renderCatalysts(quote) {
+async function renderCatalysts(quote) {
   const cal = quote.calendarEvents || {};
   const items = [];
+
+  // Ticker-specific events come from Yahoo. `iso` is the sort key; everything is
+  // rendered in one chronological list regardless of source.
+  const isoOf = (ts) => new Date(ts * 1000).toISOString().slice(0, 10);
 
   if (cal.earnings?.earningsDate?.length) {
     const ts = cal.earnings.earningsDate[0]?.raw;
     if (ts) {
       const est = cal.earnings.earningsAverage?.raw;
       items.push({
+        iso: isoOf(ts),
         date: fmt.dateLong(ts),
         title: `Q${Math.ceil(((new Date(ts*1000)).getMonth() + 1) / 3)} earnings · EPS est ${est ? '$'+est.toFixed(2) : '—'}`,
         impact: 'high',
@@ -1726,32 +1741,47 @@ function renderCatalysts(quote) {
     }
   }
   if (cal.exDividendDate?.raw) {
-    items.push({ date: fmt.dateLong(cal.exDividendDate.raw), title: 'Ex-dividend date', impact: 'med' });
+    items.push({ iso: isoOf(cal.exDividendDate.raw), date: fmt.dateLong(cal.exDividendDate.raw), title: 'Ex-dividend date', impact: 'med' });
   }
   if (cal.dividendDate?.raw) {
-    items.push({ date: fmt.dateLong(cal.dividendDate.raw), title: 'Dividend pay date', impact: 'low' });
+    items.push({ iso: isoOf(cal.dividendDate.raw), date: fmt.dateLong(cal.dividendDate.raw), title: 'Dividend pay date', impact: 'low' });
   }
 
-  // Macro context (always shown — manually curated, can be replaced with a feed)
-  const today = Date.now() / 1000;
-  const macro = [
-    { offset: 7,  title: 'FOMC meeting · rate decision', impact: 'high' },
-    { offset: 14, title: 'CPI release', impact: 'high' },
-    { offset: 21, title: 'Sector rotation watch · earnings season midpoint', impact: 'med' },
-  ];
-  for (const m of macro) {
-    items.push({ date: fmt.dateLong(today + m.offset * 86400), title: m.title, impact: m.impact });
-  }
-
-  document.getElementById('catalysts-meta').textContent = `${items.length} upcoming`;
+  // Macro events come from the Worker's official Fed/BLS calendar. Never
+  // synthesize these client-side — a guessed FOMC date is worse than none.
+  const meta = document.getElementById('catalysts-meta');
   const list = document.getElementById('catalyst-list');
-  list.innerHTML = items.map(i => `
+  let macroFailed = false;
+  try {
+    const { events = [] } = await api('/market/econ-calendar?limit=4');
+    // Format locally rather than using the API's verbose `label` — the date column
+    // is narrow, so every row uses the same compact "Aug 12, 26" form.
+    for (const e of events) {
+      items.push({
+        iso: e.date,
+        date: fmt.dateLongIso(e.date),
+        title: e.title,
+        impact: e.impact === 'HIGH' ? 'high' : e.impact === 'MEDIUM' ? 'med' : 'low',
+        note: e.note,
+      });
+    }
+  } catch (_) {
+    macroFailed = true;
+  }
+
+  items.sort((a, b) => a.iso.localeCompare(b.iso));
+
+  meta.textContent = items.length
+    ? `${items.length} upcoming${macroFailed ? ' · macro unavailable' : ''}`
+    : 'none scheduled';
+
+  list.innerHTML = items.length ? items.map(i => `
     <div class="catalyst-item">
-      <div class="catalyst-date">${i.date}</div>
-      <div class="catalyst-title">${i.title}</div>
+      <div class="catalyst-date">${esc(i.date)}</div>
+      <div class="catalyst-title">${esc(i.title)}${i.note ? `<span class="catalyst-note">${esc(i.note)}</span>` : ''}</div>
       <div class="catalyst-impact ${i.impact}">${i.impact}</div>
     </div>
-  `).join('');
+  `).join('') : '<div class="catalyst-empty">No scheduled catalysts found.</div>';
 }
 
 function renderIndicators(highs, lows, closes, volumes) {
