@@ -465,29 +465,36 @@ function emaSeries(values, period) {
   return out;
 }
 
-/* Returns null when history is too short to trust EMA200.
- * spread > 0 → EMA50 above EMA200 (golden cross in effect)
- * spread < 0 → EMA50 below EMA200 (death cross in effect) */
-function emaCrossState(closes, fast = 50, slow = 200) {
-  const vals = (closes || []).filter(v => v != null && isFinite(v));
-  // Require real smoothing runway past the EMA200 seed, not just `slow` bars.
-  if (vals.length < slow + 250) return null;
+/* Simple moving average series — plain rolling mean, no seed to wash out, so
+ * SMA200 is exact from bar `period - 1` onward. */
+function smaSeries(values, period) {
+  if (!Array.isArray(values) || values.length < period) return null;
+  const out = new Array(values.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    sum += values[i];
+    if (i >= period) sum -= values[i - period];
+    if (i >= period - 1) out[i] = sum / period;
+  }
+  return out;
+}
 
-  const sf = emaSeries(vals, fast);
-  const ss = emaSeries(vals, slow);
+/* Cross geometry for any fast/slow moving-average pair.
+ * spread > 0 → fast above slow (golden cross in effect)
+ * spread < 0 → fast below slow (death cross in effect) */
+function crossStateFrom(sf, ss) {
   if (!sf || !ss) return null;
-
-  const n = vals.length;
+  const n = sf.length;
   const back = EMA_CROSS_SLOPE_BARS;
-  const emaFast = sf[n - 1], emaSlow = ss[n - 1];
+  const maFast = sf[n - 1], maSlow = ss[n - 1];
   const prevFast = sf[n - 1 - back], prevSlow = ss[n - 1 - back];
-  if (!emaFast || !emaSlow || !prevFast || !prevSlow) return null;
+  if (!maFast || !maSlow || !prevFast || !prevSlow) return null;
 
   const r2 = v => Math.round(v * 100) / 100;
-  const spread     = (emaFast - emaSlow) / emaSlow * 100;
+  const spread     = (maFast - maSlow) / maSlow * 100;
   const prevSpread = (prevFast - prevSlow) / prevSlow * 100;
   const gap        = Math.abs(spread);
-  const fastSlope  = (emaFast - prevFast) / prevFast * 100;
+  const fastSlope  = (maFast - prevFast) / prevFast * 100;
 
   // Projected sessions to the cross, from the recent rate of spread convergence.
   // Only meaningful while the spread is actually moving toward zero.
@@ -498,8 +505,8 @@ function emaCrossState(closes, fast = 50, slow = 200) {
   const golden = spread > 0;
 
   return {
-    ema50:  r2(emaFast),
-    ema200: r2(emaSlow),
+    fast:   r2(maFast),
+    slow:   r2(maSlow),
     spread: r2(spread),
     gap:    r2(gap),
     slope:  Math.round(fastSlope * 1000) / 1000,
@@ -510,6 +517,31 @@ function emaCrossState(closes, fast = 50, slow = 200) {
     deathSetup:   golden && fastSlope < 0 && near,
     near,
   };
+}
+
+/* Returns null when history is too short to trust EMA200. */
+function emaCrossState(closes, fast = 50, slow = 200) {
+  const vals = (closes || []).filter(v => v != null && isFinite(v));
+  // Require real smoothing runway past the EMA200 seed, not just `slow` bars.
+  if (vals.length < slow + 250) return null;
+
+  const st = crossStateFrom(emaSeries(vals, fast), emaSeries(vals, slow));
+  if (!st) return null;
+  const { fast: f, slow: s, ...rest } = st;
+  return { ema50: f, ema200: s, ...rest };
+}
+
+/* SMA counterpart. Needs only `slow` bars plus the slope lookback — a rolling
+ * mean has no seed weight to dilute — so it resolves on histories where
+ * emaCrossState() still returns null. */
+function smaCrossState(closes, fast = 50, slow = 200) {
+  const vals = (closes || []).filter(v => v != null && isFinite(v));
+  if (vals.length < slow + EMA_CROSS_SLOPE_BARS) return null;
+
+  const st = crossStateFrom(smaSeries(vals, fast), smaSeries(vals, slow));
+  if (!st) return null;
+  const { fast: f, slow: s, ...rest } = st;
+  return { sma50: f, sma200: s, ...rest };
 }
 
 /* Yahoo v7 spark: close-only series for many symbols per request (max 20).
@@ -1361,13 +1393,15 @@ async function goldenCrossUniverse(env) {
   return { symbols: list, source, watchlistCount };
 }
 
-async function handleGoldenCross(origin, env) {
+async function handleGoldenCross(origin, env, params) {
   const KV_KEY = 'market:goldencross';
   const TTL = 3_600_000; // 1h — EMA crosses move on a daily timescale
+  const SCHEMA = 2;      // bump when the row shape changes, to retire old caches
+  const force = params?.get('refresh') === '1';
 
   try {
-    const cached = await env?.REC_LOG?.get(KV_KEY, 'json');
-    if (cached && Date.now() - (cached.ts || 0) < TTL) {
+    const cached = force ? null : await env?.REC_LOG?.get(KV_KEY, 'json');
+    if (cached && cached.schema === SCHEMA && Date.now() - (cached.ts || 0) < TTL) {
       return json({ ...cached, cached: true }, 200, origin);
     }
   } catch (_) {}
@@ -1384,6 +1418,10 @@ async function handleGoldenCross(origin, env) {
     if (!st) { skipped++; continue; }
     evaluated++;
     if (!st.goldenSetup) continue;
+    // Same geometry on simple MAs, shown alongside. The SMA pair crosses on its
+    // own schedule — it lags the EMA pair, so the two gaps rarely agree and the
+    // SMA one can still be widening while the EMA one closes.
+    const sma = smaCrossState(closes);
     results.push({
       ticker: symbol,
       price:  Math.round(closes[closes.length - 1] * 100) / 100,
@@ -1392,6 +1430,12 @@ async function handleGoldenCross(origin, env) {
       gap:    st.gap,        // % below the 200-day EMA
       slope:  st.slope,      // 5-session EMA50 change, %
       barsToCross: st.barsToCross,
+      sma50:  sma?.sma50  ?? null,
+      sma200: sma?.sma200 ?? null,
+      smaGap:    sma?.gap    ?? null,   // distance between the SMAs, %
+      smaSpread: sma?.spread ?? null,   // signed: > 0 means SMA50 is already above
+      smaSlope:  sma?.slope  ?? null,
+      smaBarsToCross: sma?.barsToCross ?? null,
     });
   }
 
@@ -1408,6 +1452,7 @@ async function handleGoldenCross(origin, env) {
     watchlistCount,
     nearPct: EMA_CROSS_NEAR_PCT,
     slopeBars: EMA_CROSS_SLOPE_BARS,
+    schema: SCHEMA,
     ts: Date.now(),
   };
   try { await env?.REC_LOG?.put(KV_KEY, JSON.stringify(payload), { expirationTtl: 7200 }); } catch (_) {}
@@ -3078,7 +3123,7 @@ export default {
           if (sub === 'week-ahead')  return await handleWeekAhead(origin, env);
           if (sub === 'sectors')    return await handleMarketSectors(origin, env, ctx, url.searchParams);
           if (sub === 'scanner')    return await handleScanner(url.searchParams, origin, env, ctx);
-          if (sub === 'golden-cross') return await handleGoldenCross(origin, env);
+          if (sub === 'golden-cross') return await handleGoldenCross(origin, env, url.searchParams);
           if (sub === 'econ-calendar') return handleEconCalendar(url.searchParams, origin);
           return err('unknown market route', 404, origin);
         case 'analysis':

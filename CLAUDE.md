@@ -64,7 +64,7 @@ GET  /api/watchlist/batch         Bulk fundamentals + RSI + SMA/EMA cross + Clau
 GET  /api/daily                   Daily Claude synthesis (served from KV)
 GET  /api/market/sectors          Sector summaries + top opportunity/avoid per sector (4h KV cache)
 GET  /api/market/scanner?preset=  Day-trading momentum scanner (5 Pillars, 90s KV cache)
-GET  /api/market/golden-cross     Names set up for a golden cross (1h KV cache)
+GET  /api/market/golden-cross     Names set up for a golden cross, EMA + SMA gaps (1h KV cache)
 GET  /api/market/econ-calendar    Next FOMC / CPI events from the official schedule
 GET  /api/earnings/:ticker        Last report: numbers, price reaction, call coverage (12h KV)
 ```
@@ -106,15 +106,31 @@ once the runway runs short.
 
 **Moving averages:** the watchlist's `vs 50D` / `vs 200D` / `50D vs 200D` columns use Yahoo's
 `summaryDetail.fiftyDayAverage` / `twoHundredDayAverage` — simple moving averages of daily closes
-through the *prior* close. The `Golden X` / `Death X` columns and the golden-cross scanner use
-**exponential** moving averages computed in the Worker by `emaCrossState()`.
+through the *prior* close. The `Golden X` / `Death X` columns and the golden-cross scanner's row
+selection use **exponential** moving averages computed in the Worker by `emaCrossState()`.
 
-**EMA cross (`emaCrossState`):** EMAs are seeded with an SMA of the first `period` closes and
-smoothed forward, so EMA200 needs a long runway before the seed washes out. Callers pass ~3y of
-daily closes (~750 bars), leaving the seed ~0.4% weight and EMA200 within ~0.01% of a fully
-converged value. Symbols with fewer than 450 bars return `null` rather than an unreliable value.
-A *setup* means the fast EMA is within `EMA_CROSS_NEAR_PCT` (5%) of the slow EMA **and** trending
+**MA cross (`crossStateFrom` / `emaCrossState` / `smaCrossState`):** one geometry routine over a
+fast/slow MA pair — spread, absolute gap, fast-MA slope, projected sessions to the cross, and the
+setup flags. `emaCrossState()` feeds it `emaSeries()`, `smaCrossState()` feeds it `smaSeries()`;
+both return the same shape apart from the MA values (`ema50`/`ema200` vs `sma50`/`sma200`).
+A *setup* means the fast MA is within `EMA_CROSS_NEAR_PCT` (5%) of the slow MA **and** trending
 into the cross; `EMA_CROSS_SLOPE_BARS` (5) sessions define the slope.
+
+History requirements differ, and that is the point of the split. EMAs are seeded with an SMA of the
+first `period` closes and smoothed forward, so EMA200 needs a long runway before the seed washes
+out — callers pass ~3y of daily closes (~750 bars), leaving the seed ~0.4% weight and EMA200 within
+~0.01% of converged; under 450 bars `emaCrossState()` returns `null` rather than an unreliable
+value. A rolling mean has no seed, so `smaCrossState()` is exact from `slow + EMA_CROSS_SLOPE_BARS`
+(205) bars and resolves on histories where the EMA version does not.
+
+**Golden-cross rows carry both gaps.** `/api/market/golden-cross` selects rows on the EMA setup and
+then attaches the SMA pair (`sma50`, `sma200`, `smaGap`, `smaSpread`, `smaSlope`, `smaBarsToCross`)
+purely as reference — the SMA figures never filter. The two disagree by design: the SMA pair lags,
+so on the tightest EMA setups `smaSpread` is often already **positive** (the simple-MA cross has
+happened) while on wider ones `smaGap` sits outside the 5% band. `renderGoldenCross()` renders those
+as a "crossed" chip and a dimmed bar respectively. Payloads carry `schema`; bump it in
+`handleGoldenCross()` when the row shape changes so cached entries retire instead of rendering as
+blanks, and use `?refresh=1` to force a rebuild.
 
 **Multi-symbol closes (`yahooSparkCloses`):** Yahoo v7 `spark` returns close-only series for up to
 **20 symbols per request** and needs no crumb, so a 250-name EMA sweep costs ~13 subrequests

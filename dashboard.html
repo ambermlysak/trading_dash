@@ -749,7 +749,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <span class="scan-pill on">50D EMA &lt; 200D EMA</span>
       <span class="scan-pill on">50D EMA rising</span>
       <span class="scan-pill on">Within 5% of crossing</span>
-      <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:auto">All three are hard filters · EMAs from 3y of daily closes · sorted closest-to-cross first</span>
+      <span style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-left:auto">All three are hard filters · EMAs from 3y of daily closes · sorted closest-to-cross first · SMA gap is shown for reference, not filtered on</span>
     </div>
 
     <div class="scan-legend" id="scanner-legend-momentum">
@@ -1815,9 +1815,33 @@ function renderGoldenCross(data) {
     el.innerHTML = `<div class="loading" style="padding:40px;text-align:center;">No names are set up for a golden cross right now — ${data.evaluated || 0} scanned.</div>`;
     return;
   }
+  const near = data.nearPct || 5;
+
+  // Gap bar: full = at the 5% edge, empty = crossing now.
+  const gapBar = (gap, color, title) => {
+    const pct = Math.max(2, Math.min(100, gap / near * 100));
+    return `<div class="range-bar-wrap" title="${title}">
+      <div class="range-bar"><div class="range-bar-fill" style="width:${pct.toFixed(1)}%;background:${color}"></div></div>
+      <div class="range-labels"><span style="color:${color}">${fmt(gap)}%</span><span>${near}%</span></div>
+    </div>`;
+  };
+
+  // The SMA pair is on its own schedule: it can already have crossed, or sit
+  // well outside the 5% band the EMA filter used to select the row.
+  const smaCell = (r) => {
+    if (r.smaGap == null) return '<span style="color:var(--ink-3)">—</span>';
+    if (r.smaSpread > 0) {
+      return `<span class="up mono" title="50-day SMA is already ${fmt(r.smaGap)}% above the 200-day SMA — the simple-MA golden cross has happened">crossed +${fmt(r.smaGap)}%</span>`;
+    }
+    const outside = r.smaGap > near;
+    return gapBar(
+      r.smaGap,
+      outside ? 'var(--ink-3)' : 'var(--cyan)',
+      `50D SMA $${fmt(r.sma50)} vs 200D SMA $${fmt(r.sma200)} — ${fmt(r.smaGap)}% below${outside ? `, outside the ${near}% band` : ''}`,
+    );
+  };
+
   const body = rows.map(r => {
-    // Gap bar: full = at the 5% edge, empty = crossing now.
-    const pct = Math.max(2, Math.min(100, r.gap / (data.nearPct || 5) * 100));
     const eta = r.barsToCross != null
       ? `<span class="mono">${r.barsToCross}</span> <span style="color:var(--ink-3);font-size:10px">session${r.barsToCross === 1 ? '' : 's'}</span>`
       : '<span style="color:var(--ink-3)">—</span>';
@@ -1826,12 +1850,8 @@ function renderGoldenCross(data) {
       <td class="mono">$${fmt(r.price)}</td>
       <td class="mono">$${fmt(r.ema50)}</td>
       <td class="mono">$${fmt(r.ema200)}</td>
-      <td>
-        <div class="range-bar-wrap" title="${fmt(r.gap)}% below the 200-day EMA">
-          <div class="range-bar"><div class="range-bar-fill" style="width:${pct.toFixed(1)}%;background:var(--amber)"></div></div>
-          <div class="range-labels"><span style="color:var(--amber)">${fmt(r.gap)}%</span><span>${data.nearPct || 5}%</span></div>
-        </div>
-      </td>
+      <td>${gapBar(r.gap, 'var(--amber)', `50D EMA $${fmt(r.ema50)} vs 200D EMA $${fmt(r.ema200)} — ${fmt(r.gap)}% below`)}</td>
+      <td>${smaCell(r)}</td>
       <td class="up">${fmtPct(r.slope)}</td>
       <td>${eta}</td>
     </tr>`;
@@ -1843,7 +1863,8 @@ function renderGoldenCross(data) {
       <th>Price</th>
       <th title="50-day exponential moving average">50D EMA</th>
       <th title="200-day exponential moving average">200D EMA</th>
-      <th title="How far the 50D EMA sits below the 200D EMA, against the 5% threshold">Gap to Cross</th>
+      <th title="How far the 50D EMA sits below the 200D EMA, against the 5% threshold">Gap to Cross (EMA)</th>
+      <th title="Same distance measured on simple moving averages: 50D SMA vs 200D SMA. Not a filter — the SMA pair lags the EMA pair, so it can already have crossed or still sit outside the 5% band.">Gap to Cross (SMA)</th>
       <th title="Change in the 50D EMA over the last 5 sessions — must be positive">50D EMA Slope</th>
       <th title="Projected sessions until the cross at the current rate of convergence — an estimate, not a forecast">Est. to Cross</th>
     </tr></thead>
