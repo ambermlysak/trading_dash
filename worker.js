@@ -1584,9 +1584,9 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
   // Pre-warm the crumb once so all parallel Yahoo v10 calls share it
   await getYahooCrumb(env).catch(() => {});
 
-  // Golden/death cross needs ~3y of closes — one spark call per 20 tickers,
-  // fired now and merged in after the per-ticker work below.
-  const emaClosesPromise = yahooSparkCloses(tickers, '3y').catch(() => new Map());
+  // Golden/death cross needs a long close history — one spark call per 20
+  // tickers, fired now and merged in after the per-ticker work below.
+  const crossClosesPromise = yahooSparkCloses(tickers, '3y').catch(() => new Map());
 
   const stocks = {};
 
@@ -1713,27 +1713,30 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
     }));
   }
 
-  // Merge EMA golden/death cross state. Tickers with too little history keep
+  // Merge golden/death cross state for the `SMA X` column. Deliberately
+  // MA-agnostic field names: `sma50`/`sma200` above are Yahoo's own averages
+  // through the prior close and must not be clobbered by ours, and the column's
+  // MA type has already changed once. Tickers with too little history keep
   // nulls, which the UI renders as "—" rather than a misleading state.
   try {
-    const closesBySymbol = await emaClosesPromise;
+    const closesBySymbol = await crossClosesPromise;
     for (const t of tickers) {
       const s = stocks[t];
       if (!s || s.error) continue;
-      const st = emaCrossState(closesBySymbol.get(t));
+      const st = smaCrossState(closesBySymbol.get(t));
       if (!st) continue;
-      s.ema50       = st.ema50;
-      s.ema200      = st.ema200;
-      s.emaSpread   = st.spread;
-      s.emaGap      = st.gap;
-      s.emaSlope    = st.slope;
-      s.emaSpreadChg = st.spreadChg;
-      s.emaBarsToCross = st.barsToCross;
-      s.goldenSetup = st.goldenSetup;
-      s.deathSetup  = st.deathSetup;
+      s.crossFast      = st.sma50;
+      s.crossSlow      = st.sma200;
+      s.crossSpread    = st.spread;
+      s.crossGap       = st.gap;
+      s.crossSlope     = st.slope;
+      s.crossSpreadChg = st.spreadChg;
+      s.crossBarsToCross = st.barsToCross;
+      s.goldenSetup    = st.goldenSetup;
+      s.deathSetup     = st.deathSetup;
     }
   } catch (e) {
-    console.error('[watchlist] ema cross:', e.message);
+    console.error('[watchlist] sma cross:', e.message);
   }
 
   // Fire on-demand Claude analysis for tickers that have no cached entry.
