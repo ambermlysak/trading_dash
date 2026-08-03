@@ -173,6 +173,18 @@ order, and unknown/delisted symbols are silently absent.
   `body.max_tokens` on `/api/claude`) is sized for the *answer*; `CLAUDE_THINKING_HEADROOM` is added on
   top at each of the three call sites. Raising the cap is free — it bounds spend, it doesn't cause it.
 
+**Ask for JSON with a schema, not with a prompt.** `POST /api/claude` forwards a caller-supplied
+`output_config` (merged with, not replaced by, the effort setting), so the frontend can pass
+`{format: {type: 'json_schema', schema}}`. `index.html`'s AI synthesis does this via
+`SYNTHESIS_SCHEMA`. This is not a style preference — "Return STRICT JSON" in the prompt plus
+`JSON.parse` is a coin flip once narrative fields get long, because one unescaped quote inside the
+prose terminates the string early and the parse dies mid-object with an opaque character offset.
+Opus 5 writes longer, more quote-prone prose than Sonnet 4.6 did, which is what turned a latent bug
+into a reliable one. A schema makes malformed JSON ungenerable, and removes the need to strip
+```` ``` ```` fences. The API's schema subset rejects `minimum`/`maximum`/`minLength` — keep ranges
+like "score 0-100" as prompt guidance. Truncation is still possible independently of the schema, so
+check `stop_reason === 'max_tokens'` and say so rather than surfacing a JSON offset.
+
 `CLAUDE_EFFORT` (`medium`) is the cost/latency dial. **Latency roughly tripled vs Sonnet 4.6** — a
 briefing-sized generation (~3500 answer tokens) measures 45–50s, against a 30s cron budget. Wall-clock
 time spent awaiting a subrequest is not CPU time, which is why the chained cron jobs still complete, but

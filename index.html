@@ -2614,6 +2614,54 @@ function renderTrack(entries) {
 /* ============================================================
    CLAUDE SYNTHESIS — overall rating + sentiment narrative
    ============================================================ */
+
+/* Structured-output schema for the synthesis.
+ * Asking for "STRICT JSON" in the prompt and then JSON.parse-ing the reply is a
+ * coin flip once the narrative fields get long: a single unescaped quote inside
+ * the thesis prose terminates the string early and the parse dies mid-object.
+ * Passing a schema makes malformed JSON ungenerable rather than merely
+ * discouraged, so there are no fences, no preamble, and no escaping accidents.
+ * Note the API's schema subset rejects min/max and length constraints — the
+ * 0-100 range for scores stays in the prompt text as guidance. */
+const FACTOR_SCHEMA = {
+  type: 'object',
+  properties: {
+    score:     { type: 'integer' },
+    note:      { type: 'string' },
+    narrative: { type: 'string' },
+  },
+  required: ['score', 'note', 'narrative'],
+  additionalProperties: false,
+};
+
+const SYNTHESIS_SCHEMA = {
+  type: 'object',
+  properties: {
+    rating:     { type: 'string', enum: ['BUY', 'HOLD', 'SELL'] },
+    confidence: { type: 'integer' },
+    trend:      { type: 'string' },
+    pattern:    { type: 'string' },
+    action:     { type: 'string' },
+    summary:    { type: 'string' },
+    factors: {
+      type: 'object',
+      properties: {
+        technical:   FACTOR_SCHEMA,
+        fundamental: FACTOR_SCHEMA,
+        sentiment:   FACTOR_SCHEMA,
+        analyst:     FACTOR_SCHEMA,
+        insider:     FACTOR_SCHEMA,
+        macro:       FACTOR_SCHEMA,
+      },
+      required: ['technical', 'fundamental', 'sentiment', 'analyst', 'insider', 'macro'],
+      additionalProperties: false,
+    },
+    thesis: { type: 'string' },
+  },
+  required: ['rating', 'confidence', 'trend', 'pattern', 'action', 'summary', 'factors', 'thesis'],
+  additionalProperties: false,
+};
+
 async function synthesize(ticker, lastPrice) {
   const ind = state.data.indicators || {};
   const an = state.data.analyst || {};
@@ -2671,13 +2719,18 @@ Score interpretation: 0=very bearish, 50=neutral, 100=very bullish.`;
     const resp = await claudeCall({
       messages: [{ role: 'user', content: prompt }],
       max_tokens: 2500,
+      output_config: { format: { type: 'json_schema', schema: SYNTHESIS_SCHEMA } },
     });
     let text = '';
     for (const block of (resp.content || [])) {
       if (block.type === 'text') text += block.text;
     }
-    text = text.replace(/```(?:json)?\s*/g, '').trim();
-    const result = JSON.parse(text);
+    // The schema guarantees the shape, but a hit token ceiling still truncates —
+    // say so plainly rather than surfacing a JSON offset the reader can't act on.
+    if (resp.stop_reason === 'max_tokens') {
+      throw new Error('Response hit the token limit before finishing — raise max_tokens.');
+    }
+    const result = JSON.parse(text.trim());
     // Only render if user hasn't navigated away to a different ticker mid-flight
     if (ticker !== state.ticker) return;
     renderSynthesis(result, lastPrice);

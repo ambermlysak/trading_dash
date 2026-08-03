@@ -905,11 +905,14 @@ async function handleClaude(request, env, origin) {
   const body    = await request.json();
   // Callers size max_tokens for the answer; add reasoning headroom on their behalf
   // so the frontend never has to know Opus 5 spends part of the cap on thinking.
+  // A caller-supplied output_config (i.e. a json_schema) is merged with — not
+  // replaced by — the effort setting, so both survive into the request.
   const payload = {
     model:      CLAUDE_MODEL,
     max_tokens: (body.max_tokens ?? 1500) + CLAUDE_THINKING_HEADROOM,
     messages:   body.messages,
     ...CLAUDE_REASONING,
+    output_config: { ...CLAUDE_REASONING.output_config, ...(body.output_config || {}) },
     ...(body.system ? { system: body.system } : {}),
   };
   const r = await fetch('https://api.anthropic.com/v1/messages', {
