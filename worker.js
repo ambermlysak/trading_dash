@@ -510,6 +510,9 @@ function crossStateFrom(sf, ss) {
     spread: r2(spread),
     gap:    r2(gap),
     slope:  Math.round(fastSlope * 1000) / 1000,
+    // Signed move in the spread over the slope window. Sign matches `spread`
+    // when the formation is strengthening and opposes it when it is decaying.
+    spreadChg: Math.round((spread - prevSpread) * 1000) / 1000,
     barsToCross: barsToCross != null && barsToCross <= 400 ? barsToCross : null,
     // Approaching a golden cross: below, rising, and inside the band.
     goldenSetup: !golden && fastSlope > 0 && near,
@@ -1724,12 +1727,10 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
       s.emaSpread   = st.spread;
       s.emaGap      = st.gap;
       s.emaSlope    = st.slope;
+      s.emaSpreadChg = st.spreadChg;
       s.emaBarsToCross = st.barsToCross;
       s.goldenSetup = st.goldenSetup;
       s.deathSetup  = st.deathSetup;
-      // Sort keys: higher = closer to (or already in) that formation.
-      s.goldenRank  = st.spread;
-      s.deathRank   = -st.spread;
     }
   } catch (e) {
     console.error('[watchlist] ema cross:', e.message);

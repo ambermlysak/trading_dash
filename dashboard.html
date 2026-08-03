@@ -198,8 +198,13 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .wl-table td.x-active-g { color: var(--bull); }
 .wl-table td.x-active-d { color: var(--bear); }
 .wl-table td.x-setup { color: var(--amber); font-weight: 500; }
-.wl-table td.x-near { color: var(--ink-2); }
 .wl-table td.x-far { color: var(--ink-3); }
+/* Arrow is coloured by the direction of the move, not by the formation, so a
+   decaying golden cross reads green-with-a-red-arrow. */
+.wl-table .x-arrow { font-size: 9px; }
+.wl-table .x-up   { color: var(--bull); }
+.wl-table .x-dn   { color: var(--bear); }
+.wl-table .x-flat { color: var(--ink-3); }
 .wl-table td.rsi-ob { color: var(--bear); font-family: var(--mono); }
 .wl-table td.rsi-os { color: var(--bull); font-family: var(--mono); }
 .wl-table td.rsi-neutral { color: var(--ink-1); font-family: var(--mono); }
@@ -665,7 +670,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <table class="wl-table">
         <colgroup>
           <col><col><col><col><col><col><col><col><col><col><col><col><col>
-          <col><col><col><col><col><col><col><col><col><col><col><col><col>
+          <col><col><col><col><col><col><col><col><col><col><col><col>
         </colgroup>
         <thead>
           <tr>
@@ -680,8 +685,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
             <th data-sort="pctVs50"   title="Current price vs the 50-day simple moving average">vs 50D</th>
             <th data-sort="pctVs200"  title="Current price vs the 200-day simple moving average">vs 200D</th>
             <th data-sort="smaSpread" title="50-day SMA above or below the 200-day SMA (golden / death cross)">50D vs 200D</th>
-            <th data-sort="goldenRank" title="Golden cross on EMA: 50-day EMA crossing above the 200-day EMA. Setup = below, rising, within 5%.">Golden X</th>
-            <th data-sort="deathRank"  title="Death cross on EMA: 50-day EMA crossing below the 200-day EMA. Setup = above, falling, within 5%.">Death X</th>
+            <th data-sort="emaSpread" title="EMA cross in effect: Golden = 50-day EMA above the 200-day, Death = below, with the gap between them. Arrow = which way that gap is moving over 5 sessions — ▲ the 50D is pulling up on the 200D, ▼ pulling down. So Golden ▼ is a golden cross decaying. ◆ marks a setup within 5% and trending into a flip.">EMA X</th>
             <th data-sort="rsi">RSI</th>
             <th data-sort="pe">P/E</th>
             <th data-sort="forwardPE">Fwd P/E</th>
@@ -698,7 +702,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
           </tr>
         </thead>
         <tbody id="wl-tbody">
-          <tr><td colspan="26" class="loading" style="padding:24px">Loading watchlist…</td></tr>
+          <tr><td colspan="25" class="loading" style="padding:24px">Loading watchlist…</td></tr>
         </tbody>
       </table>
     </div>
@@ -814,41 +818,49 @@ const fmtVol = (v) => {
 const clsChg = (n) => n == null ? '' : n > 0 ? 'up' : n < 0 ? 'dn' : '';
 const clsRsi = (r) => r == null ? 'rsi-neutral' : r > 70 ? 'rsi-ob' : r < 30 ? 'rsi-os' : 'rsi-neutral';
 
-/* EMA golden / death cross cell.
- * kind 'golden' → 50-day EMA crossing ABOVE the 200-day; 'death' → crossing BELOW.
- * Active = formation already in effect · Setup = within 5% and trending into it
- * · Near = within 5% but not trending · otherwise the gap is too wide to matter. */
-function crossCell(s, kind) {
+/* EMA cross cell — one column covering both formations.
+ * The label names the cross in effect (50D EMA above the 200D = Golden, below
+ * = Death) and the gap between the two EMAs. The arrow is the signed move in
+ * that gap over the last 5 sessions: ▲ the 50D is pulling up on the 200D,
+ * ▼ pulling down. Read together they give the trajectory — Golden ▲ is
+ * strengthening, Golden ▼ is decaying toward a death cross.
+ * Leading glyph: ● in formation · ◆ setup, within 5% and trending into a flip
+ * · ○ within 5% but not trending that way. */
+function crossCell(s) {
   if (s.emaSpread == null || s.ema50 == null || s.ema200 == null) {
     return '<td class="x-cell x-far">—</td>';
   }
-  const golden = kind === 'golden';
-  const active = golden ? s.emaSpread > 0 : s.emaSpread < 0;
-  const setup  = golden ? s.goldenSetup : s.deathSetup;
+  const golden = s.emaSpread > 0;
   const gap    = s.emaGap;
+  // The pending flip is the opposite formation's setup flag.
+  const setup  = golden ? s.deathSetup : s.goldenSetup;
+  const chg    = s.emaSpreadChg;
 
-  const side = s.emaSpread >= 0 ? 'above' : 'below';
-  const eta  = s.emaBarsToCross != null
+  let mark, cls;
+  if (setup)         { mark = '◆'; cls = 'x-setup'; }
+  else if (gap <= 5) { mark = '○'; cls = golden ? 'x-active-g' : 'x-active-d'; }
+  else               { mark = '●'; cls = golden ? 'x-active-g' : 'x-active-d'; }
+
+  const arrow = chg == null ? ''
+    : chg > 0   ? ' <span class="x-arrow x-up">▲</span>'
+    : chg < 0   ? ' <span class="x-arrow x-dn">▼</span>'
+    :             ' <span class="x-arrow x-flat">→</span>';
+
+  const eta = s.emaBarsToCross != null
     ? ` · est. ${s.emaBarsToCross} session${s.emaBarsToCross === 1 ? '' : 's'} to cross`
     : '';
-  const tip = `50D EMA $${fmt(s.ema50)} vs 200D EMA $${fmt(s.ema200)} — ${fmt(gap)}% ${side}`
-            + ` · 50D EMA ${fmtPct(s.emaSlope)} over 5 sessions${eta}`;
+  // The gap is |spread|, so it widens when the spread moves further from zero —
+  // which is chg > 0 under a golden cross but chg < 0 under a death cross.
+  const gapChg = chg == null ? null : chg * (golden ? 1 : -1);
+  const drift = gapChg == null ? ''
+    : ` · gap ${gapChg > 0 ? 'widening' : gapChg < 0 ? 'narrowing' : 'flat'}`
+      + ` (spread ${fmtPct(chg)} over 5 sessions)`;
+  const tip = `${golden ? 'Golden' : 'Death'} cross in effect — 50D EMA $${fmt(s.ema50)}`
+            + ` ${golden ? 'above' : 'below'} 200D EMA $${fmt(s.ema200)} by ${fmt(gap)}%`
+            + ` · 50D EMA ${fmtPct(s.emaSlope)} over 5 sessions${drift}${eta}`
+            + (setup ? ` · setup for a ${golden ? 'death' : 'golden'} cross` : '');
 
-  let cls, txt;
-  if (active) {
-    cls = golden ? 'x-active-g' : 'x-active-d';
-    txt = `● Active ${fmt(gap, 1)}%`;
-  } else if (setup) {
-    cls = 'x-setup';
-    txt = `◆ Setup ${fmt(gap, 1)}%`;
-  } else if (gap <= 5) {
-    cls = 'x-near';
-    txt = `○ Near ${fmt(gap, 1)}%`;
-  } else {
-    cls = 'x-far';
-    txt = `${fmt(gap, 1)}% off`;
-  }
-  return `<td class="x-cell ${cls}" title="${esc(tip)}">${txt}</td>`;
+  return `<td class="x-cell ${cls}" title="${esc(tip)}">${mark} ${golden ? 'Golden' : 'Death'} ${fmt(gap, 1)}%${arrow}</td>`;
 }
 
 async function apiFetch(path, opts = {}) {
@@ -1189,7 +1201,7 @@ async function loadWatchlistBatch() {
   btn.disabled = true;
   btn.textContent = '↺ Loading…';
   document.getElementById('wl-tbody').innerHTML =
-    '<tr><td colspan="26" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
+    '<tr><td colspan="25" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
   document.getElementById('wl-status').textContent = 'Fetching…';
 
   try {
@@ -1223,7 +1235,7 @@ async function loadWatchlistBatch() {
     console.error('[watchlist]', e.message);
     document.getElementById('wl-status').textContent = 'Error — ' + e.message;
     document.getElementById('wl-tbody').innerHTML =
-      '<tr><td colspan="26" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
+      '<tr><td colspan="25" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
   } finally {
     wlLoading = false;
     btn.disabled = false;
@@ -1289,8 +1301,7 @@ function renderWatchlist() {
       <td class="${clsChg(s.smaSpread)}"${s.smaSpread != null ? ` title="50D $${fmt(s.sma50)} vs 200D $${fmt(s.sma200)} (${fmtPct(s.smaSpread)})"` : ''}>${
         s.smaSpread == null ? '—' : s.smaSpread > 0 ? '▲ Above' : s.smaSpread < 0 ? '▼ Below' : 'Even'
       }</td>
-      ${crossCell(s, 'golden')}
-      ${crossCell(s, 'death')}
+      ${crossCell(s)}
       <td class="${clsRsi(s.rsi)}">${s.rsi != null ? s.rsi : '—'}</td>
       <td class="mono">${s.pe != null ? fmt(s.pe, 1) : '—'}</td>
       <td class="mono">${s.forwardPE != null ? fmt(s.forwardPE, 1) : '—'}</td>
@@ -1343,7 +1354,7 @@ function renderWatchlist() {
       }
 
       html += `<tr class="expand-row">
-        <td colspan="26">
+        <td colspan="25">
           <div class="expand-content">
             ${s.summary ? `<div class="expand-summary">${esc(s.summary)}</div>` : ''}
             <div class="expand-meta">
@@ -1358,7 +1369,7 @@ function renderWatchlist() {
       </tr>`;
     }
   }
-  tbody.innerHTML = html || '<tr><td colspan="26" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
+  tbody.innerHTML = html || '<tr><td colspan="25" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
 }
 
 /* ─── Closing auction block trades ─── */

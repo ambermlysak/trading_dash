@@ -106,8 +106,18 @@ once the runway runs short.
 
 **Moving averages:** the watchlist's `vs 50D` / `vs 200D` / `50D vs 200D` columns use Yahoo's
 `summaryDetail.fiftyDayAverage` / `twoHundredDayAverage` — simple moving averages of daily closes
-through the *prior* close. The `Golden X` / `Death X` columns and the golden-cross scanner's row
-selection use **exponential** moving averages computed in the Worker by `emaCrossState()`.
+through the *prior* close. The `EMA X` column and the golden-cross scanner's row selection use
+**exponential** moving averages computed in the Worker by `emaCrossState()`.
+
+**Watchlist `EMA X` column:** one column covers both formations — there is no separate Death column.
+`crossCell()` names the cross in effect from the sign of `emaSpread` (`Golden` / `Death`) and prints
+the gap, e.g. `● Golden 10.9% ▲`. The arrow is `emaSpreadChg`, the signed move in the spread over
+`EMA_CROSS_SLOPE_BARS`: ▲ the 50D EMA is pulling up on the 200D, ▼ pulling down. It is coloured by
+direction rather than by formation, so a decaying golden cross reads green-with-a-red-arrow. Note
+the gap is `|spread|`, so it *widens* on ▲ under a golden cross but on ▼ under a death cross — the
+tooltip resolves that for you. Leading glyph: ● in formation · ◆ setup (within 5% and trending into
+a flip, amber) · ○ within 5% but not trending that way. The column sorts on `emaSpread`, which
+orders strongest golden → strongest death in one pass.
 
 **MA cross (`crossStateFrom` / `emaCrossState` / `smaCrossState`):** one geometry routine over a
 fast/slow MA pair — spread, absolute gap, fast-MA slope, projected sessions to the cross, and the
