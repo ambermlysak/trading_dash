@@ -30,7 +30,34 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1',
 ];
 
-const CLAUDE_MODEL = 'claude-sonnet-4-6';
+const CLAUDE_MODEL = 'claude-opus-5';
+
+/* Opus 5 thinks by default, and `max_tokens` caps thinking + answer together —
+ * so every per-call budget below is the room for the *answer*, and this is added
+ * on top for reasoning. Raising the cap is free: it bounds spend, it doesn't
+ * cause it, and unused headroom is never billed.
+ *
+ * Effort is the cost/latency dial. `medium` is a genuine step up from Sonnet 4.6
+ * while keeping cron jobs inside the 30s waitUntil budget; drop to `low` if the
+ * scheduled runs start getting cut off. Do NOT set thinking to `disabled` — on
+ * Opus 5 that can leak `<thinking>` tags into the visible text, and half of what
+ * comes back here is parsed as JSON. */
+const CLAUDE_THINKING_HEADROOM = 4000;
+const CLAUDE_EFFORT = 'medium';   // low | medium | high | xhigh | max
+const CLAUDE_REASONING = {
+  thinking:      { type: 'adaptive' },
+  output_config: { effort: CLAUDE_EFFORT },
+};
+
+/* Pull the answer out of a Messages response. Never index content[0] — with
+ * thinking on, slot 0 is a thinking block whose text is empty by default. */
+function claudeText(data) {
+  return (data?.content || [])
+    .filter(b => b.type === 'text')
+    .map(b => b.text || '')
+    .join('')
+    .trim();
+}
 
 const YAHOO_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -594,8 +621,9 @@ async function workerClaude(prompt, env, maxTokens = 400) {
         },
         body: JSON.stringify({
           model:      CLAUDE_MODEL,
-          max_tokens: maxTokens,
+          max_tokens: maxTokens + CLAUDE_THINKING_HEADROOM,
           messages:   [{ role: 'user', content: prompt }],
+          ...CLAUDE_REASONING,
         }),
       });
     } catch (e) {
@@ -606,8 +634,7 @@ async function workerClaude(prompt, env, maxTokens = 400) {
     }
 
     if (r.ok) {
-      const d = await r.json();
-      return d.content?.[0]?.text?.trim() || '';
+      return claudeText(await r.json());
     }
 
     // Retry only transient statuses; fail fast on 4xx client errors (bad key, bad request)
@@ -876,10 +903,13 @@ async function handlePeers(ticker, origin) {
 async function handleClaude(request, env, origin) {
   if (!env.ANTHROPIC_API_KEY) return err('ANTHROPIC_API_KEY not configured', 500, origin);
   const body    = await request.json();
+  // Callers size max_tokens for the answer; add reasoning headroom on their behalf
+  // so the frontend never has to know Opus 5 spends part of the cap on thinking.
   const payload = {
     model:      CLAUDE_MODEL,
-    max_tokens: body.max_tokens ?? 1500,
+    max_tokens: (body.max_tokens ?? 1500) + CLAUDE_THINKING_HEADROOM,
     messages:   body.messages,
+    ...CLAUDE_REASONING,
     ...(body.system ? { system: body.system } : {}),
   };
   const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -1265,13 +1295,13 @@ async function handleScanner(searchParams, origin, env, ctx) {
           },
           body: JSON.stringify({
             model: CLAUDE_MODEL,
-            max_tokens: 500,
+            max_tokens: 500 + CLAUDE_THINKING_HEADROOM,
             messages: [{ role: 'user', content: prompt }],
+            ...CLAUDE_REASONING,
           }),
         });
         if (cr.ok) {
-          const cd = await cr.json();
-          const txt = cd?.content?.[0]?.text || '';
+          const txt = claudeText(await cr.json());
           const match = txt.match(/\{[\s\S]*\}/);
           if (match) {
             const tags = JSON.parse(match[0]);

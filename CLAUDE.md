@@ -159,7 +159,28 @@ order, and unknown/delisted symbols are silently absent.
 
 **Alpaca integration:** Optional — if `ALPACA_KEY`/`ALPACA_SECRET` are set, Alpaca overlays real-time prices on quote results and provides the news feed. Yahoo is always the fallback.
 
-**Claude model:** Locked to `const CLAUDE_MODEL = 'claude-sonnet-4-6'` at the top of `worker.js`. Change it there when upgrading models.
+**Claude model:** Locked to `const CLAUDE_MODEL = 'claude-opus-5'` at the top of `worker.js`, alongside
+`CLAUDE_EFFORT` and `CLAUDE_THINKING_HEADROOM`. Change them there when upgrading models.
+
+**Opus 5 thinks by default, and that has two consequences the code has to respect:**
+
+- **Never read `content[0].text`.** When the model thinks, slot 0 is a `thinking` block whose text is
+  empty by default, so `content[0].text` is `undefined` and the caller silently gets `''`. Use
+  `claudeText(data)`, which filters for `type === 'text'` and joins. This fails *intermittently* —
+  trivial prompts skip thinking and parse fine, so a naive parse looks healthy right up until a real
+  analytical prompt returns nothing. `index.html` already iterates blocks correctly.
+- **`max_tokens` caps thinking + answer together.** Every per-call budget (`workerClaude(prompt, env, N)`,
+  `body.max_tokens` on `/api/claude`) is sized for the *answer*; `CLAUDE_THINKING_HEADROOM` is added on
+  top at each of the three call sites. Raising the cap is free — it bounds spend, it doesn't cause it.
+
+`CLAUDE_EFFORT` (`medium`) is the cost/latency dial. **Latency roughly tripled vs Sonnet 4.6** — a
+briefing-sized generation (~3500 answer tokens) measures 45–50s, against a 30s cron budget. Wall-clock
+time spent awaiting a subrequest is not CPU time, which is why the chained cron jobs still complete, but
+this is the thing to check first if a scheduled run starts coming up empty: drop `CLAUDE_EFFORT` to
+`'low'` before reaching for anything else. Do **not** set `thinking` to `disabled` to claw back latency —
+on Opus 5 that can leak `<thinking>` tags into the visible text, and much of what comes back here is
+parsed as JSON. Note Opus 5 bills $5/$25 per MTok vs Sonnet 4.6's $3/$15, and thinking tokens bill as
+output.
 
 **KV namespace (`REC_LOG`) keys:**
 ```
