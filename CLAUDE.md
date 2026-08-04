@@ -111,6 +111,29 @@ the Worker by `smaCrossState()` over spark closes — so its `crossFast` runs a 
 Yahoo's `sma50`, which stops at the prior close. The golden-cross scanner's row selection is the
 one place still on **exponential** MAs (`emaCrossState()`).
 
+**Watchlist `Recommendation` column:** one consolidated call per ticker, replacing the old
+Trend / Pattern / Action / Rating quartet. `refreshTickerAnalysis()` writes
+`{rating, confidence, recommendation, drivers[], summary}` to `analysis:{TICKER}` under
+`ANALYSIS_SCHEMA`; `recCell()` renders badge + one-line call + driver chips, with the full rationale
+in the expanded row. Four columns invited the model to answer each in isolation — a single call
+forces it to weigh factors against each other and commit, which is the judgement the row is for.
+Confidence measures how strongly the evidence agrees, so genuine conflict lowers it rather than
+producing a hedged call. Sorts on `recRank` (signed conviction: strongest BUY → strongest SELL).
+
+The prompt is fed technicals, multi-period momentum, price action, fundamentals, and
+positioning/sentiment, plus the **macro and geopolitical backdrop** — which comes from the morning
+briefing's `daily:snapshot` headline and news cards, and event dates from `econEventsAhead()`. Never
+from model memory: the prompt says so explicitly, for the same reason the economic-calendar tables
+exist. If `daily:snapshot` is missing the prompt says so and tells the model to weight
+company-specific evidence instead of inventing world events.
+
+**Watchlist `Key Level` column:** distance to the nearer of support/resistance — never both, per the
+column's whole purpose. The worker computes `levelPct` / `levelKind` / `levelAbove` / `levelPrice`
+(so it is sortable server-side) and `levelCell()` renders it. The arrow is literal position (▲ above
+the level, ▼ below); colour is what that position *means*, which is deliberately not the same thing —
+below resistance is ordinary headroom and reads amber, not red, while below support is a break and
+reads red.
+
 **Watchlist `SMA X` column:** one column covers both formations — there is no separate Death column.
 `crossCell()` names the cross in effect from the sign of `crossSpread` (`Golden` / `Death`) and
 prints the gap, e.g. `● Golden 11.3% ▲`. The arrow is `crossSpreadChg`, the signed move in the

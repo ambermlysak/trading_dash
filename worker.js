@@ -603,7 +603,7 @@ async function yahooSparkCloses(symbols, range = '3y', concurrency = 4) {
    Retries transient failures (429 rate limit, 5xx overload) with backoff.
    A single un-retried hiccup during the 6am cron used to wipe out the daily
    briefing, sector intelligence, and watchlist signals for the whole day. */
-async function workerClaude(prompt, env, maxTokens = 400) {
+async function workerClaude(prompt, env, maxTokens = 400, schema = null) {
   if (!env?.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not set');
 
   const MAX_ATTEMPTS = 4;
@@ -624,6 +624,14 @@ async function workerClaude(prompt, env, maxTokens = 400) {
           max_tokens: maxTokens + CLAUDE_THINKING_HEADROOM,
           messages:   [{ role: 'user', content: prompt }],
           ...CLAUDE_REASONING,
+          // A schema makes malformed JSON ungenerable. Prefer it over asking for
+          // JSON in the prompt and hoping the escaping holds.
+          ...(schema ? {
+            output_config: {
+              ...CLAUDE_REASONING.output_config,
+              format: { type: 'json_schema', schema },
+            },
+          } : {}),
         }),
       });
     } catch (e) {
@@ -1700,11 +1708,30 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
         }
 
         // Claude analysis from KV (written by cron or previous on-demand run)
-        let trend = null, pattern = null, action = null, summary = null, rating = null, confidence = null, analysisTs = null;
+        let recommendation = null, drivers = null, summary = null, rating = null, confidence = null, analysisTs = null;
         const cached = analysisRes.status === 'fulfilled' ? analysisRes.value : null;
-        if (cached && Date.now() - (cached.ts || 0) < 172_800_000) {
-          ({ trend, pattern, action, summary, rating, confidence } = cached);
+        // Entries written before the four columns were consolidated carry a rating
+        // but no `recommendation`. Treat those as absent so the row regenerates in
+        // the new shape instead of rendering a badge with an empty call beside it.
+        if (cached && cached.recommendation && Date.now() - (cached.ts || 0) < 172_800_000) {
+          ({ recommendation, drivers, summary, rating, confidence } = cached);
           analysisTs = cached.ts;
+        }
+
+        // Nearest decision level: whichever of support/resistance the price sits
+        // closest to in percentage terms. The watchlist shows one, not both.
+        let levelPct = null, levelKind = null, levelAbove = null, levelPrice = null;
+        if (price != null) {
+          for (const [kind, lvl] of [['support', support], ['resistance', resist]]) {
+            if (lvl == null || !isFinite(lvl) || lvl <= 0) continue;
+            const d = Math.abs(price - lvl) / price * 100;
+            if (levelPct == null || d < levelPct) {
+              levelPct   = Math.round(d * 100) / 100;
+              levelKind  = kind;
+              levelPrice = lvl;
+              levelAbove = price >= lvl;
+            }
+          }
         }
 
         stocks[ticker] = {
@@ -1731,12 +1758,20 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
           rsi,
           support,
           resist,
-          trend,
-          pattern,
-          action,
+          levelPct,
+          levelKind,
+          levelAbove,
+          levelPrice,
+          recommendation,
+          drivers,
           summary,
           rating,
           confidence,
+          // Sort key for the consolidated column: strongest BUY through strongest
+          // SELL in one pass. Signed so conviction ranks within each rating.
+          recRank: rating
+            ? (rating === 'BUY' ? 1 : rating === 'SELL' ? -1 : 0) * (confidence ?? 50)
+            : null,
           analysisTs,
         };
       } catch (e) {
@@ -1774,7 +1809,7 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
 
   // Fire on-demand Claude analysis for tickers that have no cached entry.
   // Runs after the response is sent so it doesn't block the client.
-  const needsAnalysis = tickers.filter(t => stocks[t] && !stocks[t].trend && !stocks[t].error);
+  const needsAnalysis = tickers.filter(t => stocks[t] && !stocks[t].recommendation && !stocks[t].error);
   if (needsAnalysis.length > 0 && ctx && env?.ANTHROPIC_API_KEY) {
     ctx.waitUntil((async () => {
       for (let i = 0; i < needsAnalysis.length; i += 5) {
@@ -1917,64 +1952,161 @@ async function handleDailyGet(origin, env, ctx) {
   return json({ loading: true, ts: Date.now() }, 200, origin);
 }
 
-/* ── Cron: per-ticker analysis ── */
+/* ── Cron: per-ticker analysis ──
+ * Produces ONE consolidated recommendation per ticker rather than the separate
+ * trend / pattern / action / rating fields the watchlist used to show in four
+ * columns. Splitting them across columns invited the model to answer each in
+ * isolation; a single call forces it to weigh the factors against each other and
+ * commit, which is the judgement a trader actually wants from the row.
+ *
+ * The prompt is fed every factor the dashboard already has — technicals,
+ * multi-period momentum, price action, fundamentals, positioning/sentiment — plus
+ * the macro backdrop. Macro comes from the morning briefing and the hand-kept
+ * FOMC/CPI tables, never from model memory (see the economic-calendar note). */
+const ANALYSIS_SCHEMA = {
+  type: 'object',
+  properties: {
+    rating:         { type: 'string', enum: ['BUY', 'HOLD', 'SELL'] },
+    confidence:     { type: 'integer' },
+    recommendation: { type: 'string' },
+    drivers:        { type: 'array', items: { type: 'string' } },
+    summary:        { type: 'string' },
+  },
+  required: ['rating', 'confidence', 'recommendation', 'drivers', 'summary'],
+  additionalProperties: false,
+};
+
 async function refreshTickerAnalysis(ticker, env) {
   try {
-    const [chartRes, fundRes] = await Promise.allSettled([
-      yahoo(`/v8/finance/chart/${ticker}`, '?range=3mo&interval=1d'),
+    const [chartRes, fundRes, snapRes] = await Promise.allSettled([
+      yahoo(`/v8/finance/chart/${ticker}`, '?range=1y&interval=1d'),
       yahooAuth(
         `/v10/finance/quoteSummary/${ticker}`,
-        '?modules=price,summaryDetail,defaultKeyStatistics,financialData,assetProfile',
+        '?modules=price,summaryDetail,defaultKeyStatistics,financialData,assetProfile,recommendationTrend',
         env,
       ),
+      env?.REC_LOG?.get('daily:snapshot', 'json') ?? Promise.resolve(null),
     ]);
 
-    let priceCtx = '';
+    const pct = (a, b) => (a == null || b == null || !b) ? null : Math.round((a - b) / b * 1000) / 10;
+
+    let priceCtx = '', momentumCtx = '';
     if (chartRes.status === 'fulfilled') {
       const result = chartRes.value?.chart?.result?.[0];
       const meta   = result?.meta || {};
       const q      = result?.indicators?.quote?.[0] || {};
-      const closes = (q.close || []).filter(v => v != null);
-      const highs  = (q.high  || []).filter(v => v != null);
-      const lows   = (q.low   || []).filter(v => v != null);
-      const price  = meta.regularMarketPrice ?? 'N/A';
-      const w52h   = meta.fiftyTwoWeekHigh ?? 'N/A';
-      const w52l   = meta.fiftyTwoWeekLow  ?? 'N/A';
+      const closes = (q.close  || []).filter(v => v != null);
+      const highs  = (q.high   || []).filter(v => v != null);
+      const lows   = (q.low    || []).filter(v => v != null);
+      const vols   = (q.volume || []).filter(v => v != null);
+      const price  = meta.regularMarketPrice ?? closes[closes.length - 1] ?? null;
+      const w52h   = meta.fiftyTwoWeekHigh ?? null;
+      const w52l   = meta.fiftyTwoWeekLow  ?? null;
       const rsi    = closes.length >= 15 ? computeRSI(closes) : null;
       const sr     = highs.length  >= 5  ? computeSR(highs, lows) : null;
-      priceCtx = `Price: $${price}, 52W: $${w52l}–$${w52h}` +
-        (rsi != null ? `, RSI(14): ${rsi}` : '') +
-        (sr  ? `, Support: $${sr.support}, Resistance: $${sr.resist}` : '');
-    }
+      const at     = n => closes.length > n ? closes[closes.length - 1 - n] : null;
+      const sma    = n => closes.length >= n
+        ? closes.slice(-n).reduce((a, b) => a + b, 0) / n : null;
+      const s50 = sma(50), s200 = sma(200);
+      // Where in the 52-week band the price sits — 0% at the low, 100% at the high.
+      const bandPos = (price != null && w52h != null && w52l != null && w52h > w52l)
+        ? Math.round((price - w52l) / (w52h - w52l) * 100) : null;
+      const avgVol = vols.length >= 30
+        ? vols.slice(-30).reduce((a, b) => a + b, 0) / 30 : null;
+      const rvol = (avgVol && vols.length) ? Math.round(vols[vols.length - 1] / avgVol * 100) / 100 : null;
 
-    let fundCtx = '';
-    if (fundRes.status === 'fulfilled') {
-      const r      = fundRes.value?.quoteSummary?.result?.[0] || {};
-      const pe     = r.summaryDetail?.trailingPE?.raw ?? r.defaultKeyStatistics?.forwardPE?.raw ?? null;
-      const sector = r.assetProfile?.sector ?? null;
-      const target = r.financialData?.targetMeanPrice?.raw ?? null;
-      fundCtx = [
-        sector && `Sector: ${sector}`,
-        pe     && `P/E: ${pe.toFixed(1)}`,
-        target && `Analyst target: $${target}`,
+      priceCtx = [
+        price != null && `Price $${price}`,
+        w52l != null && w52h != null && `52W range $${w52l}–$${w52h}${bandPos != null ? ` (sitting ${bandPos}% up the band)` : ''}`,
+        rsi != null && `RSI(14) ${rsi}`,
+        sr && `Support $${sr.support}, Resistance $${sr.resist}`,
+        s50 != null && `50D SMA $${s50.toFixed(2)}`,
+        s200 != null && `200D SMA $${s200.toFixed(2)}`,
+        s50 != null && s200 != null && `50D is ${pct(s50, s200) >= 0 ? 'above' : 'below'} 200D by ${Math.abs(pct(s50, s200))}%`,
+      ].filter(Boolean).join('. ');
+
+      momentumCtx = [
+        pct(price, at(1))  != null && `1D ${pct(price, at(1))}%`,
+        pct(price, at(5))  != null && `1W ${pct(price, at(5))}%`,
+        pct(price, at(21)) != null && `1M ${pct(price, at(21))}%`,
+        pct(price, at(63)) != null && `3M ${pct(price, at(63))}%`,
+        pct(price, at(252))!= null && `1Y ${pct(price, at(252))}%`,
+        rvol != null && `latest volume ${rvol}x the 30-day average`,
       ].filter(Boolean).join(', ');
     }
 
-    const prompt = `Analyze ${ticker} briefly as a stock trader. Given: ${priceCtx}. ${fundCtx}.
+    let fundCtx = '', sentimentCtx = '', sector = null;
+    if (fundRes.status === 'fulfilled') {
+      const r  = fundRes.value?.quoteSummary?.result?.[0] || {};
+      const sd = r.summaryDetail || {}, ks = r.defaultKeyStatistics || {}, fd = r.financialData || {};
+      sector = r.assetProfile?.sector ?? null;
+      const num = v => v?.raw ?? null;
+      fundCtx = [
+        sector && `Sector: ${sector}`,
+        r.assetProfile?.industry && `Industry: ${r.assetProfile.industry}`,
+        num(sd.trailingPE)   != null && `Trailing P/E ${num(sd.trailingPE).toFixed(1)}`,
+        num(ks.forwardPE)    != null && `Forward P/E ${num(ks.forwardPE).toFixed(1)}`,
+        num(ks.pegRatio)     != null && `PEG ${num(ks.pegRatio).toFixed(2)}`,
+        num(fd.profitMargins)!= null && `Net margin ${(num(fd.profitMargins) * 100).toFixed(1)}%`,
+        num(fd.revenueGrowth)!= null && `Revenue growth ${(num(fd.revenueGrowth) * 100).toFixed(1)}% YoY`,
+        num(fd.earningsGrowth)!= null && `Earnings growth ${(num(fd.earningsGrowth) * 100).toFixed(1)}% YoY`,
+        num(fd.debtToEquity) != null && `Debt/equity ${num(fd.debtToEquity).toFixed(0)}`,
+        num(fd.returnOnEquity)!= null && `ROE ${(num(fd.returnOnEquity) * 100).toFixed(1)}%`,
+      ].filter(Boolean).join('. ');
 
-Return ONLY valid JSON (no markdown):
-{
-  "rating": "BUY" | "HOLD" | "SELL",
-  "confidence": 0-100,
-  "trend": "10-word trend description",
-  "pattern": "Chart pattern name",
-  "action": "Action phrase (e.g. Hold above $87, Buy dips to $85)",
-  "summary": "2-sentence trader summary"
-}`;
+      const rt = (r.recommendationTrend?.trend || [])[0];
+      sentimentCtx = [
+        num(fd.targetMeanPrice) != null && `Analyst mean target $${num(fd.targetMeanPrice)}`,
+        fd.recommendationKey && `Street rating: ${fd.recommendationKey}`,
+        rt && `Analyst spread — strong buy ${rt.strongBuy}, buy ${rt.buy}, hold ${rt.hold}, sell ${rt.sell}, strong sell ${rt.strongSell}`,
+        num(ks.shortPercentOfFloat) != null && `Short interest ${(num(ks.shortPercentOfFloat) * 100).toFixed(1)}% of float`,
+        num(ks.heldPercentInstitutions) != null && `Institutional ownership ${(num(ks.heldPercentInstitutions) * 100).toFixed(0)}%`,
+        num(sd.dividendYield) != null && `Dividend yield ${(num(sd.dividendYield) * 100).toFixed(2)}%`,
+      ].filter(Boolean).join('. ');
+    }
 
-    const text    = await workerClaude(prompt, env, 300);
-    const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
-    const analysis = JSON.parse(cleaned);
+    // Macro + geopolitical backdrop: reuse the morning briefing rather than asking
+    // the model to recall world events, and take event dates only from the tables.
+    const snap = snapRes.status === 'fulfilled' ? snapRes.value : null;
+    const macroCtx = [
+      snap?.headline && `Today's market headline: ${snap.headline}`,
+      Array.isArray(snap?.newsCards) && snap.newsCards.length
+        ? `Macro and geopolitical backdrop currently driving the tape:\n` +
+          snap.newsCards.slice(0, 6).map(c => `• [${c.tag}] ${c.title} — ${c.body}`).join('\n')
+        : null,
+    ].filter(Boolean).join('\n');
+
+    const econCtx = econPromptLines(econEventsAhead(3));
+
+    const prompt = `You are a senior portfolio manager. Weigh ALL the evidence below for ${ticker} and commit to ONE consolidated recommendation. Do not evaluate each category in isolation — decide what actually drives this name right now, let the dominant factors outweigh the noise, and say what you would do.
+
+TECHNICALS AND PRICE ACTION
+${priceCtx || 'Unavailable.'}
+
+MOMENTUM
+${momentumCtx || 'Unavailable.'}
+
+FUNDAMENTALS
+${fundCtx || 'Unavailable.'}
+
+POSITIONING AND SENTIMENT
+${sentimentCtx || 'Unavailable.'}
+
+MACRO AND GEOPOLITICAL BACKDROP
+${macroCtx || 'No market briefing available — weight company-specific evidence accordingly and do not invent macro or geopolitical events.'}
+
+SCHEDULED MACRO EVENTS
+${econCtx || 'Nothing scheduled in the tracked calendar.'}
+
+Rules:
+- Use ONLY the evidence above. Do not introduce news, earnings dates, or world events that are not stated here — your training data is stale and this is a live position.
+- Weight the macro and geopolitical backdrop by how much it actually bears on THIS name and sector${sector ? ` (${sector})` : ''}; ignore it where it does not.
+- "recommendation" is the single actionable line a PM would read in a table row: the call plus its trigger or level, at most 14 words. No hedging both ways.
+- "drivers" lists the 2-4 factors that actually decided the call, most important first, 2-5 words each, each naming its category (e.g. "Momentum: 3M +18%", "Macro: CPI risk Wed").
+- "confidence" reflects how strongly the evidence agrees. Genuine conflict between factors means a lower number, not a hedged recommendation.
+- "summary" is 2-3 sentences explaining the call and naming the main thing that would invalidate it.`;
+
+    const analysis = JSON.parse(await workerClaude(prompt, env, 700, ANALYSIS_SCHEMA));
 
     await env?.REC_LOG?.put(
       `analysis:${ticker}`,
@@ -2656,7 +2788,7 @@ Return ONLY valid JSON, no markdown fences.`;
     }
   }
 
-  // Refresh trend/pattern/action/rating for every Watchlist-tab ticker so the
+  // Refresh the consolidated recommendation for every Watchlist-tab ticker so the
   // columns are current each morning without the user clicking into each stock.
   await refreshWatchlistAnalyses(env);
 
@@ -2674,7 +2806,7 @@ Return ONLY valid JSON, no markdown fences.`;
    Uses the user's persisted watchlist (saved from the dashboard) unioned with
    DEFAULT_WATCHLIST so the morning briefing's opportunity/avoid picks are always
    covered too. Each ticker is written to analysis:{TICKER} for the batch endpoint
-   to serve, so trend/pattern/action/rating render instantly on page load. */
+   to serve, so the consolidated recommendation renders instantly on page load. */
 async function refreshWatchlistAnalyses(env) {
   let tickers = [...DEFAULT_WATCHLIST];
   try {

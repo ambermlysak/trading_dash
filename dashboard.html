@@ -193,6 +193,28 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .wl-table td.mono { font-family: var(--mono); }
 .wl-table td.up { color: var(--bull); font-family: var(--mono); }
 .wl-table td.dn { color: var(--bear); font-family: var(--mono); }
+/* Consolidated recommendation */
+.wl-table td.rec-cell { min-width: 260px; vertical-align: top; padding-top: 8px; padding-bottom: 8px; }
+.wl-table .rec-head { display: flex; align-items: baseline; gap: 8px; }
+/* Badge and confidence read as one unit; the shared .rating-conf margin-top is
+   for the old stacked layout and would knock it off the baseline here. */
+.wl-table .rec-badge { display: flex; align-items: baseline; gap: 5px; flex: 0 0 auto; }
+.wl-table .rec-badge .rating-conf { margin-top: 0; }
+.wl-table .rec-line { font-size: 12px; color: var(--ink-1); line-height: 1.35; }
+.wl-table .rec-drivers { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.wl-table .rec-driver {
+  font-family: var(--mono); font-size: 9px; color: var(--ink-3);
+  background: var(--bg-2); border: 1px solid var(--bg-3);
+  border-radius: 3px; padding: 1px 5px; white-space: nowrap;
+}
+
+/* Nearest decision level */
+.wl-table td.lvl-hold     { color: var(--bull); }   /* holding above support */
+.wl-table td.lvl-break    { color: var(--bear); }   /* support broken */
+.wl-table td.lvl-break-up { color: var(--bull); }   /* broken out above resistance */
+.wl-table td.lvl-cap      { color: var(--amber); }  /* capped under resistance — not bearish */
+.wl-table .lvl-tag { font-size: 9px; color: var(--ink-3); }
+
 /* EMA golden / death cross state */
 .wl-table td.x-cell { font-family: var(--mono); white-space: nowrap; }
 .wl-table td.x-active-g { color: var(--bull); }
@@ -669,8 +691,8 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     <div class="wl-table-wrap">
       <table class="wl-table">
         <colgroup>
-          <col><col><col><col><col><col><col><col><col><col><col><col>
-          <col><col><col><col><col><col><col><col><col><col><col><col>
+          <col><col><col><col><col><col><col>
+          <col><col><col><col><col><col><col>
         </colgroup>
         <thead>
           <tr>
@@ -678,22 +700,12 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
             <th data-sort="symbol">Ticker</th>
             <th data-sort="price">Price</th>
             <th data-sort="changePct">% Chg</th>
-            <th data-sort="trend">Trend</th>
-            <th data-sort="pattern">Pattern</th>
-            <th data-sort="action">Action</th>
-            <th data-sort="rating">Rating</th>
-            <th data-sort="pctVs50"   title="Current price vs the 50-day simple moving average">vs 50D</th>
-            <th data-sort="pctVs200"  title="Current price vs the 200-day simple moving average">vs 200D</th>
-            <th data-sort="smaSpread" title="50-day SMA above or below the 200-day SMA (golden / death cross)">50D vs 200D</th>
+            <th data-sort="recRank" title="One consolidated call, weighing technicals, momentum, price action, fundamentals, positioning and sentiment, and the macro / geopolitical backdrop against each other. Confidence reflects how strongly those factors agree — conflicting evidence lowers it rather than hedging the call. Hover a row for the drivers that decided it; click to expand the full rationale. Sorts strongest BUY to strongest SELL.">Recommendation</th>
             <th data-sort="crossSpread" title="SMA cross in effect: Golden = 50-day SMA above the 200-day, Death = below, with the gap between them. Arrow = which way that gap is moving over 5 sessions — ▲ the 50D is pulling up on the 200D, ▼ pulling down. So Golden ▼ is a golden cross decaying. ◆ marks a setup within 5% and trending into a flip.">SMA X</th>
             <th data-sort="rsi">RSI</th>
-            <th data-sort="pe">P/E</th>
             <th data-sort="forwardPE">Fwd P/E</th>
             <th data-sort="shortPct">Short %</th>
-            <th data-sort="volume">Volume</th>
-            <th data-sort="resist">Resist</th>
-            <th data-sort="support">Support</th>
-            <th>Target L/M/H</th>
+            <th data-sort="levelPct" title="Distance to the nearest decision level — support or resistance, whichever the price is closer to, never both. ▲ means price is above that level, ▼ below. Sorts nearest level first.">Key Level</th>
             <th data-sort="upside">Upside</th>
             <th>52W Range</th>
             <th data-sort="daysToEarnings">Earnings</th>
@@ -701,7 +713,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
           </tr>
         </thead>
         <tbody id="wl-tbody">
-          <tr><td colspan="24" class="loading" style="padding:24px">Loading watchlist…</td></tr>
+          <tr><td colspan="14" class="loading" style="padding:24px">Loading watchlist…</td></tr>
         </tbody>
       </table>
     </div>
@@ -816,6 +828,46 @@ const fmtVol = (v) => {
 };
 const clsChg = (n) => n == null ? '' : n > 0 ? 'up' : n < 0 ? 'dn' : '';
 const clsRsi = (r) => r == null ? 'rsi-neutral' : r > 70 ? 'rsi-ob' : r < 30 ? 'rsi-os' : 'rsi-neutral';
+
+/* Consolidated recommendation cell — replaces the old Trend / Pattern / Action /
+ * Rating quartet. The badge carries the call and its confidence, the line beside
+ * it is the actionable one-liner, and the drivers that decided it sit underneath.
+ * Full rationale is in the expanded row (click the row). */
+function recCell(s) {
+  if (!s.rating && !s.recommendation) {
+    return '<td class="rec-cell"><span style="color:var(--ink-3)">analyzing…</span></td>';
+  }
+  const drivers = Array.isArray(s.drivers) && s.drivers.length
+    ? `<div class="rec-drivers">${s.drivers.slice(0, 4).map(d => `<span class="rec-driver">${esc(d)}</span>`).join('')}</div>`
+    : '';
+  const tip = [s.recommendation, s.summary].filter(Boolean).join(' — ');
+  return `<td class="rec-cell"${tip ? ` title="${esc(tip)}"` : ''}>
+    <div class="rec-head"><span class="rec-badge">${ratingBadge(s.rating, s.confidence)}</span><span class="rec-line">${esc(s.recommendation || '—')}</span></div>
+    ${drivers}
+  </td>`;
+}
+
+/* Nearest decision level — support or resistance, whichever the price is closer
+ * to, never both. The arrow is literal position (▲ price above the level, ▼
+ * below); colour is what that position means, which is not the same thing: under
+ * resistance is ordinary headroom, not bearish, so it reads amber rather than red. */
+function levelCell(s) {
+  if (s.levelPct == null || !s.levelKind) {
+    return '<td class="mono" style="color:var(--ink-3)">—</td>';
+  }
+  const isSup = s.levelKind === 'support';
+  const arrow = s.levelAbove ? '▲' : '▼';
+  const cls   = isSup
+    ? (s.levelAbove ? 'lvl-hold'  : 'lvl-break')   // above support = holding; below = broken
+    : (s.levelAbove ? 'lvl-break-up' : 'lvl-cap'); // above resistance = broken out; below = capped
+  const other = isSup
+    ? (s.resist  != null ? ` Resistance $${fmt(s.resist)}.`  : '')
+    : (s.support != null ? ` Support $${fmt(s.support)}.` : '');
+  const tip = `Price $${fmt(s.price)} is ${fmt(s.levelPct, 1)}% ${s.levelAbove ? 'above' : 'below'} `
+            + `${s.levelKind} $${fmt(s.levelPrice)} — the nearer of the two levels.${other}`;
+  return `<td class="mono ${cls}" title="${esc(tip)}">${arrow} ${fmt(s.levelPct, 1)}% `
+       + `<span class="lvl-tag">${isSup ? 'Sup' : 'Res'}</span></td>`;
+}
 
 /* SMA cross cell — one column covering both formations.
  * The label names the cross in effect (50D SMA above the 200D = Golden, below
@@ -1174,7 +1226,7 @@ function saveWatchlist(tickers) {
 }
 
 // Push the watchlist to the Worker so the 6am cron refreshes analysis
-// (trend/pattern/action/rating) for exactly the tickers on this tab.
+// (the consolidated recommendation) for exactly the tickers on this tab.
 let wlSyncTimer = null;
 function syncWatchlistToServer(tickers) {
   clearTimeout(wlSyncTimer);
@@ -1200,7 +1252,7 @@ async function loadWatchlistBatch() {
   btn.disabled = true;
   btn.textContent = '↺ Loading…';
   document.getElementById('wl-tbody').innerHTML =
-    '<tr><td colspan="24" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
+    '<tr><td colspan="14" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
   document.getElementById('wl-status').textContent = 'Fetching…';
 
   try {
@@ -1234,7 +1286,7 @@ async function loadWatchlistBatch() {
     console.error('[watchlist]', e.message);
     document.getElementById('wl-status').textContent = 'Error — ' + e.message;
     document.getElementById('wl-tbody').innerHTML =
-      '<tr><td colspan="24" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
+      '<tr><td colspan="14" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
   } finally {
     wlLoading = false;
     btn.disabled = false;
@@ -1283,32 +1335,17 @@ function renderWatchlist() {
       </div>`;
     }
 
-    // Target L/M/H
-    const targets = [s.targetLow, s.targetMean, s.targetHigh].map(v => v != null ? fmt(v) : '—').join(' / ');
-
     html += `<tr class="${earningsCls}${expandedCls}" data-ticker="${esc(s.symbol)}">
       <td><button class="rm-btn" data-remove="${esc(s.symbol)}" title="Remove">×</button></td>
       <td class="ticker-cell"><a href="${EQUITY_URL}?t=${esc(s.symbol)}" onclick="event.stopPropagation()">${esc(s.symbol)}</a></td>
       <td class="mono">${s.price != null ? fmt(s.price) : '—'}</td>
       <td class="${clsChg(s.changePct)}">${fmtPct(s.changePct)}</td>
-      <td class="ai-cell" data-full="${esc(s.trend || '')}">${esc(s.trend || '—')}</td>
-      <td class="ai-cell" data-full="${esc(s.pattern || '')}">${esc(s.pattern || '—')}</td>
-      <td class="ai-cell" data-full="${esc(s.action || '')}">${esc(s.action || '—')}</td>
-      <td class="rating-cell">${ratingBadge(s.rating, s.confidence)}</td>
-      <td class="${clsChg(s.pctVs50)}"${s.sma50  != null ? ` title="50D SMA $${fmt(s.sma50)}"`  : ''}>${fmtPct(s.pctVs50)}</td>
-      <td class="${clsChg(s.pctVs200)}"${s.sma200 != null ? ` title="200D SMA $${fmt(s.sma200)}"` : ''}>${fmtPct(s.pctVs200)}</td>
-      <td class="${clsChg(s.smaSpread)}"${s.smaSpread != null ? ` title="50D $${fmt(s.sma50)} vs 200D $${fmt(s.sma200)} (${fmtPct(s.smaSpread)})"` : ''}>${
-        s.smaSpread == null ? '—' : s.smaSpread > 0 ? '▲ Above' : s.smaSpread < 0 ? '▼ Below' : 'Even'
-      }</td>
+      ${recCell(s)}
       ${crossCell(s)}
       <td class="${clsRsi(s.rsi)}">${s.rsi != null ? s.rsi : '—'}</td>
-      <td class="mono">${s.pe != null ? fmt(s.pe, 1) : '—'}</td>
       <td class="mono">${s.forwardPE != null ? fmt(s.forwardPE, 1) : '—'}</td>
       <td class="mono">${s.shortPct != null ? fmt(s.shortPct, 1) + '%' : '—'}</td>
-      <td class="mono">${fmtVol(s.volume)}</td>
-      <td class="mono">${s.resist  != null ? fmt(s.resist)  : '—'}</td>
-      <td class="mono">${s.support != null ? fmt(s.support) : '—'}</td>
-      <td class="mono" style="font-size:11px">${targets}</td>
+      ${levelCell(s)}
       <td class="${clsChg(s.upside)}">${s.upside != null ? fmtPct(s.upside) : '—'}</td>
       <td>${rangeHtml}</td>
       <td class="${earningsSoon ? 'earnings-cell' : 'mono'}">${earningsSoon ? '⚠ ' : ''}${esc(s.earningsDate || '—')}</td>
@@ -1339,7 +1376,7 @@ function renderWatchlist() {
       }
 
       html += `<tr class="expand-row">
-        <td colspan="24">
+        <td colspan="14">
           <div class="expand-content">
             ${s.summary ? `<div class="expand-summary">${esc(s.summary)}</div>` : ''}
             <div class="expand-meta">
@@ -1354,7 +1391,7 @@ function renderWatchlist() {
       </tr>`;
     }
   }
-  tbody.innerHTML = html || '<tr><td colspan="24" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
+  tbody.innerHTML = html || '<tr><td colspan="14" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
 }
 
 /* ─── Closing auction block trades ───
