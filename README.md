@@ -1,6 +1,6 @@
 # Equity Research Terminal
 
-A one-page-per-ticker research dashboard built around 16 components: price action with SMA position, performance windows, earnings + macro catalysts, short interest, insider trades, unusual options, dark pool prints, day/swing trade signals (ORB, VWAP, EMA crossovers), recommended option strategies, analyst targets + recent actions, super-investor 13F holdings, technical analysis with chart projections, sentiment, fundamentals + valuation, an AI-synthesized BUY/HOLD/SELL with confidence and factor breakdown, and a forward-logged recommendation track record.
+A one-page-per-ticker research dashboard built around 16 components: price action with SMA position, performance windows, earnings + macro catalysts, short interest, insider trades, unusual options, dark pool prints, swing trade signals (EMA crossovers), recommended option strategies, analyst targets + recent actions, super-investor 13F holdings, technical analysis with chart projections, sentiment, fundamentals + valuation, an AI-synthesized BUY/HOLD/SELL with confidence and factor breakdown, and a forward-logged recommendation track record.
 
 ## Stack
 

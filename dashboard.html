@@ -1089,18 +1089,24 @@ function renderMidday(data) {
     </a>`;
   }).join('');
 
-  // Trade ideas by style
+  // Trade ideas by style.
+  // This bucket used to be labelled "Day Trade". The model has only daily bars and
+  // a delayed quote, so any same-session entry, stop or target it produced was
+  // invented — the same defect as the removed ORB/VWAP card, one layer up. It is
+  // now a 2-10 day horizon and the prompt forbids intraday levels.
   const trades = m.trades || {};
   const groups = [
-    ['day',      'Day Trade',  'day'],
-    ['swing',    'Swing',      'swing'],
-    ['options',  'Options',    'options'],
-    ['longTerm', 'Long-Term',  'longterm'],
+    ['shortTerm', 'Short-Term', 'day'],
+    ['swing',     'Swing',      'swing'],
+    ['options',   'Options',    'options'],
+    ['longTerm',  'Long-Term',  'longterm'],
   ];
-  const anyTrades = groups.some(([k]) => (trades[k] || []).length);
+  // Cached payloads written before the rename still carry `day`; they expire within 24h.
+  const itemsFor = (key) => (key === 'shortTerm' ? (trades.shortTerm || trades.day) : trades[key]) || [];
+  const anyTrades = groups.some(([k]) => itemsFor(k).length);
   document.getElementById('midday-trades-wrap').style.display = anyTrades ? '' : 'none';
   document.getElementById('midday-trades').innerHTML = groups.map(([key, label, cls]) => {
-    const items = trades[key] || [];
+    const items = itemsFor(key);
     const body = items.length
       ? items.map(it => `<div class="midday-trade-item">
           <span class="midday-trade-ticker"><a href="${EQUITY_URL}?t=${encodeURIComponent(it.ticker || '')}">${esc(it.ticker || '')}</a></span>

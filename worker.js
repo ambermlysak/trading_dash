@@ -871,6 +871,273 @@ Only include ticker keys that appear in the data above. Max 2 strategies per tic
   return json(result, 200, origin);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   IMPLIED VOLATILITY  (/api/iv/:ticker)
+
+   Implied vol comes from the options chain and nowhere else. The page used to
+   compute a 30-day close-to-close standard deviation into a variable named `iv`
+   — that is *historical* vol, a different quantity, and it now travels as
+   `hv30` under an HV30 label. This block is the real thing.
+
+   HV30 rather than HV20 is the comparator on purpose: front-expiry ATM IV is a
+   forward ~30-day vol estimate, so 30 sessions of realised vol is the
+   apples-to-apples window for `ivHvRatio`.
+
+   Every vol figure below (atmIv, hv30, termStructure) is in **percent** — Yahoo
+   returns `impliedVolatility` as a decimal fraction and it is scaled by 100 here
+   so the ratio divides like with like.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const IV_MIN_DTE          = 7;                // front expiry must be at least this far out
+const IV_HV_WINDOW        = 30;               // sessions of realised vol compared against front IV
+const IV_HISTORY_TTL      = 400 * 24 * 3600;  // per-day sample retention, in seconds
+const IV_RANK_MIN_DAYS    = 60;               // below this, ivRank is null — never estimated
+const IV_RANK_TARGET_DAYS = 252;              // one trading year: the goal the UI counts toward
+
+/** Today in US Pacific time as an ISO `YYYY-MM-DD` string. */
+const ptDate = (d = new Date()) =>
+  new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(d);
+
+/** Yahoo expirations are midnight UTC; compare them as calendar days, not elapsed hours. */
+function dteOf(expiryUnixSec, now = Date.now()) {
+  const exp    = new Date(expiryUnixSec * 1000);
+  const expDay = Date.UTC(exp.getUTCFullYear(), exp.getUTCMonth(), exp.getUTCDate());
+  const n      = new Date(now);
+  const nowDay = Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate());
+  return Math.round((expDay - nowDay) / 86_400_000);
+}
+
+const expiryIso = unixSec => new Date(unixSec * 1000).toISOString().slice(0, 10);
+
+/** Standard monthly expiry: the third Friday of the month. */
+function isMonthlyExpiry(unixSec) {
+  const d = new Date(unixSec * 1000);
+  return d.getUTCDay() === 5 && d.getUTCDate() >= 15 && d.getUTCDate() <= 21;
+}
+
+/**
+ * ATM implied vol for one expiry: the average of `impliedVolatility` on the call
+ * and the put whose strike sits closest to spot. If only one side quotes a usable
+ * IV that side stands alone rather than discarding the expiry.
+ */
+function atmIvFor(chain, spot) {
+  const nearest = (arr = []) => arr
+    .filter(o => Number.isFinite(o?.strike))
+    .sort((a, b) => Math.abs(a.strike - spot) - Math.abs(b.strike - spot))[0];
+
+  const call = nearest(chain?.calls);
+  const put  = nearest(chain?.puts);
+  const ivs  = [call?.impliedVolatility, put?.impliedVolatility]
+    .filter(v => Number.isFinite(v) && v > 0);
+
+  if (!ivs.length) return null;
+  return {
+    atmIv:  +(ivs.reduce((a, b) => a + b, 0) / ivs.length * 100).toFixed(2),
+    strike: call?.strike ?? put?.strike ?? null,
+    legs:   ivs.length,
+  };
+}
+
+/** Annualised close-to-close historical volatility, in percent. */
+function historicalVol(closes, period = IV_HV_WINDOW) {
+  const c = (closes || []).filter(Number.isFinite);
+  if (c.length < period + 1) return null;
+  const rets = [];
+  for (let i = c.length - period; i < c.length; i++) rets.push(Math.log(c[i] / c[i - 1]));
+  const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const varc = rets.reduce((a, b) => a + (b - mean) ** 2, 0) / rets.length;
+  return +(Math.sqrt(varc) * Math.sqrt(252) * 100).toFixed(2);
+}
+
+/**
+ * Front + back ATM IV for a ticker.
+ *   front — nearest expiration at least IV_MIN_DTE out
+ *   back  — the next standard monthly expiry after the front one
+ * Costs one chain fetch when the base response already carries the front expiry,
+ * plus one per expiry it does not.
+ */
+async function ivSnapshot(ticker, env) {
+  const base = await yahooAuth(`/v7/finance/options/${encodeURIComponent(ticker)}`, '', env);
+  const res  = base?.optionChain?.result?.[0];
+  if (!res) return null;
+
+  const spot = res.quote?.regularMarketPrice;
+  const exps = (res.expirationDates || []).slice().sort((a, b) => a - b);
+  if (!Number.isFinite(spot) || !exps.length) return null;
+
+  const frontExp = exps.find(e => dteOf(e) >= IV_MIN_DTE) ?? exps[exps.length - 1];
+  const backExp  = exps.find(e => e > frontExp && isMonthlyExpiry(e)) ?? null;
+
+  // The base response already carries one expiry's strikes — reuse it when it matches.
+  const loaded = new Map();
+  if (res.options?.[0]?.expirationDate) loaded.set(res.options[0].expirationDate, res.options[0]);
+
+  const chainFor = async (exp) => {
+    if (exp == null) return null;
+    if (loaded.has(exp)) return loaded.get(exp);
+    const d = await yahooAuth(`/v7/finance/options/${encodeURIComponent(ticker)}`, `?date=${exp}`, env);
+    const c = d?.optionChain?.result?.[0]?.options?.[0] || null;
+    if (c) loaded.set(exp, c);
+    return c;
+  };
+
+  const frontChain = await chainFor(frontExp);
+  const backChain  = await chainFor(backExp);
+  const frontIv    = frontChain ? atmIvFor(frontChain, spot) : null;
+  const backIv     = backChain  ? atmIvFor(backChain,  spot) : null;
+  if (!frontIv) return null;
+
+  return {
+    spot: +spot.toFixed(4),
+    front: { expiry: expiryIso(frontExp), dte: dteOf(frontExp), atmIv: frontIv.atmIv, strike: frontIv.strike },
+    back: backIv
+      ? { expiry: expiryIso(backExp), dte: dteOf(backExp), atmIv: backIv.atmIv, strike: backIv.strike }
+      : null,
+  };
+}
+
+/**
+ * Persist one day's front-month ATM IV.
+ *
+ * IV rank needs a year of history that nothing has been collecting, so every read
+ * path and the EOD cron drop a sample. The reading is duplicated into the key's KV
+ * metadata so `ivHistory()` can rebuild the series from a single paged `list()`
+ * rather than one `get()` per stored day. Metadata is capped at 1024 bytes per
+ * key, so it stays three flat numbers — the full sample lives in the value.
+ */
+async function recordIvSample(ticker, snap, env) {
+  if (!env?.REC_LOG || !snap?.front?.atmIv) return;
+  const sample = {
+    atmIv:  snap.front.atmIv,
+    expiry: snap.front.expiry,
+    dte:    snap.front.dte,
+    spot:   snap.spot,
+    ts:     new Date().toISOString(),
+  };
+  await env.REC_LOG.put(
+    `iv:${ticker.toUpperCase()}:${ptDate()}`,
+    JSON.stringify(sample),
+    {
+      expirationTtl: IV_HISTORY_TTL,
+      metadata: { atmIv: sample.atmIv, spot: sample.spot, dte: sample.dte },
+    },
+  );
+}
+
+/** Every stored daily ATM IV for a ticker, read from key metadata in one list pass.
+ *  400 days sits under the 1000-key page limit today; the cursor loop is here so a
+ *  longer retention later cannot silently truncate the window. */
+async function ivHistory(ticker, env) {
+  if (!env?.REC_LOG) return [];
+  const out = [];
+  let cursor;
+  do {
+    const page = await env.REC_LOG.list({ prefix: `iv:${ticker.toUpperCase()}:`, cursor });
+    for (const k of page.keys) {
+      const v = k.metadata?.atmIv;
+      if (Number.isFinite(v)) out.push(v);
+    }
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
+  return out;
+}
+
+async function handleIv(ticker, params, origin, env, ctx) {
+  if (!ticker) return err('ticker required', 400, origin);
+  const sym = ticker.toUpperCase();
+
+  const snap = await ivSnapshot(sym, env);
+
+  // HV30 is independent of the chain, so it is still worth returning when a
+  // ticker has no listed options — the UI needs to tell "no IV" apart from "no data".
+  let hv30 = null;
+  try {
+    const chart  = await yahoo(`/v8/finance/chart/${encodeURIComponent(sym)}`, '?range=3mo&interval=1d');
+    const closes = chart?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
+    hv30 = historicalVol(closes, IV_HV_WINDOW);
+  } catch (e) { console.warn('[iv] hv30 failed:', e.message); }
+
+  if (!snap) {
+    return json({
+      ticker: sym, asOf: new Date().toISOString(),
+      spot: null, front: null, back: null,
+      termStructure: null, hv30, ivHvRatio: null,
+      ivRank: null, historyDays: 0,
+      rankMinDays: IV_RANK_MIN_DAYS, rankTargetDays: IV_RANK_TARGET_DAYS,
+      rankReason: 'no usable options chain — no implied-vol reading',
+      units: 'percent',
+    }, 200, origin);
+  }
+
+  // Record before ranking so today's reading is inside its own window.
+  try { await recordIvSample(sym, snap, env); }
+  catch (e) { console.warn('[iv] sample write failed:', e.message); }
+
+  const history     = await ivHistory(sym, env);
+  const historyDays = history.length;
+
+  // Below IV_RANK_MIN_DAYS there is no rank — and no percentile of HV standing in
+  // for one, since a stand-in would be indistinguishable from the real thing on screen.
+  let ivRank = null, rankReason = null;
+  if (historyDays < IV_RANK_MIN_DAYS) {
+    rankReason = `collecting — ${historyDays}/${IV_RANK_TARGET_DAYS}d (rank needs ${IV_RANK_MIN_DAYS})`;
+  } else {
+    const min = Math.min(...history), max = Math.max(...history);
+    ivRank = max === min ? 0 : +((snap.front.atmIv - min) / (max - min)).toFixed(4);
+  }
+
+  return json({
+    ticker: sym,
+    asOf:   new Date().toISOString(),
+    spot:   snap.spot,
+    front:  snap.front,
+    back:   snap.back,
+    termStructure: snap.back ? +(snap.front.atmIv - snap.back.atmIv).toFixed(2) : null,
+    hv30,
+    ivHvRatio: (hv30 > 0) ? +(snap.front.atmIv / hv30).toFixed(3) : null,
+    ivRank,
+    historyDays,
+    rankMinDays:    IV_RANK_MIN_DAYS,
+    rankTargetDays: IV_RANK_TARGET_DAYS,
+    rankReason,
+    units: 'percent',
+  }, 200, origin);
+}
+
+/* ── Cron: bank one IV reading per watchlist ticker (runs with the EOD job) ──
+   IV rank is only ever as good as the history behind it, and page views alone
+   would leave gaps on every day nobody opened the ticker. */
+async function recordWatchlistIv(env) {
+  // The 1:15pm branch spans two cron firings. Writes are idempotent (one key per
+  // ticker per PT day) but the chain fetches are not free, so skip the repeat.
+  try {
+    const last = await env?.REC_LOG?.get('ivsweep:last');
+    if (last === ptDate()) { console.log('[cron] iv sweep already ran today, skipping'); return; }
+  } catch (_) {}
+
+  let tickers = [...DEFAULT_WATCHLIST];
+  try {
+    const saved = await env?.REC_LOG?.get('watchlist:tickers', 'json');
+    if (Array.isArray(saved) && saved.length) {
+      tickers = [...new Set([...saved, ...DEFAULT_WATCHLIST].map(t => String(t).toUpperCase()))];
+    }
+  } catch (_) {}
+  tickers = tickers.slice(0, 50); // each ticker costs 1–2 chain fetches
+
+  let ok = 0;
+  for (let i = 0; i < tickers.length; i += 5) {
+    const results = await Promise.allSettled(tickers.slice(i, i + 5).map(async (t) => {
+      const snap = await ivSnapshot(t, env);
+      if (!snap) return false;
+      await recordIvSample(t, snap, env);
+      return true;
+    }));
+    ok += results.filter(r => r.status === 'fulfilled' && r.value).length;
+  }
+  try { await env?.REC_LOG?.put('ivsweep:last', ptDate(), { expirationTtl: 172800 }); } catch (_) {}
+  console.log(`[cron] iv samples recorded for ${ok}/${tickers.length} tickers`);
+}
+
 async function handleSearch(q, origin) {
   const r = await fetch(
     `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&quotesCount=8&newsCount=0`,
@@ -935,32 +1202,200 @@ async function handleClaude(request, env, origin) {
   return json(await r.json(), r.status, origin);
 }
 
+/* ── Recommendation forward-log ──────────────────────────────────────────────
+   synthesize() runs on every page load, so appending unconditionally produced a
+   dozen near-identical rows for one trading day: the same call counted a dozen
+   times, weighting whichever ticker got refreshed most and making hit rate and
+   Brier score meaningless. The log is now one entry per ticker per US/Pacific
+   trading date — the newest entry is overwritten rather than appended when it
+   falls on the same date. */
+
+const REC_FWD_HORIZONS = [
+  { days: 5,  ret: 'fwd5',  close: 'fwd5Close'  },
+  { days: 20, ret: 'fwd20', close: 'fwd20Close' },
+];
+const REC_CALIB_MIN_N = 10;
+
 async function handleLogRec(request, env, origin) {
   if (!env.REC_LOG) return err('REC_LOG KV not bound', 500, origin);
   const body = await request.json();
   const { ticker, rating, confidence, price, factors } = body;
   if (!ticker || !rating) return err('ticker and rating required', 400, origin);
 
+  const now   = new Date();
   const entry = {
     ticker:     ticker.toUpperCase(),
     rating,
     confidence: confidence ?? null,
     price:      price      ?? null,
     factors:    factors    ?? {},
-    ts:         new Date().toISOString(),
+    ts:         now.toISOString(),
+    d:          ptDate(now),   // the trading date this call belongs to
+    // Filled later by fillForwardReturns(): percent return vs `price`, with the
+    // realising close kept alongside so the number can be audited.
+    fwd5:  null, fwd5Close:  null,
+    fwd20: null, fwd20Close: null,
   };
+
   const key      = `rec:${entry.ticker}`;
   const existing = await env.REC_LOG.get(key, 'json');
   const list     = Array.isArray(existing) ? existing : [];
-  list.push(entry);
+
+  const lastIdx = list.length - 1;
+  const last    = lastIdx >= 0 ? list[lastIdx] : null;
+  const lastDay = last ? (last.d || ptDate(new Date(last.ts))) : null;
+
+  // Forward fields stay null on overwrite: the replacement carries a new entry
+  // price, so returns measured against the old one would no longer describe it.
+  // (They are null in practice anyway — a fill needs 5+ sessions to have passed,
+  // which means the entry is no longer same-day.)
+  const replaced = !!last && lastDay === entry.d;
+  if (replaced) list[lastIdx] = entry; else list.push(entry);
+
   await env.REC_LOG.put(key, JSON.stringify(list.slice(-500)));
-  return json({ ok: true, count: list.length }, 200, origin);
+  return json({ ok: true, count: list.length, replaced, tradingDate: entry.d }, 200, origin);
+}
+
+/**
+ * Calibration over the resolved slice of a ticker's log.
+ *
+ * "Resolved" means fwd20 is filled — an entry logged nine sessions ago has no
+ * outcome yet and cannot count. Below REC_CALIB_MIN_N the figures are returned
+ * as nulls with a reason: a hit rate over four entries is noise wearing a
+ * percentage sign, and it would read on screen exactly like a real one.
+ */
+function recCalibration(list) {
+  const resolved = list.filter(e => Number.isFinite(e.fwd20));
+  const n = resolved.length;
+
+  if (n < REC_CALIB_MIN_N) {
+    return {
+      n, minN: REC_CALIB_MIN_N, brier: null, brierN: 0, byRating: null,
+      reason: `${n} of ${REC_CALIB_MIN_N} recommendations have a 20-session outcome. `
+            + `Each entry needs 20 trading days to elapse before it resolves.`,
+    };
+  }
+
+  const mean = arr => arr.length
+    ? +(arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2)
+    : null;
+
+  const byRating = {};
+  for (const r of ['BUY', 'HOLD', 'SELL']) {
+    const rows = resolved.filter(e => e.rating === r);
+    // HOLD is excluded from hit rate by design: it makes no directional claim,
+    // so there is no outcome that would count as right.
+    const hits = (r === 'HOLD' || !rows.length) ? null
+      : rows.filter(e => r === 'BUY' ? e.fwd20 > 0 : e.fwd20 < 0).length;
+    byRating[r] = {
+      n:         rows.length,
+      hitRate:   hits == null ? null : +(hits / rows.length).toFixed(4),
+      meanFwd5:  mean(rows.filter(e => Number.isFinite(e.fwd5)).map(e => e.fwd5)),
+      meanFwd20: mean(rows.map(e => e.fwd20)),
+    };
+  }
+
+  // Brier scores the confidence number against the directional outcome, so it
+  // covers BUY/SELL only. Lower is better; 0.25 is what you score by saying 50%
+  // to everything.
+  const scored = resolved.filter(e =>
+    (e.rating === 'BUY' || e.rating === 'SELL') && Number.isFinite(e.confidence));
+  const brier = scored.length
+    ? +(scored.reduce((acc, e) => {
+        const p = Math.min(1, Math.max(0, e.confidence / 100));
+        const o = (e.rating === 'BUY' ? e.fwd20 > 0 : e.fwd20 < 0) ? 1 : 0;
+        return acc + (p - o) ** 2;
+      }, 0) / scored.length).toFixed(4)
+    : null;
+
+  return { n, minN: REC_CALIB_MIN_N, reason: null, brier, brierN: scored.length, byRating };
 }
 
 async function handleTrack(ticker, env, origin) {
   if (!env.REC_LOG) return err('REC_LOG KV not bound', 500, origin);
   const list = (await env.REC_LOG.get(`rec:${ticker.toUpperCase()}`, 'json')) || [];
-  return json({ ticker: ticker.toUpperCase(), entries: list }, 200, origin);
+  return json({
+    ticker:      ticker.toUpperCase(),
+    entries:     list,
+    calibration: recCalibration(list),
+  }, 200, origin);
+}
+
+/* ── Cron: fill forward returns on logged recommendations (2:00pm PT) ──
+   Walks every rec:{TICKER} list and resolves entries that have come of age.
+   One chart fetch per ticker covers all of its pending entries. */
+async function fillForwardReturns(env) {
+  if (!env?.REC_LOG) return;
+  try {
+    const last = await env.REC_LOG.get('recfwd:last');
+    if (last === ptDate()) { console.log('[cron] forward fill already ran today, skipping'); return; }
+  } catch (_) {}
+
+  const keys = [];
+  let cursor;
+  do {
+    const page = await env.REC_LOG.list({ prefix: 'rec:', cursor });
+    for (const k of page.keys) keys.push(k.name);
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor);
+
+  const today = etToday();
+  let tickers = 0, filled = 0;
+
+  for (const key of keys) {
+    const ticker = key.slice(4);
+    let list;
+    try { list = await env.REC_LOG.get(key, 'json'); } catch (_) { continue; }
+    if (!Array.isArray(list) || !list.length) continue;
+
+    const pending = list.filter(e =>
+      Number.isFinite(e.price) && REC_FWD_HORIZONS.some(h => e[h.ret] == null));
+    if (!pending.length) continue;
+
+    let bars;
+    try {
+      const chart = await yahoo(`/v8/finance/chart/${encodeURIComponent(ticker)}`, '?range=2y&interval=1d');
+      bars = chartDailyBars(chart);
+    } catch (e) {
+      console.warn(`[cron] forward fill ${ticker}: chart failed — ${e.message}`);
+      continue;
+    }
+    if (bars.length < 2) continue;
+    tickers++;
+
+    let dirty = false;
+    for (const e of pending) {
+      const day = e.d || ptDate(new Date(e.ts));
+      // Anchor on the session in effect when the call was logged: the last bar at
+      // or before that date. A call logged on a weekend anchors to the Friday.
+      let anchor = -1;
+      for (let i = bars.length - 1; i >= 0; i--) {
+        if (bars[i].iso <= day) { anchor = i; break; }
+      }
+      if (anchor < 0) continue;
+
+      for (const h of REC_FWD_HORIZONS) {
+        if (e[h.ret] != null) continue;
+        const idx = anchor + h.days;
+        // Require a completed session: today's bar is still forming.
+        if (idx >= bars.length || bars[idx].iso >= today) continue;
+        const close = bars[idx].close;
+        if (!Number.isFinite(close)) continue;
+        e[h.close] = +close.toFixed(4);
+        e[h.ret]   = +(((close / e.price) - 1) * 100).toFixed(2);
+        dirty = true;
+        filled++;
+      }
+    }
+
+    if (dirty) {
+      try { await env.REC_LOG.put(key, JSON.stringify(list)); }
+      catch (e) { console.warn(`[cron] forward fill ${ticker}: write failed — ${e.message}`); }
+    }
+  }
+
+  try { await env.REC_LOG.put('recfwd:last', ptDate(), { expirationTtl: 172800 }); } catch (_) {}
+  console.log(`[cron] forward fill: ${filled} value(s) across ${tickers} ticker(s)`);
 }
 
 /* ── New route handlers ── */
@@ -2915,7 +3350,7 @@ If you reference an FOMC meeting or CPI release, use ONLY the macro calendar abo
 
 /* ── Cron: midday market pulse (11:30am PT) ──
    Narrative of what has moved the market so far today, dynamic topic cards,
-   next-trading-day events, trade ideas by style (day/swing/options/long-term)
+   next-trading-day events, trade ideas by style (short-term/swing/options/long-term)
    drawn from the watchlist, and big movers (≥10% + volume) regardless of
    watchlist status. Served via /api/daily as `midday`. */
 async function generateMiddaySnapshot(env) {
@@ -3083,7 +3518,7 @@ Generate a midday market pulse as valid JSON (no markdown fences):
     { "title": "Concise event title", "type": "Earnings|Fed|Economic|Geopolitical|Macro", "impact": "HIGH|MEDIUM|LOW", "note": "1 sentence on what to watch" }
   ],
   "trades": {
-    "day": [ { "ticker": "SYM", "reason": "1 sentence tied to today's price action and volume" } ],
+    "shortTerm": [ { "ticker": "SYM", "reason": "1 sentence on the 2-10 day setup, referencing daily-bar levels only" } ],
     "swing": [ { "ticker": "SYM", "reason": "1 sentence on the multi-day setup" } ],
     "options": [ { "ticker": "SYM", "strategy": "e.g. Bull call spread, Cash-secured put", "reason": "1 sentence" } ],
     "longTerm": [ { "ticker": "SYM", "reason": "1 sentence on why today's action creates a long-term entry" } ]
@@ -3093,7 +3528,8 @@ Generate a midday market pulse as valid JSON (no markdown fences):
 RULES:
 - topics: 3-5 cards, only themes actually moving today's market. Vary tags as appropriate.
 - tomorrow: 3-6 events for ${nextLabel} (the next trading day). For Earnings events use ONLY the confirmed list above. For Fed/CPI/economic-calendar events use ONLY the confirmed macro calendar above — never date an FOMC meeting or CPI print from memory, your training data is out of date. If neither list has enough entries, fill the remainder with Macro/Geopolitical themes drawn from today's headlines, phrased as ongoing themes without invented dates.
-- trades: 1-2 ideas per style. day/swing/options/longTerm tickers must come from the WATCHLIST above, chosen on today's specific price action (momentum, pullbacks to support, unusual volume, oversold bounces). If no watchlist name fits a style, return an empty array for it.
+- trades: 1-2 ideas per style. shortTerm/swing/options/longTerm tickers must come from the WATCHLIST above, chosen on today's specific price action (momentum, pullbacks to support, unusual volume, oversold bounces). If no watchlist name fits a style, return an empty array for it.
+- shortTerm is NOT a day-trading bucket. Every idea in it must be a multi-day swing setup with a horizon of 2 to 10 trading days. You are working from daily bars and a delayed quote — you have no intraday data — so do NOT produce same-session entry or exit levels, opening-range or VWAP references, or any intraday timing ("buy the first hour", "exit before the close", "scalp the bounce"). Any level you cite must be a daily-bar level: a prior swing high or low, a moving average, or a support/resistance zone visible on daily closes.
 Return ONLY valid JSON.`;
 
   let midday = null;
@@ -3277,6 +3713,7 @@ export default {
         case 'options':
           if (sub === 'recap') return await handleOptionsRecap(url.searchParams, origin, env, ctx);
           return await handleOptions(sub, url.searchParams, origin, env);
+        case 'iv':       return await handleIv(sub, url.searchParams, origin, env, ctx);
         case 'search':   return await handleSearch(url.searchParams.get('q') || '', origin);
         case 'news':     return await handleNews(sub, origin, env);
         case 'peers':    return await handlePeers(sub, origin);
@@ -3370,6 +3807,9 @@ export default {
       ctx.waitUntil(generateMiddaySnapshot(env));      // 11:30am PT midday pulse (retries to 1pm; KV dedup skips once complete)
     } else if (h === 13 && m >= 15 && m < 45) {
       ctx.waitUntil(generateEODSummary(env));          // 1:15pm PT EOD summary
+      ctx.waitUntil(recordWatchlistIv(env));           // 1:15pm PT bank one IV sample per watchlist name
+    } else if (h === 14 && m < 30) {
+      ctx.waitUntil(fillForwardReturns(env));          // 2:00pm PT resolve 5/20-session forward returns
     }
   },
 };

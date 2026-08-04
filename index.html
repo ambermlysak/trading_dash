@@ -461,21 +461,61 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
 .strat-card.neutral { border-left-color: var(--amber); }
 .strat-card .name { font-family: var(--serif); font-style: italic; font-size: 14px; color: var(--ink-0); margin-bottom: 4px; }
 .strat-card .leg { font-family: var(--mono); font-size: 11px; color: var(--ink-2); margin-bottom: 8px; line-height: 1.5; }
+.strat-card .tagline {
+  font-family: var(--mono); font-size: 9px; color: var(--ink-3);
+  letter-spacing: 0.04em; margin-bottom: 8px;
+}
 .strat-card .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 8px; }
+/* Suppressed figures read as absent, not as data. */
+.strat-card .stat .v.pending { color: var(--ink-3); cursor: help; }
 .strat-card .stat .l { font-family: var(--mono); font-size: 9px; color: var(--ink-3); letter-spacing: 0.06em; text-transform: uppercase; }
 .strat-card .stat .v { font-family: var(--mono); font-size: 12px; font-weight: 500; color: var(--ink-0); margin-top: 2px; }
+/* Regime banner + "nothing qualifies" state span the whole grid, above the cards. */
+.strat-note {
+  grid-column: 1 / -1; font-family: var(--mono); font-size: 10px;
+  color: var(--ink-2); letter-spacing: 0.04em; line-height: 1.6;
+}
+.strat-note.provisional {
+  color: var(--amber); background: var(--bg-2);
+  border-left: 2px solid var(--amber); padding: 8px 10px; border-radius: 3px;
+}
+.strat-empty {
+  grid-column: 1 / -1; padding: 16px; background: var(--bg-2);
+  border: 1px dashed var(--line); border-radius: 4px;
+  font-size: 11px; color: var(--ink-2); line-height: 1.6;
+}
+.strat-empty b { color: var(--ink-0); }
 
 /* ------- Trade signal card ------- */
-.signal-row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 6px; }
+.signal-row { display: grid; grid-template-columns: 1fr; gap: 18px; margin-top: 6px; }
 .signal-block { padding: 14px; background: var(--bg-2); border: 1px solid var(--line-soft); border-radius: 4px; }
 .signal-block .head { font-family: var(--mono); font-size: 10px; color: var(--ink-3); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 10px; display: flex; justify-content: space-between; }
 .signal-block .head .badge { padding: 2px 6px; border-radius: 2px; font-weight: 500; }
 .signal-block .head .badge.active { background: var(--bull-soft); color: var(--bull); }
 .signal-block .head .badge.wait { background: var(--bg-3); color: var(--ink-2); }
-.signal-block .levels { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.signal-block .levels { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
 .signal-block .level .l { font-family: var(--mono); font-size: 9px; color: var(--ink-3); letter-spacing: 0.06em; text-transform: uppercase; }
 .signal-block .level .v { font-family: var(--mono); font-size: 14px; color: var(--ink-1); margin-top: 3px; }
 .signal-block .note { font-size: 11px; color: var(--ink-2); margin-top: 10px; line-height: 1.5; }
+
+/* ------- Recommendation track record ------- */
+.calib-pending {
+  padding: 14px; background: var(--bg-2); border: 1px dashed var(--line);
+  border-radius: 4px; font-size: 11px; color: var(--ink-2); line-height: 1.6;
+}
+.calib-pending b { color: var(--ink-0); }
+.calib-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-family: var(--mono); font-size: 10px; color: var(--ink-3);
+  letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 6px;
+}
+.calib-head span:last-child { cursor: help; color: var(--ink-2); }
+.calib-table { margin-bottom: 4px; }
+.calib-foot {
+  margin-top: 10px; font-family: var(--mono); font-size: 10px; color: var(--ink-3); line-height: 1.5;
+}
+/* An unresolved forward return is absent, not zero. */
+.pending { color: var(--ink-3); cursor: help; }
 
 /* ------- News ------- */
 .news-list { display: flex; flex-direction: column; }
@@ -821,11 +861,11 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
       <div class="strat-grid" id="strat-grid"></div>
     </div>
 
-    <!-- 7. DAY / SWING TRADE -->
+    <!-- 7. SWING TRADE -->
     <div class="card col-12" id="card-trade">
       <div class="card-header">
-        <div class="card-title"><span class="num">07</span>Trade Setups · ORB &middot; VWAP &middot; Crossovers</div>
-        <div class="card-meta">Today's session</div>
+        <div class="card-title"><span class="num">07</span>Swing Setups · EMA Crossover</div>
+        <div class="card-meta">Daily bars · Yahoo</div>
       </div>
       <div class="signal-row" id="signal-row"></div>
     </div>
@@ -886,6 +926,7 @@ async function api(path, opts = {}) {
 const fetchQuote   = (t) => api(`/quote/${t}`);
 const fetchChart   = (t, r='3mo', i='1d') => api(`/chart/${t}?range=${r}&interval=${i}`);
 const fetchOptions = (t) => api(`/options/${t}`);
+const fetchIv      = (t) => api(`/iv/${t}`);
 const fetchNews    = (t) => api(`/news/${t}`);
 const searchTicker = (q) => api(`/search?q=${encodeURIComponent(q)}`);
 const claudeCall   = (body) => api('/claude', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
@@ -1418,19 +1459,6 @@ function cci(highs, lows, closes, period = 20) {
   return out;
 }
 
-function vwap(highs, lows, closes, volumes) {
-  // Session VWAP: cumulative since first bar.
-  const out = [];
-  let cumPV = 0, cumV = 0;
-  for (let i = 0; i < closes.length; i++) {
-    const tp = (highs[i] + lows[i] + closes[i]) / 3;
-    cumPV += tp * volumes[i];
-    cumV += volumes[i];
-    out.push(cumV === 0 ? null : cumPV / cumV);
-  }
-  return out;
-}
-
 // Support/resistance via local extrema
 function findSR(highs, lows, closes, lookback = 60) {
   const start = Math.max(0, closes.length - lookback);
@@ -1447,8 +1475,11 @@ function findSR(highs, lows, closes, lookback = 60) {
   return { support, resist };
 }
 
-// Realized volatility (proxy for IV when options data missing)
-function realizedVol(closes, period = 20) {
+/* Historical (realized) volatility — annualised stdev of close-to-close log returns.
+ * This is NOT implied volatility and must never be labelled as such: IV comes off
+ * the options chain, via /api/iv. HV30 is the window that pairs with front-expiry
+ * ATM IV, which is itself a forward ~30-day estimate. */
+function historicalVol(closes, period = 30) {
   if (closes.length < period + 1) return null;
   const rets = [];
   for (let i = closes.length - period; i < closes.length; i++) {
@@ -2040,7 +2071,7 @@ function renderIndicators(highs, lows, closes, volumes) {
   const bbPos = (bbU != null && bbL != null) ? ((lastClose - bbL) / (bbU - bbL)) * 100 : null;
   const stoch = stochastic(highs, lows, closes); const stK = stoch.k.at(-1), stD = stoch.d.at(-1);
   const cciVal = cci(highs, lows, closes).at(-1);
-  const iv = realizedVol(closes, 30);
+  const hv30 = historicalVol(closes, 30);
   const sr = findSR(highs, lows, closes);
 
   const tag = (v, bullCond, bearCond, label) => {
@@ -2058,20 +2089,72 @@ function renderIndicators(highs, lows, closes, volumes) {
     { name: 'Stochastic K/D', val: (stK?.toFixed(0) ?? '—') + ' / ' + (stD?.toFixed(0) ?? '—'),
       tag: tag(stK, v=>v<20, v=>v>80, {bull:'oversold', bear:'overbought', neutral:'neutral'}) },
     { name: 'CCI (20)', val: cciVal?.toFixed(0) ?? '—', tag: tag(cciVal, v=>v<-100, v=>v>100, {bull:'oversold', bear:'overbought', neutral:'neutral'}) },
-    { name: 'Realized Vol (30d)', val: iv ? iv.toFixed(1) + '%' : '—', tag: tag(iv, v=>v<25, v=>v>50, {bull:'low', bear:'high', neutral:'normal'}) },
+    { name: 'HV30 (realized)', val: hv30 ? hv30.toFixed(1) + '%' : '—', tag: tag(hv30, v=>v<25, v=>v>50, {bull:'low', bear:'high', neutral:'normal'}),
+      title: 'Historical volatility: annualised stdev of the last 30 daily closes. Backward-looking — not implied volatility.' },
     { name: 'Support', val: sr.support ? '$' + fmt.price(sr.support) : '—', tag: '<span class="ind-tag neutral">level</span>' },
     { name: 'Resistance', val: sr.resist ? '$' + fmt.price(sr.resist) : '—', tag: '<span class="ind-tag neutral">level</span>' },
+    // Filled asynchronously by renderIv() from /api/iv — the options chain, not price history.
+    { name: 'ATM IV (front)', val: '<span id="ind-iv">…</span>', tag: '<span class="ind-tag neutral" id="ind-iv-tag">loading</span>',
+      title: 'At-the-money implied volatility on the nearest expiry ≥7 DTE, from the options chain.' },
+    { name: 'IV / HV30', val: '<span id="ind-ivhv">…</span>', tag: '<span class="ind-tag neutral" id="ind-ivhv-tag">loading</span>',
+      title: 'Front ATM IV divided by 30-day realized vol. A proxy for whether options look rich or cheap — NOT IV rank, and not comparable across tickers with different vol baselines.' },
+    { name: 'IV Rank', val: '<span id="ind-ivr">…</span>', tag: '<span class="ind-tag neutral" id="ind-ivr-tag">loading</span>',
+      title: 'Where today\'s ATM IV sits between the lowest and highest reading collected for this ticker. Needs 60+ days of history before it reports a number.' },
+    { name: 'Term Structure', val: '<span id="ind-term">…</span>', tag: '<span class="ind-tag neutral" id="ind-term-tag">loading</span>',
+      title: 'Front ATM IV minus back-month ATM IV. Positive = backwardation (near-term event premium); negative = contango, the usual state.' },
   ];
 
   document.getElementById('indicators').innerHTML = cells.map(c => `
-    <div class="ind-cell">
+    <div class="ind-cell"${c.title ? ` title="${esc(c.title)}"` : ''}>
       <div class="ind-name">${c.name}</div>
       <div class="ind-row"><span class="ind-val">${c.val}</span>${c.tag}</div>
     </div>
   `).join('');
 
   // Stash for synthesis
-  state.data.indicators = { rsi: r, macd: macdVal, macdHist: histVal, bbPos, stochK: stK, stochD: stD, cci: cciVal, iv, support: sr.support, resist: sr.resist };
+  state.data.indicators = { rsi: r, macd: macdVal, macdHist: histVal, bbPos, stochK: stK, stochD: stD, cci: cciVal, hv30, support: sr.support, resist: sr.resist };
+}
+
+/* Fill the four implied-vol cells once /api/iv resolves. Kept separate from
+   renderIndicators so one slow options-chain fetch cannot hold up the rest of
+   the grid, which is computed locally and ready immediately. */
+function renderIv(iv) {
+  const set = (id, val, tagText, tagCls = 'neutral') => {
+    const v = document.getElementById(id), t = document.getElementById(id + '-tag');
+    if (v) v.textContent = val;
+    if (t) { t.textContent = tagText; t.className = `ind-tag ${tagCls}`; }
+  };
+
+  if (!iv || iv.front?.atmIv == null) {
+    set('ind-iv',   '—', 'no chain');
+    set('ind-ivhv', '—', 'n/a');
+    set('ind-ivr',  '—', 'n/a');
+    set('ind-term', '—', 'n/a');
+    return;
+  }
+
+  set('ind-iv', iv.front.atmIv.toFixed(1) + '%', `${iv.front.dte}d · ${iv.front.expiry}`);
+
+  const ratio = iv.ivHvRatio;
+  set('ind-ivhv',
+    ratio == null ? '—' : ratio.toFixed(2) + '×',
+    ratio == null ? 'n/a' : ratio >= 1.2 ? 'rich vs HV' : ratio <= 0.9 ? 'cheap vs HV' : 'in line',
+    ratio == null ? 'neutral' : ratio >= 1.2 ? 'bear' : ratio <= 0.9 ? 'bull' : 'neutral');
+
+  // No number until the history supports one — and never a percentile of HV in its place.
+  if (iv.ivRank == null) {
+    set('ind-ivr', '—', `collecting (${iv.historyDays}/${iv.rankTargetDays}d)`);
+  } else {
+    const pct = iv.ivRank * 100;
+    set('ind-ivr', pct.toFixed(0), `${iv.historyDays}d history`,
+      pct >= 70 ? 'bear' : pct <= 30 ? 'bull' : 'neutral');
+  }
+
+  const ts = iv.termStructure;
+  set('ind-term',
+    ts == null ? '—' : (ts >= 0 ? '+' : '') + ts.toFixed(1) + ' pts',
+    ts == null ? 'no back month' : ts > 0 ? 'backwardation' : 'contango',
+    ts == null ? 'neutral' : ts > 0 ? 'bear' : 'neutral');
 }
 
 function renderAnalyst(quote, lastPrice) {
@@ -2436,133 +2519,173 @@ function renderSuperInvestors(ticker) {
   document.getElementById('superinv-content').innerHTML = html;
 }
 
-function renderStrategies(ticker, lastPrice, ind) {
-  // Pick strategies based on RSI regime + IV regime + analyst upside
-  const strategies = [];
+/* Volatility regime for the strategy gates.
+ *
+ * Absolute IV cutoffs are meaningless across tickers — a 45% print is calm for
+ * one name and extreme for another — so the gate is always a *relative* measure.
+ * IV rank is the real one. Until enough history exists for it, IV/HV30 stands in
+ * and the card says so; the two are never conflated. */
+const IVR_HIGH = 70, IVR_LOW = 30;              // IV-rank gates, in points
+const RATIO_HIGH = 1.2, RATIO_LOW = 0.9;        // IV/HV30 proxy gates
+
+function volRegime(iv) {
+  if (iv && iv.ivRank != null) {
+    const pts = iv.ivRank * 100;
+    return {
+      state: pts >= IVR_HIGH ? 'elevated' : pts <= IVR_LOW ? 'depressed' : 'normal',
+      label: `IV regime: IV rank ${pts.toFixed(0)} · ${iv.historyDays}d history`,
+      provisional: false,
+    };
+  }
+  if (iv && iv.ivHvRatio != null) {
+    const r = iv.ivHvRatio;
+    return {
+      state: r >= RATIO_HIGH ? 'elevated' : r <= RATIO_LOW ? 'depressed' : 'normal',
+      label: `IV regime: proxy (IV/HV30 ${r.toFixed(2)}×) — rank collecting, ${iv.historyDays}/${iv.rankTargetDays}d`,
+      provisional: true,
+    };
+  }
+  return { state: 'unavailable', label: 'IV regime unavailable', provisional: false };
+}
+
+function renderStrategies(ticker, lastPrice, ind, iv) {
+  const grid = document.getElementById('strat-grid');
+  const meta = document.getElementById('strat-meta');
+  const regime = volRegime(iv);
+
+  // With no vol reading at all there is no regime to trade — say so rather than
+  // defaulting to one and dressing a guess up as a recommendation.
+  if (regime.state === 'unavailable') {
+    meta.textContent = 'IV regime unavailable';
+    grid.innerHTML = `
+      <div class="strat-empty">
+        <b>IV regime unavailable.</b> No implied-vol reading for ${esc(ticker)} — the options chain
+        returned nothing usable. Strategy suggestions are suppressed: every structure below is a bet
+        on volatility being rich or cheap, and without a vol measure that call cannot be made.
+      </div>`;
+    return;
+  }
+
   const upside = state.data.analyst?.upside;
-  const rsiV = ind.rsi;
-  const iv = ind.iv;
+  const rsiV   = ind.rsi;
+  const bullish = rsiV != null && rsiV < 50 && upside != null && upside > 5;
+  const bearish = rsiV != null && rsiV > 65;
 
-  // Bullish bias?
-  if (rsiV != null && rsiV < 50 && upside != null && upside > 5) {
-    strategies.push({
-      name: 'Bull Call Spread',
-      bias: 'bull',
+  /* Two families, gated differently.
+   *
+   * `vega` — iron condor, straddle — are pure volatility bets. They need a vol
+   * edge to exist at all: 'elevated' to sell premium, 'depressed' to buy it.
+   * `premium` — CSP, covered call, wheel — are short-vol income structures and
+   * take the same elevated gate.
+   *
+   * `vertical` — debit spreads — are primarily directional with modest vega, so
+   * they are gated on direction alone (`vol: null`) and stay available across the
+   * whole rank range. They never display a vol-regime tag: a vertical has not
+   * earned the elevated/depressed read and must not appear to carry one. */
+  const candidates = [
+    { name: 'Bull Call Spread',  bias: 'bull',    family: 'vertical', vol: null,        dir: bullish,
       leg: `Buy ${(lastPrice*1.00).toFixed(0)}C / Sell ${(lastPrice*1.10).toFixed(0)}C · 30–45 DTE`,
-      pop: '52%', winRate: '61%', maxRisk: 'Limited',
-    });
-    strategies.push({
-      name: 'Cash-Secured Put',
-      bias: 'bull',
-      leg: `Sell ${(lastPrice*0.92).toFixed(0)}P · 30 DTE`,
-      pop: '72%', winRate: '78%', maxRisk: 'Strike − prem',
-    });
-  }
-  if (rsiV != null && rsiV > 65) {
-    strategies.push({
-      name: 'Bear Put Spread',
-      bias: 'bear',
+      maxRisk: 'Limited' },
+    { name: 'Bear Put Spread',   bias: 'bear',    family: 'vertical', vol: null,        dir: bearish,
       leg: `Buy ${(lastPrice*1.00).toFixed(0)}P / Sell ${(lastPrice*0.92).toFixed(0)}P · 30 DTE`,
-      pop: '48%', winRate: '54%', maxRisk: 'Limited',
-    });
-    strategies.push({
-      name: 'Covered Call',
-      bias: 'neutral',
+      maxRisk: 'Limited' },
+    { name: 'Cash-Secured Put',  bias: 'bull',    family: 'premium',  vol: 'elevated',  dir: bullish,
+      leg: `Sell ${(lastPrice*0.92).toFixed(0)}P · 30 DTE`,
+      maxRisk: 'Strike − prem' },
+    { name: 'Covered Call',      bias: 'neutral', family: 'premium',  vol: 'elevated',  dir: bearish,
       leg: `Long shares + Sell ${(lastPrice*1.05).toFixed(0)}C · 30 DTE`,
-      pop: '68%', winRate: '71%', maxRisk: 'Capped upside',
-    });
-  }
-  if (iv && iv > 50) {
-    strategies.push({
-      name: 'Iron Condor',
-      bias: 'neutral',
-      leg: `Sell ${(lastPrice*1.08).toFixed(0)}C / ${(lastPrice*0.92).toFixed(0)}P · wings ±5%`,
-      pop: '65%', winRate: '63%', maxRisk: 'Limited',
-    });
-  }
-  if (iv && iv < 30) {
-    strategies.push({
-      name: 'Long Straddle',
-      bias: 'neutral',
-      leg: `Buy ${(lastPrice).toFixed(0)}C + ${(lastPrice).toFixed(0)}P · 45 DTE`,
-      pop: '38%', winRate: '42%', maxRisk: 'Premium paid',
-    });
-  }
-  if (!strategies.length) {
-    strategies.push({
-      name: 'Wheel Strategy',
-      bias: 'neutral',
+      maxRisk: 'Capped upside' },
+    { name: 'Wheel Strategy',    bias: 'neutral', family: 'premium',  vol: 'elevated',  dir: true,
       leg: `Sell ${(lastPrice*0.95).toFixed(0)}P · 30 DTE; if assigned, sell calls`,
-      pop: '70%', winRate: '74%', maxRisk: 'Long stock cost basis',
-    });
+      maxRisk: 'Long stock cost basis' },
+    { name: 'Iron Condor',       bias: 'neutral', family: 'vega',     vol: 'elevated',  dir: true,
+      leg: `Sell ${(lastPrice*1.08).toFixed(0)}C / ${(lastPrice*0.92).toFixed(0)}P · wings ±5%`,
+      maxRisk: 'Limited' },
+    { name: 'Long Straddle',     bias: 'neutral', family: 'vega',     vol: 'depressed', dir: true,
+      leg: `Buy ${(lastPrice).toFixed(0)}C + ${(lastPrice).toFixed(0)}P · 45 DTE`,
+      maxRisk: 'Premium paid' },
+  ];
+
+  const strategies = candidates.filter(s => s.dir && (s.vol === null || s.vol === regime.state));
+
+  const note = regime.provisional
+    ? `<div class="strat-note provisional">${esc(regime.label)}. IV/HV30 is a proxy for whether options
+         look rich or cheap — it is not IV rank, and it is not comparable across tickers. Treat these
+         as provisional until the rank has ${iv.rankTargetDays} days behind it.</div>`
+    : `<div class="strat-note">${esc(regime.label)}.</div>`;
+
+  const setupWord = strategies.length === 1 ? 'setup' : 'setups';
+  meta.textContent = regime.provisional
+    ? `${strategies.length} ${setupWord} · proxy regime`
+    : `${strategies.length} ${setupWord} · IVR-gated`;
+
+  // The 30–70 band is the common case and it is a real answer: no vol edge either
+  // way, so the vega structures are withheld while the verticals still stand.
+  const vegaWithheld = regime.state === 'normal'
+    ? `<div class="strat-empty">
+         <b>No volatility edge.</b> Premium selling wants IV rank ≥ ${IVR_HIGH}, long premium wants
+         ≤ ${IVR_LOW}${regime.provisional ? ` (proxy: IV/HV30 ≥ ${RATIO_HIGH}× or ≤ ${RATIO_LOW}×)` : ''};
+         this name sits between the two. Iron condor and straddle are withheld — they are bets on
+         volatility itself, and there is nothing here to bet on.
+       </div>`
+    : '';
+
+  if (!strategies.length) {
+    grid.innerHTML = note + (vegaWithheld || `
+      <div class="strat-empty">
+        No structure qualifies at IV rank ${regime.state === 'elevated' ? `≥ ${IVR_HIGH}` : `≤ ${IVR_LOW}`}:
+        no directional read supports the structures that fit this vol regime.
+      </div>`);
+    return;
   }
 
-  document.getElementById('strat-meta').textContent = `${strategies.length} setups · regime-tuned`;
-  document.getElementById('strat-grid').innerHTML = strategies.map(s => `
+  grid.innerHTML = note + strategies.map(s => `
     <div class="strat-card ${s.bias}">
       <div class="name">${s.name}</div>
       <div class="leg">${s.leg}</div>
+      ${s.family === 'vertical'
+        ? '<div class="tagline">Directional thesis only — no volatility edge</div>'
+        : ''}
       <div class="stats">
-        <div class="stat"><div class="l">POP</div><div class="v">${s.pop}</div></div>
-        <div class="stat"><div class="l">Hist Win</div><div class="v">${s.winRate}</div></div>
+        <div class="stat" title="Not yet computed. Probability of profit needs the short strike's
+Black-Scholes delta from the options chain — POP ≈ 1 − |delta| for a short-strike structure.
+No approximation is shown in its place.">
+          <div class="l">POP</div><div class="v pending">—</div></div>
+        <div class="stat" title="Not yet computed. Requires a backtest of this structure on this
+underlying; nothing behind it yet, so nothing is shown.">
+          <div class="l">Hist Win</div><div class="v pending">—</div></div>
         <div class="stat"><div class="l">Risk</div><div class="v" style="font-size:10px;">${s.maxRisk}</div></div>
       </div>
     </div>
-  `).join('');
+  `).join('') + vegaWithheld;
 }
 
-function renderTradeSignals(highs, lows, closes, opens, volumes) {
-  // ORB: open ± 2× ATR-ish proxy from last bar
-  const lastIdx = closes.length - 1;
-  const lastClose = closes[lastIdx];
-  const lastHigh = highs[lastIdx];
-  const lastLow = lows[lastIdx];
-  const orbHigh = lastHigh;
-  const orbLow = lastLow;
-  const orbBreakUp = lastClose > orbHigh * 0.998;
-  const orbBreakDn = lastClose < orbLow * 1.002;
-
-  const v = vwap(highs, lows, closes, volumes);
-  const lastVwap = v.at(-1);
-  const aboveVwap = lastClose > lastVwap;
-
-  // EMA crossover (20/50)
-  const e20 = ema(closes, 20).at(-1);
-  const e50 = ema(closes, 50).at(-1);
-  const e20Prev = ema(closes, 20).at(-2);
-  const e50Prev = ema(closes, 50).at(-2);
-  const goldCross = e20Prev <= e50Prev && e20 > e50;
-  const deathCross = e20Prev >= e50Prev && e20 < e50;
-  const emaTrend = e20 > e50 ? 'bull' : 'bear';
+/* Swing signals only — EMA crossover on daily closes, which is what daily bars
+ * can actually support. Opening-range breakout and VWAP used to render here from
+ * the same daily series: ORB needs the first N minutes of a session and VWAP needs
+ * intraday prints weighted by intraday volume, and neither survives a single
+ * daily bar. They were removed rather than caveated (ARCHITECTURE.md, rule 5).
+ * Intraday bars — Polygon Stocks Starter — are what would bring them back. */
+function renderTradeSignals(closes) {
+  const e20 = ema(closes, 20);
+  const e50 = ema(closes, 50);
+  const e20Last = e20.at(-1), e50Last = e50.at(-1);
+  const e20Prev = e20.at(-2), e50Prev = e50.at(-2);
+  const goldCross = e20Prev <= e50Prev && e20Last > e50Last;
+  const deathCross = e20Prev >= e50Prev && e20Last < e50Last;
+  const emaTrend = e20Last > e50Last ? 'bull' : 'bear';
 
   document.getElementById('signal-row').innerHTML = `
-    <div class="signal-block">
-      <div class="head">
-        <span>DAY TRADE · Opening Range Breakout</span>
-        <span class="badge ${(orbBreakUp || orbBreakDn) ? 'active' : 'wait'}">${(orbBreakUp || orbBreakDn) ? 'TRIGGERED' : 'WAITING'}</span>
-      </div>
-      <div class="levels">
-        <div class="level"><div class="l">ORB High</div><div class="v">$${fmt.price(orbHigh)}</div></div>
-        <div class="level"><div class="l">ORB Low</div><div class="v">$${fmt.price(orbLow)}</div></div>
-        <div class="level"><div class="l">VWAP</div><div class="v">$${fmt.price(lastVwap)}</div></div>
-        <div class="level"><div class="l">vs VWAP</div><div class="v ${aboveVwap ? 'bull' : 'bear'}">${aboveVwap ? 'ABOVE' : 'BELOW'}</div></div>
-      </div>
-      <div class="note">
-        ${orbBreakUp ? '<span style="color:var(--bull)">Long bias.</span>' : orbBreakDn ? '<span style="color:var(--bear)">Short bias.</span>' : 'No range break yet.'}
-        ${aboveVwap ? ' Above VWAP — buyers in control.' : ' Below VWAP — sellers in control.'}
-        Entry on retest of breakout level; stop tight against the broken side.
-      </div>
-    </div>
     <div class="signal-block">
       <div class="head">
         <span>SWING · EMA Crossover &amp; Trend</span>
         <span class="badge ${(goldCross || deathCross) ? 'active' : 'wait'}">${goldCross ? 'GOLDEN CROSS' : deathCross ? 'DEATH CROSS' : 'TRENDING'}</span>
       </div>
       <div class="levels">
-        <div class="level"><div class="l">EMA 20</div><div class="v">$${fmt.price(e20)}</div></div>
-        <div class="level"><div class="l">EMA 50</div><div class="v">$${fmt.price(e50)}</div></div>
+        <div class="level"><div class="l">EMA 20</div><div class="v">$${fmt.price(e20Last)}</div></div>
+        <div class="level"><div class="l">EMA 50</div><div class="v">$${fmt.price(e50Last)}</div></div>
         <div class="level"><div class="l">Trend</div><div class="v ${emaTrend}">${emaTrend.toUpperCase()}</div></div>
-        <div class="level"><div class="l">Spread</div><div class="v">${(((e20 - e50)/e50)*100).toFixed(2)}%</div></div>
+        <div class="level"><div class="l">Spread</div><div class="v">${(((e20Last - e50Last)/e50Last)*100).toFixed(2)}%</div></div>
       </div>
       <div class="note">
         ${goldCross ? '<span style="color:var(--bull)">Bullish crossover detected.</span> Entry on first pullback to EMA 20.' :
@@ -2589,42 +2712,87 @@ function renderNews(newsData) {
   state.data.news = items.slice(0, 10).map(n => ({ title: n.title, publisher: n.publisher }));
 }
 
-function renderTrack(entries) {
+function renderTrack(entries, calibration) {
   const el = document.getElementById('track-content');
   if (!entries || !entries.length) {
-    // Show calibration explainer + sample
     el.innerHTML = `
       <div style="padding:18px;background:var(--bg-2);border:1px dashed var(--line);border-radius:4px;">
         <div style="font-family:var(--mono);font-size:11px;color:var(--ink-2);line-height:1.6;">
           <b style="color:var(--ink-0);">Forward-logging active.</b><br>
-          Each rating generated for ${state.ticker} is timestamped with the price at synthesis and stored to KV.
-          As time passes, realized returns are compared to the rating direction.
+          One rating per trading day for ${esc(state.ticker)} is stored with the price at synthesis.
+          Five and twenty sessions later a cron job fills in what the stock actually did.
           <br><br>
-          <span style="color:var(--ink-3);">Calibration metrics (hit rate, avg return by rating, Brier score) appear here once 5+ ratings exist for this ticker.</span>
+          <span style="color:var(--ink-3);">Calibration (hit rate, mean forward return by rating, Brier
+          score) appears once 10 entries have a 20-session outcome — not before.</span>
         </div>
-      </div>
-      <div style="margin-top:14px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">
-        Tip: Re-load this page on different days to build the track record. For a live system, schedule the Worker daily via Cron Triggers.
       </div>`;
     return;
   }
-  // Render small table of entries with realized return when possible
-  let html = `<table class="data">
-    <thead><tr><th>Date</th><th>Rating</th><th class="right">Conf</th><th class="right">Price@</th><th class="right">vs Now</th></tr></thead><tbody>`;
+
+  const pct = (v, d = 2) => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(d) + '%';
+  const cls = v => v == null ? '' : v >= 0 ? 'bull' : 'bear';
+
+  /* Calibration block. Below the threshold the worker sends nulls and a reason;
+     render the reason rather than computing something from four data points. */
+  let html = '';
+  if (calibration) {
+    if (calibration.reason || !calibration.byRating) {
+      html += `<div class="calib-pending">
+        <b>Calibration pending.</b> ${esc(calibration.reason || 'Not enough resolved history.')}
+      </div>`;
+    } else {
+      const c = calibration;
+      const rows = ['BUY', 'HOLD', 'SELL'].map(r => {
+        const b = c.byRating[r] || { n: 0 };
+        if (!b.n) return '';
+        return `<tr>
+          <td><span class="flag ${r === 'BUY' ? 'buy' : r === 'SELL' ? 'cluster' : 'cexec'}">${r}</span></td>
+          <td class="right">${b.n}</td>
+          <td class="right" ${r === 'HOLD' ? 'title="HOLD makes no directional claim, so it has no hit rate."' : ''}>${
+            b.hitRate == null ? '—' : (b.hitRate * 100).toFixed(0) + '%'}</td>
+          <td class="right ${cls(b.meanFwd5)}">${pct(b.meanFwd5)}</td>
+          <td class="right ${cls(b.meanFwd20)}">${pct(b.meanFwd20)}</td>
+        </tr>`;
+      }).join('');
+      html += `
+        <div class="calib-head">
+          <span>Calibration · ${c.n} resolved call${c.n === 1 ? '' : 's'}</span>
+          <span title="Brier score over BUY/SELL confidence vs the 20-session outcome. Lower is better; 0.25 is what you score by saying 50% to everything.">
+            Brier ${c.brier == null ? '—' : c.brier.toFixed(3)}${c.brierN ? ` · n=${c.brierN}` : ''}
+          </span>
+        </div>
+        <table class="data calib-table">
+          <thead><tr><th>Rating</th><th class="right">n</th><th class="right">Hit</th>
+            <th class="right">Mean 5d</th><th class="right">Mean 20d</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`;
+    }
+  }
+
+  html += `<table class="data" style="margin-top:14px;">
+    <thead><tr><th>Date</th><th>Rating</th><th class="right">Conf</th><th class="right">Price@</th>
+      <th class="right">5d</th><th class="right">20d</th><th class="right">vs Now</th></tr></thead><tbody>`;
   const lastPrice = state.data.lastPrice;
   for (const e of entries.slice(-10).reverse()) {
     const ret = e.price && lastPrice ? ((lastPrice - e.price) / e.price) * 100 : null;
-    const cls = ret == null ? '' : ret >= 0 ? 'bull' : 'bear';
-    const ratingCls = e.rating === 'BUY' ? 'bull' : e.rating === 'SELL' ? 'bear' : 'amber';
+    const ratingCls = e.rating === 'BUY' ? 'buy' : e.rating === 'SELL' ? 'cluster' : 'cexec';
+    // Pending forward returns read as pending, never as zero.
+    const fwd = (v, closeV) => v == null
+      ? '<span class="pending" title="Not yet resolved — needs the session to elapse.">—</span>'
+      : `<span class="${cls(v)}" title="close $${fmt.price(closeV)}">${pct(v)}</span>`;
     html += `<tr>
       <td>${new Date(e.ts).toLocaleDateString('en-US',{month:'short',day:'numeric'})}</td>
-      <td><span class="flag ${ratingCls === 'bull' ? 'buy' : ratingCls === 'bear' ? 'cluster' : 'cexec'}">${e.rating}</span></td>
+      <td><span class="flag ${ratingCls}">${esc(e.rating)}</span></td>
       <td class="right">${e.confidence ?? '—'}%</td>
       <td class="right">$${fmt.price(e.price)}</td>
-      <td class="right ${cls}">${fmt.pct(ret)}</td>
+      <td class="right">${fwd(e.fwd5, e.fwd5Close)}</td>
+      <td class="right">${fwd(e.fwd20, e.fwd20Close)}</td>
+      <td class="right ${cls(ret)}">${fmt.pct(ret)}</td>
     </tr>`;
   }
-  html += `</tbody></table>`;
+  html += `</tbody></table>
+    <div class="calib-foot">One entry per trading day · forward returns from Yahoo daily closes,
+      filled 5 and 20 sessions after the call</div>`;
   el.innerHTML = html;
 }
 
@@ -2680,6 +2848,11 @@ const SYNTHESIS_SCHEMA = {
 };
 
 async function synthesize(ticker, lastPrice) {
+  // Let the options chain land before building the prompt — the IV block below
+  // is worth the wait, and reading state.data.iv mid-flight would send nulls.
+  try { await state.ivPromise; } catch (_) {}
+  if (ticker !== state.ticker) return;
+
   const ind = state.data.indicators || {};
   const an = state.data.analyst || {};
   const fund = state.data.fundamentals || {};
@@ -2689,13 +2862,32 @@ async function synthesize(ticker, lastPrice) {
 
   const newsTitles = news.map(n => `- ${n.title}`).join('\n');
 
+  // IV is stated only when it exists, and IV rank only once its history supports
+  // it — an absent rank is reported as absent rather than approximated, so the
+  // model cannot cite a number nothing measured.
+  const ivd = state.data.iv;
+  const ivl = (ivd && ivd.front?.atmIv != null)
+    ? [
+        `Front ATM IV: ${ivd.front.atmIv.toFixed(1)}% (${ivd.front.expiry}, ${ivd.front.dte} DTE)`,
+        ivd.back ? `Back ATM IV: ${ivd.back.atmIv.toFixed(1)}% (${ivd.back.expiry})` : 'Back month: not available',
+        ivd.termStructure != null ? `Term structure: ${ivd.termStructure >= 0 ? '+' : ''}${ivd.termStructure.toFixed(1)} pts (${ivd.termStructure > 0 ? 'backwardation' : 'contango'})` : null,
+        ivd.ivHvRatio != null ? `IV/HV30: ${ivd.ivHvRatio.toFixed(2)}×` : null,
+        ivd.ivRank != null
+          ? `IV rank: ${(ivd.ivRank * 100).toFixed(0)} (over ${ivd.historyDays} days collected)`
+          : `IV rank: NOT AVAILABLE — only ${ivd.historyDays} days of IV history collected, ${ivd.rankMinDays} needed. Do not estimate or infer an IV rank.`,
+      ].filter(Boolean).join('\n')
+    : 'No implied-volatility reading available for this ticker. Do not infer one from the realized-vol figure above.';
+
   const prompt = `You are a sell-side equity research analyst. Produce an OVERALL RATING for ${ticker} given the data below.
 
 PRICE: $${fmt.price(lastPrice)}
 
 TECHNICAL:
-RSI=${ind.rsi?.toFixed(1)}, MACD hist=${ind.macdHist?.toFixed(3)}, Bollinger %B=${ind.bbPos?.toFixed(0)}%, Stochastic K/D=${ind.stochK?.toFixed(0)}/${ind.stochD?.toFixed(0)}, CCI=${ind.cci?.toFixed(0)}, 30d realized vol=${ind.iv?.toFixed(1)}%
+RSI=${ind.rsi?.toFixed(1)}, MACD hist=${ind.macdHist?.toFixed(3)}, Bollinger %B=${ind.bbPos?.toFixed(0)}%, Stochastic K/D=${ind.stochK?.toFixed(0)}/${ind.stochD?.toFixed(0)}, CCI=${ind.cci?.toFixed(0)}, HV30 (30d realized vol)=${ind.hv30?.toFixed(1)}%
 Support=$${ind.support?.toFixed(2)}, Resistance=$${ind.resist?.toFixed(2)}
+
+VOLATILITY (implied, from the options chain — distinct from the HV30 realized figure above):
+${ivl}
 
 ANALYST:
 Targets: low $${an.tgtLow}, mean $${an.tgtMean}, high $${an.tgtHigh}, mean upside ${an.upside?.toFixed(1)}%
@@ -2912,6 +3104,32 @@ function renderFactorPanels(factors) {
   }
 }
 
+/* Implied vol arrives on its own clock: /api/iv walks the options chain and the
+   stored IV history, which is slower than anything computed locally. The strategy
+   card waits on it rather than rendering against historical vol, because the whole
+   point of the gate is that it is an *implied*-vol regime. */
+async function loadIv(ticker, lastPrice) {
+  // Clear first: synthesize() reads state.data.iv, and last ticker's implied vol
+  // presented as this one's would be worse than none at all.
+  state.data.iv = null;
+  const grid = document.getElementById('strat-grid');
+  grid.innerHTML = '<div class="strat-empty">Reading options chain for implied volatility…</div>';
+  document.getElementById('strat-meta').textContent = 'checking IV regime…';
+
+  let iv = null;
+  try {
+    iv = await fetchIv(ticker);
+  } catch (e) {
+    console.warn('IV fetch failed', e);
+  }
+  if (ticker !== state.ticker) return null;   // user navigated away mid-flight
+
+  state.data.iv = iv;
+  renderIv(iv);
+  renderStrategies(ticker, lastPrice, state.data.indicators || {}, iv);
+  return iv;
+}
+
 /* ============================================================
    ORCHESTRATION
    ============================================================ */
@@ -2970,10 +3188,11 @@ async function loadTicker(ticker) {
     renderUnusualOptions(state.ticker, lastPrice);
     renderDarkPool(state.ticker);
     renderSuperInvestors(state.ticker);
-    renderTradeSignals(H, L, C, O, V);
-    renderStrategies(state.ticker, lastPrice, state.data.indicators);
+    renderTradeSignals(C);
+    // Held so synthesize() can await the same fetch rather than racing it.
+    state.ivPromise = loadIv(ticker, lastPrice);
     renderNews(newsResp);
-    renderTrack((trackResp.entries || []));
+    renderTrack(trackResp.entries || [], trackResp.calibration);
 
     // Show cached synthesis immediately as a placeholder, then always run fresh synthesis.
     // loadCachedSynthesis is fire-and-forget (KV read, fast); synthesize runs in parallel (Claude API, slow).

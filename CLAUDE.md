@@ -51,6 +51,7 @@ All data flows through the Worker. CORS is enforced via `ALLOWED_ORIGINS` allowl
 GET  /api/quote/:ticker           Yahoo quoteSummary (multi-module) + Alpaca price overlay
 GET  /api/chart/:ticker           Yahoo v8 OHLCV (?range=1y&interval=1d)
 GET  /api/options/:ticker         Yahoo v7 options chain
+GET  /api/iv/:ticker              ATM implied vol (front/back), term structure, IV rank, HV30
 GET  /api/search?q=               Ticker autocomplete
 GET  /api/news/:ticker            Alpaca news → Yahoo fallback
 GET  /api/peers/:ticker           Yahoo recommendationsBySymbol
@@ -92,6 +93,34 @@ Details worth knowing:
   than invent a quote. Setting the Alpaca secrets unlocks the archive for past quarters.
 - Scorecard rows are sanitised server-side: a metric with no consensus figure is forced to `n/a`
   rather than trusting the model not to call it a beat.
+
+**Implied vs historical volatility — do not let these merge again.** `index.html` used to compute
+a 30-day close-to-close standard deviation into a variable named `iv` and feed it to rules written
+for implied vol. That number is *historical* vol; it now travels as `hv30` and is labelled **HV30**
+everywhere it appears. Implied vol comes off the options chain and nowhere else: `/api/iv/:ticker`
+returns front/back ATM IV, `termStructure`, `hv30`, `ivHvRatio` and `ivRank`, all vol figures in
+**percent** (Yahoo's `impliedVolatility` is a decimal fraction and is scaled by 100 at the source so
+the ratio divides like with like). Front expiry is the nearest expiration ≥7 DTE; back is the next
+standard monthly (third Friday) after it; ATM IV averages the call and put nearest spot.
+
+HV30 rather than HV20 is the comparator because front-expiry ATM IV *is* a forward ~30-day estimate.
+
+**`ivRank` is null until 60 days of history exist, and nothing stands in for it.** Nothing was
+collecting IV history, so it is being built now: every `/api/iv` call and the 1:15pm PT cron
+(`recordWatchlistIv()`) writes `iv:{TICKER}:{YYYY-MM-DD}` with a 400-day TTL. The reading is
+duplicated into the key's **KV metadata** so `ivHistory()` rebuilds the series from one paged
+`list()` instead of 400 `get()`s — metadata caps at 1024 bytes, so keep it to the three flat numbers
+it holds today. Below `IV_RANK_MIN_DAYS` the endpoint returns `ivRank: null` plus a `rankReason`, and
+the UI renders "collecting (N/252d)". Never substitute a percentile of HV: on screen a stand-in is
+indistinguishable from the real thing, which is exactly the failure being corrected here.
+
+**Option-strategy gates are relative, never absolute.** `renderStrategies()` previously keyed Iron
+Condor on `iv > 50` and Long Straddle on `iv < 30` — absolute cutoffs are meaningless across tickers
+(NVDA and AAPL have completely different baseline vol), and they were being fed HV besides. The gate
+is now `volRegime()`: IV rank ≥70 for premium selling (condor, CSP, covered call, wheel), ≤30 for
+long premium (straddle, debit spreads). Until the rank exists, `ivHvRatio` stands in at ≥1.2× / ≤0.9×
+and the card is visibly labelled a proxy. With no vol reading at all the strategy list is
+**suppressed**, not defaulted — every structure there is a bet on vol being rich or cheap.
 
 **Economic calendar (`FOMC_MEETINGS` / `CPI_RELEASES`):** the single source of truth for macro
 event dates, hand-maintained near the top of `worker.js` from
@@ -224,6 +253,8 @@ daily:snapshot     — 6am cron Claude synthesis
 daily:midday       — 11:30am cron midday pulse (narrative, topics, tomorrow, trades, bigMovers)
 daily:eod          — 1:15pm cron EOD summary
 analysis:{TICKER}  — on-demand per-ticker Claude analysis
+iv:{TICKER}:{DATE} — daily front-month ATM IV sample, feeds ivRank (400d TTL; atmIv/spot/dte also in KV metadata)
+ivsweep:last       — PT date of the last cron IV sweep (dedup; deliberately outside the iv: prefix)
 earnings:{TICKER}  — earnings analysis for the last report (12h TTL)
 fund:{TICKER}      — Yahoo fundamentals cache (6h TTL)
 market:ipos        — IPO calendar (12h TTL)
@@ -231,10 +262,34 @@ market:sectors     — Sector summaries + picks (4h TTL)
 market:goldencross — Golden-cross setups (1h TTL)
 scanner:{preset}   — Day-trading scanner results (90s TTL)
 watchlist:tickers  — Saved watchlist, pushed by the dashboard; also seeds scan universes
-rec:{TICKER}       — recommendation history (up to 500 entries)
+rec:{TICKER}       — recommendation history, one entry per PT trading day (up to 500)
+recfwd:last        — PT date of the last forward-return fill (dedup; outside the rec: prefix on purpose)
 ```
 
-**Cron trigger:** a single `*/15 13-22 * * 1-5` UTC cron; `scheduled()` dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), and EOD summary (1:15pm PT). Each job uses a KV timestamp check with a 2-hour dedup window to avoid double-runs.
+**Cron trigger:** a single `*/15 13-22 * * 1-5` UTC cron; `scheduled()` dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), EOD summary + IV sample sweep (1:15pm PT), and the forward-return fill (2pm PT). Each job uses a KV timestamp check with a 2-hour dedup window to avoid double-runs; the two jobs added later (`recordWatchlistIv`, `fillForwardReturns`) use a PT-date key instead, since they should run once a day rather than once per window.
+
+**Recommendation log: one entry per ticker per trading day.** `synthesize()` fires on every page
+load, and `handleLogRec()` used to append unconditionally — so a ticker opened a dozen times in a
+day produced a dozen near-identical rows. That is not a cosmetic problem: it weights whichever name
+got refreshed most and makes hit rate and Brier score describe browsing habits rather than
+forecasting skill. `handleLogRec()` now compares the newest entry's US/Pacific trading date
+(`ptDate()`) against today's and **overwrites** rather than appends on a match. Forward fields reset
+to null on overwrite because the replacement carries a new entry price.
+
+Each entry carries `fwd5` / `fwd20` — **percent return vs the entry price**, not the close — plus
+`fwd5Close` / `fwd20Close` holding the raw realising close so the number can be audited later. The
+returns are what `fwd20 > 0` as a hit test and "mean forward return" both need. `fillForwardReturns()`
+(2pm PT cron) walks every `rec:` key, fetches 2y of daily bars **once per ticker**, anchors each
+entry on the last session at or before its trading date, and reads the close `N` sessions on. It
+only writes completed sessions (`bars[idx].iso < etToday()`), skips entries with no entry price, and
+a ticker whose chart fetch fails is skipped without stopping the sweep.
+
+`GET /api/track/:ticker` returns `calibration` alongside `entries`: `n` (entries with a resolved
+`fwd20`), per-rating hit rate and mean fwd5/fwd20, and a Brier score. **HOLD is excluded from hit
+rate and from Brier** — it makes no directional claim, so no outcome counts as right. Below
+`REC_CALIB_MIN_N` (10) every figure comes back null with a `reason` string and the card renders that
+reason: a hit rate over four entries is noise wearing a percentage sign, and on screen it would look
+exactly like a real one.
 
 ### Frontends
 
@@ -245,7 +300,7 @@ The Scanner tab hosts four presets. Three (Momentum, Pre-Market Gappers, All Mov
 `/api/market/golden-cross` and uses `renderGoldenCross()`. `loadScanner()` branches on the preset
 to pick the endpoint, renderer, header copy, and legend.
 
-`index.html` — per-ticker research page with 16 sections (price/SMA, performance, catalysts, short interest, insider trades, unusual options, dark pool, trade signals, option strategies, analyst targets, 13F holdings, technicals, sentiment, fundamentals, AI synthesis, recommendation history).
+`index.html` — per-ticker research page with 16 sections (price/SMA, performance, catalysts, short interest, insider trades, unusual options, dark pool, swing signals, option strategies, analyst targets, 13F holdings, technicals, sentiment, fundamentals, AI synthesis, recommendation history).
 
 The Catalysts card carries an "Analyze Earnings" button that expands an inline panel
 (`renderEarnings()`, backed by `/api/earnings/:ticker`). It fetches once per ticker and then just
@@ -262,7 +317,14 @@ advertised settled events as upcoming catalysts (an NVDA quote in August still l
 ex-dividend). Today itself is kept, and `isoOf`/`fmt.dateLong` both work in UTC, so item dates and
 their rendered labels stay consistent with each other.
 
-All technical indicators (RSI, MACD, Bollinger, EMA crossovers, support/resistance) are computed client-side from Yahoo OHLCV. Chart rendering uses TradingView Lightweight Charts.
+All technical indicators (RSI, MACD, Bollinger, EMA crossovers, support/resistance, HV30) are computed client-side from Yahoo OHLCV. Chart rendering uses TradingView Lightweight Charts. Implied vol is the exception and comes from `/api/iv` — it cannot be derived from OHLCV.
+
+**Section 07 is swing-only, deliberately.** It used to carry an opening-range-breakout block and a
+VWAP line computed from *daily* bars. ORB needs the first N minutes of a session and VWAP needs
+intraday prints weighted by intraday volume; on a one-bar-per-day series both were fabrications —
+"ORB High" was just yesterday's high, and "VWAP" was a cumulative typical-price average over the
+whole visible range. Both were deleted. The EMA crossover kept its place because it is genuinely a
+daily-bar signal. Do not re-add either without an intraday feed.
 
 ### Data: real vs. stubbed
 

@@ -12,12 +12,15 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   daily:midday        — 11:30am PT midday pulse (narrative, topics, tomorrow, trades, bigMovers)
 #   daily:eod           — 1:15pm PT end-of-day summary (headline, body)
 #   analysis:{TICKER}   — per-ticker Claude analysis (trend, pattern, action, summary)
+#   iv:{TICKER}:{DATE}  — daily ATM IV sample feeding ivRank (400d TTL, value + KV metadata)
+#   ivsweep:last        — PT date of last cron IV sweep (dedup)
 #   fund:{TICKER}       — per-ticker Yahoo fundamentals cache (6h TTL)
 #   market:ipos         — IPO calendar cache (12h TTL)
 #   market:goldencross  — golden-cross setups (1h TTL)
 #   scanner:{preset}    — day-trading scanner results (90s TTL)
 #   watchlist:tickers   — saved watchlist; also seeds scan universes
-#   rec:{TICKER}        — recommendation history
+#   rec:{TICKER}        — recommendation history, one entry per PT trading day
+#   recfwd:last         — PT date of last forward-return fill (dedup)
 
 [triggers]
 # Single cron (plan limit: 5 triggers max). Fires every 15 min in a UTC window
@@ -26,6 +29,8 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   Morning briefing — 6:00am PT   (13:00 UTC PDT / 14:00 UTC PST)
 #   Midday pulse     — 11:30am PT  (18:30 UTC PDT / 19:30 UTC PST)
 #   EOD summary      — 1:15pm PT   (20:15 UTC PDT / 21:15 UTC PST)
+#   IV history sweep — 1:15pm PT   (runs alongside the EOD job; own daily dedup key)
+#   Forward-ret fill — 2:00pm PT   (21:00 UTC PDT / 22:00 UTC PST; own daily dedup key)
 # Each job deduplicates via KV timestamp check (2-hour window).
 crons = ["*/15 13-22 * * 1-5"]
 

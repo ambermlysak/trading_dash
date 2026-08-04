@@ -18,6 +18,34 @@ The Worker pattern is deliberately the same as `dashboard_v10` — Yahoo proxy +
 
 ---
 
+## Data honesty rules
+
+These govern every section below and every change to them. Each one exists because it was broken
+in this codebase and shipped:
+
+1. **Never display one quantity under another's label.** A 30-day close-to-close standard deviation
+   was displayed and consumed as "IV" for months. It is historical vol; it is now `hv30`/HV30, and
+   implied vol comes from the options chain via `/api/iv` or not at all.
+2. **Never present a hardcoded or generated number as computed.** Strategy POP and "Hist Win" were
+   literal strings (`'72%'`, `'78%'`) rendered in the same style as live figures. If a number is not
+   computed, render `—` and say why on hover.
+3. **When a source is unavailable, render unavailable with a reason — never a fallback value.**
+   IV rank returns `null` plus a `rankReason` below 60 days of history rather than a percentile of HV
+   standing in for it. On screen a plausible stand-in is indistinguishable from the real thing.
+4. **Every displayed number carries a source and an as-of timestamp.** "Computed from daily bars" is
+   a source; so is "Yahoo `calendarEvents`". A figure whose provenance cannot be stated should not be
+   on the page.
+5. **A metric that requires data the app does not have is not approximated — it is removed.**
+   Opening-range breakout and VWAP were computed from daily bars, which cannot express either;
+   they were deleted rather than caveated.
+6. **The same rule applies to what the model is asked for, not just what the code computes.**
+   The Midday Pulse had a "Day Trade" bucket. No bad calculation sat behind it — but the model was
+   being asked for same-session ideas while holding only daily bars and a delayed quote, so any
+   entry, stop or intraday timing it emitted was invented. The absence of a bad calculation is not
+   the presence of a basis. It is now "Short-Term", horizon 2–10 trading days, and the prompt
+   forbids intraday levels and timing outright. Before asking Claude for a number, check that the
+   data to ground it is actually in the prompt.
+
 ## Section-by-section data source map
 
 For every component in the spec, this table shows what powers it in the **free prototype** and what to upgrade to once budget allows. "Light tier" is the ~$77/mo recommended stack you flagged for the production version.
@@ -31,14 +59,16 @@ For every component in the spec, this table shows what powers it in the **free p
 | 3 | Short interest 6mo MoM | **Mock (deterministic per ticker)** | mock | FINRA biweekly free file | **Ortex** ($35–80/mo) |
 | 4 | Insider trades + flags | Yahoo `insiderTransactions` | **partial — works but limited fields** | **SEC EDGAR Form 4 direct** (free) | Verafin / SecForm4.com |
 | 5 | Unusual options volume | **Mock (deterministic per ticker)** | mock | **Unusual Whales** ($48/mo) | Cheddar Flow ($75) + UW |
-| 6 | Recommended option strategies | Computed client-side from RSI + IV + analyst upside | **rules-based, full** | OptionStrat API ($) | tastytrade backtest data |
-| 7 | Day trade signals (ORB, VWAP) | Computed client-side from Yahoo OHLC | **functional but daily bars** | **Polygon Stocks Starter** ($29) for intraday | Polygon Advanced ($199) |
-| 7 | Swing signals (EMA crossover) | Computed client-side | **full** | — | — |
+| 6 | Recommended option strategies | Computed client-side from RSI + IV regime (`/api/iv`) + analyst upside | **rules-based, full** | OptionStrat API ($) | tastytrade backtest data |
+| 7 | Day trade signals (ORB, VWAP) | **Removed** — needs intraday bars, was computed from daily | **not shipped** | **Polygon Stocks Starter** ($29) for intraday | Polygon Advanced ($199) |
+| 7 | Swing signals (EMA crossover) | Computed client-side from daily closes | **full** | — | — |
 | 8 | Dark pool 5d volumes | **Mock** | mock | **Unusual Whales** dark pool tab | Cheddar Flow Pro |
 | 9 | Analyst targets + recs | Yahoo `financialData` + `recommendationTrend` | **full** | FactSet Estimates (paid) | Visible Alpha |
 | 9 | Recent upgrades/downgrades | Yahoo `upgradeDowngradeHistory` | **full** | Benzinga Pro ($177) | — |
 | 10 | Super-investor 13F | **Mock** | mock | **WhaleWisdom Premium** ($30/mo) | Dataroma + WW Pro |
-| 11 | Technical indicators (RSI, MACD, Bollinger, Stoch, CCI, IV) | Computed client-side from Yahoo OHLC | **full** | Same — local compute is correct | — |
+| 11 | Technical indicators (RSI, MACD, Bollinger, Stoch, CCI, HV30) | Computed client-side from Yahoo OHLC | **full** | Same — local compute is correct | — |
+| 11 | Implied volatility (ATM IV, term structure, IV/HV30) | Yahoo options chain via `/api/iv` | **full** | — | — |
+| 11 | IV rank | Worker-collected daily IV history in KV | **collecting — null until 60 days** | Same | Historical IV surface (ORATS / IVolatility) |
 | 11 | Support/resistance | Local extrema detection (60-bar lookback) | **functional** | TrendSpider API ($) | — |
 | 11 | Chart with patterns + 30d projection | TradingView Lightweight Charts + linear regression | **functional** | Add ML projection via Claude | Quantcast / Aiera |
 | 12 | Sentiment (news, insiders, mood) | **Claude synthesis** of news headlines + insider data | **full** | Add Benzinga news firehose | RavenPack ($$$$) |
@@ -129,6 +159,7 @@ All return JSON, all CORS-enabled.
 GET  /api/quote/:ticker           Yahoo quoteSummary (multi-module)
 GET  /api/chart/:ticker           ?range=1y&interval=1d
 GET  /api/options/:ticker         ?date=<unix>
+GET  /api/iv/:ticker              ATM implied vol, term structure, IV rank
 GET  /api/search?q=apple          Ticker search
 GET  /api/news/:ticker            Yahoo news feed
 GET  /api/peers/:ticker           Yahoo recommendationsBySymbol
@@ -145,13 +176,24 @@ This is the section the spec asked for explicitly: *"History of recommendations 
 
 The prototype implements **forward-logging from day one**:
 
-1. Every time `synthesize()` runs (one call per ticker page-load), the Worker writes the result to KV under key `rec:{TICKER}`:
+1. `synthesize()` runs on every ticker page-load, but the Worker writes **at most one entry per
+   ticker per US/Pacific trading day** to `rec:{TICKER}` — a same-day call overwrites the newest
+   entry instead of appending:
    ```json
    { "ticker": "PLTR", "rating": "BUY", "confidence": 78, "price": 187.34,
-     "factors": {...}, "ts": "2026-05-01T14:23:11Z" }
+     "factors": {...}, "ts": "2026-05-01T14:23:11Z", "d": "2026-05-01",
+     "fwd5": null, "fwd5Close": null, "fwd20": null, "fwd20Close": null }
    ```
-2. The Recommendation History card (section 15) reads the KV list back and shows past calls vs current price.
-3. Once you have 5+ entries per ticker, calibration metrics appear: hit rate, mean realized return by rating, Brier score for confidence calibration.
+   Appending on every load produced a dozen rows for one trading day, which weighted the log by how
+   often a ticker was browsed rather than how often the call was right.
+2. A 2pm PT cron (`fillForwardReturns`) resolves `fwd5` / `fwd20` — percent return vs the entry
+   price — 5 and 20 trading sessions later, keeping the realising close alongside for audit.
+3. The Recommendation History card (section 15) reads the list back with per-entry forward returns
+   and current price.
+4. Calibration appears once **10 entries have a resolved 20-session outcome**: hit rate by rating
+   (HOLD excluded — it makes no directional claim), mean fwd5/fwd20 by rating, and a Brier score
+   over the confidence values. Below that threshold the endpoint returns nulls and a reason string,
+   and the card renders the reason rather than a number (honesty rules 2 and 3).
 
 **For backfilling history**: the underlying signals (RSI/MACD/Bollinger/analyst targets) are all reproducible from Yahoo's historical data. A backfill script could synthesize "what would Claude have said on date X" by pulling Yahoo data as-of date X and replaying. Worth a session — maybe 100 lines of Node.
 
@@ -169,6 +211,11 @@ These are reasonable next-session targets:
 4. **Backfill of recommendation history** — replay synthesis as-of past dates so the track record card has data on day one.
 5. **Watchlist** — multi-ticker overview that links into the research page.
 6. **Cron-driven auto-refresh** — Cloudflare Cron Triggers wake the Worker nightly to refresh top tickers.
+7. **Strategy POP and Hist Win** — both currently render `—` (rule 2 above; they were hardcoded
+   strings). POP lands with the Premium tab, which already needs Black-Scholes delta off the chain:
+   for a short-strike structure POP ≈ 1 − |delta| of the short strike, and for an iron condor
+   ≈ 1 − (|delta_call| + |delta_put|). Wire these to that delta once it exists. "Hist Win" needs a
+   real backtest of the structure on the underlying — do not ship it before that exists.
 
 ---
 
