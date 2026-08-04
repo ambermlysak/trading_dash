@@ -249,7 +249,18 @@ to pick the endpoint, renderer, header copy, and legend.
 
 The Catalysts card carries an "Analyze Earnings" button that expands an inline panel
 (`renderEarnings()`, backed by `/api/earnings/:ticker`). It fetches once per ticker and then just
-toggles, and `resetEarnings()` clears it on ticker change.
+toggles, and `resetEarnings()` clears it on ticker change. That panel is deliberately retrospective —
+it analyses the *last* report — which is separate from the catalyst list above it.
+
+**The catalyst list shows only events dated today or later.** `renderCatalysts()` filters on
+`iso >= today`, where `today` is the `asOf` field returned by `/api/market/econ-calendar` (the
+Worker's ET today, and the same reference the macro events are already filtered against server-side;
+falls back to a local ET computation if that call fails). This is not belt-and-braces: Yahoo's
+`calendarEvents.exDividendDate` and `dividendDate` are routinely the *most recent past* ones rather
+than the next, and `earningsDate` can lag a report that already happened — unfiltered, the card
+advertised settled events as upcoming catalysts (an NVDA quote in August still listed a June
+ex-dividend). Today itself is kept, and `isoOf`/`fmt.dateLong` both work in UTC, so item dates and
+their rendered labels stay consistent with each other.
 
 All technical indicators (RSI, MACD, Bollinger, EMA crossovers, support/resistance) are computed client-side from Yahoo OHLCV. Chart rendering uses TradingView Lightweight Charts.
 

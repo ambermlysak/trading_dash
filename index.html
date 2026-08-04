@@ -1832,8 +1832,13 @@ async function renderCatalysts(quote) {
   const meta = document.getElementById('catalysts-meta');
   const list = document.getElementById('catalyst-list');
   let macroFailed = false;
+  let today = null;
   try {
-    const { events = [] } = await api('/market/econ-calendar?limit=4');
+    const { events = [], asOf } = await api('/market/econ-calendar?limit=4');
+    // `asOf` is the Worker's ET today — the same reference these macro events were
+    // already filtered against server-side. Reusing it keeps one authority for
+    // "now" instead of letting the browser's clock disagree with the calendar.
+    today = asOf || null;
     // Format locally rather than using the API's verbose `label` — the date column
     // is narrow, so every row uses the same compact "Aug 12, 26" form.
     for (const e of events) {
@@ -1849,13 +1854,25 @@ async function renderCatalysts(quote) {
     macroFailed = true;
   }
 
-  items.sort((a, b) => a.iso.localeCompare(b.iso));
+  // Drop anything already past. Yahoo's calendarEvents is the reason this is
+  // needed: exDividendDate and dividendDate are routinely the *most recent* ones
+  // rather than the next, and earningsDate can lag a report that already
+  // happened — so the list would advertise settled events as upcoming catalysts.
+  // Macro events arrive pre-filtered by the Worker; this covers them anyway so
+  // there is a single place that decides what "upcoming" means.
+  // Today itself is kept: the brief is nothing PRIOR to the current date.
+  if (!today) {
+    today = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+  }
+  const upcoming = items
+    .filter(i => i.iso && i.iso >= today)
+    .sort((a, b) => a.iso.localeCompare(b.iso));
 
-  meta.textContent = items.length
-    ? `${items.length} upcoming${macroFailed ? ' · macro unavailable' : ''}`
-    : 'none scheduled';
+  meta.textContent = upcoming.length
+    ? `${upcoming.length} upcoming${macroFailed ? ' · macro unavailable' : ''}`
+    : `none scheduled${macroFailed ? ' · macro unavailable' : ''}`;
 
-  list.innerHTML = items.length ? items.map(i => `
+  list.innerHTML = upcoming.length ? upcoming.map(i => `
     <div class="catalyst-item">
       <div class="catalyst-date">${esc(i.date)}</div>
       <div class="catalyst-title">${esc(i.title)}${i.note ? `<span class="catalyst-note">${esc(i.note)}</span>` : ''}</div>
