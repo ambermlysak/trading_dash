@@ -148,14 +148,28 @@ const FOMC_MEETINGS = [
   { start: '2027-12-07', end: '2027-12-08', sep: true  },
 ];
 
-// BLS Consumer Price Index, 8:30am ET. `ref` is the month the print covers.
-const CPI_RELEASES = [
-  { date: '2026-08-12', ref: 'July 2026' },
-  { date: '2026-09-11', ref: 'August 2026' },
-  { date: '2026-10-14', ref: 'September 2026' },
-  { date: '2026-11-10', ref: 'October 2026' },
-  { date: '2026-12-10', ref: 'November 2026' },
+/**
+ * Statistical-release dates come from FRED, not from a table here.
+ *
+ * The CPI dates used to be hand-maintained alongside the FOMC table above. FRED
+ * publishes the official schedule for all of these, so the table is gone and the
+ * dates are fetched — one less thing that silently goes stale. FOMC stays
+ * hardcoded because the Fed's calendar is not a FRED release.
+ *
+ * Release IDs are deliberately NOT hardcoded: they are resolved by name from
+ * /fred/releases and cached, because an ID recalled from memory is exactly the
+ * kind of unverifiable constant this codebase keeps getting wrong.
+ */
+const FRED_RELEASES = [
+  { key: 'cpi',    name: 'Consumer Price Index',                               impact: 'HIGH',   title: 'CPI report',           note: '8:30am ET. Headline and core consumer inflation.' },
+  { key: 'pce',    name: 'Personal Income and Outlays',                        impact: 'HIGH',   title: 'PCE price index',      note: "8:30am ET. The Fed's preferred inflation gauge." },
+  { key: 'jobs',   name: 'Employment Situation',                               impact: 'HIGH',   title: 'Employment Situation', note: '8:30am ET. Nonfarm payrolls and the unemployment rate.' },
+  { key: 'ppi',    name: 'Producer Price Index',                               impact: 'MEDIUM', title: 'PPI report',           note: '8:30am ET. Producer-level inflation.' },
+  { key: 'retail', name: 'Advance Monthly Sales for Retail and Food Services', impact: 'MEDIUM', title: 'Retail sales',         note: '8:30am ET. Advance monthly retail and food-services sales.' },
 ];
+const FRED_KV_KEY  = 'econ:fred';
+const FRED_TTL     = 43_200;   // 12h — the schedule moves rarely, but not never
+const FRED_HORIZON = 120;      // days of upcoming releases to keep
 
 /** Today in US Eastern (market) time as an ISO `YYYY-MM-DD` string. */
 const etToday = () =>
@@ -187,8 +201,92 @@ function isoRangeLabel(startIso, endIso) {
  * Every known macro event as a flat, date-sorted list.
  * ISO dates compare correctly as strings, so callers can filter with < / >.
  */
-function econCalendar() {
+/**
+ * Resolve FRED release IDs by name, then pull each one's upcoming dates.
+ * Returns `{ events, error, asOfIds }` — on any failure `events` is empty and
+ * `error` says why, so callers can report "unavailable" instead of showing a
+ * calendar that is quietly missing half its entries.
+ */
+async function fetchFredReleaseDates(env) {
+  const key = env?.FRED_API_KEY;
+  if (!key) return { events: [], error: 'FRED_API_KEY not configured', asOfIds: {} };
+
+  const base = 'https://api.stlouisfed.org/fred';
+  const today = etToday();
+  const through = isoAddDays(today, FRED_HORIZON);
+
+  // Name → id, from FRED itself.
+  const listUrl = `${base}/releases?api_key=${encodeURIComponent(key)}&file_type=json&limit=1000`;
+  const listRes = await fetch(listUrl);
+  if (!listRes.ok) return { events: [], error: `FRED releases ${listRes.status}`, asOfIds: {} };
+  const all = (await listRes.json())?.releases || [];
+
+  const byName = new Map(all.map(r => [String(r.name || '').toLowerCase(), r.id]));
+  const asOfIds = {};
+  for (const spec of FRED_RELEASES) {
+    const want = spec.name.toLowerCase();
+    let id = byName.get(want);
+    if (id == null) {
+      const hit = all.find(r => String(r.name || '').toLowerCase().startsWith(want));
+      id = hit?.id;
+    }
+    if (id != null) asOfIds[spec.key] = id;
+  }
+  if (!Object.keys(asOfIds).length) {
+    return { events: [], error: 'no FRED release IDs resolved by name', asOfIds: {} };
+  }
+
   const events = [];
+  const missing = [];
+  for (const spec of FRED_RELEASES) {
+    const id = asOfIds[spec.key];
+    if (id == null) { missing.push(spec.name); continue; }
+    try {
+      const u = `${base}/release/dates?release_id=${id}&api_key=${encodeURIComponent(key)}`
+              + `&file_type=json&include_release_dates_with_no_data=true&sort_order=asc`
+              + `&realtime_start=${today}&realtime_end=${through}&limit=12`;
+      const r = await fetch(u);
+      if (!r.ok) { missing.push(spec.name); continue; }
+      for (const d of ((await r.json())?.release_dates || [])) {
+        if (!d?.date || d.date < today || d.date > through) continue;
+        events.push({
+          date: d.date, type: 'Economic', impact: spec.impact,
+          title: spec.title, note: spec.note, source: 'FRED',
+        });
+      }
+    } catch (_) { missing.push(spec.name); }
+  }
+
+  return {
+    events,
+    error: events.length ? null : 'FRED returned no upcoming release dates',
+    partial: missing.length ? `no dates for: ${missing.join(', ')}` : null,
+    asOfIds,
+  };
+}
+
+/** FRED release dates, cached. Never throws — a failure degrades to FOMC-only. */
+async function getEconReleases(env) {
+  try {
+    const cached = await env?.REC_LOG?.get(FRED_KV_KEY, 'json');
+    if (cached && Array.isArray(cached.events)) return cached;
+  } catch (_) {}
+  let res;
+  try {
+    res = await fetchFredReleaseDates(env);
+  } catch (e) {
+    res = { events: [], error: `FRED fetch failed: ${e.message}`, asOfIds: {} };
+  }
+  // Cache failures too, briefly, so a FRED outage does not mean a call per request.
+  try {
+    await env?.REC_LOG?.put(FRED_KV_KEY, JSON.stringify({ ...res, ts: Date.now() }),
+      { expirationTtl: res.events.length ? FRED_TTL : 900 });
+  } catch (_) {}
+  return res;
+}
+
+function econCalendar(dataReleases = []) {
+  const events = [...dataReleases];
 
   for (const m of FOMC_MEETINGS) {
     const range = isoRangeLabel(m.start, m.end);
@@ -210,27 +308,17 @@ function econCalendar() {
     });
   }
 
-  for (const c of CPI_RELEASES) {
-    events.push({
-      date:   c.date,
-      type:   'Economic',
-      impact: 'HIGH',
-      title:  `CPI report · ${c.ref}`,
-      note:   `8:30am ET. Headline and core inflation for ${c.ref}.`,
-    });
-  }
-
   return events.sort((a, b) => a.date.localeCompare(b.date));
 }
 
 /** Macro events falling within [startIso, endIso] inclusive. */
-function econEventsBetween(startIso, endIso) {
-  return econCalendar().filter(e => e.date >= startIso && e.date <= endIso);
+function econEventsBetween(startIso, endIso, dataReleases = []) {
+  return econCalendar(dataReleases).filter(e => e.date >= startIso && e.date <= endIso);
 }
 
 /** The next `limit` macro events on or after `fromIso` (defaults to today ET). */
-function econEventsAhead(limit = 5, fromIso = etToday()) {
-  return econCalendar().filter(e => e.date >= fromIso).slice(0, limit);
+function econEventsAhead(limit = 5, fromIso = etToday(), dataReleases = []) {
+  return econCalendar(dataReleases).filter(e => e.date >= fromIso).slice(0, limit);
 }
 
 /**
@@ -266,6 +354,20 @@ const json = (data, status = 200, origin = '') =>
   });
 
 const err = (msg, status = 500, origin = '') => json({ error: msg }, status, origin);
+
+/**
+ * Provenance stamp attached to every payload that feeds a card badge.
+ *
+ * The UI badge is rendered FROM this object, never hand-written in markup. Two
+ * badges had already drifted from their fetch layer — one card credited FINRA
+ * without ever calling it, another was marked "Sample" while running on live
+ * data — and a hand-written string cannot help drifting, because nothing ties
+ * it to the code that fetches. A card that never called a source now has no way
+ * to name it.
+ */
+const srcMeta = (source, { ok = true, delayed = false, note = null, asOf = null } = {}) => ({
+  source, ok, delayed, note, asOf, fetchedAt: new Date().toISOString(),
+});
 
 /* ── Yahoo Finance (no-auth) ── */
 async function yahoo(path, search = '') {
@@ -1136,6 +1238,606 @@ async function recordWatchlistIv(env) {
   }
   try { await env?.REC_LOG?.put('ivsweep:last', ptDate(), { expirationTtl: 172800 }); } catch (_) {}
   console.log(`[cron] iv samples recorded for ${ok}/${tickers.length} tickers`);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SEC EDGAR — insider Form 4 and super-investor 13F
+
+   EDGAR is free and authoritative, and it 403s any request without a
+   User-Agent carrying a real contact address. That constant is not decorative:
+   change the email and the whole section stops working.
+
+   Workers have no DOMParser, so the XML is read with narrow regex helpers.
+   They tolerate namespace prefixes (<ns1:infoTable>) because filers use them
+   inconsistently.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const SEC_UA = 'trading-dash/1.0 (ambermlysak@gmail.com)';
+const SEC_MIN_GAP_MS = 120;      // SEC asks for ≤10 req/s; this stays well under
+const CIK_MAP_TTL    = 30 * 24 * 3600;
+const INSIDER_TTL    = 12 * 3600;
+const INSIDER_WINDOW_DAYS = 90;
+const CLUSTER_WINDOW_DAYS = 30;
+const CLUSTER_MIN_BUYERS  = 3;
+const LARGE_BUY_USD       = 500_000;
+
+let _secLast = 0;
+async function secFetch(url, asText = false) {
+  const wait = SEC_MIN_GAP_MS - (Date.now() - _secLast);
+  if (wait > 0) await sleep(wait);
+  _secLast = Date.now();
+  const r = await fetch(url, {
+    headers: {
+      'User-Agent': SEC_UA,
+      'Accept': asText ? 'application/xml, text/xml, */*' : 'application/json, */*',
+      'Accept-Encoding': 'gzip, deflate',
+    },
+  });
+  if (!r.ok) throw new Error(`SEC ${r.status} ${url.replace('https://', '').slice(0, 80)}`);
+  return asText ? r.text() : r.json();
+}
+
+/* ── tiny XML readers (namespace-tolerant) ── */
+const xmlBlock = (s, tag) => {
+  const m = s?.match(new RegExp(`<(?:\\w+:)?${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</(?:\\w+:)?${tag}>`));
+  return m ? m[1] : null;
+};
+const xmlBlocks = (s, tag) =>
+  [...(s || '').matchAll(new RegExp(`<(?:\\w+:)?${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</(?:\\w+:)?${tag}>`, 'g'))]
+    .map(m => m[1]);
+const xmlText = (s, tag) => {
+  const b = xmlBlock(s, tag);
+  if (b == null) return null;
+  return b
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ')
+    .trim() || null;
+};
+/** Form 4 wraps most leaf values in <value>; fall back to the raw text. */
+const xmlValue = (s, tag) => {
+  const b = xmlBlock(s, tag);
+  if (b == null) return null;
+  const v = xmlBlock(b, 'value');
+  const out = (v ?? b).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  return out || null;
+};
+const xmlNum = (s, tag) => {
+  const t = xmlValue(s, tag);
+  if (t == null) return null;
+  const n = Number(t.replace(/[$,]/g, ''));
+  return Number.isFinite(n) ? n : null;
+};
+
+/** Ticker → zero-padded 10-digit CIK, from SEC's own file. Cached 30 days. */
+async function getCikMap(env) {
+  try {
+    const cached = await env?.REC_LOG?.get('cik:map', 'json');
+    if (cached && typeof cached === 'object' && Object.keys(cached).length) return cached;
+  } catch (_) {}
+
+  const data = await secFetch('https://www.sec.gov/files/company_tickers.json');
+  const map = {};
+  for (const row of Object.values(data || {})) {
+    if (!row?.ticker || row.cik_str == null) continue;
+    map[String(row.ticker).toUpperCase()] = String(row.cik_str).padStart(10, '0');
+  }
+  if (!Object.keys(map).length) throw new Error('SEC ticker file parsed to zero entries');
+  try { await env?.REC_LOG?.put('cik:map', JSON.stringify(map), { expirationTtl: CIK_MAP_TTL }); } catch (_) {}
+  return map;
+}
+
+const cikToPath = cik => String(Number(cik));   // EDGAR archive paths drop leading zeros
+
+/* ── Insider trades: Form 4 ────────────────────────────────────────────────
+   Yahoo's insiderTransactions is a thin summary with free-text descriptions;
+   Form 4 carries the actual transaction code, price, and post-transaction
+   holdings, which is what makes an open-market buy distinguishable from a
+   grant. Transaction codes: P = open-market purchase, S = sale, A = award/grant,
+   M = option exercise, F = shares withheld for tax. */
+const TXN_CODE_LABEL = {
+  P: 'Open-market buy', S: 'Sale', A: 'Grant / award', M: 'Option exercise',
+  F: 'Tax withholding', G: 'Gift', C: 'Conversion', X: 'Option exercise',
+};
+
+async function parseForm4(url) {
+  const xml = await secFetch(url, true);
+  const doc = xmlBlock(xml, 'ownershipDocument') || xml;
+
+  const owners = xmlBlocks(doc, 'reportingOwner').map(o => {
+    const rel = xmlBlock(o, 'reportingOwnerRelationship') || '';
+    return {
+      name:     xmlText(xmlBlock(o, 'reportingOwnerId') || '', 'rptOwnerName'),
+      isOfficer:  /<(?:\w+:)?isOfficer>\s*(?:1|true)\s*</i.test(rel),
+      isDirector: /<(?:\w+:)?isDirector>\s*(?:1|true)\s*</i.test(rel),
+      isTenPct:   /<(?:\w+:)?isTenPercentOwner>\s*(?:1|true)\s*</i.test(rel),
+      title:    xmlText(rel, 'officerTitle'),
+    };
+  });
+  const owner = owners[0] || { name: null };
+
+  const txns = [];
+  // Non-derivative only: derivative rows are options grants and exercises, which
+  // say far less about conviction than an open-market purchase of stock.
+  const table = xmlBlock(doc, 'nonDerivativeTable') || '';
+  for (const t of xmlBlocks(table, 'nonDerivativeTransaction')) {
+    const code   = xmlValue(xmlBlock(t, 'transactionCoding') || '', 'transactionCode');
+    const amts   = xmlBlock(t, 'transactionAmounts') || '';
+    const shares = xmlNum(amts, 'transactionShares');
+    const price  = xmlNum(amts, 'transactionPricePerShare');
+    const ad     = xmlValue(amts, 'transactionAcquiredDisposedCode');
+    const post   = xmlNum(xmlBlock(t, 'postTransactionAmounts') || '', 'sharesOwnedFollowingTransaction');
+    const date   = xmlValue(t, 'transactionDate');
+    if (!code || shares == null) continue;
+    txns.push({
+      date, code,
+      label:      TXN_CODE_LABEL[code] || `Code ${code}`,
+      shares,
+      price:      price ?? null,
+      value:      (price != null && shares != null) ? +(price * shares).toFixed(2) : null,
+      acquired:   ad === 'A',
+      sharesAfter: post ?? null,
+      owner:      owner.name,
+      isOfficer:  owner.isOfficer,
+      isDirector: owner.isDirector,
+      isTenPct:   owner.isTenPct,
+      title:      owner.title,
+    });
+  }
+  return txns;
+}
+
+async function buildInsiderReport(ticker, env) {
+  const map = await getCikMap(env);
+  const cik = map[ticker.toUpperCase()];
+  if (!cik) return { ok: false, reason: `no SEC CIK on file for ${ticker.toUpperCase()}` };
+
+  const sub = await secFetch(`https://data.sec.gov/submissions/CIK${cik}.json`);
+  const rec = sub?.filings?.recent || {};
+  const cutoff = isoAddDays(etToday(), -INSIDER_WINDOW_DAYS);
+
+  const wanted = [];
+  for (let i = 0; i < (rec.form || []).length; i++) {
+    if (rec.form[i] !== '4') continue;
+    if ((rec.filingDate?.[i] || '') < cutoff) continue;
+    wanted.push({
+      accession: String(rec.accessionNumber[i]).replace(/-/g, ''),
+      doc:       rec.primaryDocument?.[i] || '',
+      filed:     rec.filingDate[i],
+    });
+  }
+  if (!wanted.length) {
+    return { ok: true, transactions: [], filings: 0, windowDays: INSIDER_WINDOW_DAYS,
+             cik, companyName: sub?.name || null };
+  }
+
+  const txns = [];
+  let failed = 0;
+  for (const f of wanted.slice(0, 60)) {   // cap subrequests on heavily-filed names
+    // primaryDocument is sometimes the XSL viewer path (xslF345X03/doc.xml);
+    // the raw XML sits at the filing root under the same filename.
+    const file = f.doc.includes('/') ? f.doc.slice(f.doc.lastIndexOf('/') + 1) : f.doc;
+    if (!file.toLowerCase().endsWith('.xml')) { failed++; continue; }
+    try {
+      const rows = await parseForm4(
+        `https://www.sec.gov/Archives/edgar/data/${cikToPath(cik)}/${f.accession}/${file}`);
+      for (const r of rows) txns.push({ ...r, filed: f.filed });
+    } catch (_) { failed++; }
+  }
+
+  txns.sort((a, b) => String(b.date || b.filed).localeCompare(String(a.date || a.filed)));
+
+  // Cluster buying: distinct insiders making open-market purchases inside a
+  // rolling 30-day window. One insider buying repeatedly is not a cluster.
+  const buys = txns.filter(t => t.code === 'P');
+  let cluster = null;
+  for (const anchor of buys) {
+    const from = isoAddDays(anchor.date || anchor.filed, -CLUSTER_WINDOW_DAYS);
+    const names = new Set(
+      buys.filter(b => (b.date || b.filed) >= from && (b.date || b.filed) <= (anchor.date || anchor.filed))
+          .map(b => b.owner).filter(Boolean));
+    if (names.size >= CLUSTER_MIN_BUYERS && (!cluster || names.size > cluster.buyers)) {
+      cluster = { buyers: names.size, through: anchor.date || anchor.filed, names: [...names] };
+    }
+  }
+
+  const largeBuys = buys.filter(t => t.value != null && t.value >= LARGE_BUY_USD);
+  const sells     = txns.filter(t => t.code === 'S');
+  const sum = arr => arr.reduce((a, t) => a + (t.value || 0), 0);
+
+  return {
+    ok: true,
+    cik,
+    companyName: sub?.name || null,
+    windowDays:  INSIDER_WINDOW_DAYS,
+    filings:     wanted.length,
+    parseFailures: failed,
+    transactions: txns.slice(0, 40),
+    summary: {
+      buyCount: buys.length, sellCount: sells.length,
+      buyValue: +sum(buys).toFixed(2), sellValue: +sum(sells).toFixed(2),
+      netValue: +(sum(buys) - sum(sells)).toFixed(2),
+    },
+    cluster,
+    largeBuys: largeBuys.slice(0, 5).map(t => ({
+      owner: t.owner, date: t.date, value: t.value, shares: t.shares, price: t.price, title: t.title,
+    })),
+  };
+}
+
+async function handleInsider(ticker, params, origin, env, ctx) {
+  if (!ticker) return err('ticker required', 400, origin);
+  const sym = ticker.toUpperCase();
+  const key = `insider:${sym}`;
+
+  if (params.get('refresh') !== '1') {
+    try {
+      const cached = await env?.REC_LOG?.get(key, 'json');
+      if (cached) return json({ ...cached, cached: true }, 200, origin);
+    } catch (_) {}
+  }
+
+  let payload;
+  try {
+    const r = await buildInsiderReport(sym, env);
+    payload = r.ok
+      ? { ticker: sym, ...r, _meta: srcMeta('SEC EDGAR Form 4', { note: `last ${INSIDER_WINDOW_DAYS} days` }) }
+      : { ticker: sym, unavailable: true, reason: r.reason,
+          _meta: srcMeta('SEC EDGAR Form 4', { ok: false, note: r.reason }) };
+  } catch (e) {
+    // No fallback to a lesser source and no generated stand-in: say what broke.
+    return json({
+      ticker: sym, unavailable: true, reason: `SEC EDGAR unavailable: ${e.message}`,
+      _meta: srcMeta('SEC EDGAR Form 4', { ok: false, note: e.message }),
+    }, 200, origin);
+  }
+
+  if (ctx) ctx.waitUntil(
+    env?.REC_LOG?.put(key, JSON.stringify(payload), { expirationTtl: INSIDER_TTL }).catch(() => {}));
+  return json(payload, 200, origin);
+}
+
+/* ── Super-investor 13F ────────────────────────────────────────────────────
+   A fixed roster of managers worth watching, by SEC CIK. 13F-HR is filed 45
+   days after quarter end, so everything here is stale by construction — the
+   card says so rather than implying it is current positioning.
+
+   EVERY CIK BELOW WAS VERIFIED against data.sec.gov/submissions/CIK{n}.json —
+   the returned `name` matches the firm and the filing history contains 13F-HR.
+   That check is not optional: the first draft of this list was written from
+   memory and 7 of 18 entries were wrong, several of them pointing at real but
+   unrelated managers (Third Point's CIK returned Two Sigma, ARK's returned
+   ValueAct). A wrong CIK does not fail loudly — it silently attributes one
+   manager's book to another. Re-verify before adding a name. */
+const SUPER_INVESTORS = [
+  { cik: '0001067983', name: 'Warren Buffett',        firm: 'Berkshire Hathaway' },
+  { cik: '0001649339', name: 'Michael Burry',         firm: 'Scion Asset Mgmt' },
+  { cik: '0001006438', name: 'David Tepper',          firm: 'Appaloosa Management' },
+  { cik: '0001336528', name: 'Bill Ackman',           firm: 'Pershing Square' },
+  { cik: '0001536411', name: 'Stanley Druckenmiller', firm: 'Duquesne Family Office' },
+  { cik: '0001167483', name: 'Chase Coleman',         firm: 'Tiger Global' },
+  { cik: '0001135730', name: 'Philippe Laffont',      firm: 'Coatue Management' },
+  { cik: '0001061165', name: 'Stephen Mandel',        firm: 'Lone Pine Capital' },
+  { cik: '0001061768', name: 'Seth Klarman',          firm: 'Baupost Group' },
+  { cik: '0001037389', name: 'Jim Simons',            firm: 'Renaissance Technologies' },
+  { cik: '0001423053', name: 'Ken Griffin',           firm: 'Citadel Advisors' },
+  { cik: '0001350694', name: 'Ray Dalio',             firm: 'Bridgewater Associates' },
+  { cik: '0001040273', name: 'Daniel Loeb',           firm: 'Third Point' },
+  { cik: '0001697748', name: 'Cathie Wood',           firm: 'ARK Investment Mgmt' },
+  { cik: '0001112520', name: 'Chuck Akre',            firm: 'Akre Capital Mgmt' },
+  { cik: '0000807249', name: 'Mario Gabelli',         firm: 'GAMCO Investors' },
+  { cik: '0001179392', name: 'Two Sigma',             firm: 'Two Sigma Investments' },
+  { cik: '0001418814', name: 'ValueAct',              firm: 'ValueAct Holdings' },
+  { cik: '0001079114', name: 'David Einhorn',         firm: 'Greenlight Capital' },
+  { cik: '0001173334', name: 'Mohnish Pabrai',        firm: 'Pabrai Investment Funds' },
+];
+
+const THIRTEENF_KEY   = '13f:index';
+const THIRTEENF_TTL   = 100 * 24 * 3600;   // rebuilt quarterly; TTL is a backstop
+const THIRTEENF_TOP_N = 150;               // largest positions per manager
+
+/** Normalise an issuer name so 13F text can be matched to SEC's company titles. */
+function normIssuer(s) {
+  return String(s || '')
+    .toUpperCase()
+    .replace(/&AMP;/g, '&')
+    .replace(/[.,'"]/g, '')
+    .replace(/\b(THE|COM|COMMON|STOCK|SHARES?|CL|CLASS|[A-C]|INC|CORP|CORPORATION|CO|COMPANY|LTD|LIMITED|PLC|LP|LLC|HOLDINGS?|GROUP|TRUST|NEW|SA|NV|AG)\b/g, ' ')
+    .replace(/[^A-Z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Latest 13F-HR information table for one manager. */
+async function fetch13F(cik) {
+  const sub = await secFetch(`https://data.sec.gov/submissions/CIK${cik}.json`);
+  const rec = sub?.filings?.recent || {};
+  let idx = -1;
+  for (let i = 0; i < (rec.form || []).length; i++) {
+    if (rec.form[i] === '13F-HR') { idx = i; break; }   // `recent` is newest-first
+  }
+  if (idx < 0) return null;
+
+  const accession = String(rec.accessionNumber[idx]).replace(/-/g, '');
+  const dir = `https://www.sec.gov/Archives/edgar/data/${cikToPath(cik)}/${accession}`;
+
+  // The information table is a separate XML from the cover page; find it by name.
+  const listing = await secFetch(`${dir}/index.json`);
+  const files = (listing?.directory?.item || []).map(f => f.name || '');
+  const info = files.find(n => /infotable.*\.xml$/i.test(n))
+            || files.find(n => /\.xml$/i.test(n) && !/primary_doc/i.test(n));
+  if (!info) return null;
+
+  const xml = await secFetch(`${dir}/${info}`, true);
+  const holdings = [];
+  for (const b of xmlBlocks(xml, 'infoTable')) {
+    const name  = xmlText(b, 'nameOfIssuer');
+    const cusip = xmlText(b, 'cusip');
+    // Post-2023 amendments report value in whole dollars (previously thousands).
+    const value = xmlNum(b, 'value');
+    const shrs  = xmlBlock(b, 'shrsOrPrnAmt') || '';
+    const shares = xmlNum(shrs, 'sshPrnamt');
+    const kind   = xmlText(shrs, 'sshPrnamtType');
+    if (!name || !cusip || kind !== 'SH') continue;   // SH only: skip principal amounts
+    holdings.push({ name, cusip, value: value ?? null, shares: shares ?? null });
+  }
+  holdings.sort((a, b) => (b.value || 0) - (a.value || 0));
+
+  return {
+    quarter:  rec.reportDate?.[idx] || null,
+    filed:    rec.filingDate?.[idx] || null,
+    holdings: holdings.slice(0, THIRTEENF_TOP_N),
+  };
+}
+
+/**
+ * Build the ticker → managers reverse index.
+ *
+ * There is no free CUSIP→ticker table, so the mapping is built opportunistically
+ * by matching the filing's issuer name against SEC's own company titles.
+ * Coverage is partial by design; anything unresolved is counted and reported
+ * rather than guessed at.
+ */
+async function build13FIndex(env) {
+  const cikMap = await getCikMap(env);
+
+  // company title → ticker, from the same SEC file (fetched fresh for titles).
+  const raw = await secFetch('https://www.sec.gov/files/company_tickers.json');
+  const byName = new Map();
+  for (const row of Object.values(raw || {})) {
+    if (!row?.ticker || !row?.title) continue;
+    const n = normIssuer(row.title);
+    if (n && !byName.has(n)) byName.set(n, String(row.ticker).toUpperCase());
+  }
+
+  const index = {};            // TICKER -> [{manager, firm, shares, value, ...}]
+  const managers = [];
+  let resolved = 0, unresolved = 0;
+
+  for (const inv of SUPER_INVESTORS) {
+    let f = null;
+    try { f = await fetch13F(inv.cik); }
+    catch (e) { console.warn(`[13f] ${inv.firm}: ${e.message}`); }
+    if (!f) { managers.push({ ...inv, ok: false }); continue; }
+    managers.push({ ...inv, ok: true, quarter: f.quarter, filed: f.filed, positions: f.holdings.length });
+
+    // A 13F reports one issuer across several rows — separate accounts, share
+    // classes, and investment-discretion categories all file their own line.
+    // Summing per manager is the position; listing the rows would show Berkshire
+    // holding Apple four times.
+    const perTicker = new Map();
+    for (const h of f.holdings) {
+      const t = byName.get(normIssuer(h.name));
+      if (!t || !cikMap[t]) { unresolved++; continue; }
+      resolved++;
+      const cur = perTicker.get(t) || { shares: 0, value: 0, rows: 0, cusip: h.cusip };
+      cur.shares += h.shares || 0;
+      cur.value  += h.value  || 0;
+      cur.rows   += 1;
+      perTicker.set(t, cur);
+    }
+    for (const [t, agg] of perTicker) {
+      (index[t] ||= []).push({
+        manager: inv.name, firm: inv.firm, cik: inv.cik,
+        shares: agg.shares || null, value: agg.value || null,
+        rows: agg.rows, cusip: agg.cusip,
+        quarter: f.quarter, filed: f.filed,
+      });
+    }
+  }
+
+  for (const t of Object.keys(index)) index[t].sort((a, b) => (b.value || 0) - (a.value || 0));
+
+  return {
+    index, managers,
+    stats: { resolved, unresolved, tickers: Object.keys(index).length,
+             managersOk: managers.filter(m => m.ok).length, managersTotal: SUPER_INVESTORS.length },
+    builtAt: new Date().toISOString(),
+  };
+}
+
+/* Build the whole index and store it. Off the request path on purpose: 20
+   managers cost ~60 rate-limited SEC round trips, which is a minute of wall
+   clock — far too long to hold a page load, and it wedges the dev server. The
+   cron owns it; a request only ever reads KV. */
+async function refresh13FIndex(env) {
+  try {
+    const store = await build13FIndex(env);
+    await env?.REC_LOG?.put(THIRTEENF_KEY, JSON.stringify(store), { expirationTtl: THIRTEENF_TTL });
+    console.log(`[13f] index built: ${store.stats.tickers} tickers, `
+              + `${store.stats.managersOk}/${store.stats.managersTotal} managers, `
+              + `${store.stats.resolved} resolved / ${store.stats.unresolved} unmapped`);
+    return store;
+  } catch (e) {
+    console.error('[13f] index build failed:', e.message);
+    return null;
+  }
+}
+
+/** Rebuild only when the stored index is older than a week (or absent). */
+async function refresh13FIndexIfStale(env) {
+  try {
+    const cur = await env?.REC_LOG?.get(THIRTEENF_KEY, 'json');
+    if (cur?.builtAt && Date.now() - Date.parse(cur.builtAt) < 7 * 86_400_000) {
+      console.log('[13f] index fresh, skipping');
+      return;
+    }
+  } catch (_) {}
+  await refresh13FIndex(env);
+}
+
+async function handle13F(ticker, params, origin, env, ctx) {
+  if (!ticker) return err('ticker required', 400, origin);
+  const sym = ticker.toUpperCase();
+
+  let store = null;
+  try { store = await env?.REC_LOG?.get(THIRTEENF_KEY, 'json'); } catch (_) {}
+
+  if (params.get('refresh') === '1') {
+    // Kick a rebuild but do not make the caller wait for it.
+    if (ctx) ctx.waitUntil(refresh13FIndex(env));
+    if (!store) {
+      return json({
+        ticker: sym, unavailable: true, building: true,
+        reason: '13F index is building — 20 managers at SEC rate limits takes about a minute. Retry shortly.',
+        _meta: srcMeta('SEC EDGAR 13F-HR', { ok: false, note: 'index building' }),
+      }, 200, origin);
+    }
+  }
+
+  if (!store) {
+    if (ctx) ctx.waitUntil(refresh13FIndex(env));
+    return json({
+      ticker: sym, unavailable: true, building: true,
+      reason: '13F index not built yet — a build has been started. Retry in about a minute.',
+      _meta: srcMeta('SEC EDGAR 13F-HR', { ok: false, note: 'index building' }),
+    }, 200, origin);
+  }
+
+  const holders = store.index?.[sym] || [];
+  const quarters = [...new Set(holders.map(h => h.quarter).filter(Boolean))].sort();
+  return json({
+    ticker: sym,
+    holders,
+    // An unmapped ticker is reported as unmapped. It must never render as
+    // "no institutional interest", which is a different and much stronger claim.
+    mapped: holders.length > 0,
+    coverage: store.stats,
+    managers: store.managers,
+    builtAt: store.builtAt,
+    _meta: srcMeta('SEC EDGAR 13F-HR', {
+      asOf: quarters.at(-1) || null,
+      note: holders.length
+        ? `quarter ending ${quarters.at(-1)} · filed up to 45 days after`
+        : 'no mapped holdings',
+    }),
+  }, 200, origin);
+}
+
+/* ── Short interest: FINRA consolidated, official and biweekly ─────────────
+   FINRA publishes settled short interest twice a month with roughly a two-week
+   reporting lag. That lag is a property of the data, not a defect, and the
+   settlement date travels with the payload so the card can show it.
+
+   Yahoo's shortPercentOfFloat is a single unofficial snapshot with no history,
+   which is why FINRA is primary: the 6-period series the MoM chart needs does
+   not exist in Yahoo at all. */
+const FINRA_TOKEN_URL = 'https://ews.fip.finra.org/fip/rest/ews/oauth2/access_token?grant_type=client_credentials';
+const FINRA_DATA_URL  = 'https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest';
+const SHORT_TTL       = 6 * 3600;
+const SHORT_PERIODS   = 6;
+
+async function finraToken(env) {
+  const id     = env?.FINRA_CLIENT_ID     || env?.FINRA_API_KEY;
+  const secret = env?.FINRA_CLIENT_SECRET || env?.FINRA_API_SECRET;
+  if (!id || !secret) throw new Error('FINRA credentials not configured');
+
+  const cached = await env?.REC_LOG?.get('finra:token', 'json').catch(() => null);
+  if (cached?.token && cached.exp > Date.now() + 60_000) return cached.token;
+
+  const r = await fetch(FINRA_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Authorization': `Basic ${btoa(`${id}:${secret}`)}` },
+  });
+  if (!r.ok) throw new Error(`FINRA auth ${r.status}`);
+  const d = await r.json();
+  if (!d?.access_token) throw new Error('FINRA auth returned no token');
+
+  const exp = Date.now() + Math.max(60, (d.expires_in || 1800) - 60) * 1000;
+  try {
+    await env?.REC_LOG?.put('finra:token', JSON.stringify({ token: d.access_token, exp }),
+      { expirationTtl: Math.max(120, (d.expires_in || 1800) - 60) });
+  } catch (_) {}
+  return d.access_token;
+}
+
+async function fetchFinraShort(ticker, env) {
+  const token = await finraToken(env);
+  const r = await fetch(FINRA_DATA_URL, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      limit: SHORT_PERIODS,
+      compareFilters: [{ fieldName: 'symbolCode', fieldValue: ticker.toUpperCase(), compareType: 'EQUAL' }],
+      sortFields: ['-settlementDate'],
+    }),
+  });
+  if (!r.ok) throw new Error(`FINRA query ${r.status}`);
+  const rows = await r.json();
+  if (!Array.isArray(rows) || !rows.length) throw new Error('FINRA returned no rows for this symbol');
+
+  const num = v => { const n = Number(v); return Number.isFinite(n) ? n : null; };
+  return rows.map(row => ({
+    settlementDate: row.settlementDate || null,
+    shares:         num(row.currentShortPositionQuantity),
+    priorShares:    num(row.previousShortPositionQuantity),
+    avgDailyVolume: num(row.averageDailyVolumeQuantity),
+    daysToCover:    num(row.daysToCoverQuantity),
+  })).filter(x => x.settlementDate);
+}
+
+async function handleShortInterest(ticker, params, origin, env, ctx) {
+  if (!ticker) return err('ticker required', 400, origin);
+  const sym = ticker.toUpperCase();
+  const key = `short:${sym}`;
+
+  if (params.get('refresh') !== '1') {
+    try {
+      const cached = await env?.REC_LOG?.get(key, 'json');
+      if (cached) return json({ ...cached, cached: true }, 200, origin);
+    } catch (_) {}
+  }
+
+  let payload;
+  try {
+    const periods = await fetchFinraShort(sym, env);
+    const latest  = periods[0];
+    payload = {
+      ticker: sym, official: true, periods, latest,
+      _meta: srcMeta('FINRA', {
+        asOf: latest.settlementDate,
+        delayed: true,
+        note: `official biweekly settlement · settled ${latest.settlementDate} · ~2-week reporting lag`,
+      }),
+    };
+  } catch (e) {
+    // Yahoo is the fallback, and it is labelled as an estimate. It must never
+    // borrow FINRA's name — that is the exact drift this task is fixing.
+    payload = {
+      ticker: sym, official: false, periods: [], latest: null,
+      reason: `Official FINRA figure unavailable: ${e.message}`,
+      _meta: srcMeta('Yahoo Finance', {
+        ok: false,
+        note: 'unofficial estimate — official FINRA settlement figure unavailable',
+      }),
+    };
+  }
+
+  if (ctx) ctx.waitUntil(
+    env?.REC_LOG?.put(key, JSON.stringify(payload),
+      { expirationTtl: payload.official ? SHORT_TTL : 900 }).catch(() => {}));
+  return json(payload, 200, origin);
 }
 
 async function handleSearch(q, origin) {
@@ -2511,7 +3213,7 @@ async function refreshTickerAnalysis(ticker, env) {
         : null,
     ].filter(Boolean).join('\n');
 
-    const econCtx = econPromptLines(econEventsAhead(3));
+    const econCtx = econPromptLines(econEventsAhead(3, etToday(), (await getEconReleases(env)).events));
 
     const prompt = `You are a senior portfolio manager. Weigh ALL the evidence below for ${ticker} and commit to ONE consolidated recommendation. Do not evaluate each category in isolation — decide what actually drives this name right now, let the dominant factors outweigh the noise, and say what you would do.
 
@@ -2554,24 +3256,34 @@ Rules:
 }
 
 /* ── Economic calendar endpoint ──
- * Static table lookup — no upstream fetch, no KV, so it is always in sync with
- * the same source the Claude prompts use. `stale` warns the frontend when the
- * hand-maintained tables are running out of runway.
+ * FOMC dates come from the hardcoded table (the Fed calendar is not a FRED
+ * release); everything else comes from FRED, cached 12h. `stale` warns when the
+ * hand-maintained FOMC runway is running out; `dataReleases` reports whether the
+ * FRED half is live, so the card can say what is missing rather than silently
+ * showing a Fed-only calendar.
  */
-function handleEconCalendar(params, origin) {
+async function handleEconCalendar(params, origin, env) {
   const limit  = Math.min(Math.max(parseInt(params.get('limit') || '6', 10) || 6, 1), 25);
   const today  = etToday();
-  const events = econEventsAhead(limit, today).map(e => ({
+  const fred   = await getEconReleases(env);
+  const events = econEventsAhead(limit, today, fred.events).map(e => ({
     ...e,
     label: isoLabel(e.date, { weekday: 'short', year: 'numeric' }),
   }));
 
   return json({
     events,
-    asOf:  today,
+    asOf:    today,
     through: ECON_CALENDAR_THROUGH,
-    stale: today > ECON_CALENDAR_THROUGH || events.length < limit,
-    ts:    Date.now(),
+    stale:   today > ECON_CALENDAR_THROUGH,
+    dataReleases: {
+      ok:      !fred.error,
+      count:   fred.events.length,
+      reason:  fred.error || fred.partial || null,
+      source:  'FRED',
+    },
+    fomcSource: 'federalreserve.gov (hand-maintained table)',
+    ts: Date.now(),
   }, 200, origin);
 }
 
@@ -3039,7 +3751,7 @@ async function handleWeekAhead(origin, env) {
     }
   } catch (_) {}
 
-  const weekEcon = econEventsBetween(monIso, friIso);
+  const weekEcon = econEventsBetween(monIso, friIso, (await getEconReleases(env)).events);
   const econBlock = weekEcon.length
     ? 'CONFIRMED MACRO CALENDAR for this week (official Fed / BLS schedule — use these exact dates, do NOT alter or add others):\n' +
       econPromptLines(weekEcon)
@@ -3097,6 +3809,8 @@ Include 6–10 events total. Order chronologically Mon→Fri.`;
 
 /* ── Cron: daily snapshot ── */
 async function generateDailySnapshot(env) {
+  // FRED supplies the statistical-release dates; FOMC comes from the hardcoded table.
+  const fredEvents = (await getEconReleases(env)).events;
   // Dedup: skip only if a *complete* snapshot was generated in the last 2 hours.
   // A previously-cached empty fallback (Claude failed) must NOT block a retry,
   // otherwise one 6am hiccup leaves the briefing blank until tomorrow.
@@ -3165,7 +3879,7 @@ RECENT NEWS HEADLINES:
 ${newsLines || 'Not available'}
 
 UPCOMING MACRO CALENDAR (official Fed / BLS schedule — the only source for these dates):
-${econPromptLines(econEventsAhead(4)) || 'Nothing scheduled in the tracked calendar.'}
+${econPromptLines(econEventsAhead(4, etToday(), fredEvents)) || 'Nothing scheduled in the tracked calendar.'}
 
 Generate a morning market briefing as valid JSON with exactly these fields:
 {
@@ -3262,6 +3976,8 @@ async function refreshWatchlistAnalyses(env) {
 
 /* ── Cron: end-of-day summary (1:15pm PT, ~15 min after market close) ── */
 async function generateEODSummary(env) {
+  // FRED supplies the statistical-release dates; FOMC comes from the hardcoded table.
+  const fredEvents = (await getEconReleases(env)).events;
   try {
     const existing = await env?.REC_LOG?.get('daily:eod', 'json');
     if (existing && Date.now() - existing.ts < 7_200_000) {
@@ -3320,7 +4036,7 @@ TODAY'S NEWS:
 ${newsLines || 'Not available'}
 
 UPCOMING MACRO CALENDAR (official Fed / BLS schedule — the only source for these dates):
-${econPromptLines(econEventsAhead(4)) || 'Nothing scheduled in the tracked calendar.'}
+${econPromptLines(econEventsAhead(4, etToday(), fredEvents)) || 'Nothing scheduled in the tracked calendar.'}
 
 Write a concise end-of-day market summary as valid JSON (no markdown):
 {
@@ -3354,6 +4070,8 @@ If you reference an FOMC meeting or CPI release, use ONLY the macro calendar abo
    drawn from the watchlist, and big movers (≥10% + volume) regardless of
    watchlist status. Served via /api/daily as `midday`. */
 async function generateMiddaySnapshot(env) {
+  // FRED supplies the statistical-release dates; FOMC comes from the hardcoded table.
+  const fredEvents = (await getEconReleases(env)).events;
   // Dedup: skip only if a complete midday pulse was generated in the last 2 hours
   // (the DST cron pair means both UTC variants fire ~1h apart).
   try {
@@ -3499,10 +4217,10 @@ CONFIRMED EARNINGS for ${nextLabel} (from Yahoo Finance — the ONLY tickers you
 ${confirmedEarnings.length ? confirmedEarnings.join(', ') : 'None from the watchlist'}
 
 CONFIRMED MACRO CALENDAR for ${nextLabel} (official Fed / BLS schedule — the ONLY Fed/economic events you may cite for tomorrow):
-${econPromptLines(econEventsBetween(nextIso, nextIso)) || 'No FOMC or CPI events scheduled for tomorrow.'}
+${econPromptLines(econEventsBetween(nextIso, nextIso, fredEvents)) || 'No FOMC or economic-release events scheduled for tomorrow.'}
 
 MACRO CALENDAR still ahead (context only — do NOT list these as tomorrow's events):
-${econPromptLines(econEventsAhead(4, isoAddDays(nextIso, 1))) || 'Nothing scheduled in the tracked calendar.'}
+${econPromptLines(econEventsAhead(4, isoAddDays(nextIso, 1), fredEvents)) || 'Nothing scheduled in the tracked calendar.'}
 
 TODAY'S HEADLINES:
 ${newsLines || 'Not available'}
@@ -3714,6 +4432,9 @@ export default {
           if (sub === 'recap') return await handleOptionsRecap(url.searchParams, origin, env, ctx);
           return await handleOptions(sub, url.searchParams, origin, env);
         case 'iv':       return await handleIv(sub, url.searchParams, origin, env, ctx);
+        case 'insider':  return await handleInsider(sub, url.searchParams, origin, env, ctx);
+        case 'short':    return await handleShortInterest(sub, url.searchParams, origin, env, ctx);
+        case '13f':      return await handle13F(sub, url.searchParams, origin, env, ctx);
         case 'search':   return await handleSearch(url.searchParams.get('q') || '', origin);
         case 'news':     return await handleNews(sub, origin, env);
         case 'peers':    return await handlePeers(sub, origin);
@@ -3730,7 +4451,7 @@ export default {
           if (sub === 'sectors')    return await handleMarketSectors(origin, env, ctx, url.searchParams);
           if (sub === 'scanner')    return await handleScanner(url.searchParams, origin, env, ctx);
           if (sub === 'golden-cross') return await handleGoldenCross(origin, env, url.searchParams);
-          if (sub === 'econ-calendar') return handleEconCalendar(url.searchParams, origin);
+          if (sub === 'econ-calendar') return await handleEconCalendar(url.searchParams, origin, env);
           return err('unknown market route', 404, origin);
         case 'analysis':
           if (!sub) return err('ticker required', 400, origin);
@@ -3810,6 +4531,10 @@ export default {
       ctx.waitUntil(recordWatchlistIv(env));           // 1:15pm PT bank one IV sample per watchlist name
     } else if (h === 14 && m < 30) {
       ctx.waitUntil(fillForwardReturns(env));          // 2:00pm PT resolve 5/20-session forward returns
+    } else if (h === 15 && m < 30) {
+      // 13F-HR lands 45 days after quarter end, so a weekly check is ample; the
+      // KV entry outlives the interval, and a rebuild only costs SEC round trips.
+      ctx.waitUntil(refresh13FIndexIfStale(env));      // 3:00pm PT 13F index
     }
   },
 };

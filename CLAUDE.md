@@ -51,6 +51,9 @@ All data flows through the Worker. CORS is enforced via `ALLOWED_ORIGINS` allowl
 GET  /api/quote/:ticker           Yahoo quoteSummary (multi-module) + Alpaca price overlay
 GET  /api/chart/:ticker           Yahoo v8 OHLCV (?range=1y&interval=1d)
 GET  /api/options/:ticker         Yahoo v7 options chain
+GET  /api/insider/:ticker         SEC EDGAR Form 4, last 90 days (12h KV)
+GET  /api/short/:ticker           FINRA consolidated short interest, 6 settlements (Yahoo fallback)
+GET  /api/13f/:ticker             Super-investor 13F holdings, from a KV reverse index
 GET  /api/iv/:ticker              ATM implied vol (front/back), term structure, IV rank, HV30
 GET  /api/search?q=               Ticker autocomplete
 GET  /api/news/:ticker            Alpaca news → Yahoo fallback
@@ -122,10 +125,64 @@ long premium (straddle, debit spreads). Until the rank exists, `ivHvRatio` stand
 and the card is visibly labelled a proxy. With no vol reading at all the strategy list is
 **suppressed**, not defaulted — every structure there is a bet on vol being rich or cheap.
 
-**Economic calendar (`FOMC_MEETINGS` / `CPI_RELEASES`):** the single source of truth for macro
+**Real sources replaced the last mock generators.** Short interest, insider trades, dark pool and
+13F were all documented as "mock". Two of the four were not: `mockShortInterest()` and
+`mockUnusualOptions()` were dead code — never called — while their cards ran on live Yahoo data.
+Dark pool was genuinely fabricated and had no free source, so it was **deleted outright** rather than
+replaced. Nothing generates numbers any more.
+
+- **`/api/insider/:ticker` — SEC EDGAR Form 4.** Replaces Yahoo's free-text `insiderTransactions`.
+  Parses the real transaction code, so an open-market buy (`P`) is finally distinguishable from a
+  grant (`A`) or an option exercise (`M`) — the old free-text matching conflated them. Flags cluster
+  buying (≥3 *distinct* insiders buying within 30 days) and any `P` over $500k.
+- **`/api/short/:ticker` — FINRA, Yahoo as fallback.** FINRA is the official biweekly settlement
+  figure and the only source with the 6-period history the MoM chart needs; Yahoo carries a single
+  unofficial snapshot. When FINRA is down the card renders Yahoo **labelled an estimate**, and the
+  badge says Yahoo — it must never borrow FINRA's name.
+- **`/api/13f/:ticker` — SEC EDGAR 13F-HR.** `SUPER_INVESTORS` holds 20 verified manager CIKs.
+
+**SEC EDGAR requires a real contact email in the User-Agent** (`SEC_UA`) or it 403s everything.
+
+**Verify every CIK against EDGAR before adding one.** The first draft of `SUPER_INVESTORS` was
+written from memory and **7 of 18 entries were wrong** — several pointed at real but unrelated
+managers (the "Third Point" CIK returned Two Sigma; "ARK" returned ValueAct). A wrong CIK does not
+fail loudly; it silently attributes one manager's book to another. Check
+`data.sec.gov/submissions/CIK{n}.json` and confirm both the `name` and that `13F-HR` appears.
+
+**13F index is built off the request path.** 20 managers cost ~60 rate-limited SEC round trips —
+about a minute — which is far too long to hold a page load and wedges `wrangler dev` outright. A
+weekly cron owns `refresh13FIndexIfStale()`; requests only ever read `13f:index`. A 13F reports one
+issuer across several rows (separate accounts, share classes, discretion categories), so rows are
+**summed per manager** — otherwise Berkshire appears to hold Apple twelve times.
+
+CUSIP→ticker mapping is built opportunistically from issuer names and is **knowingly partial**
+(~2 in 3 resolve). An unmapped ticker renders "no mapped holdings", never "no institutional
+interest" — a much stronger claim the data does not support. SEC's ticker file carries no share-class
+detail, so dual-class names (GOOGL/GOOG) collapse into one line; the card says so.
+
+**Statistical-release dates come from FRED, not a hand-maintained table.** The `CPI_RELEASES` table
+is gone. `FRED_RELEASES` names five releases (CPI, PCE, Employment Situation, PPI, retail sales) and
+their **IDs are resolved by name from `/fred/releases`** rather than hardcoded — an ID recalled from
+memory is the same unverifiable constant that produced the wrong CIKs. FOMC stays hardcoded because
+the Fed calendar is not a FRED release. If FRED fails the calendar degrades to FOMC-only and reports
+`dataReleases.ok: false` with a reason; it never invents a date.
+
+**Provenance badges are derived, never authored.** Every card badge is rendered by `setBadge()` from
+the `_meta` a fetch returned (`srcMeta()` server-side). Hand-written badges had already drifted from
+the fetch layer in both directions: one card credited **FINRA without ever calling it**, another read
+"Sample · upgrade" while running on live data. A literal in the markup has nothing tying it to the
+code that fetches, so it drifts silently. A card that never called a source now cannot name it.
+
+**Model confidence renders as an ordinal, never a percentage.** `confLabel()` maps to Low / Moderate
+/ High in all three places it surfaced (synthesis hero + ring, watchlist recommendation, options-recap
+strategies). A self-reported "78%" has nothing measured behind it yet reads as a probability. The
+numeric value is still logged — the Brier score in the rec history is scored against realized forward
+returns, so that one is a measurement and stays numeric. The confidence ring is three discrete steps
+so the arc cannot be read back as a percentage.
+
+**Economic calendar (`FOMC_MEETINGS`):** the single source of truth for macro
 event dates, hand-maintained near the top of `worker.js` from
-[federalreserve.gov](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm) and
-[bls.gov](https://www.bls.gov/schedule/news_release/cpi.htm). **Never let Claude date an FOMC
+[federalreserve.gov](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm); the CPI/PPI/PCE/jobs/retail dates now come from FRED. **Never let Claude date an FOMC
 meeting or CPI print from memory** — it answers from its training cutoff and silently ships a wrong
 date. Every prompt that can mention macro timing (morning briefing, midday pulse, EOD, week ahead)
 is fed `econPromptLines()` and told to use only those dates; `index.html` pulls the same table via
@@ -254,6 +311,12 @@ daily:midday       — 11:30am cron midday pulse (narrative, topics, tomorrow, t
 daily:eod          — 1:15pm cron EOD summary
 analysis:{TICKER}  — on-demand per-ticker Claude analysis
 iv:{TICKER}:{DATE} — daily front-month ATM IV sample, feeds ivRank (400d TTL; atmIv/spot/dte also in KV metadata)
+cik:map            — SEC ticker→CIK map (30d TTL)
+insider:{TICKER}   — parsed Form 4 report (12h TTL)
+short:{TICKER}     — FINRA short interest (6h TTL; 15min when falling back to Yahoo)
+13f:index          — ticker→managers reverse index, rebuilt weekly by cron
+finra:token        — FINRA OAuth2 bearer token (expiry-bound)
+econ:fred          — FRED release dates (12h TTL; 15min on failure)
 ivsweep:last       — PT date of the last cron IV sweep (dedup; deliberately outside the iv: prefix)
 earnings:{TICKER}  — earnings analysis for the last report (12h TTL)
 fund:{TICKER}      — Yahoo fundamentals cache (6h TTL)
@@ -300,7 +363,7 @@ The Scanner tab hosts four presets. Three (Momentum, Pre-Market Gappers, All Mov
 `/api/market/golden-cross` and uses `renderGoldenCross()`. `loadScanner()` branches on the preset
 to pick the endpoint, renderer, header copy, and legend.
 
-`index.html` — per-ticker research page with 16 sections (price/SMA, performance, catalysts, short interest, insider trades, unusual options, dark pool, swing signals, option strategies, analyst targets, 13F holdings, technicals, sentiment, fundamentals, AI synthesis, recommendation history).
+`index.html` — per-ticker research page with 15 sections (price/SMA, performance, catalysts, short interest, insider trades, unusual options, swing signals, option strategies, analyst targets, 13F holdings, technicals, sentiment, fundamentals, AI synthesis, recommendation history).
 
 The Catalysts card carries an "Analyze Earnings" button that expands an inline panel
 (`renderEarnings()`, backed by `/api/earnings/:ticker`). It fetches once per ticker and then just

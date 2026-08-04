@@ -13,6 +13,12 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   daily:eod           — 1:15pm PT end-of-day summary (headline, body)
 #   analysis:{TICKER}   — per-ticker Claude analysis (trend, pattern, action, summary)
 #   iv:{TICKER}:{DATE}  — daily ATM IV sample feeding ivRank (400d TTL, value + KV metadata)
+#   cik:map             — SEC ticker->CIK map (30d TTL)
+#   insider:{TICKER}    — parsed SEC Form 4 report (12h TTL)
+#   short:{TICKER}      — FINRA short interest (6h TTL)
+#   13f:index           — ticker->managers 13F reverse index (rebuilt weekly)
+#   finra:token         — FINRA OAuth2 bearer token
+#   econ:fred           — FRED release dates (12h TTL)
 #   ivsweep:last        — PT date of last cron IV sweep (dedup)
 #   fund:{TICKER}       — per-ticker Yahoo fundamentals cache (6h TTL)
 #   market:ipos         — IPO calendar cache (12h TTL)
@@ -31,6 +37,7 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   EOD summary      — 1:15pm PT   (20:15 UTC PDT / 21:15 UTC PST)
 #   IV history sweep — 1:15pm PT   (runs alongside the EOD job; own daily dedup key)
 #   Forward-ret fill — 2:00pm PT   (21:00 UTC PDT / 22:00 UTC PST; own daily dedup key)
+#   13F index build  — 3:00pm PT   (weekly staleness check; ~60 SEC round trips)
 # Each job deduplicates via KV timestamp check (2-hour window).
 crons = ["*/15 13-22 * * 1-5"]
 
@@ -38,3 +45,7 @@ crons = ["*/15 13-22 * * 1-5"]
 #   ANTHROPIC_API_KEY  — Anthropic API key
 #   ALPACA_KEY         — Alpaca API key ID (optional, improves price + news quality)
 #   ALPACA_SECRET      — Alpaca API secret key
+#   FRED_API_KEY       — FRED (statistical release dates; without it the calendar is FOMC-only)
+#   FINRA_CLIENT_ID    — FINRA OAuth2 client id (short interest; falls back to a labelled Yahoo estimate)
+#   FINRA_CLIENT_SECRET— FINRA OAuth2 client secret
+# SEC EDGAR needs no key, but SEC_UA in worker.js must carry a real contact email.

@@ -670,7 +670,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <div id="midday-tomorrow-wrap" style="display:none">
         <div class="midday-sub" id="midday-tomorrow-head">On Deck Tomorrow</div>
         <div class="midday-tomorrow" id="midday-tomorrow"></div>
-        <div class="midday-disclaimer">* Earnings sourced from Yahoo Finance confirmed dates. Fed / economic events are calendar estimates — verify with official sources. Not financial advice.</div>
+        <div class="midday-disclaimer">* Earnings from Yahoo confirmed dates. FOMC dates from the Federal Reserve's published calendar; CPI, PPI, PCE, employment and retail-sales dates from FRED's official release schedule. Not financial advice.</div>
       </div>
     </div>
   </div>
@@ -1421,10 +1421,30 @@ async function loadWatchlistAuction() {
 }
 
 /* ─── Rating badge ─── */
+/* Model confidence is rendered as an ordinal, never a percentage.
+ * A self-reported "78%" has no calibration behind it — nothing was measured to
+ * produce that number — yet it reads as a probability and invites arithmetic.
+ * Low / Moderate / High carries the same information the model actually has.
+ * The numeric value is still logged, because the Brier score in the rec history
+ * is scored against realized forward returns and is a measurement, not a claim. */
+const CONF_LEVELS = ['Low', 'Moderate', 'High'];
+function confLevel(n) {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+  return n >= 75 ? 2 : n >= 50 ? 1 : 0;
+}
+function confLabel(n) {
+  const i = confLevel(n);
+  return i == null ? '—' : CONF_LEVELS[i];
+}
+function confClass(n) {
+  const i = confLevel(n);
+  return i == null ? 'low' : ['low', 'mid', 'high'][i];
+}
+
 function ratingBadge(rating, conf) {
   if (!rating) return '<span style="color:var(--ink-3)">—</span>';
   const cls = rating === 'BUY' ? 'buy' : rating === 'SELL' ? 'sell' : 'hold';
-  return `<span class="rating-tag ${cls}">${esc(rating)}</span>${conf != null ? `<div class="rating-conf">${conf}%</div>` : ''}`;
+  return `<span class="rating-tag ${cls}">${esc(rating)}</span>${conf != null ? `<div class="rating-conf">${confLabel(conf)}</div>` : ''}`;
 }
 
 /* ─── Escape HTML ─── */
@@ -1630,14 +1650,14 @@ function renderStrategies(strats) {
   if (!strats?.length) return '';
   let html = '<div class="options-strat-head">Recommended Strategies</div>';
   for (const s of strats.slice(0, 2)) {
-    const conf    = typeof s.confidence === 'number' ? s.confidence : 0;
-    const confCls = conf >= 70 ? 'high' : conf >= 50 ? 'mid' : 'low';
+    const conf    = typeof s.confidence === 'number' ? s.confidence : null;
+    const confCls = confClass(conf);
     html += `<div class="options-strat-row">
       <div class="options-strat-name">${esc(s.name || '')}</div>
       <div class="options-strat-meta">
         <span class="options-strat-strike">${esc(s.strikes || '')}</span>
         <span class="options-strat-exp">${esc(s.expiration || '')}</span>
-        <span class="options-strat-conf ${confCls}">${conf}% confidence</span>
+        <span class="options-strat-conf ${confCls}">${confLabel(conf)} confidence</span>
       </div>
       <div class="options-strat-rationale">${esc(s.rationale || '')}</div>
     </div>`;

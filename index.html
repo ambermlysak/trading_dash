@@ -230,16 +230,77 @@ body::after {
 }
 .card-meta { font-family: var(--mono); font-size: 10px; color: var(--ink-3); letter-spacing: 0.06em; text-transform: uppercase; }
 
-.mock-tag {
+/* Provenance badge. Rendered only by setBadge() from the `_meta` a fetch
+   returned — never written into the markup, so it cannot name a source the card
+   did not call. The violet "Sample · upgrade" badge it replaces is gone with the
+   last mock generator. */
+.src-tag {
   display: inline-flex; align-items: center; gap: 5px;
   font-family: var(--mono); font-size: 9px; font-weight: 500;
-  color: var(--violet);
-  background: rgba(180, 142, 173, 0.1);
-  border: 1px solid rgba(180, 142, 173, 0.3);
+  color: var(--cyan);
+  background: rgba(94, 197, 234, 0.08);
+  border: 1px solid rgba(94, 197, 234, 0.28);
   padding: 2px 7px; border-radius: 3px;
   letter-spacing: 0.06em; text-transform: uppercase;
+  cursor: help; max-width: 60%; text-align: right; line-height: 1.35;
 }
-.mock-tag::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--violet); }
+.src-tag:empty { display: none; }
+.src-tag::before { content: ''; flex: 0 0 auto; width: 5px; height: 5px; border-radius: 50%; background: var(--cyan); }
+.src-tag.delayed { color: var(--amber); background: rgba(244, 183, 64, 0.08); border-color: rgba(244, 183, 64, 0.3); }
+.src-tag.delayed::before { background: var(--amber); }
+.src-tag.bad { color: var(--bear); background: rgba(242, 95, 92, 0.08); border-color: rgba(242, 95, 92, 0.3); }
+.src-tag.bad::before { background: var(--bear); }
+
+/* "Source unavailable, and here is why" — never a generated stand-in. */
+.src-unavailable {
+  padding: 14px; background: var(--bg-2); border: 1px dashed var(--line);
+  border-radius: 4px; font-size: 11px; color: var(--ink-2); line-height: 1.6;
+}
+.src-unavailable b { color: var(--ink-0); }
+.src-foot { margin-top: 10px; font-family: var(--mono); font-size: 10px; color: var(--ink-3); line-height: 1.55; }
+.src-foot b { color: var(--ink-2); }
+.src-foot.bad { color: var(--bear); }
+.src-foot.bad b { color: var(--bear); }
+
+/* ------- Insider (SEC Form 4) ------- */
+.ins-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+.ins-stat { padding: 10px; background: var(--bg-2); border-radius: 4px; }
+.ins-stat .l { font-family: var(--mono); font-size: 9px; color: var(--ink-3); letter-spacing: 0.06em; }
+.ins-stat .v { font-family: var(--mono); font-size: 17px; font-weight: 500; margin-top: 4px; }
+.ins-flag {
+  margin-bottom: 8px; padding: 9px 11px; border-radius: 3px;
+  font-size: 11px; line-height: 1.55; color: var(--ink-2);
+  background: var(--bg-2); border-left: 2px solid var(--bull);
+}
+.ins-flag b { color: var(--bull); }
+.ins-flag.large { border-left-color: var(--cyan); }
+.ins-flag.large b { color: var(--cyan); }
+.ins-role { color: var(--ink-3); font-size: 10px; }
+.ins-code {
+  font-family: var(--mono); font-size: 11px; font-weight: 600; cursor: help;
+  padding: 1px 5px; border-radius: 2px; background: var(--bg-3);
+}
+
+/* ------- Short interest (FINRA) ------- */
+.si-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 12px; }
+.si-big { font-family: var(--mono); font-size: 28px; font-weight: 600; color: var(--ink-0); }
+.si-sub { font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
+.si-est {
+  font-size: 9px; color: var(--amber); border: 1px solid rgba(244, 183, 64, 0.35);
+  padding: 1px 5px; border-radius: 2px; margin-left: 4px; text-transform: uppercase;
+}
+.si-mom { margin-left: auto; font-family: var(--mono); font-size: 11px; }
+.si-chart { display: grid; grid-auto-flow: column; gap: 8px; height: 84px; margin-bottom: 14px; }
+.si-bar { display: flex; flex-direction: column; justify-content: flex-end; cursor: help; }
+.si-bar-fill { background: var(--cyan); opacity: 0.55; border-radius: 2px 2px 0 0; min-height: 2px; }
+.si-bar-label { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-align: center; margin-top: 4px; }
+.si-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.si-stat .l { font-size: 9px; color: var(--ink-3); font-family: var(--mono); letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 3px; }
+.si-stat .v { font-family: var(--mono); font-size: 14px; color: var(--ink-0); }
+
+/* ------- 13F holdings ------- */
+.inv-name { font-size: 12px; color: var(--ink-1); }
+.inv-firm { font-size: 10px; color: var(--ink-3); font-family: var(--mono); }
 
 /* ------- Performance ------- */
 .perf-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 18px; }
@@ -811,7 +872,6 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     <div class="card col-6" id="card-insider" data-factor="insider">
       <div class="card-header">
         <div class="card-title"><span class="num">04</span>Insider Trades</div>
-        <span class="mock-tag" id="insider-tag">Yahoo data · upgrade: SEC EDGAR Form 4</span>
       </div>
       <div id="insider-content"></div>
     </div>
@@ -820,7 +880,6 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     <div class="card col-6" id="card-13f">
       <div class="card-header">
         <div class="card-title"><span class="num">10</span>Super-Investor Holdings</div>
-        <span class="mock-tag">Sample · upgrade: 13F via WhaleWisdom / Dataroma</span>
       </div>
       <div id="superinv-content"></div>
     </div>
@@ -829,7 +888,6 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     <div class="card col-6" id="card-short">
       <div class="card-header">
         <div class="card-title"><span class="num">03</span>Short Interest</div>
-        <span class="mock-tag" id="short-tag">Yahoo · FINRA biweekly</span>
       </div>
       <div id="short-content"></div>
     </div>
@@ -837,19 +895,9 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     <!-- 5. UNUSUAL OPTIONS -->
     <div class="card col-6" id="card-unusual">
       <div class="card-header">
-        <div class="card-title"><span class="num">05</span>Unusual Options Volume</div>
-        <span class="mock-tag">Sample · upgrade: Unusual Whales</span>
+        <div class="card-title"><span class="num">05</span>Options Volume · V/OI Screen</div>
       </div>
       <div id="unusual-content"></div>
-    </div>
-
-    <!-- 8. DARK POOL -->
-    <div class="card col-6" id="card-darkpool">
-      <div class="card-header">
-        <div class="card-title"><span class="num">08</span>Dark Pool Volume · 5D</div>
-        <span class="mock-tag">Sample · upgrade: Cheddar Flow / UW</span>
-      </div>
-      <div id="darkpool-content"></div>
     </div>
 
     <!-- 6. OPTIONS STRATEGIES -->
@@ -865,7 +913,7 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
     <div class="card col-12" id="card-trade">
       <div class="card-header">
         <div class="card-title"><span class="num">07</span>Swing Setups · EMA Crossover</div>
-        <div class="card-meta">Daily bars · Yahoo</div>
+        <div class="card-meta">Swing horizon</div>
       </div>
       <div class="signal-row" id="signal-row"></div>
     </div>
@@ -891,7 +939,7 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
   </div>
 
   <div class="footer">
-    <span>Data: Yahoo Finance · Alpaca (price/news) · Synthesis: Claude API · <b>Research prototype</b></span>
+    <span>Data: SEC EDGAR (Form 4, 13F) · FINRA (short interest) · FRED (release dates) · Yahoo Finance · Alpaca (price/news) · Synthesis: Claude API · <b>Research prototype</b></span>
     <span>Not investment advice. For research only.</span>
   </div>
 
@@ -927,6 +975,9 @@ const fetchQuote   = (t) => api(`/quote/${t}`);
 const fetchChart   = (t, r='3mo', i='1d') => api(`/chart/${t}?range=${r}&interval=${i}`);
 const fetchOptions = (t) => api(`/options/${t}`);
 const fetchIv      = (t) => api(`/iv/${t}`);
+const fetchInsider = (t) => api(`/insider/${t}`);
+const fetchShort   = (t) => api(`/short/${t}`);
+const fetch13F     = (t) => api(`/13f/${t}`);
 const fetchNews    = (t) => api(`/news/${t}`);
 const searchTicker = (q) => api(`/search?q=${encodeURIComponent(q)}`);
 const claudeCall   = (body) => api('/claude', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
@@ -1688,61 +1739,60 @@ function renderPatternPanel(patterns) {
   });
 }
 
+
+/* Model confidence is rendered as an ordinal, never a percentage.
+ * A self-reported "78%" has no calibration behind it — nothing was measured to
+ * produce that number — yet it reads as a probability and invites arithmetic.
+ * Low / Moderate / High carries the same information the model actually has.
+ * The numeric value is still logged, because the Brier score in the rec history
+ * is scored against realized forward returns and is a measurement, not a claim. */
+const CONF_LEVELS = ['Low', 'Moderate', 'High'];
+function confLevel(n) {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+  return n >= 75 ? 2 : n >= 50 ? 1 : 0;
+}
+function confLabel(n) {
+  const i = confLevel(n);
+  return i == null ? '—' : CONF_LEVELS[i];
+}
+function confClass(n) {
+  const i = confLevel(n);
+  return i == null ? 'low' : ['low', 'mid', 'high'][i];
+}
+
 /* ============================================================
-   MOCK GENERATORS — clearly labeled in UI
-   These are deterministic from ticker so the same ticker always
-   shows the same values; replace with real feeds in production.
+   PROVENANCE BADGES
+
+   Every source badge is generated from the `_meta` the fetch actually
+   returned — never written into the markup. Two hand-written badges had
+   already drifted from their fetch layer: one credited FINRA on a card that
+   never called FINRA, another said "Sample" on a card running live data. A
+   literal in the HTML has nothing tying it to the code that fetches, so it
+   drifts silently and for free. This makes the badge a function of the
+   response, so a card that never called a source cannot name it.
    ============================================================ */
-function seededRng(seed) {
-  let s = 0;
-  for (let i = 0; i < seed.length; i++) s = (s * 31 + seed.charCodeAt(i)) | 0;
-  return () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+function setBadge(cardId, meta) {
+  const card = document.getElementById(cardId);
+  if (!card) return;
+  let el = card.querySelector('.src-tag');
+  if (!el) {
+    el = document.createElement('span');
+    el.className = 'src-tag';
+    card.querySelector('.card-header')?.appendChild(el);
+  }
+  if (!meta) { el.textContent = ''; el.className = 'src-tag'; return; }
+
+  const bits = [meta.source];
+  if (meta.asOf) bits.push(meta.asOf);
+  if (meta.note) bits.push(meta.note);
+  el.textContent = bits.filter(Boolean).join(' · ');
+  el.className = 'src-tag' + (meta.ok === false ? ' bad' : '') + (meta.delayed ? ' delayed' : '');
+  el.title = meta.fetchedAt ? `fetched ${new Date(meta.fetchedAt).toLocaleString()}` : '';
 }
 
-function mockShortInterest(ticker, currentPrice) {
-  const r = seededRng(ticker + 'short');
-  const months = ['6mo ago','5mo ago','4mo ago','3mo ago','2mo ago','Last mo'];
-  const baseSI = 8 + r() * 18; // 8–26%
-  let v = baseSI;
-  return months.map(m => {
-    v = Math.max(2, v + (r() - 0.5) * 3.5);
-    return { month: m, si: +v.toFixed(1), dtc: +(0.5 + r()*4).toFixed(2) };
-  });
-}
-
-function mockUnusualOptions(ticker, price) {
-  const r = seededRng(ticker + 'unusual');
-  const strikes = [
-    { dte: 7,  type: 'CALL', strike: Math.round(price * 1.05), vol: Math.floor(8000 + r()*40000), oi: Math.floor(1000 + r()*5000), ratio: 4 + r()*15, prem: '+0.45 to +1.20' },
-    { dte: 14, type: 'CALL', strike: Math.round(price * 1.10), vol: Math.floor(5000 + r()*25000), oi: Math.floor(800 + r()*3000), ratio: 3 + r()*10, prem: '+0.80 to +2.10' },
-    { dte: 30, type: 'PUT',  strike: Math.round(price * 0.92), vol: Math.floor(3000 + r()*15000), oi: Math.floor(600 + r()*2500), ratio: 2 + r()*8,  prem: '+1.10 to +2.80' },
-    { dte: 45, type: 'CALL', strike: Math.round(price * 1.20), vol: Math.floor(2000 + r()*8000),  oi: Math.floor(400 + r()*1500), ratio: 2 + r()*6,  prem: '+0.30 to +0.85' },
-  ];
-  return strikes;
-}
-
-function mockDarkPool(ticker) {
-  const r = seededRng(ticker + 'dp');
-  const days = ['T-4','T-3','T-2','T-1','Today'];
-  return days.map(d => ({
-    day: d,
-    pct: +(28 + r() * 22).toFixed(1),
-    notional: +(120 + r() * 380).toFixed(0),
-    sentiment: r() > 0.55 ? 'bull' : 'bear',
-  }));
-}
-
-function mockSuperInvestors(ticker) {
-  const list = [
-    { name: 'Stanley Druckenmiller (Duquesne)', shares: '1.2M', value: '$185M', delta: '+18%' },
-    { name: 'Ken Griffin (Citadel)',             shares: '4.8M', value: '$720M', delta: '−6%' },
-    { name: 'Jim Simons (Renaissance)',          shares: '2.1M', value: '$315M', delta: '+4%' },
-    { name: 'David Tepper (Appaloosa)',          shares: '0.9M', value: '$135M', delta: 'NEW' },
-    { name: 'Cathie Wood (ARK)',                 shares: '3.4M', value: '$510M', delta: '+22%' },
-  ];
-  const r = seededRng(ticker + '13f');
-  return list.filter(() => r() > 0.25);
-}
+/** Uniform "this source is unavailable and here is why" panel. */
+const unavailable = (reason) =>
+  `<div class="src-unavailable"><b>Unavailable.</b> ${esc(reason || 'Source returned no data.')}</div>`;
 
 /* ============================================================
    RENDERERS
@@ -2280,101 +2330,171 @@ function renderFundamentals(quote) {
   state.data.fundamentals = Object.fromEntries(rows);
 }
 
-function renderInsider(quote) {
-  const txns = quote.insiderTransactions?.transactions || [];
-  const npsa = quote.netSharePurchaseActivity || {};
+async function renderInsider(ticker) {
+  const el = document.getElementById('insider-content');
+  el.innerHTML = '<div class="loading-state">Reading SEC Form 4 filings…</div>';
+  setBadge('card-insider', null);
 
-  let html = '';
-  if (npsa.netInfoCount?.raw != null) {
-    const buyCount = npsa.buyInfoCount?.raw || 0;
-    const sellCount = npsa.sellInfoCount?.raw || 0;
-    const netShares = npsa.netInfoShares?.raw || 0;
-    const netCls = netShares > 0 ? 'bull' : 'bear';
-    html += `
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px;">
-        <div style="padding:10px;background:var(--bg-2);border-radius:4px;">
-          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);letter-spacing:0.06em;">6MO BUYS</div>
-          <div style="font-family:var(--mono);font-size:18px;color:var(--bull);font-weight:500;margin-top:4px;">${buyCount}</div>
-        </div>
-        <div style="padding:10px;background:var(--bg-2);border-radius:4px;">
-          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);letter-spacing:0.06em;">6MO SELLS</div>
-          <div style="font-family:var(--mono);font-size:18px;color:var(--bear);font-weight:500;margin-top:4px;">${sellCount}</div>
-        </div>
-        <div style="padding:10px;background:var(--bg-2);border-radius:4px;">
-          <div style="font-family:var(--mono);font-size:9px;color:var(--ink-3);letter-spacing:0.06em;">NET SHARES</div>
-          <div style="font-family:var(--mono);font-size:14px;color:var(--${netCls});font-weight:500;margin-top:4px;">${(netShares>=0?'+':'')+fmt.big(netShares)}</div>
-        </div>
-      </div>`;
+  let d;
+  try { d = await fetchInsider(ticker); }
+  catch (e) { d = { unavailable: true, reason: `SEC EDGAR request failed: ${e.message}` }; }
+  if (ticker !== state.ticker) return;
+
+  setBadge('card-insider', d._meta);
+  if (d.unavailable) {
+    el.innerHTML = unavailable(d.reason);
+    state.data.insider = null;
+    return;
   }
 
-  if (txns.length) {
-    html += `<table class="data">
-      <thead><tr><th>Date</th><th>Insider</th><th>Action</th><th class="right">Shares</th><th class="right">Value</th></tr></thead>
-      <tbody>`;
-    for (const t of txns.slice(0, 8)) {
-      const tx = (t.transactionText || '').toLowerCase();
-      const isBuy = tx.includes('purchase') || tx.includes('buy') || tx.includes('acquir');
-      const isOption = tx.includes('option') || tx.includes('grant') || tx.includes('rsu');
-      const flags = [];
-      if (isBuy && !isOption) flags.push('<span class="flag buy">buy</span>');
-      if ((t.filerRelation || '').match(/CEO|CFO|COO|CTO|chief|president/i)) flags.push('<span class="flag cexec">c-suite</span>');
-      const valColor = isBuy && !isOption ? 'bull' : '';
-      html += `
-        <tr>
-          <td>${fmt.date(t.startDate?.raw)}</td>
-          <td>${flags.join('')}${t.filerName || '—'}<br><span style="color:var(--ink-3);font-size:10px;">${t.filerRelation || ''}</span></td>
-          <td style="font-size:11px;">${t.transactionText || '—'}</td>
-          <td class="right ${valColor}">${t.shares?.raw ? fmt.big(t.shares.raw) : '—'}</td>
-          <td class="right ${valColor}">${t.value?.raw ? '$'+fmt.big(t.value.raw) : '—'}</td>
-        </tr>`;
-    }
-    html += `</tbody></table>`;
+  const s = d.summary || {};
+  const money = v => v == null ? '—' : (v >= 1e6 ? '$' + (v / 1e6).toFixed(1) + 'M'
+                    : v >= 1e3 ? '$' + (v / 1e3).toFixed(0) + 'K' : '$' + v.toFixed(0));
+
+  let html = `
+    <div class="ins-summary">
+      <div class="ins-stat"><div class="l">${d.windowDays}D BUYS</div><div class="v bull">${s.buyCount ?? 0}</div></div>
+      <div class="ins-stat"><div class="l">${d.windowDays}D SELLS</div><div class="v bear">${s.sellCount ?? 0}</div></div>
+      <div class="ins-stat"><div class="l">NET VALUE</div>
+        <div class="v ${(s.netValue ?? 0) >= 0 ? 'bull' : 'bear'}">${money(s.netValue)}</div></div>
+    </div>`;
+
+  // Flags first: a cluster of distinct buyers is the signal this card exists for.
+  if (d.cluster) {
+    html += `<div class="ins-flag cluster"><b>Cluster buying.</b> ${d.cluster.buyers} distinct insiders
+      bought on the open market within 30 days (through ${esc(d.cluster.through)}):
+      ${esc(d.cluster.names.slice(0, 4).join(', '))}${d.cluster.names.length > 4 ? '…' : ''}</div>`;
+  }
+  for (const b of (d.largeBuys || [])) {
+    html += `<div class="ins-flag large"><b>Large open-market buy.</b> ${esc(b.owner || 'Insider')}
+      ${b.title ? `(${esc(b.title)}) ` : ''}bought ${fmt.big(b.shares)} shares at
+      $${fmt.price(b.price)} — ${money(b.value)} on ${esc(b.date)}</div>`;
+  }
+
+  const txns = d.transactions || [];
+  if (!txns.length) {
+    html += `<div class="loading-state">No Form 4 transactions filed in the last ${d.windowDays} days.</div>`;
   } else {
-    html += `<div class="loading-state">No recent insider activity from Yahoo</div>`;
+    html += `<table class="data">
+      <thead><tr><th>Date</th><th>Insider</th><th>Code</th><th class="right">Shares</th>
+        <th class="right">Price</th><th class="right">Value</th><th class="right">Held after</th></tr></thead><tbody>`;
+    for (const t of txns.slice(0, 12)) {
+      const role = t.title || (t.isDirector ? 'Director' : t.isTenPct ? '10% owner' : '');
+      // Only P (open-market purchase) is coloured as a buy. A grant or an option
+      // exercise is not a purchase; the old free-text matching conflated them.
+      const cls = t.code === 'P' ? 'bull' : t.code === 'S' ? 'bear' : '';
+      const flags = [];
+      if (t.code === 'P') flags.push('<span class="flag buy">buy</span>');
+      if (/C[EFOT]O|chief|president/i.test(role)) flags.push('<span class="flag cexec">c-suite</span>');
+      html += `<tr>
+        <td>${esc(t.date || t.filed || '—')}</td>
+        <td>${flags.join('')}${esc(t.owner || '—')}${role ? `<br><span class="ins-role">${esc(role)}</span>` : ''}</td>
+        <td><span class="ins-code ${cls}" title="${esc(t.label)}">${esc(t.code)}</span></td>
+        <td class="right ${cls}">${fmt.big(t.shares)}</td>
+        <td class="right">${t.price == null ? '—' : '$' + fmt.price(t.price)}</td>
+        <td class="right ${cls}">${money(t.value)}</td>
+        <td class="right">${t.sharesAfter == null ? '—' : fmt.big(t.sharesAfter)}</td>
+      </tr>`;
+    }
+    html += `</tbody></table>
+      <div class="src-foot">P open-market buy · S sale · A grant · M option exercise · F tax withholding.
+        Non-derivative transactions only, from ${d.filings} Form 4 filing${d.filings === 1 ? '' : 's'}
+        in the last ${d.windowDays} days${d.parseFailures ? ` (${d.parseFailures} unparseable)` : ''}.</div>`;
   }
 
-  document.getElementById('insider-content').innerHTML = html;
-  state.data.insider = { netShares: npsa.netInfoShares?.raw, buys: npsa.buyInfoCount?.raw, sells: npsa.sellInfoCount?.raw, txnCount: txns.length };
+  el.innerHTML = html;
+  state.data.insider = {
+    buys: s.buyCount, sells: s.sellCount, netValue: s.netValue,
+    cluster: d.cluster ? d.cluster.buyers : 0, largeBuys: (d.largeBuys || []).length,
+  };
 }
 
-function renderShortInterest(quote) {
-  const stats     = quote.defaultKeyStatistics || {};
-  const siRaw     = stats.shortPercentOfFloat?.raw;   // decimal e.g. 0.011 = 1.1%
-  const dtc       = stats.shortRatio?.raw;            // days to cover
-  const shares    = stats.sharesShort?.raw;
-  const sharesPM  = stats.sharesShortPriorMonth?.raw;
-  const reportTs  = stats.dateShortInterest?.raw;     // unix seconds
+async function renderShortInterest(ticker, quote) {
+  const el = document.getElementById('short-content');
+  el.innerHTML = '<div class="loading-state">Reading FINRA settlement data…</div>';
+  setBadge('card-short', null);
 
-  const siPct     = siRaw != null ? (siRaw * 100).toFixed(1) : null;
-  const siColor   = siRaw == null ? 'var(--ink-0)' : siRaw > 0.20 ? 'var(--bear)' : siRaw > 0.10 ? 'var(--amber)' : 'var(--ink-0)';
+  let d;
+  try { d = await fetchShort(ticker); }
+  catch (e) { d = { official: false, periods: [], reason: `FINRA request failed: ${e.message}` }; }
+  if (ticker !== state.ticker) return;
 
-  let momHtml = '';
-  if (shares != null && sharesPM != null && sharesPM > 0) {
-    const momPct = ((shares - sharesPM) / sharesPM) * 100;
-    const cls    = momPct > 1 ? 'bear' : momPct < -1 ? 'bull' : '';
-    momHtml = `<div style="margin-left:auto;font-family:var(--mono);font-size:11px;" class="${cls}">${momPct >= 0 ? '↑ +' : '↓ '}${Math.abs(momPct).toFixed(1)}% MoM</div>`;
+  const stat = (label, val, title) => `
+    <div class="si-stat"${title ? ` title="${esc(title)}"` : ''}>
+      <div class="l">${label}</div><div class="v">${val}</div>
+    </div>`;
+
+  if (d.official && d.periods.length) {
+    setBadge('card-short', d._meta);
+    const cur = d.periods[0];
+    const prev = d.periods[1];
+    const mom = (prev?.shares && cur.shares != null)
+      ? ((cur.shares - prev.shares) / prev.shares) * 100 : null;
+    const momCls = mom == null ? '' : mom > 1 ? 'bear' : mom < -1 ? 'bull' : '';
+
+    // Six settlement periods, oldest → newest, so the bars read left to right.
+    const series = d.periods.slice().reverse();
+    const max = Math.max(...series.map(p => p.shares || 0)) || 1;
+    const bars = series.map(p => {
+      const h = Math.max(2, Math.round(((p.shares || 0) / max) * 100));
+      return `<div class="si-bar" title="${esc(p.settlementDate)} · ${fmt.big(p.shares)} shares short">
+                <div class="si-bar-fill" style="height:${h}%"></div>
+                <div class="si-bar-label">${esc((p.settlementDate || '').slice(5))}</div>
+              </div>`;
+    }).join('');
+
+    el.innerHTML = `
+      <div class="si-head">
+        <div class="si-big">${fmt.big(cur.shares)}</div>
+        <div class="si-sub">shares short</div>
+        ${mom != null ? `<div class="si-mom ${momCls}">${mom >= 0 ? '↑ +' : '↓ '}${Math.abs(mom).toFixed(1)}% vs prior</div>` : ''}
+      </div>
+      <div class="si-chart">${bars}</div>
+      <div class="si-grid">
+        ${stat('Days to Cover', cur.daysToCover != null ? cur.daysToCover.toFixed(2) : '—')}
+        ${stat('Avg Daily Vol', cur.avgDailyVolume != null ? fmt.big(cur.avgDailyVolume) : '—')}
+        ${stat('Prior Period', prev?.shares != null ? fmt.big(prev.shares) : '—')}
+        ${stat('Settled', esc(cur.settlementDate || '—'), 'FINRA settlement date')}
+      </div>
+      <div class="src-foot"><b>This figure is two weeks old by design.</b> FINRA publishes consolidated
+        short interest twice monthly, settled ${esc(cur.settlementDate)} and released about two weeks
+        later. It is the official number; anything more current is an estimate.</div>`;
+    state.data.shortInterest = { shares: cur.shares, dtc: cur.daysToCover, settled: cur.settlementDate, official: true };
+    return;
   }
 
-  const stat = (label, val) => `
-    <div>
-      <div style="font-size:9px;color:var(--ink-3);font-family:var(--mono);letter-spacing:0.06em;text-transform:uppercase;margin-bottom:3px;">${label}</div>
-      <div style="font-family:var(--mono);font-size:15px;color:var(--ink-0);">${val}</div>
-    </div>`;
+  // FINRA unavailable → Yahoo, labelled an estimate. It must not borrow FINRA's
+  // name: the badge is rendered from _meta, which says Yahoo.
+  const stats = quote?.defaultKeyStatistics || {};
+  const siRaw = stats.shortPercentOfFloat?.raw;
+  const shares = stats.sharesShort?.raw;
+  const dtc = stats.shortRatio?.raw;
+  const asOf = stats.dateShortInterest?.raw;
 
-  document.getElementById('short-content').innerHTML = `
-    <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:16px;">
-      <div style="font-family:var(--mono);font-size:32px;font-weight:600;color:${siColor};">${siPct != null ? siPct + '%' : '—'}</div>
-      <div style="font-family:var(--mono);font-size:11px;color:var(--ink-2);">of float</div>
-      ${momHtml}
+  setBadge('card-short', d._meta || { source: 'Yahoo Finance', ok: false,
+    note: 'unofficial estimate — official FINRA settlement figure unavailable' });
+
+  if (siRaw == null && shares == null) {
+    el.innerHTML = unavailable(`${d.reason || 'FINRA unavailable.'} Yahoo has no short-interest figure for this ticker either.`);
+    state.data.shortInterest = null;
+    return;
+  }
+
+  el.innerHTML = `
+    <div class="si-head">
+      <div class="si-big">${siRaw != null ? (siRaw * 100).toFixed(1) + '%' : '—'}</div>
+      <div class="si-sub">of float <span class="si-est">estimate</span></div>
     </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
-      ${stat('Days to Cover',  dtc     != null ? dtc.toFixed(1)   : '—')}
-      ${stat('Shares Short',   shares  != null ? fmt.big(shares)  : '—')}
-      ${stat('Prior Month',    sharesPM != null ? fmt.big(sharesPM) : '—')}
-      ${stat('Report Date',    reportTs != null ? fmt.date(reportTs) : '—')}
-    </div>`;
-
-  state.data.shortInterest = { si: siPct != null ? +siPct : null, dtc: dtc ?? null };
+    <div class="si-grid">
+      ${stat('Shares Short', shares != null ? fmt.big(shares) : '—')}
+      ${stat('Days to Cover', dtc != null ? dtc.toFixed(2) : '—')}
+      ${stat('As Of', asOf != null ? fmt.date(asOf) : '—')}
+      ${stat('Periods', '1', 'Yahoo carries a single snapshot, not a settlement series')}
+    </div>
+    <div class="src-foot bad"><b>Unofficial.</b> ${esc(d.reason || 'The official FINRA settlement figure is unavailable.')}
+      This is Yahoo's estimate — a single snapshot with no settlement date and no history,
+      which is why the six-period chart is absent.</div>`;
+  state.data.shortInterest = { si: siRaw != null ? +(siRaw * 100).toFixed(1) : null, dtc: dtc ?? null, official: false };
 }
 
 async function renderUnusualOptions(ticker, lastPrice) {
@@ -2384,7 +2504,9 @@ async function renderUnusualOptions(ticker, lastPrice) {
     const chain = data?.optionChain?.result?.[0];
     if (!chain) {
       document.getElementById('unusual-content').innerHTML =
-        `<div style="color:var(--ink-3);font-size:12px;padding:8px 0;">No listed options data available for ${ticker}.</div>`;
+        unavailable(`No listed options chain for ${esc(ticker)}.`);
+      setBadge('card-unusual', { source: 'Yahoo options chain', ok: false,
+                                 note: 'no listed chain', fetchedAt: new Date().toISOString() });
       return;
     }
 
@@ -2455,68 +2577,71 @@ async function renderUnusualOptions(ticker, lastPrice) {
         </tr>`;
       }
       html += `</tbody></table>
-        <div style="margin-top:8px;font-family:var(--mono);font-size:10px;color:var(--ink-3);">● ITM · ○ OTM · unusual = V/OI ≥ 2× · sorted by notional</div>`;
+        <div class="src-foot">● ITM · ○ OTM · flagged at V/OI ≥ 2×, sorted by notional.
+          <b>This is volume relative to open interest, not directional flow.</b> The chain carries no
+          side classification and no sweep detection, and an opening trade is indistinguishable from a
+          closing one — a high ratio says something unusual traded, not that anyone was buying.</div>`;
     }
 
     document.getElementById('unusual-content').innerHTML = html;
-    const tag = document.querySelector('#card-unusual .mock-tag');
-    if (tag) tag.textContent = 'Yahoo · 15min delay · V/OI calc';
+    setBadge('card-unusual', {
+      source: 'Yahoo options chain', ok: true, delayed: true,
+      note: '15-min delayed · V/OI computed locally', fetchedAt: new Date().toISOString(),
+    });
     state.data.unusualOptions = top;
   } catch (e) {
-    document.getElementById('unusual-content').innerHTML =
-      `<div style="color:var(--ink-3);font-size:12px;padding:8px 0;">Options unavailable: ${e.message}</div>`;
+    document.getElementById('unusual-content').innerHTML = unavailable(`Options chain unavailable: ${e.message}`);
+    setBadge('card-unusual', { source: 'Yahoo options chain', ok: false, note: e.message,
+                               fetchedAt: new Date().toISOString() });
   }
 }
 
-function renderDarkPool(ticker) {
-  const data = mockDarkPool(ticker);
-  const w = 360, h = 140, pad = 28;
-  const max = Math.max(...data.map(d => d.notional));
-  let svg = `<svg viewBox="0 0 ${w} ${h}" class="mini-chart-tall" preserveAspectRatio="none">`;
-  data.forEach((d, i) => {
-    const barW = (w - pad*2) / data.length - 12;
-    const x = pad + i * ((w - pad*2) / data.length) + 6;
-    const barH = (d.notional / max) * (h - pad*2);
-    const y = h - pad - barH;
-    const fill = d.sentiment === 'bull' ? '#23d18b' : '#f25f5c';
-    svg += `<rect x="${x}" y="${y}" width="${barW}" height="${barH}" fill="${fill}" opacity="0.7" rx="2"/>`;
-    svg += `<text x="${x + barW/2}" y="${y - 6}" text-anchor="middle" font-family="JetBrains Mono" font-size="10" fill="#888591">$${d.notional}M</text>`;
-    svg += `<text x="${x + barW/2}" y="${h - 8}" text-anchor="middle" font-family="JetBrains Mono" font-size="9" fill="#5a5862">${d.day}</text>`;
-  });
-  svg += `</svg>`;
-  const totalDP = data.reduce((s,d) => s + d.notional, 0);
-  const avgPct = data.reduce((s,d) => s + d.pct, 0) / data.length;
-  document.getElementById('darkpool-content').innerHTML = `
-    <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:6px;">
-      <div style="font-family:JetBrains Mono;font-size:24px;font-weight:600;color:var(--ink-0);">$${totalDP.toFixed(0)}M</div>
-      <div style="font-family:JetBrains Mono;font-size:11px;color:var(--ink-2);">5d notional</div>
-      <div style="margin-left:auto;font-family:JetBrains Mono;font-size:12px;color:var(--ink-2);">avg ${avgPct.toFixed(1)}% of vol</div>
-    </div>
-    ${svg}`;
-}
+async function renderSuperInvestors(ticker) {
+  const el = document.getElementById('superinv-content');
+  el.innerHTML = '<div class="loading-state">Reading 13F filings…</div>';
+  setBadge('card-13f', null);
 
-function renderSuperInvestors(ticker) {
-  const data = mockSuperInvestors(ticker);
-  if (!data.length) {
-    document.getElementById('superinv-content').innerHTML = '<div class="loading-state">No reported holdings</div>';
+  let d;
+  try { d = await fetch13F(ticker); }
+  catch (e) { d = { unavailable: true, reason: `13F request failed: ${e.message}` }; }
+  if (ticker !== state.ticker) return;
+
+  setBadge('card-13f', d._meta);
+  if (d.unavailable) { el.innerHTML = unavailable(d.reason); return; }
+
+  const cov = d.coverage || {};
+  // "No mapped holdings" is deliberately not "no institutional interest" — the
+  // CUSIP-to-ticker map is built from issuer names and is knowingly partial.
+  if (!d.mapped) {
+    el.innerHTML = `<div class="src-unavailable">
+      <b>No mapped holdings.</b> None of the ${cov.managersOk ?? 0} tracked managers report a position
+      in ${esc(ticker)} for the quarter ending ${esc(d._meta?.asOf || '—')} — or the position exists but its
+      issuer name did not resolve to a ticker. The CUSIP-to-ticker map is built from issuer names in the
+      filings and covers ${cov.resolved ?? 0} of ${(cov.resolved ?? 0) + (cov.unresolved ?? 0)} positions,
+      so absence here is not evidence of absence in the filings.</div>`;
     return;
   }
+
+  const money = v => v == null ? '—' : v >= 1e9 ? '$' + (v / 1e9).toFixed(2) + 'B'
+                   : v >= 1e6 ? '$' + (v / 1e6).toFixed(0) + 'M' : '$' + (v / 1e3).toFixed(0) + 'K';
+
   let html = `<table class="data">
-    <thead><tr><th>Investor</th><th class="right">Shares</th><th class="right">Value</th><th class="right">Q/Q</th></tr></thead>
-    <tbody>`;
-  for (const r of data) {
-    const dCls = r.delta === 'NEW' ? 'bull' : r.delta.startsWith('+') ? 'bull' : 'bear';
-    html += `
-      <tr>
-        <td style="font-size:12px;">${r.name}</td>
-        <td class="right">${r.shares}</td>
-        <td class="right">${r.value}</td>
-        <td class="right ${dCls}">${r.delta}</td>
-      </tr>`;
+    <thead><tr><th>Manager</th><th class="right">Shares</th><th class="right">Value</th></tr></thead><tbody>`;
+  for (const h of d.holders.slice(0, 12)) {
+    html += `<tr>
+      <td><div class="inv-name">${esc(h.manager)}</div><div class="inv-firm">${esc(h.firm)}</div></td>
+      <td class="right">${fmt.big(h.shares)}</td>
+      <td class="right">${money(h.value)}</td>
+    </tr>`;
   }
   html += `</tbody></table>
-    <div style="margin-top:10px;font-family:JetBrains Mono;font-size:10px;color:var(--ink-3);">13F filings lag 45d · live data: WhaleWisdom Pro / Dataroma</div>`;
-  document.getElementById('superinv-content').innerHTML = html;
+    <div class="src-foot">Quarter ending ${esc(d._meta?.asOf || '—')} · 13F-HR is filed up to 45 days
+      after quarter end, so these are positions as they stood then, not today.
+      ${cov.managersOk}/${cov.managersTotal} managers filed; ${cov.unresolved} positions across all
+      managers could not be mapped to a ticker and are excluded. Mapping is by issuer name, and SEC's
+      ticker file carries no share-class detail — dual-class names (GOOGL/GOOG, BRK.A/BRK.B) collapse
+      into one line.</div>`;
+  el.innerHTML = html;
 }
 
 /* Volatility regime for the strategy gates.
@@ -2667,6 +2792,9 @@ underlying; nothing behind it yet, so nothing is shown.">
  * daily bar. They were removed rather than caveated (ARCHITECTURE.md, rule 5).
  * Intraday bars — Polygon Stocks Starter — are what would bring them back. */
 function renderTradeSignals(closes) {
+  setBadge('card-trade', { source: 'Yahoo daily bars', ok: true, delayed: true,
+                           note: `EMA 20/50 over ${closes.length} sessions`,
+                           fetchedAt: new Date().toISOString() });
   const e20 = ema(closes, 20);
   const e50 = ema(closes, 50);
   const e20Last = e20.at(-1), e50Last = e50.at(-1);
@@ -2783,7 +2911,7 @@ function renderTrack(entries, calibration) {
     html += `<tr>
       <td>${new Date(e.ts).toLocaleDateString('en-US',{month:'short',day:'numeric'})}</td>
       <td><span class="flag ${ratingCls}">${esc(e.rating)}</span></td>
-      <td class="right">${e.confidence ?? '—'}%</td>
+      <td class="right">${confLabel(e.confidence)}</td>
       <td class="right">$${fmt.price(e.price)}</td>
       <td class="right">${fwd(e.fwd5, e.fwd5Close)}</td>
       <td class="right">${fwd(e.fwd20, e.fwd20Close)}</td>
@@ -2992,14 +3120,16 @@ function renderSynthesis(r, lastPrice) {
   const heroRating = document.getElementById('hero-rating');
   heroRating.textContent = r.rating;
   heroRating.className = 'rating-badge ' + r.rating.toLowerCase();
-  document.getElementById('hero-conf').textContent = `${r.confidence}% confidence`;
+  document.getElementById('hero-conf').textContent = `${confLabel(r.confidence)} confidence`;
 
   // Confidence ring
   const arc = document.getElementById('synth-conf-arc');
   const C = 2 * Math.PI * 34;
-  arc.setAttribute('stroke-dasharray', `${(r.confidence/100) * C} ${C}`);
-  arc.setAttribute('stroke', r.confidence > 70 ? '#23d18b' : r.confidence > 40 ? '#f4b740' : '#f25f5c');
-  document.getElementById('synth-conf-num').textContent = r.confidence + '%';
+  // Three discrete steps for three ordinal levels — the arc must not read as a percentage.
+  const lvl = confLevel(r.confidence);
+  arc.setAttribute('stroke-dasharray', `${(lvl == null ? 0 : (lvl + 1) / 3) * C} ${C}`);
+  arc.setAttribute('stroke', lvl === 2 ? '#23d18b' : lvl === 1 ? '#f4b740' : '#f25f5c');
+  document.getElementById('synth-conf-num').textContent = confLabel(r.confidence);
 
   // Narrative
   const paragraphs = (r.thesis || '').split(/\n\n+/);
@@ -3183,10 +3313,9 @@ async function loadTicker(ticker) {
     renderIndicators(H, L, C, V);
     renderAnalyst(quote, lastPrice);
     renderFundamentals(quote);
-    renderInsider(quote);
-    renderShortInterest(quote);
+    renderInsider(ticker);
+    renderShortInterest(ticker, quote);
     renderUnusualOptions(state.ticker, lastPrice);
-    renderDarkPool(state.ticker);
     renderSuperInvestors(state.ticker);
     renderTradeSignals(C);
     // Held so synthesize() can await the same fetch rather than racing it.
