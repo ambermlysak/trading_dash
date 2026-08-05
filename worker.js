@@ -931,24 +931,32 @@ const PREM_TARGETS     = [0.30, 0.16];   // the two short-strike deltas this scr
 const PREM_MAX_SYMBOLS = 60;
 const PREM_SCHEMA      = 2;              // bump when the row shape changes, to retire cached rows
 
-/* ── Subrequest budget ───────────────────────────────────────────────────────
+/* ── Subrequest budget: why this is on-demand ────────────────────────────────
    MEASURED, not estimated: one ticker costs ~4.8 outbound fetches — 1 expiry
    list, 1 quoteSummary for the earnings date, and ~2.8 dated expiry chains
    (front, back, clean monthly, post-earnings monthly, minus whatever dedupes).
    A 6-ticker probe came to 30 fetches: 6 base + 6 quoteSummary + 17 dated + 1
-   spark. Fixed overhead is ~3 (crumb, FRED rate, one spark per 20 symbols).
+   spark.
 
-   Cloudflare caps subrequests PER INVOCATION — 50 on Workers Free, 1000 on
-   Paid. A 22-name watchlist is ~110, which is why the old fan-out died. Note
-   the cap is per *invocation*, not per chunk: chunking inside one handler does
-   nothing for it, which is why the sweep is spread across cron firings below.
+   This account is on **Workers Free: 50 subrequests per invocation.** One
+   ticker is ~5, so a single on-demand fetch has an order of magnitude of head-
+   room. A whole 22-name watchlist is ~110 and cannot be done in one invocation
+   at all — and the cap is per *invocation*, not per chunk, so no amount of
+   internal chunking helps.
 
-   PREMIUM_CRON_BATCH is sized against the *stricter* bound so it is correct on
-   either plan: 6 × 4.8 + 3 ≈ 33, comfortably inside 50 and nowhere near 1000. */
-const PREMIUM_CRON_BATCH = 6;
-const PREMIUM_QUEUE_KEY  = 'premium:queue';   // outside the premium:{TICKER} space on purpose
-const PREMIUM_ROW_TTL    = 3 * 24 * 3600;     // rows outlive a long weekend
-const PREMIUM_FRESH_MS   = 8 * 3600_000;      // past this the UI calls a row stale
+   There was briefly a KV queue drained across cron firings to work around that.
+   It is gone: the screen is used one or two names at a time when deciding what
+   to sell, so fetching all 22 daily was solving a problem nobody had, at the
+   cost of a queue, a cursor, a seed step and a share of every cron firing.
+   Expanding a row fetches that row. Nothing else fetches anything.
+
+   Rows are cached PREMIUM_FRESH_MS (4h) and KEPT longer than that on purpose:
+   if KV evicted at exactly the freshness horizon there would be nothing left to
+   render as stale, and "stale" is the honest state for a 5-hour-old chain — more
+   useful than a blank row. Past the freshness window the cached row still shows,
+   badged stale, and revalidates behind itself. */
+const PREMIUM_FRESH_MS = 4 * 3600_000;    // "fresh" horizon — drives the stale badge
+const PREMIUM_ROW_TTL  = 24 * 3600;       // KV retention — outlives freshness so stale can render
 
 /* Row status, so the UI can tell three different failures apart. They used to
    render identically as dim red, which conflated "we have not looked yet" with
@@ -1347,82 +1355,11 @@ async function refreshPremiumTicker(sym, env, shared = null) {
   return row;
 }
 
-/* ── Cron sweep, sliced across firings ───────────────────────────────────────
-   The subrequest cap is per INVOCATION, so chunking inside one handler buys
-   nothing — a 22-name sweep is ~110 fetches however it is arranged internally,
-   and on Workers Free that dies at 50.
-
-   So the sweep is a queue drained across the cron firings that already exist.
-   An anchor time (pre-open, and again after the close) seeds the queue with the
-   whole watchlist; every firing — anchor included — drains up to
-   PREMIUM_CRON_BATCH tickers. At 6 per firing on the quarter-hourly cron, a
-   22-name watchlist completes in 4 firings — within the hour — and each
-   invocation spends ~33 subrequests.
-
-   No self-dispatch: a Worker fetching its own public URL to fan out would work,
-   but it needs the deployed hostname as configuration and fails silently when
-   that drifts. The queue needs nothing but KV. */
-async function seedPremiumQueue(env, reason) {
-  let tickers = [...DEFAULT_WATCHLIST];
-  try {
-    const saved = await env?.REC_LOG?.get('watchlist:tickers', 'json');
-    if (Array.isArray(saved) && saved.length) {
-      tickers = [...new Set([...saved, ...DEFAULT_WATCHLIST].map(t => String(t).toUpperCase()))];
-    }
-  } catch (_) {}
-  tickers = tickers.slice(0, PREM_MAX_SYMBOLS);
-  try {
-    await env?.REC_LOG?.put(PREMIUM_QUEUE_KEY, JSON.stringify({ tickers, seededAt: Date.now(), reason }));
-    console.log(`[premium] queue seeded with ${tickers.length} tickers (${reason})`);
-  } catch (e) { console.warn('[premium] queue seed failed:', e.message); }
-  return tickers;
-}
-
-/** Drain up to PREMIUM_CRON_BATCH tickers. Runs on every cron firing. */
-async function drainPremiumQueue(env) {
-  let queue = null;
-  try { queue = await env?.REC_LOG?.get(PREMIUM_QUEUE_KEY, 'json'); } catch (_) {}
-  const pending = Array.isArray(queue?.tickers) ? queue.tickers : [];
-  if (!pending.length) return;
-
-  const batch = pending.slice(0, PREMIUM_CRON_BATCH);
-  const rest  = pending.slice(PREMIUM_CRON_BATCH);
-
-  // Write the shortened queue FIRST. If the batch below blows its budget or the
-  // invocation is killed, the next firing moves on instead of retrying the same
-  // six tickers forever and never reaching the rest of the watchlist.
-  try {
-    await env?.REC_LOG?.put(PREMIUM_QUEUE_KEY, JSON.stringify({ ...queue, tickers: rest }));
-  } catch (e) { console.warn('[premium] queue advance failed:', e.message); }
-
-  // Shared across the batch so they are paid for once, not once per ticker.
-  const rate = await riskFreeRate(env);
-  const hv = new Map();
-  try {
-    const closes = await yahooSparkCloses(batch, '3mo');
-    for (const [sym, c] of closes) hv.set(sym, historicalVol(c, IV_HV_WINDOW));
-  } catch (_) {}
-
-  let ok = 0;
-  for (const sym of batch) {
-    try {
-      const row = await refreshPremiumTicker(sym, env, { rate, hv });
-      if (row.ok) ok++;
-    } catch (e) {
-      console.warn(`[premium] ${sym} refresh failed:`, e.message);
-      await storePremiumRow({
-        symbol: sym, ok: false, status: 'error', reason: `refresh failed: ${e.message}`,
-        legs: [], bestAroc: null, schema: PREM_SCHEMA, ts: Date.now(),
-      }, env);
-    }
-  }
-  console.log(`[premium] drained ${batch.length} (${ok} ok), ${rest.length} left in queue`);
-}
-
 /* ── GET /api/premium/batch?symbols= ─────────────────────────────────────────
-   Reads KV and makes ZERO outbound calls, so it cannot hit the subrequest cap
-   no matter how long the watchlist is. Tickers with no banked row come back in
-   `missing` with a reason, rather than being silently absent. */
+   Cache-status read, NOT a data fetch. Reads KV and makes ZERO outbound calls,
+   so the tab can paint every watchlist ticker on load without spending a single
+   subrequest. Tickers with nothing cached come back in `missing` so the row can
+   say "not loaded" rather than being silently absent. */
 async function handlePremiumBatch(params, origin, env) {
   const symbols = (params.get('symbols') || '')
     .split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, PREM_MAX_SYMBOLS);
@@ -1432,23 +1369,11 @@ async function handlePremiumBatch(params, origin, env) {
   await Promise.all(symbols.map(async (sym) => {
     const row = await readPremiumRow(sym, env);
     if (row) rows.push(row);
-    else missing.push({ symbol: sym, status: 'pending' });
+    else missing.push({
+      symbol: sym, status: 'not-loaded',
+      reason: 'not loaded — expand the row, or use ↻, to fetch this ticker',
+    });
   }));
-
-  // How much of the queue is still outstanding tells the UI whether a pending
-  // ticker is genuinely coming or whether nothing has ever been scheduled.
-  let queued = null, seededAt = null;
-  try {
-    const q = await env?.REC_LOG?.get(PREMIUM_QUEUE_KEY, 'json');
-    queued = Array.isArray(q?.tickers) ? q.tickers.length : null;
-    seededAt = q?.seededAt ?? null;
-  } catch (_) {}
-
-  for (const m of missing) {
-    m.reason = queued
-      ? `not yet computed — ${queued} ticker${queued === 1 ? '' : 's'} still queued for the scheduled sweep`
-      : 'not yet computed — the scheduled sweep has not covered this ticker yet';
-  }
 
   rows.sort((a, b) => a.symbol.localeCompare(b.symbol));
 
@@ -1462,46 +1387,56 @@ async function handlePremiumBatch(params, origin, env) {
     ts: Date.now(),
     minDte: PREM_MIN_DTE,
     targetDeltas: PREM_TARGETS,
+    freshMs: PREMIUM_FRESH_MS,
     gates: { ...REGIME_GATES, ratioSellMin: RATIO_SELL_MIN },
     rate,
-    queued, queueSeededAt: seededAt,
-    batchSize: PREMIUM_CRON_BATCH,
-    _meta: srcMeta('Yahoo options chain (KV snapshot)', {
-      delayed: true,
+    _meta: srcMeta('KV cache (no fetch)', {
       ttlSeconds: PREMIUM_FRESH_MS / 1000,
       // The as-of that matters is the OLDEST row on screen, not this read.
       asOf: oldest ? new Date(oldest).toISOString().slice(0, 16).replace('T', ' ') : null,
-      ok: rows.length > 0,
-      note: `${rows.length}/${symbols.length} banked`
-          + (missing.length ? ` · ${missing.length} pending` : '')
-          + ` · refreshed by the scheduled sweep, ${PREMIUM_CRON_BATCH} tickers per run`,
+      ok: true,
+      note: `${rows.length}/${symbols.length} cached`
+          + (missing.length ? ` · ${missing.length} not loaded` : '')
+          + ' · rows fetch on expand, one ticker per request',
     }),
   }, 200, origin);
 }
 
 /* ── GET /api/premium/:ticker ────────────────────────────────────────────────
-   One ticker on demand: ~5 subrequests, safely inside the cap on any plan.
-   This is what the per-row refresh control calls. Without `?refresh=1` it just
-   reads KV. */
+   The only path in the premium screen that spends subrequests, and it spends
+   ~5 — an order of magnitude inside the 50 cap. **One ticker per invocation,
+   never more**: this is the whole reason the batch sweep is gone.
+
+     (no param)   serve the cached row if it is inside PREMIUM_FRESH_MS,
+                  otherwise refetch. A cache hit costs ZERO outbound calls.
+     ?refresh=1   always refetch, whatever the cache says. Backs the ↻ control.
+     ?cached=1    never fetch; report what is banked and how old it is. */
 async function handlePremiumTicker(ticker, params, origin, env, ctx) {
   const sym = String(ticker || '').toUpperCase();
   if (!sym) return err('ticker required', 400, origin);
 
-  if (params.get('refresh') !== '1') {
-    const row = await readPremiumRow(sym, env);
-    if (row) return json({ row, cached: true, _meta: premiumRowMeta(row) }, 200, origin);
+  const force      = params.get('refresh') === '1';
+  const cachedOnly = params.get('cached')  === '1';
+  const cached = force ? null : await readPremiumRow(sym, env);
+  const age    = cached?.ts ? Date.now() - cached.ts : null;
+  const fresh  = age != null && age < PREMIUM_FRESH_MS;
+
+  if (cached && (fresh || cachedOnly)) {
+    return json({ row: cached, cached: true, stale: !fresh, ageMs: age, _meta: premiumRowMeta(cached) }, 200, origin);
+  }
+  if (cachedOnly) {
     return json({
       row: null, cached: true,
-      missing: { symbol: sym, status: 'pending', reason: 'not yet computed — pass ?refresh=1 to build it now' },
-      _meta: srcMeta('Yahoo options chain (KV snapshot)', {
-        ok: false, ttlSeconds: PREMIUM_FRESH_MS / 1000, note: 'no banked row',
+      missing: { symbol: sym, status: 'not-loaded', reason: 'not loaded — no cached row for this ticker' },
+      _meta: srcMeta('KV cache (no fetch)', {
+        ok: false, ttlSeconds: PREMIUM_FRESH_MS / 1000, note: 'nothing cached',
       }),
     }, 200, origin);
   }
 
   await getYahooCrumb(env).catch(() => {});
   const row = await refreshPremiumTicker(sym, env);
-  return json({ row, cached: false, _meta: premiumRowMeta(row) }, 200, origin);
+  return json({ row, cached: false, stale: false, ageMs: 0, _meta: premiumRowMeta(row) }, 200, origin);
 }
 
 function premiumRowMeta(row) {
@@ -2366,10 +2301,31 @@ async function fetch13F(cik) {
  * Coverage is partial by design; anything unresolved is counted and reported
  * rather than guessed at.
  */
-async function build13FIndex(env) {
-  const cikMap = await getCikMap(env);
+/* ── 13F index: built a few managers at a time ───────────────────────────────
+   The old `build13FIndex` walked all 20 managers in one invocation: 1 fetch for
+   the issuer-name table plus 3 SEC round trips each = 61, against a 50-subrequest
+   cap on Workers Free.
 
-  // company title → ticker, from the same SEC file (fetched fresh for titles).
+   It did not fail. `fetch13F` is wrapped in a per-manager try/catch that logs and
+   continues, so the cap error was swallowed 4 times and the function returned
+   NORMALLY with 16 of 20 managers — and `refresh13FIndex` wrote that partial
+   index to KV as if it were complete. Worse, the four dropped managers were
+   recorded as `{ ok: false }`, which is the same shape used for a manager who
+   genuinely filed nothing: the card reported "16/20 managers filed", blaming the
+   managers for our own budget overrun. Verified by stubbing secFetch to throw the
+   real cap error after 50 calls — always the same last four (Two Sigma, ValueAct,
+   Greenlight, Pabrai), because the loop order is fixed.
+
+   Now: THIRTEENF_BATCH managers per firing, merged into the stored index rather
+   than rebuilding it. 13F data changes quarterly, so a pass taking several
+   firings costs nothing. Per-manager holdings are kept in `byManager` and the
+   ticker→managers index is derived from it, so one manager can be replaced
+   without touching the others. */
+const THIRTEENF_BATCH  = 4;             // 4 × 3 + 1 = 13 subrequests — a quarter of the cap
+const THIRTEENF_CURSOR = '13f:cursor';  // deliberately outside the 13f:index key
+
+/** Issuer-name → ticker, from SEC's company_tickers.json. One fetch. */
+async function issuerNameMap() {
   const raw = await secFetch('https://www.sec.gov/files/company_tickers.json');
   const byName = new Map();
   for (const row of Object.values(raw || {})) {
@@ -2377,128 +2333,219 @@ async function build13FIndex(env) {
     const n = normIssuer(row.title);
     if (n && !byName.has(n)) byName.set(n, String(row.ticker).toUpperCase());
   }
+  return byName;
+}
 
-  const index = {};            // TICKER -> [{manager, firm, shares, value, ...}]
-  const managers = [];
+/** Collapse one manager's 13F rows into per-ticker positions.
+ *  A 13F reports one issuer across several rows — separate accounts, share
+ *  classes and discretion categories each file their own line — so rows are
+ *  summed. Listing them would show Berkshire holding Apple four times. */
+function foldHoldings(filing, byName, cikMap) {
+  const perTicker = new Map();
   let resolved = 0, unresolved = 0;
-
-  for (const inv of SUPER_INVESTORS) {
-    let f = null;
-    try { f = await fetch13F(inv.cik); }
-    catch (e) { console.warn(`[13f] ${inv.firm}: ${e.message}`); }
-    if (!f) { managers.push({ ...inv, ok: false }); continue; }
-    managers.push({ ...inv, ok: true, quarter: f.quarter, filed: f.filed, positions: f.holdings.length });
-
-    // A 13F reports one issuer across several rows — separate accounts, share
-    // classes, and investment-discretion categories all file their own line.
-    // Summing per manager is the position; listing the rows would show Berkshire
-    // holding Apple four times.
-    const perTicker = new Map();
-    for (const h of f.holdings) {
-      const t = byName.get(normIssuer(h.name));
-      if (!t || !cikMap[t]) { unresolved++; continue; }
-      resolved++;
-      const cur = perTicker.get(t) || { shares: 0, value: 0, rows: 0, cusip: h.cusip };
-      cur.shares += h.shares || 0;
-      cur.value  += h.value  || 0;
-      cur.rows   += 1;
-      perTicker.set(t, cur);
-    }
-    for (const [t, agg] of perTicker) {
-      (index[t] ||= []).push({
-        manager: inv.name, firm: inv.firm, cik: inv.cik,
-        shares: agg.shares || null, value: agg.value || null,
-        rows: agg.rows, cusip: agg.cusip,
-        quarter: f.quarter, filed: f.filed,
-      });
-    }
+  for (const h of filing.holdings) {
+    const t = byName.get(normIssuer(h.name));
+    if (!t || !cikMap[t]) { unresolved++; continue; }
+    resolved++;
+    const cur = perTicker.get(t) || { shares: 0, value: 0, rows: 0, cusip: h.cusip };
+    cur.shares += h.shares || 0;
+    cur.value  += h.value  || 0;
+    cur.rows   += 1;
+    perTicker.set(t, cur);
   }
-
-  for (const t of Object.keys(index)) index[t].sort((a, b) => (b.value || 0) - (a.value || 0));
-
   return {
-    index, managers,
-    stats: { resolved, unresolved, tickers: Object.keys(index).length,
-             managersOk: managers.filter(m => m.ok).length, managersTotal: SUPER_INVESTORS.length },
-    builtAt: new Date().toISOString(),
+    resolved, unresolved,
+    positions: [...perTicker].map(([ticker, a]) => ({
+      ticker, shares: a.shares || null, value: a.value || null, rows: a.rows, cusip: a.cusip,
+    })),
   };
 }
 
-/* Build the whole index and store it. Off the request path on purpose: 20
-   managers cost ~60 rate-limited SEC round trips, which is a minute of wall
-   clock — far too long to hold a page load, and it wedges the dev server. The
-   cron owns it; a request only ever reads KV. */
-async function refresh13FIndex(env) {
-  try {
-    const store = await build13FIndex(env);
-    await env?.REC_LOG?.put(THIRTEENF_KEY, JSON.stringify(store), { expirationTtl: THIRTEENF_TTL });
-    console.log(`[13f] index built: ${store.stats.tickers} tickers, `
-              + `${store.stats.managersOk}/${store.stats.managersTotal} managers, `
-              + `${store.stats.resolved} resolved / ${store.stats.unresolved} unmapped`);
-    return store;
-  } catch (e) {
-    console.error('[13f] index build failed:', e.message);
-    return null;
+/** Rebuild the ticker→managers reverse index from per-manager positions. */
+function derive13FIndex(byManager) {
+  const index = {};
+  for (const rec of Object.values(byManager || {})) {
+    if (!rec?.ok) continue;
+    for (const p of (rec.positions || [])) {
+      (index[p.ticker] ||= []).push({
+        manager: rec.name, firm: rec.firm, cik: rec.cik,
+        shares: p.shares, value: p.value, rows: p.rows, cusip: p.cusip,
+        quarter: rec.quarter, filed: rec.filed,
+      });
+    }
   }
+  for (const t of Object.keys(index)) index[t].sort((a, b) => (b.value || 0) - (a.value || 0));
+  return index;
 }
 
-/** Rebuild only when the stored index is older than a week (or absent). */
+/**
+ * Refresh one slice of managers and merge. Runs on the 3pm PT firing.
+ * Spends ~13 subrequests, so it can never truncate the way the old build did —
+ * and if a manager genuinely fails, only that manager is marked failed.
+ */
+async function refresh13FSlice(env) {
+  let store = null, cursor = null;
+  try { store  = await env?.REC_LOG?.get(THIRTEENF_KEY, 'json'); } catch (_) {}
+  try { cursor = await env?.REC_LOG?.get(THIRTEENF_CURSOR, 'json'); } catch (_) {}
+
+  // A store from before the incremental rewrite has no byManager; start it over
+  // rather than trying to reinterpret a shape that was partial anyway.
+  if (!store?.byManager) store = { byManager: {}, index: {}, builtAt: null, lastFullPass: null };
+  let at = Number.isInteger(cursor?.at) ? cursor.at : 0;
+  if (at >= SUPER_INVESTORS.length) at = 0;
+  const passStartedAt = cursor?.passStartedAt || new Date().toISOString();
+
+  const batch = SUPER_INVESTORS.slice(at, at + THIRTEENF_BATCH);
+  if (!batch.length) return;
+
+  const cikMap = await getCikMap(env);
+  let byName;
+  try { byName = await issuerNameMap(); }
+  catch (e) { console.warn('[13f] issuer map failed, slice skipped:', e.message); return; }
+
+  for (const inv of batch) {
+    let f = null, failReason = null;
+    try { f = await fetch13F(inv.cik); }
+    catch (e) { failReason = e.message; console.warn(`[13f] ${inv.firm}: ${e.message}`); }
+
+    if (!f) {
+      // Keep any previous good record rather than replacing it with a failure —
+      // a transient SEC hiccup should not blank a manager that was already indexed.
+      const prev = store.byManager[inv.cik];
+      store.byManager[inv.cik] = prev?.ok
+        ? { ...prev, lastError: failReason || 'no 13F-HR found', lastTriedAt: new Date().toISOString() }
+        : { ...inv, ok: false, reason: failReason || 'no 13F-HR filing found', lastTriedAt: new Date().toISOString() };
+      continue;
+    }
+
+    const folded = foldHoldings(f, byName, cikMap);
+    store.byManager[inv.cik] = {
+      ...inv, ok: true,
+      quarter: f.quarter, filed: f.filed,
+      positions: folded.positions,
+      resolved: folded.resolved, unresolved: folded.unresolved,
+      refreshedAt: new Date().toISOString(),
+      lastError: null,
+    };
+  }
+
+  store.index = derive13FIndex(store.byManager);
+
+  const recs = Object.values(store.byManager);
+  const okRecs = recs.filter(r => r.ok);
+  store.managers = SUPER_INVESTORS.map((inv) => {
+    const r = store.byManager[inv.cik];
+    return r
+      ? { name: inv.name, firm: inv.firm, cik: inv.cik, ok: !!r.ok,
+          quarter: r.quarter ?? null, filed: r.filed ?? null,
+          positions: r.positions?.length ?? 0, refreshedAt: r.refreshedAt ?? null,
+          reason: r.ok ? null : (r.reason || r.lastError || null) }
+      : { name: inv.name, firm: inv.firm, cik: inv.cik, ok: false,
+          quarter: null, filed: null, positions: 0, refreshedAt: null,
+          reason: 'not yet fetched — the index is still filling in' };
+  });
+  store.stats = {
+    resolved:   okRecs.reduce((a, r) => a + (r.resolved   || 0), 0),
+    unresolved: okRecs.reduce((a, r) => a + (r.unresolved || 0), 0),
+    tickers: Object.keys(store.index).length,
+    managersOk: okRecs.length,
+    managersTotal: SUPER_INVESTORS.length,
+    // Distinguishes "we have not reached this manager" from "this manager failed".
+    managersNotFetched: SUPER_INVESTORS.length - recs.length,
+  };
+  store.builtAt = new Date().toISOString();
+
+  const next = at + THIRTEENF_BATCH;
+  const wrapped = next >= SUPER_INVESTORS.length;
+  if (wrapped) store.lastFullPass = new Date().toISOString();
+
+  try {
+    await env?.REC_LOG?.put(THIRTEENF_KEY, JSON.stringify(store), { expirationTtl: THIRTEENF_TTL });
+    await env?.REC_LOG?.put(THIRTEENF_CURSOR, JSON.stringify({
+      at: wrapped ? 0 : next,
+      passStartedAt: wrapped ? null : passStartedAt,
+    }), { expirationTtl: THIRTEENF_TTL });
+  } catch (e) { console.warn('[13f] write failed:', e.message); }
+
+  console.log(`[13f] slice ${at}–${Math.min(next, SUPER_INVESTORS.length) - 1} done · `
+            + `${store.stats.managersOk}/${store.stats.managersTotal} represented · `
+            + `${store.stats.tickers} tickers${wrapped ? ' · full pass complete' : ''}`);
+}
+
+/** Runs every 3pm PT firing. A slice is cheap, so it advances whenever the index
+ *  is mid-pass, and only idles once a complete pass is recent. */
 async function refresh13FIndexIfStale(env) {
   try {
-    const cur = await env?.REC_LOG?.get(THIRTEENF_KEY, 'json');
-    if (cur?.builtAt && Date.now() - Date.parse(cur.builtAt) < 7 * 86_400_000) {
-      console.log('[13f] index fresh, skipping');
-      return;
-    }
+    const cursor = await env?.REC_LOG?.get(THIRTEENF_CURSOR, 'json');
+    const store  = await env?.REC_LOG?.get(THIRTEENF_KEY, 'json');
+    const midPass = Number.isInteger(cursor?.at) && cursor.at > 0;
+    const recent  = store?.lastFullPass && Date.now() - Date.parse(store.lastFullPass) < 7 * 86_400_000;
+    if (!midPass && recent) { console.log('[13f] full pass recent, skipping'); return; }
   } catch (_) {}
-  await refresh13FIndex(env);
+  await refresh13FSlice(env);
 }
 
 async function handle13F(ticker, params, origin, env, ctx) {
   if (!ticker) return err('ticker required', 400, origin);
   const sym = ticker.toUpperCase();
 
-  let store = null;
-  try { store = await env?.REC_LOG?.get(THIRTEENF_KEY, 'json'); } catch (_) {}
+  let store = null, cursor = null;
+  try { store  = await env?.REC_LOG?.get(THIRTEENF_KEY, 'json'); } catch (_) {}
+  try { cursor = await env?.REC_LOG?.get(THIRTEENF_CURSOR, 'json'); } catch (_) {}
 
-  if (params.get('refresh') === '1') {
-    // Kick a rebuild but do not make the caller wait for it.
-    if (ctx) ctx.waitUntil(refresh13FIndex(env));
-    if (!store) {
-      return json({
-        ticker: sym, unavailable: true, building: true,
-        reason: '13F index is building — 20 managers at SEC rate limits takes about a minute. Retry shortly.',
-        _meta: srcMeta('SEC EDGAR 13F-HR', { ok: false, ttlSeconds: TTL.thirteenF, note: 'index building' }),
-      }, 200, origin);
-    }
-  }
+  // One slice per request at most: a slice is ~13 subrequests and the caller is
+  // not made to wait for it. `refresh=1` advances the pass by one batch, it does
+  // not rebuild everything — that is what put the old version over the cap.
+  if (params.get('refresh') === '1' && ctx) ctx.waitUntil(refresh13FSlice(env));
 
-  if (!store) {
-    if (ctx) ctx.waitUntil(refresh13FIndex(env));
+  if (!store?.index) {
+    if (ctx) ctx.waitUntil(refresh13FSlice(env));
     return json({
       ticker: sym, unavailable: true, building: true,
-      reason: '13F index not built yet — a build has been started. Retry in about a minute.',
+      reason: `13F index has not started filling in yet. It is built ${THIRTEENF_BATCH} managers at a `
+            + `time on the daily 3pm PT job — SEC round trips do not fit in one run — so first `
+            + `coverage appears within a few runs.`,
       _meta: srcMeta('SEC EDGAR 13F-HR', { ok: false, ttlSeconds: TTL.thirteenF, note: 'index building' }),
     }, 200, origin);
   }
 
   const holders = store.index?.[sym] || [];
   const quarters = [...new Set(holders.map(h => h.quarter).filter(Boolean))].sort();
+
+  // The card has to be able to say how much of the manager list is actually
+  // behind this answer. The old build silently dropped 4 of 20 and reported the
+  // survivors as "16/20 managers filed" — attributing our budget overrun to the
+  // managers' filing behaviour.
+  const st = store.stats || {};
+  const coverage = {
+    ...st,
+    managersRepresented: st.managersOk ?? 0,
+    managersTotal: st.managersTotal ?? SUPER_INVESTORS.length,
+    managersNotFetched: st.managersNotFetched ?? 0,
+    managersFailed: (st.managersTotal ?? SUPER_INVESTORS.length)
+                    - (st.managersOk ?? 0) - (st.managersNotFetched ?? 0),
+    lastFullPass: store.lastFullPass || null,
+    passInProgress: Number.isInteger(cursor?.at) && cursor.at > 0,
+    passPosition: Number.isInteger(cursor?.at) ? cursor.at : 0,
+    batchSize: THIRTEENF_BATCH,
+  };
+
   return json({
     ticker: sym,
     holders,
     // An unmapped ticker is reported as unmapped. It must never render as
     // "no institutional interest", which is a different and much stronger claim.
     mapped: holders.length > 0,
-    coverage: store.stats,
+    coverage,
     managers: store.managers,
     builtAt: store.builtAt,
     _meta: srcMeta('SEC EDGAR 13F-HR', {
       ttlSeconds: TTL.thirteenF,
       asOf: quarters.at(-1) || null,
-      note: holders.length
-        ? `quarter ending ${quarters.at(-1)} · filed up to 45 days after`
-        : 'no mapped holdings',
+      ok: coverage.managersRepresented > 0,
+      note: `${coverage.managersRepresented}/${coverage.managersTotal} managers indexed`
+          + (coverage.passInProgress ? ' · pass in progress' : '')
+          + (holders.length ? ` · quarter ending ${quarters.at(-1)}` : ' · no mapped holdings'),
     }),
   }, 200, origin);
 }
@@ -5480,31 +5527,6 @@ export default {
     const pt = new Date(new Date(event.scheduledTime).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
     const h = pt.getHours(), m = pt.getMinutes();
 
-    /* Premium sweep. Two anchors seed the whole watchlist — 5:00am PT (pre-open)
-     * and 1:45pm PT (after the close) — and every OTHER firing drains a slice,
-     * because the subrequest cap is per invocation and one invocation cannot
-     * cover a whole watchlist. 21–45 DTE structures do not need fresher chain
-     * data than twice a day.
-     *
-     * The drain deliberately skips any firing that already runs one of the heavy
-     * jobs below. `waitUntil` does not get its own budget — it shares the
-     * invocation's — so draining alongside the morning briefing would put both
-     * at risk of the same cap this whole restructure exists to avoid. */
-    const heavyFiring =
-      (h === 6  && m < 30) ||                 // morning briefing
-      ((h === 11 && m >= 30) || h === 12) ||  // midday pulse
-      (h === 13 && m >= 15 && m < 45) ||      // EOD summary + IV sweep
-      (h === 14 && m < 30) ||                 // forward-return fill
-      (h === 15 && m < 30);                   // 13F index (~61 SEC round trips on its own)
-
-    if (h === 5 && m < 15) {
-      ctx.waitUntil(seedPremiumQueue(env, 'pre-open').then(() => drainPremiumQueue(env)));
-    } else if (h === 13 && m >= 45) {
-      ctx.waitUntil(seedPremiumQueue(env, 'post-close').then(() => drainPremiumQueue(env)));
-    } else if (!heavyFiring) {
-      ctx.waitUntil(drainPremiumQueue(env));
-    }
-
     if (h === 6 && m < 30) {
       ctx.waitUntil(generateDailySnapshot(env));       // 6:00am PT morning briefing
     } else if ((h === 11 && m >= 30) || h === 12) {
@@ -5514,10 +5536,16 @@ export default {
       ctx.waitUntil(recordWatchlistIv(env));           // 1:15pm PT bank one IV sample per watchlist name
     } else if (h === 14 && m < 30) {
       ctx.waitUntil(fillForwardReturns(env));          // 2:00pm PT resolve 5/20-session forward returns
-    } else if (h === 15 && m < 30) {
-      // 13F-HR lands 45 days after quarter end, so a weekly check is ample; the
-      // KV entry outlives the interval, and a rebuild only costs SEC round trips.
-      ctx.waitUntil(refresh13FIndexIfStale(env));      // 3:00pm PT 13F index
+    } else if (h === 10) {
+      // 10:00am PT, not 3:00pm: at 3pm PT the UTC hour is 22 under PDT but 23
+      // under PST, and the cron window ends at 22 — so this job silently never
+      // ran for the whole winter half of the year. 10am PT is 17:00/18:00 UTC,
+      // inside the window in both regimes.
+      //
+      // Fires on all four firings of the hour: a slice is only 4 managers, so
+      // four slices a day completes a 20-manager pass in ~1.3 days. 13F-HR lands
+      // 45 days after quarter end, so that is ample.
+      ctx.waitUntil(refresh13FIndexIfStale(env));      // 10:00am PT 13F index slice
     }
   },
 };

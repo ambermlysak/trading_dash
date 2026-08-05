@@ -77,17 +77,27 @@ in this codebase and shipped:
    ticker; the first is a fact about our own scheduler and the fourth is worth retrying. Collapsing
    them cost the user the ability to act on any of them — and it made a scheduling gap look like a
    verdict on the stock. Every unavailable state now carries its own `status` and says which it is.
-12. **A gate whose input does not exist yet must not read as a verdict.** `sellable` was
+12. **A swallowed error is worse than a loud one when it changes what the data means.**
+   `build13FIndex` needed ~61 SEC round trips against a 50-subrequest cap. It never failed — a
+   per-manager `try/catch` absorbed the cap error and the function returned normally with 16 of 20
+   managers, which was then written to KV and rendered as a complete answer. The dropped managers
+   were stored in the same shape as a manager who genuinely filed nothing, so the card said "16/20
+   managers filed" and attributed our budget overrun to them. **Verified by stubbing the fetch layer
+   to throw the real cap error**: always the same last four, because the loop order is fixed. A
+   `catch` that lets a loop continue is fine; one that cannot distinguish "this item failed" from
+   "we ran out of budget and every remaining item will fail" is not. Two Sigma's real Apple position
+   was missing from the card for as long as this shipped.
+13. **A gate whose input does not exist yet must not read as a verdict.** `sellable` was
    `ivRank != null && ivRank >= 50`, so a null rank — the state for the first 60 days of collection —
    counted as failing. The whole screen greyed out for three months, which reads as "nothing here is
    worth selling" rather than "we cannot tell yet". The gate is now tri-state, falls through to the
    IV/HV30 proxy while the rank collects, and names the number that decided it on hover.
-13. **An input that is unavailable is not defaulted to a convenient value.** Black-Scholes delta needs
+14. **An input that is unavailable is not defaulted to a convenient value.** Black-Scholes delta needs
    a risk-free rate. With FRED unreachable and nothing banked, every delta is **suppressed** rather
    than computed at `r = 0`: that substitution is worth about a full delta point at 30 DTE, which is
    enough to change which strike the screen selects, and it would be invisible on screen. Same rule as
    3, applied to an input rather than an output.
-14. **The same rule applies to what the model is asked for, not just what the code computes.**
+15. **The same rule applies to what the model is asked for, not just what the code computes.**
    The Midday Pulse had a "Day Trade" bucket. No bad calculation sat behind it — but the model was
    being asked for same-session ideas while holding only daily bars and a delayed quote, so any
    entry, stop or intraday timing it emitted was invented. The absence of a bad calculation is not
@@ -108,14 +118,14 @@ For every component in the spec, this table shows what powers it in the **free p
 | 3 | Short interest 6mo MoM | **FINRA** consolidated short interest, 6 settlements (Yahoo estimate as labelled fallback) | **full** | — | **Ortex** ($35–80/mo) for daily |
 | 4 | Insider trades + flags | **SEC EDGAR Form 4** — real transaction codes, prices, post-txn holdings | **full** | — | Verafin / SecForm4.com |
 | 5 | Options volume · V/OI screen | Yahoo chain volume + open interest | **real, but not flow** — no side classification, no sweep detection | **Unusual Whales** ($48/mo) for true flow | Cheddar Flow ($75) + UW |
-| 5 | Premium screen (dashboard) | Yahoo chain + `/api/premium` — ATM IV term structure, expected move, 0.30/0.16-delta strikes, ROC | **full** | — | ORATS for a historical IV surface |
+| 5 | Premium screen (dashboard) | Yahoo chain + `/api/premium/:ticker`, on demand one ticker at a time — ATM IV term structure, expected move, 0.30/0.16-delta strikes, ROC, POP | **full** | — | ORATS for a historical IV surface |
 | 6 | Recommended option strategies | Computed client-side from RSI + IV regime (`/api/iv`) + analyst upside; POP from Worker-side Black-Scholes delta | **rules-based, full** | OptionStrat API ($) | tastytrade backtest data |
 | 7 | Day trade signals (ORB, VWAP) | **Removed** — needs intraday bars, was computed from daily | **not shipped** | **Polygon Stocks Starter** ($29) for intraday | Polygon Advanced ($199) |
 | 7 | Swing signals (EMA crossover) | Computed client-side from daily closes | **full** | — | — |
 | 8 | Dark pool 5d volumes | **REMOVED** — was fabricated, no free source exists | **not shipped** | **Unusual Whales** dark pool tab | Cheddar Flow Pro |
 | 9 | Analyst targets + recs | Yahoo `financialData` + `recommendationTrend` | **full** | FactSet Estimates (paid) | Visible Alpha |
 | 9 | Recent upgrades/downgrades | Yahoo `upgradeDowngradeHistory` | **full** | Benzinga Pro ($177) | — |
-| 10 | Super-investor 13F | **SEC EDGAR 13F-HR**, 20 verified manager CIKs, name-based CUSIP mapping | **partial — ~2 in 3 positions map to a ticker** | **WhaleWisdom Premium** ($30/mo) for full CUSIP coverage | Dataroma + WW Pro |
+| 10 | Super-investor 13F | **SEC EDGAR 13F-HR**, 20 verified manager CIKs, name-based CUSIP mapping, index built 4 managers per cron firing | **partial — ~2 in 3 positions map to a ticker; card states how many managers are indexed** | **WhaleWisdom Premium** ($30/mo) for full CUSIP coverage | Dataroma + WW Pro |
 | 11 | Technical indicators (RSI, MACD, Bollinger, Stoch, CCI, HV30) | Computed client-side from Yahoo OHLC | **full** | Same — local compute is correct | — |
 | 11 | Implied volatility (ATM IV, term structure, IV/HV30) | Yahoo options chain via `/api/iv` | **full** | — | — |
 | 11 | Option greeks (delta) | **Computed** — Black-Scholes in the Worker; Yahoo's chain carries no greeks. Risk-free rate from FRED `DGS3MO` | **full** | — | Broker greeks (tastytrade / IBKR) |

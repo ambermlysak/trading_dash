@@ -2718,15 +2718,42 @@ async function renderSuperInvestors(ticker) {
   if (d.unavailable) { el.innerHTML = unavailable(d.reason); return; }
 
   const cov = d.coverage || {};
+
+  /* How much of the manager list is actually behind this answer.
+   *
+   * This used to read "N/20 managers filed", which attributed a shortfall to the
+   * managers. It was ours: the index was built in one invocation costing ~61 SEC
+   * round trips against a 50-subrequest cap, the overflow was swallowed by a
+   * per-manager catch, and 4 of 20 were dropped every single time — recorded in
+   * the same shape as a manager who genuinely filed nothing. The index is now
+   * built a few managers per run, so a shortfall means the pass is still filling
+   * in, and the card says exactly that. */
+  const rep = cov.managersRepresented ?? cov.managersOk ?? 0;
+  const tot = cov.managersTotal ?? 0;
+  const covLine = () => {
+    const bits = [`<b>${rep}/${tot}</b> of the tracked managers are indexed`];
+    if (cov.managersNotFetched) {
+      bits.push(`${cov.managersNotFetched} not yet fetched — the index refreshes
+        ${cov.batchSize ?? 4} managers per daily run, so coverage fills in over a few days`);
+    }
+    if (cov.managersFailed > 0) bits.push(`${cov.managersFailed} had no readable 13F-HR`);
+    bits.push(cov.lastFullPass
+      ? `last complete pass ${esc(new Date(cov.lastFullPass).toLocaleDateString())}`
+      : 'no complete pass yet');
+    if (cov.passInProgress) bits.push('a pass is in progress');
+    return bits.join(' · ');
+  };
+
   // "No mapped holdings" is deliberately not "no institutional interest" — the
   // CUSIP-to-ticker map is built from issuer names and is knowingly partial.
   if (!d.mapped) {
     el.innerHTML = `<div class="src-unavailable">
-      <b>No mapped holdings.</b> None of the ${cov.managersOk ?? 0} tracked managers report a position
+      <b>No mapped holdings.</b> None of the ${rep} indexed managers report a position
       in ${esc(ticker)} for the quarter ending ${esc(d._meta?.asOf || '—')} — or the position exists but its
       issuer name did not resolve to a ticker. The CUSIP-to-ticker map is built from issuer names in the
       filings and covers ${cov.resolved ?? 0} of ${(cov.resolved ?? 0) + (cov.unresolved ?? 0)} positions,
-      so absence here is not evidence of absence in the filings.</div>`;
+      so absence here is not evidence of absence in the filings.
+      <div class="src-foot" style="margin-top:8px">${covLine()}.</div></div>`;
     return;
   }
 
@@ -2745,7 +2772,7 @@ async function renderSuperInvestors(ticker) {
   html += `</tbody></table>
     <div class="src-foot">Quarter ending ${esc(d._meta?.asOf || '—')} · 13F-HR is filed up to 45 days
       after quarter end, so these are positions as they stood then, not today.
-      ${cov.managersOk}/${cov.managersTotal} managers filed; ${cov.unresolved} positions across all
+      ${covLine()}. ${cov.unresolved} positions across all indexed
       managers could not be mapped to a ticker and are excluded. Mapping is by issuer name, and SEC's
       ticker file carries no share-class detail — dual-class names (GOOGL/GOOG, BRK.A/BRK.B) collapse
       into one line.</div>`;

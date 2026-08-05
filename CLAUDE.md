@@ -191,11 +191,27 @@ managers (the "Third Point" CIK returned Two Sigma; "ARK" returned ValueAct). A 
 fail loudly; it silently attributes one manager's book to another. Check
 `data.sec.gov/submissions/CIK{n}.json` and confirm both the `name` and that `13F-HR` appears.
 
-**13F index is built off the request path.** 20 managers cost ~60 rate-limited SEC round trips —
-about a minute — which is far too long to hold a page load and wedges `wrangler dev` outright. A
-weekly cron owns `refresh13FIndexIfStale()`; requests only ever read `13f:index`. A 13F reports one
-issuer across several rows (separate accounts, share classes, discretion categories), so rows are
-**summed per manager** — otherwise Berkshire appears to hold Apple twelve times.
+**The 13F index is built a few managers at a time, and the old version silently truncated.**
+`build13FIndex()` walked all 20 managers in one invocation: 1 fetch for the issuer-name table plus 3
+SEC round trips each = **61, against a 50-subrequest cap**. It did not fail. `fetch13F` is wrapped in a
+per-manager `try/catch` that logs and continues, so the cap error was swallowed four times and the
+function **returned normally with 16 of 20 managers** — and `refresh13FIndex` wrote that partial index
+to KV as if complete. The four dropped managers were recorded as `{ ok: false }`, the same shape used
+for a manager who genuinely filed nothing, and the card reported "16/20 managers filed" — blaming the
+managers for our own budget overrun. Always the same last four, because the loop order is fixed.
+
+`refresh13FSlice()` now does `THIRTEENF_BATCH` (4) managers per firing — 13 subrequests — keeping
+per-manager holdings in `byManager` and **deriving** the ticker→managers index from it, so one manager
+can be replaced without touching the others. `13f:cursor` tracks the position and `lastFullPass` is
+stamped when it wraps. A transient failure keeps the previous good record rather than blanking a
+manager that was already indexed. Requests only ever read `13f:index`.
+
+The card now reports `managersRepresented` / `managersNotFetched` / `managersFailed` separately —
+"still filling in" and "no readable 13F-HR" are different facts and neither is "did not file".
+
+A 13F reports one issuer across several rows (separate accounts, share classes, discretion
+categories), so rows are **summed per manager** — otherwise Berkshire appears to hold Apple twelve
+times.
 
 CUSIP→ticker mapping is built opportunistically from issuer names and is **knowingly partial**
 (~2 in 3 resolve). An unmapped ticker renders "no mapped holdings", never "no institutional
@@ -373,8 +389,8 @@ daily:midday       — 11:30am cron midday pulse (narrative, topics, tomorrow, t
 daily:eod          — 1:15pm cron EOD summary
 analysis:{TICKER}  — on-demand per-ticker Claude analysis
 iv:{TICKER}:{DATE} — daily front-month ATM IV sample, feeds ivRank (400d TTL; atmIv/spot/dte also in KV metadata)
-premium:{TICKER}   — one premium-screen row, written by the sliced cron sweep (3d TTL)
-premium:queue      — tickers still awaiting refresh this pass (deliberately outside the premium:{TICKER} space)
+premium:{TICKER}   — one premium-screen row, cached on demand (4h fresh horizon, 24h KV retention)
+13f:cursor         — which manager the 13F pass is up to (deliberately outside the 13f:index key)
 econ:dgs3mo        — FRED 3-month T-bill, the risk-free rate for Black-Scholes (refreshed 12h, kept 7d)
 cik:map            — SEC ticker→CIK map (30d TTL)
 insider:{TICKER}   — parsed Form 4 report (12h TTL)
@@ -394,7 +410,11 @@ rec:{TICKER}       — recommendation history, one entry per PT trading day (up 
 recfwd:last        — PT date of the last forward-return fill (dedup; outside the rec: prefix on purpose)
 ```
 
-**Cron trigger:** a single `*/15 12-22 * * 1-5` UTC cron; `scheduled()` dispatches by Pacific wall-clock time to the premium sweep (5am PT seed, 1:45pm PT re-seed, a 6-ticker drain on every other non-heavy firing), the morning briefing (6am PT), midday pulse (11:30am PT), EOD summary + IV sample sweep (1:15pm PT), and the forward-return fill (2pm PT). **Anything added here shares the invocation's subrequest budget with whatever else that firing runs** — check `heavyFiring` before adding work. Each job uses a KV timestamp check with a 2-hour dedup window to avoid double-runs; the two jobs added later (`recordWatchlistIv`, `fillForwardReturns`) use a PT-date key instead, since they should run once a day rather than once per window.
+**Cron trigger:** a single `*/15 13-22 * * 1-5` UTC cron; `scheduled()` dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), EOD summary + IV sample sweep (1:15pm PT), the forward-return fill (2pm PT), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
+
+**Check the UTC hour in both DST regimes before scheduling anything.** The 13F job used to run at 3pm PT, which is 22:00 UTC under PDT but **23:00 under PST** — outside this window — so it silently never ran for the winter half of the year. It moved to 10am PT (17:00/18:00 UTC), inside the window in both. Every other job was already safe; this one was not.
+
+**Anything added here shares the invocation's subrequest budget with whatever else that firing runs.** `ctx.waitUntil` does not get its own. Each job uses a KV timestamp check with a 2-hour dedup window to avoid double-runs; the two jobs added later (`recordWatchlistIv`, `fillForwardReturns`) use a PT-date key instead, since they should run once a day rather than once per window.
 
 **Recommendation log: one entry per ticker per trading day.** `synthesize()` fires on every page
 load, and `handleLogRec()` used to append unconditionally — so a ticker opened a dozen times in a
@@ -453,31 +473,32 @@ chain data and was never part of this.
   not the cost of shares in a covered call; the legend says so, because the same number under two
   capital bases would not be comparable.
 
-**The screen is fed by a cron sweep, not by the request.** Cloudflare caps subrequests **per
-invocation** — 50 on Workers Free, 1000 on Paid — and one ticker costs a *measured* ~4.8 outbound
-fetches (1 expiry list + 1 quoteSummary for earnings + ~2.8 dated expiry chains, plus ~3 fixed for
-crumb/rate/spark). A 22-name watchlist is ~110, which is what killed the original fan-out. **Chunking
-inside a handler does nothing for this** — the cap is per invocation, not per chunk. Re-measure with a
-counting `fetch` wrapper before changing the batch size; do not estimate it.
+**The screen loads on demand, one ticker per request.** Cloudflare caps subrequests **per
+invocation** and this account is on **Workers Free: 50**. One ticker costs a *measured* ~4.8 outbound
+fetches (1 expiry list + 1 quoteSummary for earnings + ~2.8 dated expiry chains); a 22-name watchlist
+is ~110 and cannot be done in one invocation at all. **Chunking inside a handler does nothing for
+this** — the cap is per invocation, not per chunk. Re-measure with a counting `fetch` wrapper before
+changing anything here; do not estimate it.
 
-So the work is sliced across cron firings:
+There was briefly a KV queue drained across cron firings to work around that. It is gone. The screen
+is used one or two names at a time when deciding what to sell, so fetching all 22 daily was solving a
+problem nobody had at the cost of a queue, a cursor, a seed step and a share of every cron firing.
 
-- `seedPremiumQueue()` writes the whole watchlist to `premium:queue` at two anchors — **5:00am PT**
-  (pre-open) and **1:45pm PT** (after the close). The cron window starts at **12:00 UTC** so 5am PT
-  exists under PDT as well as PST; at 13:00 UTC it only existed in winter.
-- `drainPremiumQueue()` runs on every *other* firing and refreshes `PREMIUM_CRON_BATCH` (6) tickers —
-  ~33 subrequests, inside the strict 50 bound and therefore correct on either plan. A 22-name
-  watchlist completes in 4 firings, within the hour.
-- It **skips any firing that already runs a heavy job** (briefing, midday, EOD, forward-fill, 13F).
-  `ctx.waitUntil` does not get its own budget — it shares the invocation's — so draining alongside the
-  13F build (~61 SEC round trips by itself) would recreate the exact failure this design removes.
-- The queue is **advanced before** the batch runs. If an invocation dies mid-batch the next firing
-  moves on instead of retrying the same six forever and never reaching the rest of the watchlist.
-
-`GET /api/premium/batch` then reads KV and makes **zero outbound calls**, so watchlist length cannot
-break it; tickers with no banked row come back in `missing[]` with a reason rather than vanishing.
-`GET /api/premium/:ticker?refresh=1` rebuilds one ticker (~5 subrequests, safe anywhere) and backs the
-per-row ↻ control.
+- `GET /api/premium/batch?symbols=` is a **cache-status read, not a data fetch**: it reads KV and
+  makes zero outbound calls, so the tab paints every watchlist ticker on load for free. Tickers with
+  nothing cached come back in `missing[]` as `not-loaded`.
+- `GET /api/premium/:ticker` is the only path that spends subrequests, and spends ~5. Bare = serve
+  cache if inside `PREMIUM_FRESH_MS`, else refetch. `?refresh=1` always refetches (the ↻ control).
+  `?cached=1` never fetches.
+- **Freshness (4h) and KV retention (24h) are deliberately different.** If KV evicted at exactly the
+  freshness horizon there would be nothing left to render as stale — and "stale" is the honest state
+  for a 5-hour-old chain, more useful than a blank row. Past 4h the cached row still shows, badged
+  stale, and revalidates behind itself.
+- **Load all is strictly sequential**, one awaited request at a time, with a progress line and a Stop
+  control. Firing 22 concurrently would put 22 invocations against Yahoo at once and get the crumb
+  rate-limited — a different failure from the subrequest cap but just as effective. `premInflight`
+  guarantees a ticker is never fetched twice concurrently, since expand and Load all can both reach
+  for the same row. **Expand all never fetches**; it only opens what is already loaded.
 
 **Row `status` distinguishes three failures that used to render identically as dim red:**
 `ok` · `no-options` (nothing listed — nothing to screen) · `no-iv` (options listed but the front expiry

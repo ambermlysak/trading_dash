@@ -21,8 +21,8 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   econ:fred           — FRED release dates (12h TTL)
 #   ivsweep:last        — PT date of last cron IV sweep (dedup)
 #   fund:{TICKER}       — per-ticker Yahoo fundamentals cache (6h TTL)
-#   premium:{TICKER}    — premium-screen row, written by the sliced cron sweep (3d TTL)
-#   premium:queue       — tickers still awaiting refresh this pass (outside premium:{TICKER})
+#   premium:{TICKER}    — premium-screen row, cached on demand (4h fresh, 24h retained)
+#   13f:cursor          — which manager the 13F pass is up to (outside 13f:index)
 #   econ:dgs3mo         — FRED 3-month T-bill, risk-free rate for Black-Scholes (12h fresh, 7d kept)
 #   market:ipos         — IPO calendar cache (12h TTL)
 #   market:goldencross  — golden-cross setups (1h TTL)
@@ -35,19 +35,18 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 # Single cron (plan limit: 5 triggers max). Fires every 15 min in a UTC window
 # covering all PT jobs in both DST regimes; scheduled() dispatches by
 # Pacific wall-clock time:
-#   Premium sweep    — 5:00am PT seed + drain, 1:45pm PT re-seed, drained a slice
-#                      at a time on every non-heavy firing (subrequest cap is
-#                      per invocation, so one run cannot cover the watchlist).
-#                      The window starts at 12:00 UTC so 5:00am PT exists under
-#                      PDT as well as PST — under 13:00 UTC it only existed in winter.
 #   Morning briefing — 6:00am PT   (13:00 UTC PDT / 14:00 UTC PST)
 #   Midday pulse     — 11:30am PT  (18:30 UTC PDT / 19:30 UTC PST)
 #   EOD summary      — 1:15pm PT   (20:15 UTC PDT / 21:15 UTC PST)
 #   IV history sweep — 1:15pm PT   (runs alongside the EOD job; own daily dedup key)
 #   Forward-ret fill — 2:00pm PT   (21:00 UTC PDT / 22:00 UTC PST; own daily dedup key)
-#   13F index build  — 3:00pm PT   (weekly staleness check; ~60 SEC round trips)
+#   13F index slice  — 10:00am PT  (4 managers per firing, ~13 subrequests)
+#                      NOT 3:00pm PT: that is 23:00 UTC under PST, outside this
+#                      window, so the job never ran for half the year.
+# The premium screen is deliberately NOT here — it loads on demand, one ticker
+# per request, because a whole watchlist does not fit in one invocation.
 # Each job deduplicates via KV timestamp check (2-hour window).
-crons = ["*/15 12-22 * * 1-5"]
+crons = ["*/15 13-22 * * 1-5"]
 
 # Required secrets (set via: npx wrangler secret put <NAME>):
 #   ANTHROPIC_API_KEY  — Anthropic API key
