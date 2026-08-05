@@ -144,10 +144,33 @@ Then paste the same value into `DASH_KEY` at the top of the script block in
 **both** `index.html` and `dashboard.html`. It is sent as `x-dash-key`.
 
 Ceilings live next to the gate: `AI_RATE_PER_IP_HOUR` (40) and
-`AI_RATE_GLOBAL_DAY` (200). The **global** one is what bounds the bill, because
-rotating IPs defeats the per-IP one for free. 200 × ~6500 output tokens ×
-$25/MTok ≈ **$32/day worst case** — that is the number to move if the exposure
-feels wrong.
+`AI_RATE_GLOBAL_DAY` (60). The **global** one is what bounds the bill, because
+rotating IPs defeats the per-IP one for free.
+
+**They are denominated in Claude calls, not requests, and the difference is 30×.**
+`aiGuard` takes a `cost`, and `/api/watchlist/batch` passes the number of
+analyses it is about to queue. Counting requests would have let a 60/day ceiling
+authorise ~1,800 calls, because one batch request fans out to up to 30. A request
+whose cost would breach a ceiling is refused **entirely** — never partially
+charged and never partially served.
+
+Order matters at the call site: `maySpend()` *increments*, so it must be called
+only once the handler knows it will actually spend. Asking before checking
+`needsAnalysis.length` charged ordinary cached page loads against the ceiling.
+
+Worst case, every call taking the most expensive gated route (`generateSectors`,
+3500 answer + 4000 thinking headroom = 7500 output tokens):
+
+```
+60 × 7500 output = 0.45 MTok × $25  = $11.25
+   + ~3000 input/call = 0.18 MTok × $5 =  $0.90
+                                       ---------
+                                        ~$12/day   (~$365/month)
+```
+
+That is the number to move if the exposure still feels wrong — not the per-IP
+one, which an attacker simply routes around. Note the crons are **not** counted:
+they call `workerClaude()` directly, so their ~30 calls/day sit on top.
 
 **None of this is authentication.** Read the residual-risk section in
 `ARCHITECTURE.md` before assuming any of it stops a motivated attacker.

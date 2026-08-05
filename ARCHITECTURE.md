@@ -434,7 +434,7 @@ secure.
 | **1. No passthrough.** Callers name a task + ticker; prompts are built in `worker.js` | The endpoint having any value as a free LLM. This is the only *structural* fix here | Someone burning your quota generating equity analyses of random tickers |
 | **2. Origin allowlist**, absent Origin now rejected | Hostile web pages using the Worker through a visitor's browser; scanners that send no headers | `curl -H 'Origin: https://ambermlysak.github.io'`. Origin is client-set and forging it is one flag |
 | **3. Shared secret** `x-dash-key` | Opportunistic abuse of a URL found in a network trace or a repo search | Anyone who opens devtools or reads `index.html`, which is public on GitHub Pages. **The secret is in the client bundle by design** |
-| **4. Rate limits**, 40/IP/hour + 200/day global | The bill being unbounded. This is the layer that actually protects money | A determined attacker rotating IPs, who still gets 200 calls/day out of you |
+| **4. Rate limits**, 40/IP/hour + 60/day global, counted in Claude *calls* | The bill being unbounded. This is the layer that actually protects money | A determined attacker rotating IPs, who still gets 60 calls/day out of you |
 
 ### What remains open, concretely
 
@@ -444,10 +444,17 @@ secure.
   a rotation procedure, not a credential.
 - **Origin is forgeable in one flag.** Layer 2 is meaningful only against browsers,
   which honour it, and against lazy scanners, which do not set it.
-- **The global daily cap is the real ceiling, and it is not zero.** 200 calls/day
-  × ~6500 output tokens × $25/MTok ≈ **$32/day worst case** if someone with the
-  secret decides to spend it. Over a month that is ~$960. If that is unacceptable,
-  lower `AI_RATE_GLOBAL_DAY` — it is the only number that bounds this.
+- **The global daily cap is the real ceiling, and it is not zero.** 60 calls/day at
+  the most expensive gated route (7500 output tokens) ≈ **$12/day worst case**, or
+  ~$365/month, if someone with the secret decides to spend it. `AI_RATE_GLOBAL_DAY`
+  is the only number that bounds this.
+- **The ceiling counts Claude calls, not HTTP requests** — `aiGuard` takes a `cost`
+  and `/api/watchlist/batch` charges one per queued analysis. This was not true at
+  first: counting requests meant a 60/day ceiling actually authorised ~1,800 calls,
+  because one batch request fans out to 30. Any new endpoint that makes more than
+  one Claude call per request must pass its own `cost`, or it silently reopens the
+  same 30× gap.
+- **Cron spend is on top of the ceiling, not inside it** — see below.
 - **Rate limiting is approximate.** KV has no atomic increment, so the counter is
   read-modify-write and concurrent requests undercount. A burst can overshoot the
   ceiling before the count catches up. It is a ceiling, not a valve.
@@ -478,8 +485,8 @@ In increasing order of effort:
    Worker being correct.
 
 Until one of those is in place, the accurate statement is: *the endpoint is no
-longer an open LLM proxy, and worst-case spend is bounded at roughly $32/day by a
-limiter that a determined attacker can still reach.*
+longer an open LLM proxy, and worst-case request-path spend is bounded at roughly
+$12/day by a limiter that a determined attacker can still reach.*
 
 ## Visual design notes
 

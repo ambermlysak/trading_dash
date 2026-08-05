@@ -157,7 +157,8 @@ the data is past its refresh window.
   Replaced by `POST /api/ai/:type/:ticker`, where the caller names a task and a
   ticker and the prompt is built server-side. Four layers now gate AI spend —
   no passthrough, an origin allowlist, a shared `x-dash-key` secret, and rate
-  limits of 40/IP/hour and 200/day. **None of it is authentication**; read the
+  limits of 40/IP/hour and 60/day (counted in Claude calls, ~$12/day worst case).
+  **None of it is authentication**; read the
   residual-risk section in `ARCHITECTURE.md` before relying on it.
 - **`AI_GATE_SECRET` must be set or every AI endpoint 503s** — the gate fails
   closed on purpose. Set it on the Worker and paste the same value into `DASH_KEY`
