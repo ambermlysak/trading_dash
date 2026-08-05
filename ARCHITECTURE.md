@@ -4,10 +4,12 @@
 
 ```
 stock-research/
-├── index.html        # Single-page dashboard (dark fintech aesthetic, 16 sections)
-├── worker.js         # Cloudflare Worker (Yahoo proxy + Claude API + KV log)
-├── ARCHITECTURE.md   # this file
-└── README.md         # quick start
+├── dashboard.html       # Macro landing view (market, midday, scanner, watchlist, sectors, premium)
+├── index.html           # Per-ticker research page (dark fintech aesthetic, 16 sections)
+├── worker.js            # Cloudflare Worker (Yahoo/SEC/FINRA/FRED proxy + Claude API + KV)
+├── bs-delta.check.mjs   # Black-Scholes delta check — prints computed vs expected, no build step
+├── ARCHITECTURE.md      # this file
+└── README.md            # quick start
 ```
 
 ## How it differs from `dashboard_v10`
@@ -28,13 +30,24 @@ in this codebase and shipped:
    implied vol comes from the options chain via `/api/iv` or not at all.
 2. **Never present a hardcoded or generated number as computed.** Strategy POP and "Hist Win" were
    literal strings (`'72%'`, `'78%'`) rendered in the same style as live figures. If a number is not
-   computed, render `—` and say why on hover.
+   computed, render `—` and say why on hover. POP is now genuinely computed (1 − |Δ| of the short
+   strike, Black-Scholes delta from the Worker) — and **the card states what kind of number it is**:
+   a delta-derived approximation under a lognormal assumption, not a measured frequency. That caption
+   is not decoration. The stat sitting next to it, "Hist Win", is exactly the measured thing POP is
+   not, and it stays blank until a real backtest exists.
 3. **When a source is unavailable, render unavailable with a reason — never a fallback value.**
    IV rank returns `null` plus a `rankReason` below 60 days of history rather than a percentile of HV
    standing in for it. On screen a plausible stand-in is indistinguishable from the real thing.
 4. **Every displayed number carries a source and an as-of timestamp.** "Computed from daily bars" is
    a source; so is "Yahoo `calendarEvents`". A figure whose provenance cannot be stated should not be
-   on the page.
+   on the page. Provenance alone was not enough: a 15-minute-delayed price, a 6-hour-cached P/E and a
+   nightly Claude rating sat in one watchlist row with nothing distinguishing them. So `srcMeta()`
+   also carries `ttlSeconds`, every badge renders **as of HH:MM** from `fetchedAt`, and it turns amber
+   once the age passes the TTL. `delayed` and `stale` are deliberately separate: `delayed` is a
+   property of the *source* (Yahoo is 15 minutes behind however recently we asked), staleness is a
+   property of *our copy*. A badge can be both. Staleness is re-evaluated on a 30-second timer,
+   because a "stale" flag computed only at page load announces itself at the one moment it is least
+   likely to be true.
 5. **A source may only be named by code that actually called it.** Provenance badges are generated
    from the `_meta` a fetch returned, never hand-written in markup. Two had already drifted: one card
    credited FINRA without ever calling it; another read "Sample" while running live data.
@@ -43,10 +56,27 @@ in this codebase and shipped:
 7. **Constants that identify external records get verified, not recalled.** 7 of 18 hand-written
    super-investor CIKs were wrong, several pointing at real but unrelated managers. Same rule killed
    the hardcoded FRED release IDs.
-8. **A metric that requires data the app does not have is not approximated — it is removed.**
+8. **A non-zero-baseline chart is honest only when the baseline is visible.** Scaling a small-range
+   series from zero is its own failure — six short-interest settlements spanning 4% all rendered at
+   the same bar height, costing vertical space to say less than the text beside them. Zero is not a
+   meaningful comparison for short interest or days-to-cover; the shape of the change is the signal.
+   So `sparkline()` scales to the data range — and because a suppressed baseline exaggerates
+   movement, it draws the **min and max on the axis as required elements, not options**. Never ship a
+   truncated axis the reader cannot see.
+9. **A metric that requires data the app does not have is not approximated — it is removed.**
    Opening-range breakout and VWAP were computed from daily bars, which cannot express either;
    they were deleted rather than caveated.
-9. **The same rule applies to what the model is asked for, not just what the code computes.**
+10. **A formula that does not describe the structure is not applied to it.** POP as 1 − |delta| holds
+   for a short strike. For a debit spread or a long straddle the break-even is not the short strike,
+   so the same formula would produce a plausible-looking number measuring nothing at all. Those cards
+   render **n/a** with the reason, not a figure. The temptation is always to fill the cell — a blank
+   looks like a bug and a number looks like work — but a wrong number is the more expensive of the two.
+11. **An input that is unavailable is not defaulted to a convenient value.** Black-Scholes delta needs
+   a risk-free rate. With FRED unreachable and nothing banked, every delta is **suppressed** rather
+   than computed at `r = 0`: that substitution is worth about a full delta point at 30 DTE, which is
+   enough to change which strike the screen selects, and it would be invisible on screen. Same rule as
+   3, applied to an input rather than an output.
+12. **The same rule applies to what the model is asked for, not just what the code computes.**
    The Midday Pulse had a "Day Trade" bucket. No bad calculation sat behind it — but the model was
    being asked for same-session ideas while holding only daily bars and a delayed quote, so any
    entry, stop or intraday timing it emitted was invented. The absence of a bad calculation is not
@@ -67,7 +97,8 @@ For every component in the spec, this table shows what powers it in the **free p
 | 3 | Short interest 6mo MoM | **FINRA** consolidated short interest, 6 settlements (Yahoo estimate as labelled fallback) | **full** | — | **Ortex** ($35–80/mo) for daily |
 | 4 | Insider trades + flags | **SEC EDGAR Form 4** — real transaction codes, prices, post-txn holdings | **full** | — | Verafin / SecForm4.com |
 | 5 | Options volume · V/OI screen | Yahoo chain volume + open interest | **real, but not flow** — no side classification, no sweep detection | **Unusual Whales** ($48/mo) for true flow | Cheddar Flow ($75) + UW |
-| 6 | Recommended option strategies | Computed client-side from RSI + IV regime (`/api/iv`) + analyst upside | **rules-based, full** | OptionStrat API ($) | tastytrade backtest data |
+| 5 | Premium screen (dashboard) | Yahoo chain + `/api/premium` — ATM IV term structure, expected move, 0.30/0.16-delta strikes, ROC | **full** | — | ORATS for a historical IV surface |
+| 6 | Recommended option strategies | Computed client-side from RSI + IV regime (`/api/iv`) + analyst upside; POP from Worker-side Black-Scholes delta | **rules-based, full** | OptionStrat API ($) | tastytrade backtest data |
 | 7 | Day trade signals (ORB, VWAP) | **Removed** — needs intraday bars, was computed from daily | **not shipped** | **Polygon Stocks Starter** ($29) for intraday | Polygon Advanced ($199) |
 | 7 | Swing signals (EMA crossover) | Computed client-side from daily closes | **full** | — | — |
 | 8 | Dark pool 5d volumes | **REMOVED** — was fabricated, no free source exists | **not shipped** | **Unusual Whales** dark pool tab | Cheddar Flow Pro |
@@ -76,6 +107,7 @@ For every component in the spec, this table shows what powers it in the **free p
 | 10 | Super-investor 13F | **SEC EDGAR 13F-HR**, 20 verified manager CIKs, name-based CUSIP mapping | **partial — ~2 in 3 positions map to a ticker** | **WhaleWisdom Premium** ($30/mo) for full CUSIP coverage | Dataroma + WW Pro |
 | 11 | Technical indicators (RSI, MACD, Bollinger, Stoch, CCI, HV30) | Computed client-side from Yahoo OHLC | **full** | Same — local compute is correct | — |
 | 11 | Implied volatility (ATM IV, term structure, IV/HV30) | Yahoo options chain via `/api/iv` | **full** | — | — |
+| 11 | Option greeks (delta) | **Computed** — Black-Scholes in the Worker; Yahoo's chain carries no greeks. Risk-free rate from FRED `DGS3MO` | **full** | — | Broker greeks (tastytrade / IBKR) |
 | 11 | IV rank | Worker-collected daily IV history in KV | **collecting — null until 60 days** | Same | Historical IV surface (ORATS / IVolatility) |
 | 11 | Support/resistance | Local extrema detection (60-bar lookback) | **functional** | TrendSpider API ($) | — |
 | 11 | Chart with patterns + 30d projection | TradingView Lightweight Charts + linear regression | **functional** | Add ML projection via Claude | Quantcast / Aiera |
@@ -170,7 +202,8 @@ All return JSON, all CORS-enabled.
 GET  /api/quote/:ticker           Yahoo quoteSummary (multi-module)
 GET  /api/chart/:ticker           ?range=1y&interval=1d
 GET  /api/options/:ticker         ?date=<unix>
-GET  /api/iv/:ticker              ATM implied vol, term structure, IV rank
+GET  /api/iv/:ticker              ATM implied vol, term structure, IV rank, POP strike ladder
+GET  /api/premium?symbols=        Premium-selling screen: term structure, expected move, delta strikes
 GET  /api/search?q=apple          Ticker search
 GET  /api/news/:ticker            Yahoo news feed
 GET  /api/peers/:ticker           Yahoo recommendationsBySymbol
@@ -222,11 +255,20 @@ These are reasonable next-session targets:
 4. **Backfill of recommendation history** — replay synthesis as-of past dates so the track record card has data on day one.
 5. **Watchlist** — multi-ticker overview that links into the research page.
 6. **Cron-driven auto-refresh** — Cloudflare Cron Triggers wake the Worker nightly to refresh top tickers.
-8. **Strategy POP and Hist Win** — both currently render `—` (rule 2 above; they were hardcoded
-   strings). POP lands with the Premium tab, which already needs Black-Scholes delta off the chain:
-   for a short-strike structure POP ≈ 1 − |delta| of the short strike, and for an iron condor
-   ≈ 1 − (|delta_call| + |delta_put|). Wire these to that delta once it exists. "Hist Win" needs a
-   real backtest of the structure on the underlying — do not ship it before that exists.
+7. ~~**Strategy POP**~~ — **done.** Black-Scholes delta is computed in the Worker (`bsDelta()`) and
+   `/api/iv/:ticker` returns a `pop` strike ladder: real listed strikes, each with a delta from that
+   strike's *own* implied vol. The strategy cards snap their leg to the nearest listed strike and
+   render 1 − |Δ| (both short deltas for the condor). Debit structures show `n/a` — see honesty
+   rule 10.
+8. **"Hist Win"** — still `—`, and still needs a real backtest of the structure on the underlying.
+   Do not ship it before that exists; it is the measured claim POP is not, and the two sit side by
+   side precisely so the difference is visible.
+9. **A real backtest engine** — what would fill Hist Win. Needs historical option chains (ORATS /
+   IVolatility), which none of the free sources carry.
+10. **Two `setBadge()` implementations.** `index.html` and `dashboard.html` each carry one, byte-for-byte
+   equivalent. There is no build step and no module system, so the alternatives were a duplicated
+   function or a third HTTP request for a shared script. If a bundler ever arrives, unify these first —
+   they are the most drift-prone duplication left in the repo.
 
 ---
 

@@ -364,10 +364,51 @@ const err = (msg, status = 500, origin = '') => json({ error: msg }, status, ori
  * data — and a hand-written string cannot help drifting, because nothing ties
  * it to the code that fetches. A card that never called a source now has no way
  * to name it.
+ *
+ * `ttlSeconds` is how long this payload is meant to stay good — the cache TTL for
+ * a cached endpoint, the refresh interval for a live one. The UI renders "as of
+ * HH:MM" from `fetchedAt` and flips the badge amber once the age passes it, which
+ * is the only thing separating a 15-minute-delayed quote from a 6-hour-old P/E
+ * and a nightly Claude rating when all three sit in the same row.
+ *
+ * `delayed` says the *source* is not real-time (Yahoo's 15 minutes); staleness is
+ * about our own copy. They are different failures and both need saying.
  */
-const srcMeta = (source, { ok = true, delayed = false, note = null, asOf = null } = {}) => ({
-  source, ok, delayed, note, asOf, fetchedAt: new Date().toISOString(),
+const srcMeta = (source, {
+  ok = true, delayed = false, note = null, asOf = null, ttlSeconds = null,
+} = {}) => ({
+  source, ok, delayed, note, asOf, ttlSeconds, fetchedAt: new Date().toISOString(),
 });
+
+/** The `?cached=1` answer when nothing has been banked yet: an explicitly empty
+ *  payload the UI can render as "loading" rather than as "no results". */
+const emptySnapshot = (source, ttlSeconds) => ({
+  empty: true, ts: null,
+  _meta: srcMeta(source, { ok: false, ttlSeconds, note: 'no snapshot banked yet — refreshing' }),
+});
+
+/* Delay/TTL constants, so a card and the handler feeding it cannot disagree. */
+const YAHOO_DELAY_NOTE = '15-min delayed';
+const TTL = {
+  quote:    60,        // live-ish price; Yahoo itself is 15 min behind
+  chart:    300,
+  chain:    900,       // option quotes move, but not faster than the 15-min delay
+  iv:       900,
+  premium:  900,
+  news:     900,
+  fund:     6 * 3600,
+  insider:  12 * 3600,
+  short:    6 * 3600,
+  thirteenF: 7 * 24 * 3600,
+  econ:     12 * 3600,
+  daily:    24 * 3600,
+  sectors:  4 * 3600,
+  scanner:  90,
+  golden:   3600,
+  ipos:     12 * 3600,
+  earnings: 12 * 3600,
+  track:    3600,
+};
 
 /* ── Yahoo Finance (no-auth) ── */
 async function yahoo(path, search = '') {
@@ -411,10 +452,10 @@ function extractCookie(rawSetCookie, ...names) {
 
 async function getYahooCrumb(env) {
   const now = Date.now();
-  const TTL = 3_000_000; // 50 minutes
+  const CRUMB_TTL = 3_000_000; // 50 minutes
 
   // Fast path — no await needed
-  if (_crumbCache && _crumbCache.ts > now - TTL) return _crumbCache;
+  if (_crumbCache && _crumbCache.ts > now - CRUMB_TTL) return _crumbCache;
 
   // Dedup: if another concurrent call is already fetching, piggyback on it
   if (_crumbInflight) return _crumbInflight;
@@ -424,7 +465,7 @@ async function getYahooCrumb(env) {
       // KV cache
       try {
         const kv = await env?.REC_LOG?.get('yahoo:crumb', 'json');
-        if (kv && kv.ts > Date.now() - TTL) { _crumbCache = kv; return _crumbCache; }
+        if (kv && kv.ts > Date.now() - CRUMB_TTL) { _crumbCache = kv; return _crumbCache; }
       } catch (_) {}
 
       let crumb = null;
@@ -819,6 +860,15 @@ async function handleQuote(ticker, origin, env) {
     }
   }
 
+  // Alpaca is a real-time feed; Yahoo is 15 minutes behind. The badge has to be
+  // able to tell them apart, because on the page they land in the same field.
+  const priced = alpacaRes.status === 'fulfilled';
+  data._meta = srcMeta(priced ? 'Alpaca + Yahoo Finance' : 'Yahoo Finance', {
+    ok: yahooRes.status === 'fulfilled' || chartRes.status === 'fulfilled',
+    delayed: !priced,
+    ttlSeconds: TTL.quote,
+    note: priced ? 'price real-time · fundamentals 15-min delayed' : YAHOO_DELAY_NOTE,
+  });
   return json(data, 200, origin);
 }
 
@@ -829,6 +879,9 @@ async function handleChart(ticker, params, origin) {
     `/v8/finance/chart/${ticker}`,
     `?range=${range}&interval=${interval}&includePrePost=false`,
   );
+  data._meta = srcMeta('Yahoo Finance', {
+    delayed: true, ttlSeconds: TTL.chart, note: `${range}/${interval} · ${YAHOO_DELAY_NOTE}`,
+  });
   return json(data, 200, origin);
 }
 
@@ -837,140 +890,411 @@ async function handleOptions(ticker, params, origin, env) {
   const search = date ? `?date=${date}` : '';
   try {
     const data = await yahooAuth(`/v7/finance/options/${ticker}`, search, env);
+    data._meta = srcMeta('Yahoo options chain', {
+      delayed: true, ttlSeconds: TTL.chain, note: YAHOO_DELAY_NOTE,
+    });
     return json(data, 200, origin);
   } catch (e) {
     // Ticker may have no listed options — return empty chain instead of 500
-    return json({ optionChain: { result: [], error: e.message } }, 200, origin);
+    return json({
+      optionChain: { result: [], error: e.message },
+      _meta: srcMeta('Yahoo options chain', { ok: false, ttlSeconds: TTL.chain, note: e.message }),
+    }, 200, origin);
   }
 }
 
-async function handleOptionsRecap(params, origin, env, ctx) {
-  const symbolsParam = params.get('symbols') || '';
-  const force   = params.get('refresh') === '1';
-  const symbols = symbolsParam.split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 25);
+/* ═══════════════════════════════════════════════════════════════════════════
+   PREMIUM-SELLING SCREEN  (/api/premium)
+
+   Replaces the old options recap, which surfaced the nearest expiration filtered
+   to volume/OI ≥ 2×. That view answers "what traded today", and at the nearest
+   expiration the answer is mostly 0DTE and expiry-week churn — the wrong
+   question for anyone selling 20–45 DTE premium against earnings dates.
+
+   What this returns per ticker: where implied vol sits relative to its own
+   history, what the chain implies the stock can move by front expiry, when
+   earnings lands relative to that, and the strikes a premium seller would
+   actually consider — at a real delta, computed here, with the bid actually
+   quoted against them.
+
+   Two candidate expiries, because they answer different questions:
+     • `clean`  — first monthly ≥ PREM_MIN_DTE with no earnings inside it. Vol
+                  decay with no event risk.
+     • `post`   — first monthly expiring after the earnings date. This one holds
+                  the print, so it carries the crush and the gap risk together.
+   When earnings falls before the first monthly ≥ 21 DTE the two collapse into
+   one expiry, and the row says so rather than printing a duplicate.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const PREM_TTL_MS      = 900_000;        // 15 min — the chain is 15-min delayed anyway
+const PREM_MIN_DTE     = 21;             // "20–45 DTE": first monthly at least this far out
+const PREM_TARGETS     = [0.30, 0.16];   // the two short-strike deltas this screen selects
+const PREM_MAX_SYMBOLS = 30;
+const PREM_SCHEMA      = 1;              // bump when the row shape changes, to retire caches
+
+/** Next *scheduled* earnings date as ISO, or null.
+ *  Same field the watchlist's Earnings column reads, deliberately — two tabs
+ *  quoting different earnings dates for one ticker is a bug the user would find
+ *  before we did. Yahoo sometimes leaves a past report in here, so anything not
+ *  in the future is discarded rather than shown as upcoming. */
+function nextEarningsIso(qsResult) {
+  const raw = qsResult?.calendarEvents?.earnings?.earningsDate?.[0]?.raw;
+  if (!Number.isFinite(raw)) return null;
+  const iso = new Date(raw * 1000).toISOString().slice(0, 10);
+  return iso >= etToday() ? iso : null;
+}
+
+/**
+ * IV rank from a stored history. Factored out so `/api/iv` and `/api/premium`
+ * cannot drift into two different definitions of the same number.
+ * Below IV_RANK_MIN_DAYS the rank is null and carries a reason — never a
+ * percentile of HV standing in for it.
+ */
+function ivRankFrom(history, currentIv) {
+  const historyDays = history.length;
+  if (historyDays < IV_RANK_MIN_DAYS) {
+    return {
+      ivRank: null, historyDays,
+      rankReason: `collecting — ${historyDays}/${IV_RANK_TARGET_DAYS}d (rank needs ${IV_RANK_MIN_DAYS})`,
+    };
+  }
+  const min = Math.min(...history), max = Math.max(...history);
+  return {
+    ivRank: max === min ? 0 : +((currentIv - min) / (max - min)).toFixed(4),
+    historyDays, rankReason: null,
+  };
+}
+
+/**
+ * The 0.30- and 0.16-delta put and call for one expiry.
+ *
+ * Only OTM strikes are considered: a short strike for premium selling is OTM by
+ * definition, and without that filter a sparse chain can hand back an ITM strike
+ * whose |delta| happens to sit nearer the target.
+ *
+ * ROC uses the cash-secured denominator the screen is specified on —
+ * credit / (strike × 100 − credit) — for both sides. On the put that is literal
+ * collateral. On the call it is the equivalent naked-margin basis, not the cost
+ * of the shares in a covered call; the card says so, because the same number
+ * under two different capital bases would not be comparable.
+ */
+function pickCandidates(chainExp, spot, rate, expUnix) {
+  const dte = dteOf(expUnix);
+  if (!(dte > 0) || !Number.isFinite(spot) || !Number.isFinite(rate)) return [];
+  const tYears = dte / 365;
+
+  const build = (list, type) => (list || [])
+    .filter(o =>
+      Number.isFinite(o?.strike) &&
+      Number.isFinite(o?.impliedVolatility) && o.impliedVolatility > 0 &&
+      (type === 'call' ? o.strike >= spot : o.strike <= spot))
+    .map((o) => {
+      const delta = bsDelta({ spot, strike: o.strike, tYears, vol: o.impliedVolatility, rate, type });
+      if (delta == null) return null;
+      // Credit is the bid, not the mid: it is what a seller can actually hit.
+      const bid    = Number.isFinite(o.bid) && o.bid > 0 ? o.bid : null;
+      const credit = bid == null ? null : +(bid * 100).toFixed(2);
+      const collateral = o.strike * 100;
+      const roc  = credit == null || collateral <= credit ? null : credit / (collateral - credit);
+      const aroc = roc == null ? null : roc * 365 / dte;
+      return {
+        type: type.toUpperCase(),
+        strike: o.strike,
+        delta: +delta.toFixed(4),
+        iv: +(o.impliedVolatility * 100).toFixed(2),
+        bid, credit,
+        openInterest: o.openInterest ?? null,
+        volume: o.volume ?? null,
+        roc:  roc  == null ? null : +roc.toFixed(6),
+        aroc: aroc == null ? null : +aroc.toFixed(6),
+        otmPct: +(Math.abs(o.strike / spot - 1) * 100).toFixed(2),
+      };
+    })
+    .filter(Boolean);
+
+  const calls = build(chainExp?.calls, 'call');
+  const puts  = build(chainExp?.puts,  'put');
+  const nearest = (arr, target) => arr.reduce((best, o) =>
+    best == null || Math.abs(Math.abs(o.delta) - target) < Math.abs(Math.abs(best.delta) - target)
+      ? o : best, null);
+
+  const out  = [];
+  const seen = new Set();
+  for (const target of PREM_TARGETS) {
+    for (const arr of [puts, calls]) {
+      const hit = nearest(arr, target);
+      if (!hit) continue;
+      const id = `${hit.type}:${hit.strike}`;
+      // A chain too sparse to offer distinct 0.30 and 0.16 strikes would otherwise
+      // print the same contract twice and read as a rendering bug.
+      if (seen.has(id)) { out.find(c => `${c.type}:${c.strike}` === id).sparse = true; continue; }
+      seen.add(id);
+      out.push({ ...hit, targetDelta: target, sparse: false });
+    }
+  }
+  return out;
+}
+
+/** One screen row. Never throws — a failed ticker reports why and the sweep continues. */
+async function premiumRow(sym, rate, hv30, env) {
+  const fail = reason => ({ symbol: sym, ok: false, reason, legs: [], bestAroc: null });
+
+  let base;
+  try {
+    base = await yahooAuth(`/v7/finance/options/${encodeURIComponent(sym)}`, '', env);
+  } catch (e) { return fail(`options chain unavailable: ${e.message}`); }
+
+  const res  = base?.optionChain?.result?.[0];
+  const spot = res?.quote?.regularMarketPrice;
+  const exps = (res?.expirationDates || []).slice().sort((a, b) => a - b);
+  if (!res || !Number.isFinite(spot) || !exps.length) return fail('no listed options');
+
+  // Earnings is a separate module; a failure here costs the earnings flag and the
+  // post-earnings leg, not the whole row.
+  let earnIso = null, earnErr = null;
+  try {
+    const qs = await yahooAuth(
+      `/v10/finance/quoteSummary/${encodeURIComponent(sym)}`, '?modules=calendarEvents', env);
+    earnIso = nextEarningsIso(qs?.quoteSummary?.result?.[0]);
+  } catch (e) { earnErr = e.message; }
+
+  // The base response already carries one expiry's strikes — reuse it when it matches.
+  const loaded = new Map();
+  if (res.options?.[0]?.expirationDate) loaded.set(res.options[0].expirationDate, res.options[0]);
+  const chainFor = async (exp) => {
+    if (exp == null) return null;
+    if (loaded.has(exp)) return loaded.get(exp);
+    try {
+      const d = await yahooAuth(
+        `/v7/finance/options/${encodeURIComponent(sym)}`, `?date=${exp}`, env);
+      const c = d?.optionChain?.result?.[0]?.options?.[0] || null;
+      if (c) loaded.set(exp, c);
+      return c;
+    } catch (_) { return null; }
+  };
+
+  // Front/back match /api/iv exactly, so the two endpoints cannot disagree about
+  // this ticker's term structure.
+  const frontExp = exps.find(e => dteOf(e) >= IV_MIN_DTE) ?? exps[exps.length - 1];
+  const backExp  = exps.find(e => e > frontExp && isMonthlyExpiry(e)) ?? null;
+
+  const monthlies = exps.filter(isMonthlyExpiry);
+  // earnIso is already known to be today or later, so "inside this expiry" is
+  // just "on or before the expiration date".
+  const holdsEarnings = e => earnIso != null && earnIso <= expiryIso(e);
+  const cleanExp = monthlies.find(e => dteOf(e) >= PREM_MIN_DTE && !holdsEarnings(e)) ?? null;
+  const postExp  = earnIso ? (monthlies.find(e => expiryIso(e) > earnIso) ?? null) : null;
+
+  // Sequential: chainFor dedupes through `loaded`, which concurrent calls would defeat.
+  const frontChain = await chainFor(frontExp);
+  const backChain  = await chainFor(backExp);
+  const cleanChain = await chainFor(cleanExp);
+  const postChain  = await chainFor(postExp);
+
+  const frontIv = frontChain ? atmIvFor(frontChain, spot) : null;
+  const backIv  = backChain  ? atmIvFor(backChain,  spot) : null;
+  if (!frontIv) return fail('no usable implied vol on the front expiry');
+
+  const frontDte = dteOf(frontExp);
+  const snap = {
+    spot: +spot.toFixed(4),
+    front: { expiry: expiryIso(frontExp), dte: frontDte, atmIv: frontIv.atmIv, strike: frontIv.strike },
+    back: backIv
+      ? { expiry: expiryIso(backExp), dte: dteOf(backExp), atmIv: backIv.atmIv, strike: backIv.strike }
+      : null,
+  };
+
+  // Bank the reading before ranking, so today sits inside its own window. This
+  // screen sweeping the whole watchlist is now a second collector for the history
+  // that IV rank — the thing gating this entire tab — is waiting on.
+  try { await recordIvSample(sym, snap, env); }
+  catch (e) { console.warn(`[premium] ${sym} iv sample write failed:`, e.message); }
+
+  const history = await ivHistory(sym, env).catch(() => []);
+  const { ivRank, historyDays, rankReason } = ivRankFrom(history, frontIv.atmIv);
+
+  const ivHvRatio = Number.isFinite(hv30) && hv30 > 0 ? +(frontIv.atmIv / hv30).toFixed(3) : null;
+  const regime = volRegime({ ivRank, ivHvRatio, historyDays, rankTargetDays: IV_RANK_TARGET_DAYS });
+
+  // Expected move through front expiry: spot × IV × √(dte/365), the one-sigma
+  // move the chain is pricing. IV is carried in percent here, hence the /100.
+  const emPct     = (frontIv.atmIv / 100) * Math.sqrt(frontDte / 365) * 100;
+  const emDollars = spot * emPct / 100;
+
+  const termStructure = (frontIv && backIv) ? +(frontIv.atmIv - backIv.atmIv).toFixed(2) : null;
+
+  const legFor = (exp, chain, kind) => {
+    if (exp == null) return null;
+    if (!chain) return { kind, expiry: expiryIso(exp), dte: dteOf(exp), holdsEarnings: holdsEarnings(exp),
+                         candidates: [], reason: 'expiry chain did not load' };
+    return {
+      kind, expiry: expiryIso(exp), dte: dteOf(exp),
+      holdsEarnings: holdsEarnings(exp),
+      candidates: Number.isFinite(rate) ? pickCandidates(chain, spot, rate, exp) : [],
+      reason: Number.isFinite(rate) ? null : 'no risk-free rate — deltas suppressed',
+    };
+  };
+
+  const legs = [];
+  if (cleanExp != null && cleanExp === postExp) {
+    // Earnings already sits before the first monthly ≥ 21 DTE, so one expiry is
+    // both the clean one and the first one after the print.
+    const leg = legFor(cleanExp, cleanChain, 'clean+post');
+    if (leg) legs.push(leg);
+  } else {
+    const a = legFor(cleanExp, cleanChain, 'clean');
+    const b = legFor(postExp,  postChain,  'post');
+    if (a) legs.push(a);
+    if (b) legs.push(b);
+  }
+
+  // A missing clean leg is a finding, not a gap: when the next print lands inside
+  // 21 DTE, every monthly from here spans it and there is no earnings-free expiry
+  // to sell. Absent rows read as missing data, so the row says which it is.
+  const cleanMissing = cleanExp == null
+    ? (earnIso
+        ? `no earnings-free monthly ≥ ${PREM_MIN_DTE} DTE — the ${isoLabel(earnIso)} print falls inside every one`
+        : `no monthly expiry ≥ ${PREM_MIN_DTE} DTE is listed`)
+    : null;
+
+  const allCands = legs.flatMap(l => l.candidates);
+  const arocs    = allCands.map(c => c.aroc).filter(Number.isFinite);
+  const bestAroc = arocs.length ? Math.max(...arocs) : null;
+
+  return {
+    symbol: sym,
+    ok: true,
+    spot: +spot.toFixed(2),
+    front: snap.front,
+    back:  snap.back,
+    termStructure,
+    // Front IV richer than back = backwardation, the earnings-crush setup. The
+    // sign convention is stated on the card: with termStructure = front − back
+    // that condition is POSITIVE, which is the opposite of how it is often said
+    // aloud ("negative term structure").
+    backwardation: termStructure != null && termStructure > 0,
+    expectedMove: {
+      pct: +emPct.toFixed(2),
+      dollars: +emDollars.toFixed(2),
+      dte: frontDte,
+      expiry: expiryIso(frontExp),
+    },
+    earnings: earnIso
+      ? {
+          iso: earnIso,
+          daysAway: Math.round((Date.parse(earnIso + 'T00:00:00Z') - Date.parse(etToday() + 'T00:00:00Z')) / 86_400_000),
+          insideFront: earnIso <= expiryIso(frontExp),
+          source: 'Yahoo calendarEvents',
+        }
+      : { iso: null, reason: earnErr ? `earnings lookup failed: ${earnErr}` : 'no scheduled earnings date from Yahoo' },
+    hv30: Number.isFinite(hv30) ? hv30 : null,
+    ivHvRatio,
+    ivRank, historyDays, rankReason,
+    rankTargetDays: IV_RANK_TARGET_DAYS,
+    regime,
+    // Dimmed, never hidden: a low-IV name should look unattractive rather than
+    // vanish, so the absence of candidates is visibly a judgement and not a gap.
+    sellable: ivRank != null && ivRank * 100 >= IVR_SELL_MIN,
+    legs,
+    cleanMissing,
+    bestAroc,
+  };
+}
+
+async function handlePremium(params, origin, env, ctx) {
+  const symbols = (params.get('symbols') || '')
+    .split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, PREM_MAX_SYMBOLS);
   if (!symbols.length) return err('symbols required', 400, origin);
 
-  const cacheKey = `options:recap:${symbols.slice().sort().join(',')}`;
+  const force      = params.get('refresh') === '1';
+  const cachedOnly = params.get('cached')  === '1';
+  const cacheKey   = `premium:${symbols.slice().sort().join(',')}`;
 
-  if (!force) {
-    try {
-      const cached = await env?.REC_LOG?.get(cacheKey, 'json');
-      if (cached && Date.now() - cached.ts < 7_200_000) return json(cached, 200, origin);
-    } catch (_) {}
-  }
+  let cached = null;
+  try { cached = await env?.REC_LOG?.get(cacheKey, 'json'); } catch (_) {}
+  if (cached && cached.schema !== PREM_SCHEMA) cached = null;
 
-  // Fetch nearest-expiration chain for each symbol in batches of 5
-  // yahooAuth provides the crumb+cookie that Yahoo v7 now requires
-  const rawResults = [];
-  for (let i = 0; i < symbols.length; i += 5) {
-    const batch = await Promise.allSettled(
-      symbols.slice(i, i + 5).map(sym => yahooAuth(`/v7/finance/options/${sym}`, '', env)),
-    );
-    rawResults.push(...batch);
-  }
-  const failCount = rawResults.filter(r => r.status === 'rejected').length;
-  if (failCount > 0) console.warn(`[options recap] ${failCount}/${symbols.length} chains failed`);
-
-  const fmtNotional = n => n >= 1e6 ? '$' + (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? '$' + (n/1e3).toFixed(0) + 'K' : '$' + n;
-
-  const tickers = [];
-  for (let i = 0; i < symbols.length; i++) {
-    const sym = symbols[i];
-    if (rawResults[i].status !== 'fulfilled') continue;
-    const chain = rawResults[i].value?.optionChain?.result?.[0];
-    if (!chain) continue;
-
-    const price = chain.quote?.regularMarketPrice ?? null;
-    let totalCallVol = 0, totalPutVol = 0, totalCallOI = 0, totalPutOI = 0;
-    const unusual = [];
-
-    for (const exp of (chain.options || [])) {
-      const expDte = exp.expirationDate
-        ? Math.max(0, Math.round((exp.expirationDate * 1000 - Date.now()) / 86400000))
-        : null;
-
-      for (const c of (exp.calls || [])) {
-        const vol = c.volume ?? 0;
-        const oi  = c.openInterest ?? 0;
-        totalCallVol += vol;
-        totalCallOI  += oi;
-        const mid = c.bid > 0 && c.ask > 0 ? (c.bid + c.ask) / 2 : c.lastPrice ?? 0;
-        const notional = Math.round(vol * mid * 100);
-        const voi = oi > 0 ? vol / oi : (vol > 0 ? 99 : 0);
-        if (vol >= 100 && voi >= 2 && notional > 0 && (expDte == null || expDte >= 5))
-          unusual.push({ type: 'CALL', strike: c.strike, dte: expDte, vol, oi, volOiRatio: +voi.toFixed(1), notional });
-      }
-      for (const p of (exp.puts || [])) {
-        const vol = p.volume ?? 0;
-        const oi  = p.openInterest ?? 0;
-        totalPutVol += vol;
-        totalPutOI  += oi;
-        const mid = p.bid > 0 && p.ask > 0 ? (p.bid + p.ask) / 2 : p.lastPrice ?? 0;
-        const notional = Math.round(vol * mid * 100);
-        const voi = oi > 0 ? vol / oi : (vol > 0 ? 99 : 0);
-        if (vol >= 100 && voi >= 2 && notional > 0 && (expDte == null || expDte >= 5))
-          unusual.push({ type: 'PUT', strike: p.strike, dte: expDte, vol, oi, volOiRatio: +voi.toFixed(1), notional });
-      }
+  // Stale-while-revalidate: `cached=1` returns whatever is banked without ever
+  // rebuilding, so a tab can paint instantly and refresh behind itself.
+  if (cachedOnly) {
+    if (!cached) {
+      return json({
+        rows: [], symbols, schema: PREM_SCHEMA, empty: true, ts: null,
+        _meta: srcMeta('Yahoo options chain', {
+          ok: false, ttlSeconds: PREM_TTL_MS / 1000,
+          note: 'no snapshot banked yet — refreshing',
+        }),
+      }, 200, origin);
     }
-
-    tickers.push({
-      symbol: sym, price,
-      totalCallVol, totalPutVol, totalCallOI, totalPutOI,
-      pcRatio:   totalCallVol > 0 ? +(totalPutVol / totalCallVol).toFixed(2) : null,
-      pcOiRatio: totalCallOI  > 0 ? +(totalPutOI  / totalCallOI ).toFixed(2) : null,
-      unusual: unusual.sort((a, b) => b.notional - a.notional).slice(0, 3),
-    });
+    return json(cached, 200, origin);
   }
 
-  // Claude synthesis
-  let synthesis = null;
-  if (env?.ANTHROPIC_API_KEY && tickers.length > 0) {
-    const lines = tickers.map(t => {
-      const top = t.unusual.slice(0, 2)
-        .map(u => `${u.vol} ${u.type}s $${u.strike} ${u.dte}d (${u.volOiRatio}× V/OI, ${fmtNotional(u.notional)})`)
-        .join('; ');
-      return `${t.symbol} $${t.price?.toFixed(2) ?? '?'}: calls ${t.totalCallVol} puts ${t.totalPutVol} P/C ${t.pcRatio ?? 'N/A'} P/C-OI ${t.pcOiRatio ?? 'N/A'}` +
-        (top ? ` | unusual: ${top}` : '');
-    }).join('\n');
-
-    const prompt = `You are an options market analyst. Review today's options flow for this watchlist (nearest expiration, 15-min delay). Unusual activity already filtered to DTE ≥ 5:
-
-${lines}
-
-Return ONLY valid JSON (no markdown):
-{
-  "overall": "2-sentence summary of collective options tone and any cross-ticker themes",
-  "tickers": {
-    "SYMBOL": "2-3 sentences: where call/put activity concentrated, what unusual prints imply, near-term directional read from the flow"
-  },
-  "strategies": {
-    "SYMBOL": [
-      {
-        "name": "Strategy name (e.g. Long Call, Bull Call Spread, Cash-Secured Put, Covered Call, Long Put, Iron Condor, Bear Put Spread)",
-        "strikes": "Strike or strikes (e.g. $150 or $150/$160 spread)",
-        "expiration": "Expiration date (e.g. Jun 20 '25)",
-        "confidence": 75,
-        "rationale": "1 sentence on why this strategy fits the current flow and price action"
-      }
-    ]
-  }
-}
-Only include ticker keys that appear in the data above. Max 2 strategies per ticker. Confidence is 0–100. Match strategy direction to flow signal: bullish flow → call strategies, bearish → put strategies, neutral/high IV → spreads or condors. Be specific about strikes relative to current price.`;
-
-    try {
-      const text    = await workerClaude(prompt, env, 2500);
-      const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
-      synthesis = JSON.parse(cleaned);
-    } catch (e) {
-      console.error('[options recap] synthesis failed:', e.message);
-    }
+  if (!force && cached && Date.now() - (cached.ts || 0) < PREM_TTL_MS) {
+    return json(cached, 200, origin);
   }
 
-  const result = { tickers, synthesis, ts: Date.now() };
-  if (ctx) ctx.waitUntil(
-    env?.REC_LOG?.put(cacheKey, JSON.stringify(result), { expirationTtl: 7200 }).catch(() => {}),
-  );
-  return json(result, 200, origin);
+  await getYahooCrumb(env).catch(() => {});
+
+  // One rate for the whole sweep. Null means FRED gave us nothing and has nothing
+  // banked — every delta is then suppressed rather than computed at r = 0, which
+  // is a 1-point delta error at 30 DTE, not a neutral default.
+  const rate = await riskFreeRate(env);
+
+  // HV30 for the ratio proxy: close-only, 20 symbols per request, no crumb — two
+  // subrequests for a whole watchlist instead of one per ticker.
+  const closesBySymbol = await yahooSparkCloses(symbols, '3mo').catch(() => new Map());
+  const hvBySymbol = new Map();
+  for (const [sym, closes] of closesBySymbol) hvBySymbol.set(sym, historicalVol(closes, IV_HV_WINDOW));
+
+  const rows = [];
+  const CHUNK = 4;
+  for (let i = 0; i < symbols.length; i += CHUNK) {
+    const settled = await Promise.allSettled(symbols.slice(i, i + CHUNK).map(
+      sym => premiumRow(sym, rate.rate, hvBySymbol.get(sym), env),
+    ));
+    settled.forEach((r, j) => rows.push(
+      r.status === 'fulfilled'
+        ? r.value
+        : { symbol: symbols[i + j], ok: false, reason: r.reason?.message || 'row failed', legs: [], bestAroc: null },
+    ));
+  }
+
+  // Best annualised ROC on the row decides the order — a row carries up to four
+  // candidates per expiry and the screen ranks by the best one available.
+  rows.sort((a, b) => {
+    if (a.bestAroc == null && b.bestAroc == null) return a.symbol.localeCompare(b.symbol);
+    if (a.bestAroc == null) return 1;
+    if (b.bestAroc == null) return -1;
+    return b.bestAroc - a.bestAroc;
+  });
+
+  const okCount = rows.filter(r => r.ok).length;
+  const payload = {
+    rows,
+    symbols,
+    schema: PREM_SCHEMA,
+    ts: Date.now(),
+    minDte: PREM_MIN_DTE,
+    targetDeltas: PREM_TARGETS,
+    gates: REGIME_GATES,
+    rate: {
+      value: rate.rate, pct: rate.pct ?? null, asOf: rate.asOf ?? null,
+      source: rate.rate != null ? 'FRED DGS3MO' : null,
+      stale: !!rate.stale, reason: rate.reason || null,
+    },
+    _meta: srcMeta('Yahoo options chain', {
+      delayed: true,
+      ttlSeconds: PREM_TTL_MS / 1000,
+      note: `${okCount}/${symbols.length} chains · deltas Black-Scholes`
+          + (rate.rate != null ? ` at r=${(rate.rate * 100).toFixed(2)}%` : ' suppressed — no risk-free rate')
+          + ` · ${YAHOO_DELAY_NOTE}`,
+    }),
+  };
+
+  const write = env?.REC_LOG?.put(cacheKey, JSON.stringify(payload), { expirationTtl: 7200 })
+    ?.catch(() => {});
+  if (ctx && write) ctx.waitUntil(write);
+  return json(payload, 200, origin);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1058,7 +1382,7 @@ function historicalVol(closes, period = IV_HV_WINDOW) {
  * Costs one chain fetch when the base response already carries the front expiry,
  * plus one per expiry it does not.
  */
-async function ivSnapshot(ticker, env) {
+async function ivSnapshot(ticker, env, { withLadder = false, rate = null } = {}) {
   const base = await yahooAuth(`/v7/finance/options/${encodeURIComponent(ticker)}`, '', env);
   const res  = base?.optionChain?.result?.[0];
   if (!res) return null;
@@ -1089,12 +1413,24 @@ async function ivSnapshot(ticker, env) {
   const backIv     = backChain  ? atmIvFor(backChain,  spot) : null;
   if (!frontIv) return null;
 
+  // Only the research page needs the strike ladder; the cron sweep would pay an
+  // extra chain fetch per ticker for something it never reads.
+  let pop = null;
+  if (withLadder && Number.isFinite(rate)) {
+    const popExp = exps.reduce((best, e) =>
+      best == null || Math.abs(dteOf(e) - IV_POP_TARGET_DTE) < Math.abs(dteOf(best) - IV_POP_TARGET_DTE)
+        ? e : best, null);
+    const popChain = await chainFor(popExp);
+    if (popChain) pop = popLadder(popChain, spot, rate, popExp);
+  }
+
   return {
     spot: +spot.toFixed(4),
     front: { expiry: expiryIso(frontExp), dte: dteOf(frontExp), atmIv: frontIv.atmIv, strike: frontIv.strike },
     back: backIv
       ? { expiry: expiryIso(backExp), dte: dteOf(backExp), atmIv: backIv.atmIv, strike: backIv.strike }
       : null,
+    pop,
   };
 }
 
@@ -1144,11 +1480,56 @@ async function ivHistory(ticker, env) {
   return out;
 }
 
+/* ── Strike ladder for POP ────────────────────────────────────────────────────
+   The strategy cards on the research page quote legs as a percentage of spot
+   ("sell the 0.92× put"). A probability of profit attached to a strike that does
+   not exist, priced off ATM IV rather than the strike's own IV, would be a
+   decorative number — puts carry meaningful skew, so a 0.92× put's real IV is
+   several points above ATM and its delta with it.
+
+   So the ladder returns real listed strikes with each strike's own IV and a
+   delta computed from it. The page snaps its leg to the nearest listed strike
+   and reads the delta off this, which is why the card can print a strike you
+   could actually trade next to a POP that belongs to it.
+
+   Expiry is the listed one closest to 35 DTE — the middle of the 30–45 DTE band
+   those cards are written for. */
+const IV_POP_TARGET_DTE = 35;
+const IV_POP_BAND       = 0.35;   // keep strikes within ±35% of spot
+
+function popLadder(chainExp, spot, rate, expUnix) {
+  const dte = dteOf(expUnix);
+  if (!(dte > 0) || !Number.isFinite(spot) || !Number.isFinite(rate)) return null;
+  const tYears = dte / 365;
+
+  const byStrike = new Map();
+  const add = (list, type) => {
+    for (const o of (list || [])) {
+      if (!Number.isFinite(o?.strike) || !Number.isFinite(o?.impliedVolatility) || o.impliedVolatility <= 0) continue;
+      if (Math.abs(o.strike / spot - 1) > IV_POP_BAND) continue;
+      const d = bsDelta({ spot, strike: o.strike, tYears, vol: o.impliedVolatility, rate, type });
+      if (d == null) continue;
+      const row = byStrike.get(o.strike) || { strike: o.strike };
+      row[type === 'put' ? 'putDelta' : 'callDelta'] = +d.toFixed(4);
+      row[type === 'put' ? 'putIv'    : 'callIv']    = +(o.impliedVolatility * 100).toFixed(2);
+      row[type === 'put' ? 'putBid'   : 'callBid']   = Number.isFinite(o.bid) && o.bid > 0 ? o.bid : null;
+      byStrike.set(o.strike, row);
+    }
+  };
+  add(chainExp?.calls, 'call');
+  add(chainExp?.puts,  'put');
+
+  const strikes = [...byStrike.values()].sort((a, b) => a.strike - b.strike);
+  if (!strikes.length) return null;
+  return { expiry: expiryIso(expUnix), dte, strikes };
+}
+
 async function handleIv(ticker, params, origin, env, ctx) {
   if (!ticker) return err('ticker required', 400, origin);
   const sym = ticker.toUpperCase();
 
-  const snap = await ivSnapshot(sym, env);
+  const rate = await riskFreeRate(env);
+  const snap = await ivSnapshot(sym, env, { withLadder: true, rate: rate.rate });
 
   // HV30 is independent of the chain, so it is still worth returning when a
   // ticker has no listed options — the UI needs to tell "no IV" apart from "no data".
@@ -1167,7 +1548,15 @@ async function handleIv(ticker, params, origin, env, ctx) {
       ivRank: null, historyDays: 0,
       rankMinDays: IV_RANK_MIN_DAYS, rankTargetDays: IV_RANK_TARGET_DAYS,
       rankReason: 'no usable options chain — no implied-vol reading',
+      regime: volRegime(null),
+      gates: REGIME_GATES,
+      pop: null,
+      rate: { value: rate.rate, asOf: rate.asOf ?? null, stale: !!rate.stale, reason: rate.reason || null },
       units: 'percent',
+      _meta: srcMeta('Yahoo options chain', {
+        ok: false, delayed: true, ttlSeconds: TTL.iv,
+        note: 'no usable options chain',
+      }),
     }, 200, origin);
   }
 
@@ -1175,18 +1564,12 @@ async function handleIv(ticker, params, origin, env, ctx) {
   try { await recordIvSample(sym, snap, env); }
   catch (e) { console.warn('[iv] sample write failed:', e.message); }
 
-  const history     = await ivHistory(sym, env);
-  const historyDays = history.length;
-
   // Below IV_RANK_MIN_DAYS there is no rank — and no percentile of HV standing in
-  // for one, since a stand-in would be indistinguishable from the real thing on screen.
-  let ivRank = null, rankReason = null;
-  if (historyDays < IV_RANK_MIN_DAYS) {
-    rankReason = `collecting — ${historyDays}/${IV_RANK_TARGET_DAYS}d (rank needs ${IV_RANK_MIN_DAYS})`;
-  } else {
-    const min = Math.min(...history), max = Math.max(...history);
-    ivRank = max === min ? 0 : +((snap.front.atmIv - min) / (max - min)).toFixed(4);
-  }
+  // for one, since a stand-in would be indistinguishable from the real thing on
+  // screen. `ivRankFrom` is shared with /api/premium so the two cannot drift.
+  const history = await ivHistory(sym, env);
+  const { ivRank, historyDays, rankReason } = ivRankFrom(history, snap.front.atmIv);
+  const ivHvRatio = (hv30 > 0) ? +(snap.front.atmIv / hv30).toFixed(3) : null;
 
   return json({
     ticker: sym,
@@ -1196,13 +1579,31 @@ async function handleIv(ticker, params, origin, env, ctx) {
     back:   snap.back,
     termStructure: snap.back ? +(snap.front.atmIv - snap.back.atmIv).toFixed(2) : null,
     hv30,
-    ivHvRatio: (hv30 > 0) ? +(snap.front.atmIv / hv30).toFixed(3) : null,
+    ivHvRatio,
     ivRank,
     historyDays,
     rankMinDays:    IV_RANK_MIN_DAYS,
     rankTargetDays: IV_RANK_TARGET_DAYS,
     rankReason,
+    // The strategy gate travels with the reading it was derived from. It used to
+    // be computed in index.html off these same fields; two frontends now need it,
+    // and two copies of a threshold is how they drift apart.
+    regime: volRegime({ ivRank, ivHvRatio, historyDays, rankTargetDays: IV_RANK_TARGET_DAYS }),
+    gates: REGIME_GATES,
+    // Real listed strikes with each strike's own IV and a delta computed from it,
+    // so the strategy cards can print a POP that belongs to a tradeable strike.
+    // Null when there is no risk-free rate — a delta is not guessed at r = 0.
+    pop: snap.pop,
+    rate: {
+      value: rate.rate, pct: rate.pct ?? null, asOf: rate.asOf ?? null,
+      source: rate.rate != null ? 'FRED DGS3MO' : null,
+      stale: !!rate.stale, reason: rate.reason || null,
+    },
     units: 'percent',
+    _meta: srcMeta('Yahoo options chain', {
+      delayed: true, ttlSeconds: TTL.iv, asOf: snap.front.expiry,
+      note: `front ${snap.front.dte}d ATM IV${ivRank == null ? ' · IV rank collecting' : ''}`,
+    }),
   }, 200, origin);
 }
 
@@ -1238,6 +1639,152 @@ async function recordWatchlistIv(env) {
   }
   try { await env?.REC_LOG?.put('ivsweep:last', ptDate(), { expirationTtl: 172800 }); } catch (_) {}
   console.log(`[cron] iv samples recorded for ${ok}/${tickers.length} tickers`);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BLACK-SCHOLES DELTA
+
+   Yahoo's chain returns strikes, bids and an implied vol, and no greeks at all.
+   Delta has to be computed, and everything downstream leans on it: which strikes
+   the premium screen picks, and the POP printed on every short-strike card. A
+   quietly wrong delta here would not fail — it would just select the wrong
+   strikes and print a confident, wrong probability beside them.
+
+   `node bs-delta.check.mjs` prints computed vs expected for every case rather
+   than asserting silently — against Hull's published worked example, against an
+   independently implemented series-erf, and against put-call parity. Worst
+   deviation 7.0e-8, inside the 7.5e-8 the approximation claims. Run it after any
+   edit here.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/** Standard normal CDF — Abramowitz & Stegun 26.2.17, |error| < 7.5e-8.
+ *  Workers have no erf, and a cruder approximation shows up directly in delta. */
+function normCdf(x) {
+  if (!Number.isFinite(x)) return null;
+  const b1 = 0.319381530, b2 = -0.356563782, b3 = 1.781477937,
+        b4 = -1.821255978, b5 = 1.330274429, p = 0.2316419;
+  const invRoot2Pi = 0.3989422804014327;
+  const ax = Math.abs(x);
+  const t  = 1 / (1 + p * ax);
+  const poly = t * (b1 + t * (b2 + t * (b3 + t * (b4 + t * b5))));
+  const tail = invRoot2Pi * Math.exp(-ax * ax / 2) * poly;
+  return x >= 0 ? 1 - tail : tail;
+}
+
+/**
+ * Black-Scholes delta for a European option on a non-dividend-paying underlying.
+ *
+ * `vol` and `rate` are decimals (0.42, 0.043) — NOT the percent this codebase
+ * carries IV around in. Yahoo's `impliedVolatility` is already a decimal, so it
+ * feeds straight in; anything read off an `atmIv` field must be divided by 100.
+ *
+ * No dividend yield: Yahoo's chain carries none, and a made-up q would shift
+ * every strike selection downstream. American early exercise is likewise ignored
+ * — for the OTM strikes this screen selects the difference is immaterial, and
+ * the alternative is a binomial tree the data does not justify.
+ *
+ * Returns null rather than NaN on unusable input, so callers suppress instead of
+ * rendering a broken number.
+ */
+function bsDelta({ spot, strike, tYears, vol, rate = 0, type = 'call' }) {
+  if (![spot, strike, tYears, vol, rate].every(Number.isFinite)) return null;
+  if (spot <= 0 || strike <= 0 || tYears <= 0 || vol <= 0) return null;
+  const sqrtT = Math.sqrt(tYears);
+  const d1 = (Math.log(spot / strike) + (rate + vol * vol / 2) * tYears) / (vol * sqrtT);
+  const nd1 = normCdf(d1);
+  if (nd1 == null) return null;
+  // Put-call parity: Δcall − Δput = 1 exactly when there is no dividend yield.
+  return type === 'put' ? nd1 - 1 : nd1;
+}
+
+/* ── Risk-free rate: FRED DGS3MO ──────────────────────────────────────────────
+   The FRED integration above resolves release *dates*; it never fetched a series
+   observation, so there was no cached rate to read. This adds one.
+
+   3-month T-bill is the right tenor for 21–45 DTE options. The value is cached
+   12h but kept in KV for a week, so a FRED outage degrades to the last real
+   print (flagged stale) rather than to a made-up rate — and with no print at all
+   the rate is null and the deltas that depend on it are suppressed, not defaulted
+   to zero. r = 0 is not a neutral choice; it is a 4-point error that biases every
+   call delta down and every put delta up. */
+const RATE_KV_KEY  = 'econ:dgs3mo';
+const RATE_FRESH_S = 12 * 3600;
+const RATE_KEEP_S  = 7 * 24 * 3600;
+
+async function riskFreeRate(env) {
+  let cached = null;
+  try { cached = await env?.REC_LOG?.get(RATE_KV_KEY, 'json'); } catch (_) {}
+  if (cached?.rate != null && Date.now() - (cached.ts || 0) < RATE_FRESH_S * 1000) {
+    return { ...cached, stale: false };
+  }
+
+  const key = env?.FRED_API_KEY;
+  if (!key) {
+    return cached?.rate != null
+      ? { ...cached, stale: true, reason: 'FRED_API_KEY not configured — last stored print' }
+      : { rate: null, asOf: null, reason: 'FRED_API_KEY not configured' };
+  }
+
+  try {
+    const u = `https://api.stlouisfed.org/fred/series/observations?series_id=DGS3MO`
+            + `&api_key=${encodeURIComponent(key)}&file_type=json&sort_order=desc&limit=10`;
+    const r = await fetch(u);
+    if (!r.ok) throw new Error(`FRED observations ${r.status}`);
+    // DGS3MO is not published on market holidays; those rows carry "." as the value.
+    const obs = ((await r.json())?.observations || []).find(o => o?.value && o.value !== '.');
+    const pct = Number(obs?.value);
+    if (!Number.isFinite(pct)) throw new Error('no numeric DGS3MO observation in the last 10 rows');
+
+    const fresh = { rate: +(pct / 100).toFixed(6), pct, asOf: obs.date, ts: Date.now(), source: 'FRED DGS3MO' };
+    try { await env?.REC_LOG?.put(RATE_KV_KEY, JSON.stringify(fresh), { expirationTtl: RATE_KEEP_S }); } catch (_) {}
+    return { ...fresh, stale: false };
+  } catch (e) {
+    console.warn('[rate] DGS3MO fetch failed:', e.message);
+    return cached?.rate != null
+      ? { ...cached, stale: true, reason: `FRED unavailable (${e.message}) — last stored print` }
+      : { rate: null, asOf: null, reason: `FRED unavailable: ${e.message}` };
+  }
+}
+
+/* ── Volatility regime ────────────────────────────────────────────────────────
+   Lives here rather than in the page because two frontends now gate on it, and
+   two copies of a threshold is how they drift apart. `index.html` reads it off
+   the /api/iv payload; the premium screen reads it off /api/premium.
+
+   Absolute IV cutoffs are meaningless across tickers — a 45% print is calm for
+   one name and extreme for another — so the gate is always *relative*. IV rank is
+   the real measure. Until enough history exists for it, IV/HV30 stands in and
+   every surface that shows it says so; the two are never conflated. */
+const IVR_HIGH   = 70,  IVR_LOW   = 30;    // IV-rank gates, in points
+const RATIO_HIGH = 1.2, RATIO_LOW = 0.9;   // IV/HV30 proxy gates
+const IVR_SELL_MIN = 50;                   // below this the premium screen dims the row
+
+const REGIME_GATES = {
+  ivrHigh: IVR_HIGH, ivrLow: IVR_LOW,
+  ratioHigh: RATIO_HIGH, ratioLow: RATIO_LOW,
+  ivrSellMin: IVR_SELL_MIN,
+};
+
+function volRegime(iv) {
+  if (iv && iv.ivRank != null) {
+    const pts = iv.ivRank * 100;
+    return {
+      state: pts >= IVR_HIGH ? 'elevated' : pts <= IVR_LOW ? 'depressed' : 'normal',
+      label: `IV regime: IV rank ${pts.toFixed(0)} · ${iv.historyDays}d history`,
+      rankPts: +pts.toFixed(1),
+      provisional: false,
+    };
+  }
+  if (iv && iv.ivHvRatio != null) {
+    const r = iv.ivHvRatio;
+    return {
+      state: r >= RATIO_HIGH ? 'elevated' : r <= RATIO_LOW ? 'depressed' : 'normal',
+      label: `IV regime: proxy (IV/HV30 ${r.toFixed(2)}×) — rank collecting, ${iv.historyDays}/${iv.rankTargetDays ?? IV_RANK_TARGET_DAYS}d`,
+      rankPts: null,
+      provisional: true,
+    };
+  }
+  return { state: 'unavailable', label: 'IV regime unavailable', rankPts: null, provisional: false };
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1482,14 +2029,14 @@ async function handleInsider(ticker, params, origin, env, ctx) {
   try {
     const r = await buildInsiderReport(sym, env);
     payload = r.ok
-      ? { ticker: sym, ...r, _meta: srcMeta('SEC EDGAR Form 4', { note: `last ${INSIDER_WINDOW_DAYS} days` }) }
+      ? { ticker: sym, ...r, _meta: srcMeta('SEC EDGAR Form 4', { ttlSeconds: TTL.insider, note: `last ${INSIDER_WINDOW_DAYS} days` }) }
       : { ticker: sym, unavailable: true, reason: r.reason,
-          _meta: srcMeta('SEC EDGAR Form 4', { ok: false, note: r.reason }) };
+          _meta: srcMeta('SEC EDGAR Form 4', { ok: false, ttlSeconds: TTL.insider, note: r.reason }) };
   } catch (e) {
     // No fallback to a lesser source and no generated stand-in: say what broke.
     return json({
       ticker: sym, unavailable: true, reason: `SEC EDGAR unavailable: ${e.message}`,
-      _meta: srcMeta('SEC EDGAR Form 4', { ok: false, note: e.message }),
+      _meta: srcMeta('SEC EDGAR Form 4', { ok: false, ttlSeconds: TTL.insider, note: e.message }),
     }, 200, origin);
   }
 
@@ -1701,7 +2248,7 @@ async function handle13F(ticker, params, origin, env, ctx) {
       return json({
         ticker: sym, unavailable: true, building: true,
         reason: '13F index is building — 20 managers at SEC rate limits takes about a minute. Retry shortly.',
-        _meta: srcMeta('SEC EDGAR 13F-HR', { ok: false, note: 'index building' }),
+        _meta: srcMeta('SEC EDGAR 13F-HR', { ok: false, ttlSeconds: TTL.thirteenF, note: 'index building' }),
       }, 200, origin);
     }
   }
@@ -1711,7 +2258,7 @@ async function handle13F(ticker, params, origin, env, ctx) {
     return json({
       ticker: sym, unavailable: true, building: true,
       reason: '13F index not built yet — a build has been started. Retry in about a minute.',
-      _meta: srcMeta('SEC EDGAR 13F-HR', { ok: false, note: 'index building' }),
+      _meta: srcMeta('SEC EDGAR 13F-HR', { ok: false, ttlSeconds: TTL.thirteenF, note: 'index building' }),
     }, 200, origin);
   }
 
@@ -1727,6 +2274,7 @@ async function handle13F(ticker, params, origin, env, ctx) {
     managers: store.managers,
     builtAt: store.builtAt,
     _meta: srcMeta('SEC EDGAR 13F-HR', {
+      ttlSeconds: TTL.thirteenF,
       asOf: quarters.at(-1) || null,
       note: holders.length
         ? `quarter ending ${quarters.at(-1)} · filed up to 45 days after`
@@ -1912,6 +2460,7 @@ async function handleShortInterest(ticker, params, origin, env, ctx) {
       _meta: srcMeta('FINRA', {
         asOf: latest.settlementDate,
         delayed: true,
+        ttlSeconds: TTL.short,
         note: `official biweekly settlement · settled ${latest.settlementDate} · ~2-week reporting lag`,
       }),
     };
@@ -1923,6 +2472,7 @@ async function handleShortInterest(ticker, params, origin, env, ctx) {
       reason: `Official FINRA figure unavailable: ${e.message}`,
       _meta: srcMeta('Yahoo Finance', {
         ok: false,
+        ttlSeconds: 900,
         note: 'unofficial estimate — official FINRA settlement figure unavailable',
       }),
     };
@@ -1940,7 +2490,7 @@ async function handleSearch(q, origin) {
     { headers: YAHOO_HEADERS },
   );
   if (!r.ok) throw new Error(`Yahoo search ${r.status}`);
-  return json(await r.json(), 200, origin);
+  return json({ ...(await r.json()), _meta: srcMeta('Yahoo Finance', { ttlSeconds: TTL.quote }) }, 200, origin);
 }
 
 async function handleNews(ticker, origin, env) {
@@ -1953,7 +2503,10 @@ async function handleNews(ticker, origin, env) {
         publisher:           n.source,
         providerPublishTime: Math.floor(new Date(n.created_at).getTime() / 1000),
       }));
-      return json({ news }, 200, origin);
+      return json({
+        news,
+        _meta: srcMeta('Alpaca news', { ttlSeconds: TTL.news, note: 'real-time' }),
+      }, 200, origin);
     } catch (e) {
       console.error('[news] Alpaca failed, falling back to Yahoo:', e.message);
     }
@@ -1963,11 +2516,15 @@ async function handleNews(ticker, origin, env) {
     `https://query2.finance.yahoo.com/v1/finance/search?q=${ticker}&quotesCount=0&newsCount=15`,
     { headers: YAHOO_HEADERS },
   );
-  return json(await r.json(), 200, origin);
+  return json({
+    ...(await r.json()),
+    _meta: srcMeta('Yahoo Finance', { delayed: true, ttlSeconds: TTL.news, note: YAHOO_DELAY_NOTE }),
+  }, 200, origin);
 }
 
 async function handlePeers(ticker, origin) {
   const data = await yahoo(`/v6/finance/recommendationsbysymbol/${ticker}`);
+  data._meta = srcMeta('Yahoo Finance', { delayed: true, ttlSeconds: TTL.fund });
   return json(data, 200, origin);
 }
 
@@ -2114,6 +2671,11 @@ async function handleTrack(ticker, env, origin) {
     ticker:      ticker.toUpperCase(),
     entries:     list,
     calibration: recCalibration(list),
+    _meta: srcMeta('KV forward log', {
+      ttlSeconds: TTL.track,
+      asOf: list[list.length - 1]?.d || null,
+      note: `${list.length} entr${list.length === 1 ? 'y' : 'ies'} · forward returns filled 2pm PT`,
+    }),
   }, 200, origin);
 }
 
@@ -2220,7 +2782,12 @@ async function handleMarketSnapshot(origin, env) {
     };
   });
 
-  return json({ snapshot, ts: Date.now() }, 200, origin);
+  return json({
+    snapshot, ts: Date.now(),
+    _meta: srcMeta('Yahoo Finance', {
+      delayed: true, ttlSeconds: TTL.quote, note: `${snapshot.length} symbols · ${YAHOO_DELAY_NOTE}`,
+    }),
+  }, 200, origin);
 }
 
 async function handleMarketMovers(origin, env) {
@@ -2325,6 +2892,9 @@ async function handleMarketMovers(origin, env) {
     postGainers: applyFilter(postMovers, true),
     postLosers:  applyFilter(postMovers, false),
     ts: Date.now(),
+    _meta: srcMeta('Yahoo screener', {
+      delayed: true, ttlSeconds: TTL.quote, note: `≥ ±${MIN_PCT}% · ${YAHOO_DELAY_NOTE}`,
+    }),
   }, 200, origin);
 }
 
@@ -2448,15 +3018,20 @@ async function handleScanner(searchParams, origin, env, ctx) {
   const preset = SCANNER_PRESETS[searchParams.get('preset')] ? searchParams.get('preset') : 'momentum';
   const cfg    = SCANNER_PRESETS[preset];
   const KV_KEY = `scanner:${preset}`;
-  const TTL    = 90_000; // 90s
+  const SCAN_TTL = 90_000; // 90s
+
+  let cached = null;
+  try { cached = await env?.REC_LOG?.get(KV_KEY, 'json'); } catch (_) {}
+
+  // Stale-while-revalidate: return the banked snapshot at any age, never rebuild.
+  if (searchParams.get('cached') === '1') {
+    return json(cached ? { ...cached, cached: true } : { preset, results: [], ...emptySnapshot('Yahoo screener', TTL.scanner) }, 200, origin);
+  }
 
   // Serve fresh KV cache
-  try {
-    const cached = await env?.REC_LOG?.get(KV_KEY, 'json');
-    if (cached && Date.now() - (cached.ts || 0) < TTL) {
-      return json({ ...cached, cached: true }, 200, origin);
-    }
-  } catch (_) {}
+  if (cached && Date.now() - (cached.ts || 0) < SCAN_TTL) {
+    return json({ ...cached, cached: true }, 200, origin);
+  }
 
   // ── Stage 1: candidate sweep ──
   let raw = await yahooScreenerPOST(cfg, env);
@@ -2582,7 +3157,13 @@ async function handleScanner(searchParams, origin, env, ctx) {
     };
   }).sort((a, b) => b.score - a.score);
 
-  const payload = { preset, count: scored.length, results: scored, ts: Date.now() };
+  const payload = {
+    preset, count: scored.length, results: scored, ts: Date.now(),
+    _meta: srcMeta('Yahoo screener', {
+      delayed: true, ttlSeconds: TTL.scanner,
+      note: `${preset} · ${scored.length} names · ${YAHOO_DELAY_NOTE}`,
+    }),
+  };
   try { await env?.REC_LOG?.put(KV_KEY, JSON.stringify(payload), { expirationTtl: 300 }); } catch (_) {}
   return json(payload, 200, origin);
 }
@@ -2670,16 +3251,22 @@ async function goldenCrossUniverse(env) {
 
 async function handleGoldenCross(origin, env, params) {
   const KV_KEY = 'market:goldencross';
-  const TTL = 3_600_000; // 1h — EMA crosses move on a daily timescale
+  const GOLDEN_TTL = 3_600_000; // 1h — EMA crosses move on a daily timescale
   const SCHEMA = 2;      // bump when the row shape changes, to retire old caches
   const force = params?.get('refresh') === '1';
 
-  try {
-    const cached = force ? null : await env?.REC_LOG?.get(KV_KEY, 'json');
-    if (cached && cached.schema === SCHEMA && Date.now() - (cached.ts || 0) < TTL) {
-      return json({ ...cached, cached: true }, 200, origin);
-    }
-  } catch (_) {}
+  let cached = null;
+  try { cached = await env?.REC_LOG?.get(KV_KEY, 'json'); } catch (_) {}
+  if (cached && cached.schema !== SCHEMA) cached = null;
+
+  // Stale-while-revalidate: return the banked snapshot at any age, never rebuild.
+  if (params?.get('cached') === '1') {
+    return json(cached ? { ...cached, cached: true } : { results: [], ...emptySnapshot('Yahoo daily closes', TTL.golden) }, 200, origin);
+  }
+
+  if (!force && cached && Date.now() - (cached.ts || 0) < GOLDEN_TTL) {
+    return json({ ...cached, cached: true }, 200, origin);
+  }
 
   const { symbols, source, watchlistCount } = await goldenCrossUniverse(env);
   if (!symbols.length) return err('universe unavailable', 502, origin);
@@ -2729,6 +3316,10 @@ async function handleGoldenCross(origin, env, params) {
     slopeBars: EMA_CROSS_SLOPE_BARS,
     schema: SCHEMA,
     ts: Date.now(),
+    _meta: srcMeta('Yahoo daily closes', {
+      delayed: true, ttlSeconds: TTL.golden,
+      note: `${results.length} setups from ${evaluated} evaluated · EMA 50/200 over 3y`,
+    }),
   };
   try { await env?.REC_LOG?.put(KV_KEY, JSON.stringify(payload), { expirationTtl: 7200 }); } catch (_) {}
   return json(payload, 200, origin);
@@ -2736,11 +3327,11 @@ async function handleGoldenCross(origin, env, params) {
 
 async function handleMarketIPOs(origin, env) {
   const KV_KEY = 'market:ipos';
-  const TTL    = 43_200_000; // 12 hours
+  const IPO_TTL = 43_200_000; // 12 hours
 
   try {
     const cached = await env?.REC_LOG?.get(KV_KEY, 'json');
-    if (cached && Date.now() - cached.ts < TTL) return json(cached, 200, origin);
+    if (cached && Date.now() - cached.ts < IPO_TTL) return json(cached, 200, origin);
   } catch (_) {}
 
   const NASDAQ_HEADERS = {
@@ -2832,7 +3423,13 @@ async function handleMarketIPOs(origin, env) {
     return (a.date || '').localeCompare(b.date || '');
   });
 
-  const result = { ipos: ipos.slice(0, 20), ts: Date.now() };
+  const result = {
+    ipos: ipos.slice(0, 20), ts: Date.now(),
+    _meta: srcMeta('Yahoo IPO calendar', {
+      ok: ipos.length > 0, ttlSeconds: TTL.ipos,
+      note: ipos.length ? `${Math.min(ipos.length, 20)} upcoming` : 'no upcoming IPOs returned',
+    }),
+  };
   env?.REC_LOG?.put(KV_KEY, JSON.stringify(result), { expirationTtl: 43200 }).catch(() => {});
   return json(result, 200, origin);
 }
@@ -3051,7 +3648,16 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
     })());
   }
 
-  return json({ stocks, analysisLoading: needsAnalysis.length > 0, ts: Date.now() }, 200, origin);
+  // Three different clocks land in one watchlist row and the badge has to say so:
+  // the price is 15 minutes behind, the fundamentals are a 6-hour cache, and the
+  // Recommendation column is whatever the nightly Claude pass last wrote.
+  return json({
+    stocks, analysisLoading: needsAnalysis.length > 0, ts: Date.now(),
+    _meta: srcMeta('Yahoo Finance + Claude', {
+      delayed: true, ttlSeconds: TTL.quote,
+      note: `price ${YAHOO_DELAY_NOTE} · fundamentals cached 6h · recommendation refreshed daily`,
+    }),
+  }, 200, origin);
 }
 
 async function handleWatchlistAuction(symbols, origin, env, ctx) {
@@ -3172,7 +3778,14 @@ async function handleDailyGet(origin, env, ctx) {
       // Signal "still preparing" when there's nothing useful yet, so the UI shows a
       // friendly loading state instead of an empty briefing.
       const loading = !isComplete;
-      return json({ ...snapshot, eod: eod || null, eodLoading, midday: midday || null, middayLoading, loading }, 200, origin);
+      return json({
+        ...snapshot, eod: eod || null, eodLoading, midday: midday || null, middayLoading, loading,
+        _meta: srcMeta('Claude synthesis', {
+          ok: isComplete, ttlSeconds: TTL.daily,
+          asOf: snapshot.ts ? new Date(snapshot.ts).toISOString() : null,
+          note: '6am PT briefing' + (isStale ? ' · regenerating' : ''),
+        }),
+      }, 200, origin);
     }
   } catch (_) {}
 
@@ -3180,7 +3793,10 @@ async function handleDailyGet(origin, env, ctx) {
   if (ctx && env?.ANTHROPIC_API_KEY) {
     ctx.waitUntil(generateDailySnapshot(env));
   }
-  return json({ loading: true, ts: Date.now() }, 200, origin);
+  return json({
+    loading: true, ts: Date.now(),
+    _meta: srcMeta('Claude synthesis', { ok: false, ttlSeconds: TTL.daily, note: 'generating' }),
+  }, 200, origin);
 }
 
 /* ── Cron: per-ticker analysis ──
@@ -3378,6 +3994,10 @@ async function handleEconCalendar(params, origin, env) {
     },
     fomcSource: 'federalreserve.gov (hand-maintained table)',
     ts: Date.now(),
+    _meta: srcMeta(fred.error ? 'FOMC calendar (FRED unavailable)' : 'FRED + FOMC calendar', {
+      ok: !fred.error, ttlSeconds: TTL.econ, asOf: today,
+      note: fred.error || fred.partial || `${events.length} events ahead`,
+    }),
   }, 200, origin);
 }
 
@@ -3754,7 +4374,13 @@ CRITICAL RULES:
   // Commentary must be attributable; drop anything that lost its source.
   analysis.callCommentary = arr(analysis.callCommentary).filter(c => c?.detail && c?.source);
 
-  const payload = { ticker: sym, facts, analysis, ts: Date.now() };
+  const payload = {
+    ticker: sym, facts, analysis, ts: Date.now(),
+    _meta: srcMeta('Yahoo + Claude synthesis', {
+      ttlSeconds: TTL.earnings, asOf: facts.reportDate || null,
+      note: `last report${facts.dateSource ? ` · ${facts.dateSource}` : ''}`,
+    }),
+  };
   try { await env?.REC_LOG?.put(key, JSON.stringify(payload), { expirationTtl: 172800 }); } catch (_) {}
   return json(payload, 200, origin);
 }
@@ -3896,7 +4522,12 @@ Include 6–10 events total. Order chronologically Mon→Fri.`;
     return err('generation failed', 500, origin);
   }
 
-  const payload = { ...result, ts: Date.now() };
+  const payload = {
+    ...result, ts: Date.now(),
+    _meta: srcMeta('Claude synthesis + FOMC/FRED calendar', {
+      ttlSeconds: 64_800, note: 'week ahead · event dates from the calendar tables, not model memory',
+    }),
+  };
   try { await env?.REC_LOG?.put('market:week-ahead', JSON.stringify(payload), { expirationTtl: 64800 }); } catch (_) {}
   return json(payload, 200, origin);
 }
@@ -4369,12 +5000,14 @@ const SECTORS_TTL    = 14_400_000; // 4 hours
 async function handleMarketSectors(origin, env, ctx, params) {
   const force = params?.get('refresh') === '1';
 
-  if (!force) {
-    try {
-      const cached = await env?.REC_LOG?.get(SECTORS_KV_KEY, 'json');
-      if (cached && Date.now() - cached.ts < SECTORS_TTL) return json(cached, 200, origin);
-    } catch (_) {}
-  }
+  let cached = null;
+  try { cached = await env?.REC_LOG?.get(SECTORS_KV_KEY, 'json'); } catch (_) {}
+
+  // Stale-while-revalidate: paint whatever is banked, however old, then let the
+  // caller refresh behind it. No tab should sit on "click to load".
+  if (params?.get('cached') === '1') return json(cached || emptySnapshot('Claude synthesis', TTL.sectors), 200, origin);
+
+  if (!force && cached && Date.now() - cached.ts < SECTORS_TTL) return json(cached, 200, origin);
 
   const result = await generateSectors(env);
   if (!result) return err('sector generation failed', 500, origin);
@@ -4491,7 +5124,13 @@ Include all 11 sectors in order: Technology, Financials, Energy, Health Care, Co
     return null;
   }
 
-  const result = { ...sectorData, ts: Date.now() };
+  const result = {
+    ...sectorData, ts: Date.now(),
+    _meta: srcMeta('Yahoo Finance + Claude synthesis', {
+      delayed: true, ttlSeconds: TTL.sectors,
+      note: `11 SPDR sectors · ${YAHOO_DELAY_NOTE} · picks from Claude`,
+    }),
+  };
   await env?.REC_LOG?.put(SECTORS_KV_KEY, JSON.stringify(result), { expirationTtl: 14400 }).catch(() => {});
   return result;
 }
@@ -4522,9 +5161,8 @@ export default {
       switch (route) {
         case 'quote':    return await handleQuote(sub, origin, env);
         case 'chart':    return await handleChart(sub, url.searchParams, origin);
-        case 'options':
-          if (sub === 'recap') return await handleOptionsRecap(url.searchParams, origin, env, ctx);
-          return await handleOptions(sub, url.searchParams, origin, env);
+        case 'options': return await handleOptions(sub, url.searchParams, origin, env);
+        case 'premium': return await handlePremium(url.searchParams, origin, env, ctx);
         case 'iv':       return await handleIv(sub, url.searchParams, origin, env, ctx);
         case 'insider':  return await handleInsider(sub, url.searchParams, origin, env, ctx);
         case 'short':    return await handleShortInterest(sub, url.searchParams, origin, env, ctx);

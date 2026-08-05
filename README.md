@@ -6,7 +6,7 @@ A one-page-per-ticker research dashboard built around 16 components: price actio
 
 - **Frontend**: Single HTML file (`index.html`). TradingView Lightweight Charts + custom SVG. Fraunces / Geist / JetBrains Mono fonts.
 - **Backend**: Cloudflare Worker (`worker.js`) — proxies Yahoo Finance, calls Claude API, persists rating history to KV.
-- **AI**: Claude Sonnet 4.5 for sentiment scoring + overall rating synthesis with structured JSON output.
+- **AI**: Claude Opus 5 for sentiment scoring + overall rating synthesis, with a JSON schema rather than a prompt instruction.
 
 ## Quick start
 
@@ -59,11 +59,11 @@ Push to GitHub Pages (or open `index.html` locally — note: opening directly wi
 
 See `ARCHITECTURE.md` for the section-by-section data source map and the paid-API upgrade path. Short version:
 
-- **Real Yahoo data**: prices, SMAs, performance windows, fundamentals, analyst targets, recent up/downgrades, news, earnings dates, technical indicators, option strategies (rule-based), trade signals
+- **Real Yahoo data**: prices, SMAs, performance windows, fundamentals, analyst targets, recent up/downgrades, news, earnings dates, technical indicators, implied vol + option chains, trade signals
+- **Real SEC / FINRA / FRED data**: Form 4 insider trades, super-investor 13F holdings, consolidated short interest, macro release dates
+- **Computed here**: all technical indicators, HV30, Black-Scholes delta and POP (Yahoo carries no greeks)
 - **Claude-generated**: sentiment scores, overall rating + confidence + factor breakdown + thesis paragraphs
-- **Stubbed (clearly labeled in UI)**: short interest 6mo MoM, unusual options flow, dark pool prints, super-investor 13F holdings — each tagged with the recommended paid feed
-
-The light-tier upgrade path (~$77/mo: Polygon + Unusual Whales) replaces all four stubs with real data. SEC EDGAR (free) replaces the Yahoo insider feed with full Form 4 filings — best wired in v2.
+- **Nothing is stubbed.** The dark-pool card was deleted rather than faked — no free source exists for it. Every card names the source it actually called and when it last called it; a source that fails renders "unavailable" with the reason, never a generated number.
 
 ## Files
 
@@ -75,6 +75,6 @@ The light-tier upgrade path (~$77/mo: Polygon + Unusual Whales) replaces all fou
 ## Notes
 
 - Yahoo Finance data is delayed 15 minutes. For real-time, swap to Polygon (already proxied through the Worker — just add a new handler).
-- Claude model identifier is locked to `claude-sonnet-4-5` (the dated variant returns auth errors).
+- Claude model identifier is locked to `claude-opus-5` in `worker.js`.
 - Recommendation track record (section 15) starts populating on first use. For backfilled history, see the "next steps" section in `ARCHITECTURE.md`.
 - Not investment advice. For research only.

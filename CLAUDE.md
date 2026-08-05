@@ -51,10 +51,11 @@ All data flows through the Worker. CORS is enforced via `ALLOWED_ORIGINS` allowl
 GET  /api/quote/:ticker           Yahoo quoteSummary (multi-module) + Alpaca price overlay
 GET  /api/chart/:ticker           Yahoo v8 OHLCV (?range=1y&interval=1d)
 GET  /api/options/:ticker         Yahoo v7 options chain
+GET  /api/premium?symbols=        Premium-selling screen (term structure, expected move, delta strikes)
 GET  /api/insider/:ticker         SEC EDGAR Form 4, last 90 days (12h KV)
 GET  /api/short/:ticker           FINRA consolidated short interest, 6 settlements (Yahoo fallback)
 GET  /api/13f/:ticker             Super-investor 13F holdings, from a KV reverse index
-GET  /api/iv/:ticker              ATM implied vol (front/back), term structure, IV rank, HV30
+GET  /api/iv/:ticker              ATM implied vol (front/back), term structure, IV rank, HV30, POP ladder
 GET  /api/search?q=               Ticker autocomplete
 GET  /api/news/:ticker            Alpaca news → Yahoo fallback
 GET  /api/peers/:ticker           Yahoo recommendationsBySymbol
@@ -125,6 +126,35 @@ long premium (straddle, debit spreads). Until the rank exists, `ivHvRatio` stand
 and the card is visibly labelled a proxy. With no vol reading at all the strategy list is
 **suppressed**, not defaulted — every structure there is a bet on vol being rich or cheap.
 
+`volRegime()` **lives in `worker.js`**, not in the page. It arrives on `/api/iv` as `regime` and on
+`/api/premium` per row, with its thresholds as `gates` (`IVR_HIGH` 70 / `IVR_LOW` 30 /
+`RATIO_HIGH` 1.2 / `RATIO_LOW` 0.9 / `IVR_SELL_MIN` 50). It used to be computed in `index.html`; the
+premium screen on `dashboard.html` needs the identical gate, and two copies of a threshold across two
+HTML files is exactly how they drift apart. `index.html` is now only a reader — do not reintroduce a
+local copy.
+
+**Black-Scholes delta (`bsDelta`) is computed in the Worker, because Yahoo's chain has no greeks.**
+Everything downstream leans on it: which strikes `/api/premium` selects, and the POP on every
+short-strike strategy card. `normCdf()` is Abramowitz & Stegun 26.2.17. `vol` and `rate` are
+**decimals**, not the percent this codebase carries IV around in — Yahoo's `impliedVolatility` is
+already a decimal and feeds straight in, but anything read off an `atmIv` field must be divided by 100.
+No dividend yield and no American early exercise: both would be invented inputs, and for the OTM
+strikes this screen selects the early-exercise difference is immaterial.
+
+`node bs-delta.check.mjs` **prints computed vs expected** for every case rather than asserting — Hull's
+published worked example (0.522), an independently implemented series-erf reference, put-call parity,
+and the OTM ladder the screen actually selects from. Worst deviation 7.0e-8 against the 7.5e-8 the
+approximation claims. Run it after any edit to that block; a silently wrong delta does not fail, it
+just picks the wrong strikes and prints a confident probability beside them.
+
+**The risk-free rate comes from FRED `DGS3MO`, and is suppressed rather than defaulted.** The FRED
+integration only ever fetched release *dates*; `riskFreeRate()` adds a series-observations call
+(`econ:dgs3mo`, refreshed 12h, kept 7d so an outage degrades to the last real print, flagged stale).
+With no print at all the rate is `null` and **every delta is suppressed** — `r = 0` is not a neutral
+default, it is worth about a full delta point at 30 DTE, enough to move which strike gets picked, and
+invisible on screen. Holidays publish `"."` as the value, so the fetch scans the last 10 rows for a
+numeric one.
+
 **Real sources replaced the last mock generators.** Short interest, insider trades, dark pool and
 13F were all documented as "mock". Two of the four were not: `mockShortInterest()` and
 `mockUnusualOptions()` were dead code — never called — while their cards ran on live Yahoo data.
@@ -183,6 +213,26 @@ the `_meta` a fetch returned (`srcMeta()` server-side). Hand-written badges had 
 the fetch layer in both directions: one card credited **FINRA without ever calling it**, another read
 "Sample · upgrade" while running on live data. A literal in the markup has nothing tying it to the
 code that fetches, so it drifts silently. A card that never called a source now cannot name it.
+
+**Every response carries `_meta`, and every badge carries an as-of time.** `srcMeta()` also returns
+`ttlSeconds` (from the `TTL` table near the top of `worker.js`, so a card and the handler feeding it
+cannot disagree). Badges render `source · 15-min delayed · as of HH:MM` and turn amber `.stale` once
+`Date.now() - fetchedAt` passes `ttlSeconds`. **`delayed` and `stale` are different failures and a
+badge can be both**: `delayed` is a property of the *source* (Yahoo is 15 minutes behind however
+recently we asked), staleness is a property of *our copy*. Alpaca-sourced payloads say "real-time".
+`sweepStaleBadges()` re-ages every badge on a 30-second timer — staleness computed only at page load
+would announce itself at the one moment it is least likely to be true.
+
+Note the `TTL` object is a **global**; four handlers used to declare a local `const TTL` that shadowed
+it (now `CRUMB_TTL` / `SCAN_TTL` / `GOLDEN_TTL` / `IPO_TTL`). If you add another, do not call it `TTL`
+— the shadow is silent and turns `TTL.scanner` into `undefined`.
+
+**Stale-while-revalidate: no tab waits on a click.** Sectors, Scanner and Premium accept `?cached=1`,
+which returns the banked KV snapshot at **any** age and never rebuilds; `primeTabs()` paints all three
+on page load, then revalidates through the normal endpoint (which still serves from KV inside its TTL,
+so priming all three costs about what clicking one used to). A failed revalidation leaves the painted
+snapshot alone rather than blanking a view the user is reading, and a loading wall is only drawn when
+there is nothing on screen yet. The manual Refresh buttons pass `?refresh=1` and still force a rebuild.
 
 **Model confidence renders as an ordinal, never a percentage.** `confLabel()` maps to Low / Moderate
 / High in all three places it surfaced (synthesis hero + ring, watchlist recommendation, options-recap
@@ -322,6 +372,8 @@ daily:midday       — 11:30am cron midday pulse (narrative, topics, tomorrow, t
 daily:eod          — 1:15pm cron EOD summary
 analysis:{TICKER}  — on-demand per-ticker Claude analysis
 iv:{TICKER}:{DATE} — daily front-month ATM IV sample, feeds ivRank (400d TTL; atmIv/spot/dte also in KV metadata)
+premium:{SYMBOLS}  — premium screen snapshot, keyed on the sorted symbol list (15min TTL, kept 2h for stale-while-revalidate)
+econ:dgs3mo        — FRED 3-month T-bill, the risk-free rate for Black-Scholes (refreshed 12h, kept 7d)
 cik:map            — SEC ticker→CIK map (30d TTL)
 insider:{TICKER}   — parsed Form 4 report (12h TTL)
 short:{TICKER}     — FINRA short interest (6h TTL; 15min when falling back to Yahoo)
@@ -369,6 +421,41 @@ exactly like a real one.
 
 `dashboard.html` — macro landing view: market strip, AI headline, news cards, pre/post-market movers, watchlist, IPO calendar. The Midday Pulse (11:30am PT synthesis) lives on its own tab (`#tab-midday`, deep-linkable via `dashboard.html#midday`).
 
+**The Premium tab (`#tab-premium`) replaced the Options flow recap.** The old view showed the nearest
+expiration filtered to volume/OI ≥ 2×, which answers "what traded today" — and at the nearest
+expiration the answer is mostly 0DTE and expiry-week churn, the wrong question for selling 20–45 DTE
+premium against earnings dates. `handleOptionsRecap()` and its Claude flow synthesis are **deleted**.
+The separate "Options Volume · V/OI Screen" card on `index.html` is untouched: that one is real Yahoo
+chain data and was never part of this.
+
+`/api/premium` returns one row per watchlist ticker:
+
+- front/back ATM IV and `termStructure` — **front minus back**, matching `/api/iv` exactly so the two
+  endpoints cannot disagree. **Backwardation therefore reads POSITIVE here**, which is the reverse of
+  how it is usually said aloud; the chip and the legend both state the sign. It is the earnings-crush
+  setup, which is what the flag is for.
+- `expectedMove` = spot × ATM IV × √(dte/365) through front expiry, in dollars and percent.
+- next earnings from `calendarEvents.earnings.earningsDate[0]` — deliberately the **same field the
+  watchlist's Earnings column reads**, because two tabs quoting different earnings dates for one
+  ticker is a bug the user finds before we do. Past dates are discarded, not shown as upcoming.
+- two candidate expiries: `clean` (first monthly ≥ 21 DTE with no earnings inside) and `post` (first
+  monthly expiring after the print). They collapse to one `clean+post` leg when earnings already sits
+  before the first monthly ≥ 21 DTE. **A missing clean leg is a finding, not a gap** — when the print
+  lands inside 21 DTE, every monthly from here spans it, and `cleanMissing` says so rather than
+  leaving an absent row that reads as missing data.
+- per candidate: nearest 0.30- and 0.16-delta put and call, **OTM only** (a short strike is OTM by
+  definition, and without that filter a sparse chain hands back an ITM strike whose |delta| happens to
+  sit nearer the target). Delta uses each strike's **own** implied vol, so put skew is respected.
+  Credit is the **bid**, not the mid — what a seller can actually hit. `roc = credit / (strike × 100 −
+  credit)`, `aroc = roc × 365/dte`. On the call side that denominator is the naked-margin equivalent,
+  not the cost of shares in a covered call; the legend says so, because the same number under two
+  capital bases would not be comparable.
+
+Rows sort by `bestAroc` (the best annualised ROC among the row's candidates), nulls last. Rows below
+`IVR_SELL_MIN` — or with no IV rank yet — are **dimmed, never hidden**: a thin-premium name has to
+look unattractive, and hiding it makes "no vol edge here" and "no data for this ticker" render
+identically.
+
 The Scanner tab hosts four presets. Three (Momentum, Pre-Market Gappers, All Movers) hit
 `/api/market/scanner` and share `renderScanner()`; the Golden Cross Setup preset hits
 `/api/market/golden-cross` and uses `renderGoldenCross()`. `loadScanner()` branches on the preset
@@ -402,7 +489,21 @@ daily-bar signal. Do not re-add either without an intraday feed.
 
 ### Data: real vs. stubbed
 
-Sections with mock data are labeled with a violet "Sample · upgrade: X" badge in the UI. Currently stubbed: short interest, unusual options flow, dark pool prints, super-investor 13F holdings. See `ARCHITECTURE.md` for the paid upgrade path.
+**Nothing is stubbed.** This section used to describe a violet "Sample · upgrade: X" badge and four
+mock sections; the badge system is gone, the dark-pool card was deleted outright (fabricated, no free
+source), and short interest / insider / 13F run on FINRA and SEC EDGAR. Provenance now comes from
+`_meta` on every response — see the badge notes above. `ARCHITECTURE.md` holds the paid upgrade path
+and the section-by-section source map.
+
+**POP on the strategy cards** is 1 − |Δ| of the short strike (both short deltas for the condor),
+against the `pop` strike ladder `/api/iv` returns: real listed strikes, each delta from that strike's
+own IV, at the listed expiry nearest 35 DTE. `renderStrategies()` snaps its legs to those strikes, so
+the card prints a strike you can actually trade with a probability that belongs to it. It is labelled
+on the card as a **delta-derived approximation under a lognormal assumption, not a backtested
+frequency** — that caption is load-bearing, because "Hist Win" sits right beside it and is exactly the
+measured thing POP is not. Debit structures (both verticals, the straddle) render **n/a**: their
+break-even is not the short strike, so 1 − |Δ| would be a plausible number measuring nothing. Hist Win
+stays suppressed pending a real backtest.
 
 ## Design system
 
@@ -415,3 +516,20 @@ CSS custom properties in `:root`. Never hardcode colors — use the variables:
 - `--ink-0..3` — text (brightest to dimmest)
 
 Fonts: `--serif` (Fraunces, display), `--sans` (Geist, body), `--mono` (JetBrains Mono, numbers/labels).
+
+## Git workflow
+
+Commit and push automatically at the end of each completed task, without being asked. One commit per logical task, not per file. Message format: short imperative summary line, then a blank line, then 2-4 bullets on what changed and why.
+
+Do not commit:
+- Mid-task, or when a task ended with something broken or unverified
+- Work whose verification failed, or that you haven't tested
+- Anything requiring my decision that I haven't answered yet
+
+When a task ends with an open question or a known defect, say so and hold the commit until I respond.
+
+Never use git push --force, never rewrite published history, never commit secrets or .dev.vars.
+
+If a push fails, report the error rather than working around it.
+
+Deployment stays manual — do not run npx wrangler deploy unless I explicitly ask.

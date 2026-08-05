@@ -250,6 +250,9 @@ body::after {
 .src-tag.delayed::before { background: var(--amber); }
 .src-tag.bad { color: var(--bear); background: rgba(242, 95, 92, 0.08); border-color: rgba(242, 95, 92, 0.3); }
 .src-tag.bad::before { background: var(--bear); }
+.src-tag.stale { color: var(--amber); background: rgba(244, 183, 64, 0.14); border-color: rgba(244, 183, 64, 0.45); }
+.src-tag.stale::before { background: var(--amber); animation: stale-pulse 2s ease-in-out infinite; }
+@keyframes stale-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 
 /* "Source unavailable, and here is why" — never a generated stand-in. */
 .src-unavailable {
@@ -290,10 +293,16 @@ body::after {
   padding: 1px 5px; border-radius: 2px; margin-left: 4px; text-transform: uppercase;
 }
 .si-mom { margin-left: auto; font-family: var(--mono); font-size: 11px; }
-.si-chart { display: grid; grid-auto-flow: column; gap: 8px; height: 84px; margin-bottom: 14px; }
-.si-bar { display: flex; flex-direction: column; justify-content: flex-end; cursor: help; }
-.si-bar-fill { background: var(--cyan); opacity: 0.55; border-radius: 2px 2px 0 0; min-height: 2px; }
-.si-bar-label { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-align: center; margin-top: 4px; }
+/* Sparkline. The y-axis is scaled to the data, never to zero — see sparkline()
+   for why, and note the min/max axis labels are what keep that honest. */
+.spark { width: 100%; height: 68px; display: block; overflow: visible; }
+.spark circle { cursor: help; }
+.spark-caption {
+  font-family: var(--mono); font-size: 10px; color: var(--ink-3);
+  letter-spacing: 0.05em; margin: 2px 0 12px;
+}
+.spark-caption.bear { color: var(--bear); }
+.spark-caption.bull { color: var(--bull); }
 .si-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .si-stat .l { font-size: 9px; color: var(--ink-3); font-family: var(--mono); letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 3px; }
 .si-stat .v { font-family: var(--mono); font-size: 14px; color: var(--ink-0); }
@@ -624,9 +633,6 @@ table.data .flag.buy { background: var(--bull-soft); color: var(--bull); }
 .up-down-item .action.flat { color: var(--amber); }
 .up-down-item .pt { color: var(--ink-1); text-align: right; }
 
-/* ------- Mini chart (sparklines, mom bars) ------- */
-.mini-chart { width: 100%; height: 80px; }
-.mini-chart-tall { height: 140px; }
 
 /* ------- Fundamentals ------- */
 .fund-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line-soft); border: 1px solid var(--line-soft); }
@@ -1783,16 +1789,107 @@ function setBadge(cardId, meta) {
   if (!meta) { el.textContent = ''; el.className = 'src-tag'; return; }
 
   const bits = [meta.source];
+  if (meta.delayed) bits.push('15-min delayed');
+  else if (meta.source && /alpaca/i.test(meta.source)) bits.push('real-time');
   if (meta.asOf) bits.push(meta.asOf);
   if (meta.note) bits.push(meta.note);
+  // Every card says when we last asked, not just what we asked.
+  if (meta.fetchedAt) {
+    bits.push('as of ' + new Date(meta.fetchedAt).toLocaleTimeString('en-US',
+      { hour: '2-digit', minute: '2-digit', hour12: false }));
+  }
   el.textContent = bits.filter(Boolean).join(' · ');
-  el.className = 'src-tag' + (meta.ok === false ? ' bad' : '') + (meta.delayed ? ' delayed' : '');
-  el.title = meta.fetchedAt ? `fetched ${new Date(meta.fetchedAt).toLocaleString()}` : '';
+  el.dataset.fetched = meta.fetchedAt || '';
+  el.dataset.ttl     = meta.ttlSeconds ?? '';
+  el.dataset.bad     = meta.ok === false ? '1' : '';
+  el.dataset.delayed = meta.delayed ? '1' : '';
+  el.dataset.note    = meta.note || '';
+  applyBadgeAge(el);
 }
+
+/* `delayed` and `stale` are different failures and both need saying: `delayed`
+ * is a property of the SOURCE (Yahoo is 15 minutes behind however recently we
+ * asked), staleness is a property of OUR COPY (how long ago we asked, against
+ * the TTL the payload declared). */
+function applyBadgeAge(el) {
+  const fetched = Date.parse(el.dataset.fetched || '');
+  const ttl     = Number(el.dataset.ttl);
+  const stale   = Number.isFinite(fetched) && Number.isFinite(ttl) && ttl > 0
+    && (Date.now() - fetched) > ttl * 1000;
+  el.className = 'src-tag'
+    + (el.dataset.bad ? ' bad' : '')
+    + (el.dataset.delayed ? ' delayed' : '')
+    + (stale ? ' stale' : '');
+  const age = Number.isFinite(fetched) ? Math.round((Date.now() - fetched) / 60000) : null;
+  el.title = [
+    Number.isFinite(fetched) ? `fetched ${new Date(fetched).toLocaleString()}${age != null ? ` (${age} min ago)` : ''}` : '',
+    Number.isFinite(ttl) && ttl > 0 ? `expected good for ${ttl >= 3600 ? (ttl / 3600) + 'h' : Math.round(ttl / 60) + ' min'}` : '',
+    stale ? 'STALE — past its refresh window' : '',
+  ].filter(Boolean).join(' · ');
+}
+
+/** Re-age every badge on a timer, so staleness shows up without a reload —
+ *  a page load is exactly when "stale" is least likely to be true. */
+function sweepStaleBadges() {
+  document.querySelectorAll('.src-tag[data-fetched]').forEach(applyBadgeAge);
+}
+setInterval(sweepStaleBadges, 30_000);
 
 /** Uniform "this source is unavailable and here is why" panel. */
 const unavailable = (reason) =>
   `<div class="src-unavailable"><b>Unavailable.</b> ${esc(reason || 'Source returned no data.')}</div>`;
+
+/**
+ * Sparkline for a small-range series.
+ *
+ * The y-axis is scaled to the data, not to zero — a 4% move in short interest
+ * plotted from zero is six bars of identical height, which is a chart that costs
+ * vertical space and says less than the text beside it. Zero is not a meaningful
+ * comparison for short interest or days-to-cover; the shape of the change is.
+ *
+ * A suppressed baseline exaggerates movement unless the reader can see the
+ * scale, so `min` and `max` are drawn on the axis and are NOT optional — that is
+ * the whole thing that makes a non-zero baseline honest rather than misleading.
+ */
+function sparkline(points, { fmtVal = v => String(v), rising = 'bear', falling = 'bull' } = {}) {
+  const pts = points.filter(p => Number.isFinite(p.v));
+  if (pts.length < 2) return '';
+
+  const vals = pts.map(p => p.v);
+  const lo = Math.min(...vals), hi = Math.max(...vals);
+  const range = (hi - lo) || Math.abs(hi) || 1;
+  const yLo = lo - range * 0.10, yHi = hi + range * 0.10;   // modest padding, both ends
+
+  const W = 320, H = 74, X0 = 52, X1 = 314, Y0 = 12, Y1 = 52;
+  const xAt = i => X0 + (i * (X1 - X0)) / (pts.length - 1);
+  const yAt = v => Y1 - ((v - yLo) / (yHi - yLo)) * (Y1 - Y0);
+
+  const dir = vals.at(-1) > vals[0] ? rising : vals.at(-1) < vals[0] ? falling : 'flat';
+  const stroke = dir === 'flat' ? 'var(--ink-2)' : `var(--${dir})`;
+
+  const path = pts.map((p, i) => `${i ? 'L' : 'M'}${xAt(i).toFixed(1)},${yAt(p.v).toFixed(1)}`).join(' ');
+  const dots = pts.map((p, i) =>
+    `<circle cx="${xAt(i).toFixed(1)}" cy="${yAt(p.v).toFixed(1)}" r="2.5" fill="${stroke}">
+       <title>${esc(p.title || `${p.label}: ${fmtVal(p.v)}`)}</title></circle>`).join('');
+
+  // Guides sit at the true min and max, so the labels mark real values.
+  const guide = (v) => `<line x1="${X0}" y1="${yAt(v).toFixed(1)}" x2="${X1}" y2="${yAt(v).toFixed(1)}"
+    stroke="var(--line-soft)" stroke-width="1" stroke-dasharray="2 3"/>`;
+  const axis = (v, anchorY) => `<text x="${X0 - 8}" y="${anchorY}" text-anchor="end"
+    font-family="JetBrains Mono" font-size="9" fill="var(--ink-3)">${esc(fmtVal(v))}</text>`;
+
+  return `
+    <svg class="spark" viewBox="0 0 ${W} ${H}" role="img"
+         aria-label="${esc(`Range ${fmtVal(lo)} to ${fmtVal(hi)}, ${dir === 'flat' ? 'flat' : dir === rising ? 'rising' : 'falling'}`)}">
+      ${guide(hi)}${guide(lo)}
+      ${axis(hi, (yAt(hi) + 3).toFixed(1))}${axis(lo, (yAt(lo) + 3).toFixed(1))}
+      <path d="${path}" fill="none" stroke="${stroke}" stroke-width="1.75"
+            stroke-linejoin="round" stroke-linecap="round"/>
+      ${dots}
+      <text x="${X0}" y="${H - 4}" font-family="JetBrains Mono" font-size="9" fill="var(--ink-3)">${esc(pts[0].label || '')}</text>
+      <text x="${X1}" y="${H - 4}" text-anchor="end" font-family="JetBrains Mono" font-size="9" fill="var(--ink-3)">${esc(pts.at(-1).label || '')}</text>
+    </svg>`;
+}
 
 /* ============================================================
    RENDERERS
@@ -2243,16 +2340,20 @@ function renderAnalyst(quote, lastPrice) {
   const tr = recTrend[0];
   if (tr) {
     const total = tr.strongBuy + tr.buy + tr.hold + tr.sell + tr.strongSell;
-    const pct = (n) => total ? (n/total)*100 : 0;
+    // Proportions of a whole, so a zero baseline is correct here — unlike the
+    // short-interest series, an empty bucket genuinely means zero. The floor only
+    // applies to non-zero counts: a bucket with no analysts must draw no bar,
+    // otherwise the chart shows coverage that does not exist.
+    const barH = (n) => !n ? 0 : Math.max(8, (n / total) * 100);
     html += `
       <div style="margin-top:18px;">
         <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);letter-spacing:0.06em;text-transform:uppercase;margin-bottom:8px;">Distribution</div>
         <div class="recs-row">
-          <div class="recs-segment sb"><div class="bar" style="height:${Math.max(8, pct(tr.strongBuy))}%"></div></div>
-          <div class="recs-segment b"><div class="bar"  style="height:${Math.max(8, pct(tr.buy))}%"></div></div>
-          <div class="recs-segment h"><div class="bar"  style="height:${Math.max(8, pct(tr.hold))}%"></div></div>
-          <div class="recs-segment s"><div class="bar"  style="height:${Math.max(8, pct(tr.sell))}%"></div></div>
-          <div class="recs-segment ss"><div class="bar" style="height:${Math.max(8, pct(tr.strongSell))}%"></div></div>
+          <div class="recs-segment sb"><div class="bar" style="height:${barH(tr.strongBuy)}%"></div></div>
+          <div class="recs-segment b"><div class="bar"  style="height:${barH(tr.buy)}%"></div></div>
+          <div class="recs-segment h"><div class="bar"  style="height:${barH(tr.hold)}%"></div></div>
+          <div class="recs-segment s"><div class="bar"  style="height:${barH(tr.sell)}%"></div></div>
+          <div class="recs-segment ss"><div class="bar" style="height:${barH(tr.strongSell)}%"></div></div>
         </div>
         <div class="recs-labels">
           <span>S.Buy<br>${tr.strongBuy}</span>
@@ -2432,16 +2533,23 @@ async function renderShortInterest(ticker, quote) {
       ? ((cur.shares - prev.shares) / prev.shares) * 100 : null;
     const momCls = mom == null ? '' : mom > 1 ? 'bear' : mom < -1 ? 'bull' : '';
 
-    // Six settlement periods, oldest → newest, so the bars read left to right.
+    // Six settlement periods, oldest → newest, so the line reads left to right.
     const series = d.periods.slice().reverse();
-    const max = Math.max(...series.map(p => p.shares || 0)) || 1;
-    const bars = series.map(p => {
-      const h = Math.max(2, Math.round(((p.shares || 0) / max) * 100));
-      return `<div class="si-bar" title="${esc(p.settlementDate)} · ${fmt.big(p.shares)} shares short">
-                <div class="si-bar-fill" style="height:${h}%"></div>
-                <div class="si-bar-label">${esc((p.settlementDate || '').slice(5))}</div>
-              </div>`;
-    }).join('');
+    const chart = sparkline(
+      series.map(p => ({
+        v: p.shares, label: (p.settlementDate || '').slice(5),
+        title: `${p.settlementDate} · ${fmt.big(p.shares)} shares short`,
+      })),
+      { fmtVal: fmt.big },
+    );
+    const first = series[0]?.shares, last = series.at(-1)?.shares;
+    const trend = (first == null || last == null || first === last) ? null
+      : last > first ? { word: 'rising', cls: 'bear' } : { word: 'falling', cls: 'bull' };
+    const caption = chart
+      ? `<div class="spark-caption ${trend ? trend.cls : ''}">${
+          trend ? `Short interest ${trend.word}` : 'Short interest flat'
+        } · ${series.length} settlements</div>`
+      : '';
 
     el.innerHTML = `
       <div class="si-head">
@@ -2449,7 +2557,7 @@ async function renderShortInterest(ticker, quote) {
         <div class="si-sub">shares short</div>
         ${mom != null ? `<div class="si-mom ${momCls}">${mom >= 0 ? '↑ +' : '↓ '}${Math.abs(mom).toFixed(1)}% vs prior</div>` : ''}
       </div>
-      <div class="si-chart">${bars}</div>
+      ${chart}${caption}
       <div class="si-grid">
         ${stat('Days to Cover', cur.daysToCover != null ? cur.daysToCover.toFixed(2) : '—')}
         ${stat('Avg Daily Vol', cur.avgDailyVolume != null ? fmt.big(cur.avgDailyVolume) : '—')}
@@ -2646,31 +2754,63 @@ async function renderSuperInvestors(ticker) {
 
 /* Volatility regime for the strategy gates.
  *
+ * The gate itself now lives in the Worker (`volRegime()` there) and arrives on
+ * the /api/iv payload as `regime`, with its thresholds as `gates`. It used to be
+ * computed here; the premium screen on the dashboard needs the same gate, and
+ * two copies of a threshold in two HTML files is how they drift apart. This is
+ * only the reader.
+ *
  * Absolute IV cutoffs are meaningless across tickers — a 45% print is calm for
  * one name and extreme for another — so the gate is always a *relative* measure.
  * IV rank is the real one. Until enough history exists for it, IV/HV30 stands in
  * and the card says so; the two are never conflated. */
-const IVR_HIGH = 70, IVR_LOW = 30;              // IV-rank gates, in points
-const RATIO_HIGH = 1.2, RATIO_LOW = 0.9;        // IV/HV30 proxy gates
+const REGIME_FALLBACK = { state: 'unavailable', label: 'IV regime unavailable', provisional: false };
+const GATE_DEFAULTS   = { ivrHigh: 70, ivrLow: 30, ratioHigh: 1.2, ratioLow: 0.9 };
 
-function volRegime(iv) {
-  if (iv && iv.ivRank != null) {
-    const pts = iv.ivRank * 100;
-    return {
-      state: pts >= IVR_HIGH ? 'elevated' : pts <= IVR_LOW ? 'depressed' : 'normal',
-      label: `IV regime: IV rank ${pts.toFixed(0)} · ${iv.historyDays}d history`,
-      provisional: false,
-    };
+const volRegime = (iv) => iv?.regime || REGIME_FALLBACK;
+const volGates  = (iv) => iv?.gates  || GATE_DEFAULTS;
+
+/* ── Probability of profit ────────────────────────────────────────────────────
+ * POP ≈ 1 − |delta| of the short strike, and for a two-sided structure
+ * 1 − (|Δcall| + |Δput|). Delta is Black-Scholes, computed in the Worker off the
+ * strike's OWN implied vol, and the ladder carries real listed strikes — so the
+ * leg printed on the card is one that exists and the probability belongs to it.
+ *
+ * This is a lognormal approximation, not a measured frequency. It reads delta as
+ * the risk-neutral probability of finishing in the money, which is what makes it
+ * a one-line formula rather than a backtest — and it inherits every assumption
+ * Black-Scholes makes, including that vol is constant and the move is lognormal.
+ * Real return distributions have fatter tails, so a POP near the wings is
+ * optimistic. The card says all of this; "Hist Win" stays suppressed because it
+ * is a different claim entirely and needs an actual backtest.
+ *
+ * Debit structures are deliberately NOT given a POP here. For a spread bought
+ * for a debit the break-even is inside the long strike, so 1 − |delta| is simply
+ * the wrong quantity — it would be a plausible-looking number measuring nothing. */
+function nearestStrike(ladder, target) {
+  if (!ladder?.strikes?.length || !Number.isFinite(target)) return null;
+  return ladder.strikes.reduce((best, s) =>
+    best == null || Math.abs(s.strike - target) < Math.abs(best.strike - target) ? s : best, null);
+}
+
+/** POP for a structure, or null with a reason. `shorts` is a list of
+ *  {type:'put'|'call', target:<strike price>} legs sold. */
+function popFor(ladder, shorts) {
+  if (!ladder) return { pop: null, reason: 'no strike ladder — needs the options chain and a risk-free rate' };
+  const legs = [];
+  for (const s of shorts) {
+    const row = nearestStrike(ladder, s.target);
+    const d   = row ? (s.type === 'put' ? row.putDelta : row.callDelta) : null;
+    if (row == null || !Number.isFinite(d)) {
+      return { pop: null, reason: `no listed ${s.type} strike near $${fmt.price(s.target)} with a quoted IV` };
+    }
+    legs.push({ type: s.type, strike: row.strike, delta: d });
   }
-  if (iv && iv.ivHvRatio != null) {
-    const r = iv.ivHvRatio;
-    return {
-      state: r >= RATIO_HIGH ? 'elevated' : r <= RATIO_LOW ? 'depressed' : 'normal',
-      label: `IV regime: proxy (IV/HV30 ${r.toFixed(2)}×) — rank collecting, ${iv.historyDays}/${iv.rankTargetDays}d`,
-      provisional: true,
-    };
-  }
-  return { state: 'unavailable', label: 'IV regime unavailable', provisional: false };
+  const total = legs.reduce((a, l) => a + Math.abs(l.delta), 0);
+  // Two short legs deep enough to sum past 1 would give a negative POP; the
+  // approximation has simply broken down there rather than found a bad trade.
+  if (total >= 1) return { pop: null, reason: 'short deltas sum past 1 — the 1 − delta approximation does not hold here', legs };
+  return { pop: 1 - total, reason: null, legs };
 }
 
 function renderStrategies(ticker, lastPrice, ind, iv) {
@@ -2707,27 +2847,49 @@ function renderStrategies(ticker, lastPrice, ind, iv) {
    * they are gated on direction alone (`vol: null`) and stay available across the
    * whole rank range. They never display a vol-regime tag: a vertical has not
    * earned the elevated/depressed read and must not appear to carry one. */
+  /* Legs are expressed as a multiple of spot, then snapped to a real listed
+   * strike where the ladder has one — a POP is only meaningful attached to a
+   * strike that exists, priced off that strike's own IV. `shorts` names the legs
+   * actually sold, which is what POP is computed from; a structure with no
+   * `shorts` gets no POP rather than a formula that does not apply to it. */
+  const ladder = iv?.pop || null;
+  const K = (mult) => {
+    const target = lastPrice * mult;
+    const row = nearestStrike(ladder, target);
+    return row ? row.strike : +target.toFixed(0);
+  };
+  const dteTag = ladder ? `${ladder.dte} DTE` : '30–45 DTE';
+
+  const kPut92 = K(0.92), kPut95 = K(0.95), kCall105 = K(1.05), kCall108 = K(1.08);
+
   const candidates = [
     { name: 'Bull Call Spread',  bias: 'bull',    family: 'vertical', vol: null,        dir: bullish,
-      leg: `Buy ${(lastPrice*1.00).toFixed(0)}C / Sell ${(lastPrice*1.10).toFixed(0)}C · 30–45 DTE`,
+      leg: `Buy ${K(1.00)}C / Sell ${K(1.10)}C · ${dteTag}`,
+      shorts: null, popNote: 'debit structure — break-even sits inside the long strike, so 1 − delta is the wrong quantity',
       maxRisk: 'Limited' },
     { name: 'Bear Put Spread',   bias: 'bear',    family: 'vertical', vol: null,        dir: bearish,
-      leg: `Buy ${(lastPrice*1.00).toFixed(0)}P / Sell ${(lastPrice*0.92).toFixed(0)}P · 30 DTE`,
+      leg: `Buy ${K(1.00)}P / Sell ${kPut92}P · ${dteTag}`,
+      shorts: null, popNote: 'debit structure — break-even sits inside the long strike, so 1 − delta is the wrong quantity',
       maxRisk: 'Limited' },
     { name: 'Cash-Secured Put',  bias: 'bull',    family: 'premium',  vol: 'elevated',  dir: bullish,
-      leg: `Sell ${(lastPrice*0.92).toFixed(0)}P · 30 DTE`,
+      leg: `Sell ${kPut92}P · ${dteTag}`,
+      shorts: [{ type: 'put', target: kPut92 }],
       maxRisk: 'Strike − prem' },
     { name: 'Covered Call',      bias: 'neutral', family: 'premium',  vol: 'elevated',  dir: bearish,
-      leg: `Long shares + Sell ${(lastPrice*1.05).toFixed(0)}C · 30 DTE`,
+      leg: `Long shares + Sell ${kCall105}C · ${dteTag}`,
+      shorts: [{ type: 'call', target: kCall105 }],
       maxRisk: 'Capped upside' },
     { name: 'Wheel Strategy',    bias: 'neutral', family: 'premium',  vol: 'elevated',  dir: true,
-      leg: `Sell ${(lastPrice*0.95).toFixed(0)}P · 30 DTE; if assigned, sell calls`,
+      leg: `Sell ${kPut95}P · ${dteTag}; if assigned, sell calls`,
+      shorts: [{ type: 'put', target: kPut95 }],
       maxRisk: 'Long stock cost basis' },
     { name: 'Iron Condor',       bias: 'neutral', family: 'vega',     vol: 'elevated',  dir: true,
-      leg: `Sell ${(lastPrice*1.08).toFixed(0)}C / ${(lastPrice*0.92).toFixed(0)}P · wings ±5%`,
+      leg: `Sell ${kCall108}C / ${kPut92}P · wings ±5%`,
+      shorts: [{ type: 'call', target: kCall108 }, { type: 'put', target: kPut92 }],
       maxRisk: 'Limited' },
     { name: 'Long Straddle',     bias: 'neutral', family: 'vega',     vol: 'depressed', dir: true,
-      leg: `Buy ${(lastPrice).toFixed(0)}C + ${(lastPrice).toFixed(0)}P · 45 DTE`,
+      leg: `Buy ${K(1.00)}C + ${K(1.00)}P · ${dteTag}`,
+      shorts: null, popNote: 'long premium — profit needs a move past both break-evens, which no short delta describes',
       maxRisk: 'Premium paid' },
   ];
 
@@ -2744,12 +2906,14 @@ function renderStrategies(ticker, lastPrice, ind, iv) {
     ? `${strategies.length} ${setupWord} · proxy regime`
     : `${strategies.length} ${setupWord} · IVR-gated`;
 
+  const g = volGates(iv);
+
   // The 30–70 band is the common case and it is a real answer: no vol edge either
   // way, so the vega structures are withheld while the verticals still stand.
   const vegaWithheld = regime.state === 'normal'
     ? `<div class="strat-empty">
-         <b>No volatility edge.</b> Premium selling wants IV rank ≥ ${IVR_HIGH}, long premium wants
-         ≤ ${IVR_LOW}${regime.provisional ? ` (proxy: IV/HV30 ≥ ${RATIO_HIGH}× or ≤ ${RATIO_LOW}×)` : ''};
+         <b>No volatility edge.</b> Premium selling wants IV rank ≥ ${g.ivrHigh}, long premium wants
+         ≤ ${g.ivrLow}${regime.provisional ? ` (proxy: IV/HV30 ≥ ${g.ratioHigh}× or ≤ ${g.ratioLow}×)` : ''};
          this name sits between the two. Iron condor and straddle are withheld — they are bets on
          volatility itself, and there is nothing here to bet on.
        </div>`
@@ -2758,11 +2922,33 @@ function renderStrategies(ticker, lastPrice, ind, iv) {
   if (!strategies.length) {
     grid.innerHTML = note + (vegaWithheld || `
       <div class="strat-empty">
-        No structure qualifies at IV rank ${regime.state === 'elevated' ? `≥ ${IVR_HIGH}` : `≤ ${IVR_LOW}`}:
+        No structure qualifies at IV rank ${regime.state === 'elevated' ? `≥ ${g.ivrHigh}` : `≤ ${g.ivrLow}`}:
         no directional read supports the structures that fit this vol regime.
       </div>`);
     return;
   }
+
+  const popCell = (s) => {
+    // Structures the 1 − delta formula does not describe say so, rather than
+    // borrowing a number that would look identical to a real one.
+    if (!s.shorts) {
+      return `<div class="stat" title="Not applicable to this structure: ${esc(s.popNote)}. Nothing is shown in its place.">
+        <div class="l">POP</div><div class="v pending">n/a</div></div>`;
+    }
+    const { pop, reason, legs } = popFor(ladder, s.shorts);
+    if (pop == null) {
+      return `<div class="stat" title="Not computed: ${esc(reason)}.">
+        <div class="l">POP</div><div class="v pending">—</div></div>`;
+    }
+    const detail = legs.map(l => `${l.type === 'put' ? 'P' : 'C'} ${l.strike} Δ${Math.abs(l.delta).toFixed(2)}`).join(' + ');
+    const tip = `Delta-derived approximation, not a backtested frequency. `
+      + `1 − ${legs.length > 1 ? '(' : ''}${detail}${legs.length > 1 ? ')' : ''} at ${ladder.expiry} (${ladder.dte} DTE). `
+      + `Black-Scholes delta off each strike's own implied vol, read as the risk-neutral probability of `
+      + `finishing in the money — so it assumes a lognormal move and constant vol. Real tails are fatter, `
+      + `which makes a POP out near the wings optimistic.`;
+    return `<div class="stat" title="${esc(tip)}">
+      <div class="l">POP</div><div class="v">${(pop * 100).toFixed(0)}%</div></div>`;
+  };
 
   grid.innerHTML = note + strategies.map(s => `
     <div class="strat-card ${s.bias}">
@@ -2772,17 +2958,33 @@ function renderStrategies(ticker, lastPrice, ind, iv) {
         ? '<div class="tagline">Directional thesis only — no volatility edge</div>'
         : ''}
       <div class="stats">
-        <div class="stat" title="Not yet computed. Probability of profit needs the short strike's
-Black-Scholes delta from the options chain — POP ≈ 1 − |delta| for a short-strike structure.
-No approximation is shown in its place.">
-          <div class="l">POP</div><div class="v pending">—</div></div>
+        ${popCell(s)}
         <div class="stat" title="Not yet computed. Requires a backtest of this structure on this
 underlying; nothing behind it yet, so nothing is shown.">
           <div class="l">Hist Win</div><div class="v pending">—</div></div>
         <div class="stat"><div class="l">Risk</div><div class="v" style="font-size:10px;">${s.maxRisk}</div></div>
       </div>
     </div>
-  `).join('') + vegaWithheld;
+  `).join('') + vegaWithheld + popFootnote(ladder, iv);
+}
+
+/** Says on the card what POP is and is not. A percentage in a stats row reads as
+ *  a measured win rate unless something on screen says otherwise — and the number
+ *  beside it, "Hist Win", is exactly the measured thing POP is not. */
+function popFootnote(ladder, iv) {
+  if (!ladder) {
+    const why = iv?.rate?.value == null
+      ? `no risk-free rate available (${esc(iv?.rate?.reason || 'FRED unavailable')}), and a delta is not guessed at r = 0`
+      : 'the options chain returned no strikes with quoted implied vol';
+    return `<div class="strat-note">POP is not shown: ${why}.</div>`;
+  }
+  return `<div class="strat-note">POP is a <b>delta-derived approximation</b>, not a backtested
+    frequency: 1 − |Δ| of the short strike (both short deltas for the condor), from Black-Scholes on
+    each strike's own implied vol at the ${esc(ladder.expiry)} expiry (${ladder.dte} DTE)${
+      iv?.rate?.value != null ? `, r = ${(iv.rate.value * 100).toFixed(2)}% (${esc(iv.rate.source || 'FRED')})` : ''
+    }. It assumes a lognormal move and constant vol, so it runs optimistic in the tails. Debit
+    structures show <i>n/a</i> — their break-even is not the short strike, so the formula does not
+    describe them. <b>Hist Win</b> stays blank: that one needs a real backtest, which does not exist yet.</div>`;
 }
 
 /* Swing signals only — EMA crossover on daily closes, which is what daily bars
@@ -3255,6 +3457,9 @@ async function loadIv(ticker, lastPrice) {
   if (ticker !== state.ticker) return null;   // user navigated away mid-flight
 
   state.data.iv = iv;
+  // The strategy gate and every POP on the card come off this one fetch, so the
+  // badge is that fetch's own provenance.
+  setBadge('card-strategies', iv?._meta);
   renderIv(iv);
   renderStrategies(ticker, lastPrice, state.data.indicators || {}, iv);
   return iv;
@@ -3304,6 +3509,20 @@ async function loadTicker(ticker) {
 
     state.data.lastPrice = lastPrice;
     state.data.OHLC = { T, O, H, L, C, V };
+
+    /* Every card that reads the quote or the chart gets that fetch's own
+     * provenance and as-of time. The cards below all derive from one of those
+     * two payloads, so the badge is set from the response rather than authored
+     * per card — a card cannot name a source its data did not come from. */
+    const quoteMeta = quoteResp._meta;
+    const chartMeta = chartResp._meta;
+    for (const id of ['card-catalysts', 'card-analyst', 'card-fundamentals', 'card-sentiment']) {
+      setBadge(id, quoteMeta);
+    }
+    setBadge('card-perf',  chartMeta);
+    setBadge('card-chart', chartMeta);
+    setBadge('card-news',  newsResp?._meta);
+    setBadge('card-track', trackResp?._meta);
 
     // Render all sections
     renderHero(quote, lastPrice, change, changePct);

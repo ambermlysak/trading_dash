@@ -472,41 +472,68 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .scan-float-unknown { color: var(--violet); }
 
 /* Options recap tab */
-.options-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
-.options-synthesis { background: var(--bg-1); border: 1px solid var(--line); border-radius: 10px; padding: 18px 24px; margin-bottom: 24px; }
-.options-synthesis-label { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
-.options-synthesis-text { font-family: var(--serif); font-size: 15px; font-weight: 300; color: var(--ink-1); line-height: 1.65; }
-.options-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
-.options-card { background: var(--bg-1); border: 1px solid var(--line); border-radius: 8px; padding: 16px 20px; }
-.options-card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
-.options-sym { font-family: var(--mono); font-weight: 600; font-size: 14px; color: var(--cyan); text-decoration: none; }
-.options-sym:hover { color: var(--ink-0); }
-.options-price { font-family: var(--mono); font-size: 11px; color: var(--ink-2); margin-left: 8px; }
-.options-pc-badge { font-family: var(--mono); font-size: 13px; font-weight: 600; }
-.options-pc-badge.bull { color: var(--bull); }
-.options-pc-badge.bear { color: var(--bear); }
-.options-stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-bottom: 14px; }
-.options-stat { }
-.options-stat-label { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
-.options-stat-val { font-family: var(--mono); font-size: 13px; color: var(--ink-0); }
-.options-unusual-head { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; border-top: 1px solid var(--line-soft); padding-top: 12px; }
-.options-unusual-row { display: grid; grid-template-columns: 44px 44px 60px 1fr 1fr 1fr; gap: 4px; font-family: var(--mono); font-size: 11px; padding: 4px 0; border-bottom: 1px solid var(--line-soft); align-items: center; }
-.options-unusual-row:last-child { border-bottom: none; }
-.options-narrative { font-size: 12px; color: var(--ink-2); line-height: 1.6; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
+.tab-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
 
-/* Recommended strategies */
-.options-strat-head { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; border-top: 1px solid var(--line-soft); padding-top: 12px; margin-top: 4px; margin-bottom: 6px; }
-.options-strat-row { padding: 7px 0; border-bottom: 1px solid var(--line-soft); }
-.options-strat-row:last-child { border-bottom: none; }
-.options-strat-name { font-size: 12px; font-weight: 600; color: var(--ink-0); margin-bottom: 4px; }
-.options-strat-meta { display: flex; gap: 10px; align-items: center; margin-bottom: 3px; flex-wrap: wrap; }
-.options-strat-strike { font-family: var(--mono); font-size: 11px; color: var(--cyan); }
-.options-strat-exp { font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
-.options-strat-conf { font-family: var(--mono); font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 3px; }
-.options-strat-conf.high { background: var(--bull-soft);  color: var(--bull);   }
-.options-strat-conf.mid  { background: var(--amber-soft); color: var(--amber);  }
-.options-strat-conf.low  { background: var(--bg-3);       color: var(--ink-3);  }
-.options-strat-rationale { font-size: 11px; color: var(--ink-2); line-height: 1.45; }
+/* ── Premium screen ──────────────────────────────────────────────────────────
+   One row per watchlist ticker. Rows the vol regime does not support are dimmed
+   rather than dropped: a low-IV name has to look unattractive, and hiding it
+   would make the absence of a candidate indistinguishable from missing data. */
+.prem-row { background: var(--bg-1); border: 1px solid var(--line); border-radius: 8px; padding: 14px 18px; margin-bottom: 10px; }
+.prem-row.dim { opacity: 0.44; }
+.prem-row.dim:hover { opacity: 0.9; }
+.prem-row.bad { border-color: rgba(242,95,92,0.28); }
+.prem-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
+.prem-sym { font-family: var(--mono); font-weight: 600; font-size: 15px; color: var(--cyan); text-decoration: none; }
+.prem-sym:hover { color: var(--ink-0); }
+.prem-spot { font-family: var(--mono); font-size: 12px; color: var(--ink-1); }
+.prem-chip { font-family: var(--mono); font-size: 9px; padding: 2px 7px; border-radius: 3px; background: var(--bg-3); color: var(--ink-2); letter-spacing: 0.04em; white-space: nowrap; }
+.prem-chip.bull  { background: rgba(35,209,139,0.16);  color: var(--bull); }
+.prem-chip.bear  { background: rgba(242,95,92,0.16);   color: var(--bear); }
+.prem-chip.amber { background: rgba(244,183,64,0.16);  color: var(--amber); }
+.prem-chip.cyan  { background: rgba(94,197,234,0.14);  color: var(--cyan); }
+.prem-chip.muted { color: var(--ink-3); }
+.prem-aroc { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+.prem-aroc b { color: var(--bull); font-size: 14px; }
+
+.prem-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.prem-metric-l { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
+.prem-metric-v { font-family: var(--mono); font-size: 13px; color: var(--ink-0); }
+.prem-metric-v.sub { font-size: 10px; color: var(--ink-3); }
+.prem-metric-v.up { color: var(--bull); } .prem-metric-v.dn { color: var(--bear); } .prem-metric-v.am { color: var(--amber); }
+
+.prem-leg { border-top: 1px solid var(--line-soft); padding-top: 10px; margin-top: 4px; }
+.prem-leg-head { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 7px; }
+.prem-cands { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 11px; }
+.prem-cands th { font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.05em; text-align: right; padding: 0 8px 5px; font-weight: 400; }
+.prem-cands th:first-child, .prem-cands td:first-child { text-align: left; }
+.prem-cands td { padding: 4px 8px; color: var(--ink-1); text-align: right; border-top: 1px solid var(--line-soft); }
+.prem-cands td.put  { color: var(--bear); }
+.prem-cands td.call { color: var(--bull); }
+.prem-cands td.hot  { color: var(--amber); font-weight: 600; }
+.prem-cands tr.sparse td { color: var(--ink-3); }
+.prem-note { font-size: 11px; color: var(--ink-3); line-height: 1.5; margin-top: 8px; }
+.prem-note.bad { color: var(--bear); }
+.prem-legend { font-family: var(--mono); font-size: 10px; color: var(--ink-3); line-height: 1.7; margin-bottom: 18px; padding: 10px 14px; background: var(--bg-1); border: 1px solid var(--line-soft); border-radius: 6px; }
+
+/* ── Provenance badge (mirrors index.html's .src-tag) ────────────────────────
+   Rendered from the `_meta` a fetch returned, never written into the markup —
+   a card that never called a source has no way to name it. "as of HH:MM" comes
+   from _meta.fetchedAt; .stale lights once the age passes _meta.ttlSeconds. */
+.src-tag {
+  display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 9px;
+  color: var(--cyan); background: rgba(94,197,234,0.08); border: 1px solid rgba(94,197,234,0.28);
+  border-radius: 3px; padding: 2px 7px; letter-spacing: 0.03em; white-space: nowrap; vertical-align: middle;
+}
+.src-tag:empty { display: none; }
+.src-tag::before { content: ''; flex: 0 0 auto; width: 5px; height: 5px; border-radius: 50%; background: var(--cyan); }
+.src-tag.delayed { color: var(--amber); background: rgba(244,183,64,0.08); border-color: rgba(244,183,64,0.3); }
+.src-tag.delayed::before { background: var(--amber); }
+.src-tag.stale { color: var(--amber); background: rgba(244,183,64,0.14); border-color: rgba(244,183,64,0.45); }
+.src-tag.stale::before { background: var(--amber); animation: stale-pulse 2s ease-in-out infinite; }
+.src-tag.bad { color: var(--bear); background: rgba(242,95,92,0.08); border-color: rgba(242,95,92,0.3); }
+.src-tag.bad::before { background: var(--bear); }
+@keyframes stale-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+.card-title .src-tag { margin-left: 8px; }
 
 /* Auction column (3:55–4:05pm ET block trades) */
 .flow-wrap { min-width: 90px; }
@@ -530,6 +557,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .auction-time { color: var(--ink-3); }
 .auction-notional { color: var(--amber); }
 .auction-moc { font-size: 9px; background: var(--cyan-soft); color: var(--cyan); padding: 1px 5px; border-radius: 3px; }
+.auction-stat-label { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
 </style>
 </head>
 <body>
@@ -543,7 +571,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     <button class="tab-btn" data-tab="scanner">Scanner</button>
     <button class="tab-btn" data-tab="watchlist">Watchlist</button>
     <button class="tab-btn" data-tab="sectors">Sectors</button>
-    <button class="tab-btn" data-tab="options">Options</button>
+    <button class="tab-btn" data-tab="premium">Premium</button>
   </nav>
   <div class="topbar-right"><span id="clock"></span></div>
 </header>
@@ -558,7 +586,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 <div class="tab-panel active" id="tab-market">
   <div class="main">
     <div class="headline-card" id="headline-card">
-      <div class="headline-label">Today's Brief</div>
+      <div class="headline-label">Today's Brief <span class="src-tag" id="daily-badge"></span></div>
       <div class="headline-text" id="headline-text">Loading daily briefing…</div>
       <div class="headline-ts" id="headline-ts"></div>
     </div>
@@ -574,7 +602,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 
     <div class="week-ahead-card" id="week-ahead-card">
       <div class="week-ahead-header">
-        <span class="week-ahead-badge">Week Ahead</span>
+        <span class="week-ahead-badge">Week Ahead</span><span class="src-tag" id="wa-badge"></span>
         <div class="week-ahead-title" id="wa-title"></div>
       </div>
       <div class="week-ahead-overview" id="wa-overview"></div>
@@ -591,7 +619,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <!-- Movers column: pre-market stacked above post-market -->
       <div class="movers-col">
         <div class="card">
-          <div class="card-title">Market Movers <span class="min-pct-badge">≥10%</span></div>
+          <div class="card-title">Market Movers <span class="min-pct-badge">≥10%</span><span class="src-tag" id="movers-badge"></span></div>
           <div class="movers-grid">
             <div>
               <div class="movers-col-label">Gainers</div>
@@ -605,7 +633,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
         </div>
 
         <div class="card">
-          <div class="card-title">Post-Market Movers <span class="min-pct-badge">≥10%</span></div>
+          <div class="card-title">Post-Market Movers <span class="min-pct-badge">≥10%</span><span class="src-tag" id="post-movers-badge"></span></div>
           <div class="movers-grid">
             <div>
               <div class="movers-col-label">Gainers</div>
@@ -620,7 +648,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       </div>
 
       <div class="card">
-        <div class="card-title">Upcoming IPOs</div>
+        <div class="card-title">Upcoming IPOs<span class="src-tag" id="ipo-badge"></span></div>
         <table class="ipo-table">
           <thead><tr><th>Company</th><th>Ticker</th><th>Date</th><th>Price</th><th>Status</th></tr></thead>
           <tbody id="ipo-tbody"><tr><td colspan="5" class="loading">Loading…</td></tr></tbody>
@@ -628,7 +656,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       </div>
 
       <div class="card">
-        <div class="card-title">Watchlist Signals</div>
+        <div class="card-title">Watchlist Signals<span class="src-tag" id="reco-badge"></span></div>
         <div class="reco-cards" id="reco-cards">
           <div class="loading">Loading…</div>
         </div>
@@ -640,12 +668,12 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 <!-- Midday tab -->
 <div class="tab-panel" id="tab-midday">
   <div class="main">
-    <div class="options-header">
+    <div class="tab-header">
       <div>
         <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">Midday Pulse</div>
         <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Generated each trading day at 11:30am PT · session narrative · next-day events · trade ideas · big movers</div>
       </div>
-      <span class="sectors-ts" id="midday-ts"></span>
+      <span class="src-tag" id="midday-badge"></span><span class="sectors-ts" id="midday-ts"></span>
     </div>
 
     <div id="midday-empty" class="loading" style="padding:40px;text-align:center">Midday Pulse is generated each trading day at 11:30am PT. Check back after 11:30am.</div>
@@ -686,6 +714,7 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <input class="wl-input" id="wl-add-input" placeholder="Add ticker…" maxlength="10" />
       <button class="wl-btn" id="wl-add-btn">Add</button>
       <span class="wl-status" id="wl-status"></span>
+      <span class="src-tag" id="wl-badge"></span>
       <button class="wl-btn refresh" id="wl-refresh-btn">↺ Refresh</button>
     </div>
     <div class="wl-table-wrap">
@@ -727,13 +756,13 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
       <div class="sectors-header">
         <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">Sector Updates</div>
         <div style="display:flex;align-items:center;gap:12px">
-          <span class="sectors-ts" id="sectors-ts"></span>
+          <span class="src-tag" id="sectors-badge"></span><span class="sectors-ts" id="sectors-ts"></span>
           <button class="sectors-refresh-btn" id="sectors-refresh-btn">↺ Refresh</button>
         </div>
       </div>
       <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-bottom:18px">All 11 SPDR sectors · ETF % change + top opportunity &amp; avoid · updated every 4h · no penny stocks</div>
       <div class="sectors-grid" id="sectors-grid">
-        <div class="loading" style="grid-column:1/-1">Click the Sectors tab to load data.</div>
+        <div class="loading" style="grid-column:1/-1">Loading sector intelligence…</div>
       </div>
     </div>
   </div>
@@ -742,13 +771,13 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 <!-- Scanner tab -->
 <div class="tab-panel" id="tab-scanner">
   <div class="main" style="max-width:none">
-    <div class="options-header">
+    <div class="tab-header">
       <div>
         <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);" id="scanner-title">Day-Trading Scanner</div>
         <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;" id="scanner-sub">Warrior "Most Active" momentum · every active mover ≥ $2 · major exchanges only · no penny/OTC · ranked by 5 Pillars</div>
       </div>
       <div style="display:flex;align-items:center;gap:12px">
-        <span class="sectors-ts" id="scanner-ts"></span>
+        <span class="src-tag" id="scanner-badge"></span><span class="sectors-ts" id="scanner-ts"></span>
         <button class="wl-btn refresh" id="scanner-refresh-btn">↺ Refresh</button>
       </div>
     </div>
@@ -777,23 +806,25 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     </div>
 
     <div id="scanner-content">
-      <div class="loading" style="padding:40px;text-align:center;">Click the Scanner tab to load momentum candidates.</div>
+      <div class="loading" style="padding:40px;text-align:center;">Loading scanner…</div>
     </div>
   </div>
 </div>
 
-<!-- Options tab -->
-<div class="tab-panel" id="tab-options">
-  <div class="main">
-    <div class="options-header">
+<!-- Premium tab -->
+<div class="tab-panel" id="tab-premium">
+  <div class="main" style="max-width:none">
+    <div class="tab-header">
       <div>
-        <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">Options Flow</div>
-        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Watchlist EOD recap · nearest expiration · 15-min delay · V/OI ≥ 2× unusual filter</div>
+        <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">
+          Premium <span class="src-tag" id="premium-badge"></span>
+        </div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Short-premium screen · one row per watchlist ticker · monthly expiries ≥ 21 DTE · ranked by annualised ROC</div>
       </div>
-      <button class="wl-btn refresh" id="options-refresh-btn">↺ Refresh</button>
+      <button class="wl-btn refresh" id="premium-refresh-btn">↺ Refresh</button>
     </div>
-    <div id="options-content">
-      <div class="loading" style="padding:40px;text-align:center;">Click Refresh to load options flow.</div>
+    <div id="premium-content">
+      <div class="loading" style="padding:40px;text-align:center;">Loading premium screen…</div>
     </div>
   </div>
 </div>
@@ -920,6 +951,67 @@ async function apiFetch(path, opts = {}) {
   return r.json();
 }
 
+/* ─── Provenance + freshness badge ────────────────────────────────────────────
+ * Rendered FROM the `_meta` a fetch returned, never written into the markup —
+ * a card that never called a source has no way to name it.
+ *
+ * Two different clocks are on show and they are not the same failure. `delayed`
+ * is a property of the SOURCE: Yahoo is 15 minutes behind the tape no matter how
+ * recently we asked. Staleness is a property of OUR COPY: how long ago we asked,
+ * against the TTL the payload declared. A 15-minute-delayed price, a 6-hour P/E
+ * cache and a nightly Claude rating used to sit in one row with nothing telling
+ * them apart; the badge is what tells them apart.
+ *
+ * `data-fetched`/`data-ttl` are left on the element so `sweepStaleBadges()` can
+ * re-evaluate age on a timer — otherwise "stale" would only ever appear on a
+ * page load, which is exactly when it is least likely to be true.
+ */
+function setBadge(elOrId, meta) {
+  const el = typeof elOrId === 'string' ? document.getElementById(elOrId) : elOrId;
+  if (!el) return;
+  if (!meta) { el.textContent = ''; el.className = 'src-tag'; return; }
+
+  const bits = [meta.source];
+  if (meta.delayed) bits.push('15-min delayed');
+  else if (meta.source && /alpaca/i.test(meta.source)) bits.push('real-time');
+  if (meta.asOf) bits.push(meta.asOf);
+  if (meta.fetchedAt) {
+    bits.push('as of ' + new Date(meta.fetchedAt).toLocaleTimeString('en-US',
+      { hour: '2-digit', minute: '2-digit', hour12: false }));
+  }
+  el.textContent = bits.filter(Boolean).join(' · ');
+  el.dataset.fetched = meta.fetchedAt || '';
+  el.dataset.ttl     = meta.ttlSeconds ?? '';
+  el.dataset.bad     = meta.ok === false ? '1' : '';
+  el.dataset.delayed = meta.delayed ? '1' : '';
+  el.dataset.note    = meta.note || '';
+  applyBadgeAge(el);
+}
+
+/** Age a single badge against its declared TTL. */
+function applyBadgeAge(el) {
+  const fetched = Date.parse(el.dataset.fetched || '');
+  const ttl     = Number(el.dataset.ttl);
+  const stale   = Number.isFinite(fetched) && Number.isFinite(ttl) && ttl > 0
+    && (Date.now() - fetched) > ttl * 1000;
+  el.className = 'src-tag'
+    + (el.dataset.bad ? ' bad' : '')
+    + (el.dataset.delayed ? ' delayed' : '')
+    + (stale ? ' stale' : '');
+  const age = Number.isFinite(fetched) ? Math.round((Date.now() - fetched) / 60000) : null;
+  el.title = [
+    el.dataset.note,
+    Number.isFinite(fetched) ? `fetched ${new Date(fetched).toLocaleString()}${age != null ? ` (${age} min ago)` : ''}` : '',
+    Number.isFinite(ttl) && ttl > 0 ? `expected good for ${ttl >= 3600 ? (ttl / 3600) + 'h' : Math.round(ttl / 60) + ' min'}` : '',
+    stale ? 'STALE — past its refresh window' : '',
+  ].filter(Boolean).join(' · ');
+}
+
+/** Re-age every badge on a timer, so staleness appears without a reload. */
+function sweepStaleBadges() {
+  document.querySelectorAll('.src-tag[data-fetched]').forEach(applyBadgeAge);
+}
+
 /* ─── Clock ─── */
 function tickClock() {
   const now = new Date();
@@ -950,6 +1042,8 @@ async function loadMarketStrip() {
 async function loadDailySnapshot() {
   try {
     const data = await apiFetch('/daily');
+    setBadge('daily-badge', data._meta);
+    if (data.midday?._meta || data._meta) setBadge('midday-badge', data.midday?._meta || data._meta);
     if (data.loading) {
       document.getElementById('headline-text').textContent = 'Morning briefing is being prepared… check back shortly.';
       // The worker kicks off generation on this request; poll until it's ready.
@@ -1146,6 +1240,7 @@ async function loadWeekAhead() {
   document.getElementById('wa-overview').textContent = 'Generating week-ahead preview…';
   try {
     const data = await apiFetch('/market/week-ahead');
+    setBadge('wa-badge', data._meta);
     document.getElementById('wa-title').textContent = data.weekOf || '';
     document.getElementById('wa-overview').textContent = data.overview || '';
     const VALID_TYPES = new Set(['Earnings','Fed','Economic','Geopolitical','Macro']);
@@ -1186,7 +1281,10 @@ async function loadMovers() {
   };
 
   try {
-    const { gainers, losers, postGainers, postLosers } = await apiFetch('/market/movers');
+    const data = await apiFetch('/market/movers');
+    const { gainers, losers, postGainers, postLosers } = data;
+    setBadge('movers-badge', data._meta);
+    setBadge('post-movers-badge', data._meta);
     document.getElementById('gainers-list').innerHTML      = renderList(gainers,     'No movers ≥10% yet.');
     document.getElementById('losers-list').innerHTML       = renderList(losers,      'No movers ≤−10% yet.');
     document.getElementById('post-gainers-list').innerHTML = renderList(postGainers, 'No post-market gainers ≥10%.');
@@ -1202,7 +1300,9 @@ async function loadMovers() {
 /* ─── IPOs ─── */
 async function loadIPOs() {
   try {
-    const { ipos } = await apiFetch('/market/ipos');
+    const ipoRes = await apiFetch('/market/ipos');
+    const { ipos } = ipoRes;
+    setBadge('ipo-badge', ipoRes._meta);
     const tbody = document.getElementById('ipo-tbody');
     if (!ipos || !ipos.length) {
       tbody.innerHTML = '<tr><td colspan="5" style="color:var(--ink-3);padding:10px 0;font-size:12px">No upcoming IPOs found.</td></tr>';
@@ -1272,6 +1372,8 @@ async function loadWatchlistBatch() {
       const data = await apiFetch('/watchlist/batch?symbols=' + chunk.join(','), { cache: 'no-store' });
       Object.assign(allStocks, data.stocks || {});
       if (data.analysisLoading) anyAnalysisLoading = true;
+      // Every chunk carries the same provenance; the last one wins the badge.
+      setBadge('wl-badge', data._meta);
     }
     wlData = allStocks;
 
@@ -1372,11 +1474,11 @@ function renderWatchlist() {
         blocksHtml = `<div class="auction-blocks">
           <div class="auction-blocks-head">4:00pm First After-Hours Bar · Yahoo 1-min</div>
           <div style="display:flex;gap:24px;font-family:var(--mono);font-size:12px;flex-wrap:wrap;margin-top:4px">
-            <div><div class="options-stat-label">AH Volume</div><div class="${cls}" style="font-size:13px">${fmtVol(auc.ahVol)}</div></div>
-            <div><div class="options-stat-label">AH Open</div><div style="color:var(--ink-1)">${auc.ahOpen  != null ? '$' + fmt(auc.ahOpen)  : '—'}</div></div>
-            <div><div class="options-stat-label">AH Close</div><div style="color:var(--ink-1)">${auc.ahClose != null ? '$' + fmt(auc.ahClose) : '—'}</div></div>
-            <div><div class="options-stat-label">vs Reg Close</div><div class="${cls}">${chg} (${pct})</div></div>
-            <div><div class="options-stat-label">Reg Close</div><div style="color:var(--ink-2)">$${fmt(auc.regularClose)}</div></div>
+            <div><div class="auction-stat-label">AH Volume</div><div class="${cls}" style="font-size:13px">${fmtVol(auc.ahVol)}</div></div>
+            <div><div class="auction-stat-label">AH Open</div><div style="color:var(--ink-1)">${auc.ahOpen  != null ? '$' + fmt(auc.ahOpen)  : '—'}</div></div>
+            <div><div class="auction-stat-label">AH Close</div><div style="color:var(--ink-1)">${auc.ahClose != null ? '$' + fmt(auc.ahClose) : '—'}</div></div>
+            <div><div class="auction-stat-label">vs Reg Close</div><div class="${cls}">${chg} (${pct})</div></div>
+            <div><div class="auction-stat-label">Reg Close</div><div style="color:var(--ink-2)">$${fmt(auc.regularClose)}</div></div>
           </div>
         </div>`;
       }
@@ -1436,10 +1538,9 @@ function confLabel(n) {
   const i = confLevel(n);
   return i == null ? '—' : CONF_LEVELS[i];
 }
-function confClass(n) {
-  const i = confLevel(n);
-  return i == null ? 'low' : ['low', 'mid', 'high'][i];
-}
+/* `confClass()` lived here to colour the options-recap strategy chips. The recap
+ * is gone and nothing else consumed it, so it went with its CSS rather than
+ * lingering as a function with no caller and no stylesheet to target. */
 
 function ratingBadge(rating, conf) {
   if (!rating) return '<span style="color:var(--ink-3)">—</span>';
@@ -1478,15 +1579,41 @@ function showStatus(msg) {
   setTimeout(() => { el.textContent = ''; }, 3000);
 }
 
-/* ─── Tab switching ─── */
+/* ─── Tab switching ─────────────────────────────────────────────────────────
+ * Every tab is already painted from its KV snapshot by `primeTabs()` before a
+ * click ever happens, so this only covers the case where that snapshot was
+ * empty and the background refresh has not landed yet. No tab waits on a click.
+ */
 function switchTab(tab) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tab));
   if (tab === 'watchlist' && Object.keys(wlData).length === 0) loadWatchlistBatch();
-  if (tab === 'sectors'   && document.getElementById('sectors-grid').children.length <= 1 &&
-      !document.getElementById('sectors-grid').querySelector('.sector-card')) loadSectors();
-  if (tab === 'options'   && !optionsData) loadOptionsRecap();
+  if (tab === 'sectors'   && !sectorsData) loadSectors();
+  if (tab === 'premium'   && !premiumData) loadPremium();
   if (tab === 'scanner'   && !scannerData) loadScanner();
+}
+
+/* ─── Stale-while-revalidate ────────────────────────────────────────────────
+ * On load, every tab paints its last KV snapshot immediately — however old,
+ * with the stale badge saying so — then refreshes behind itself and re-renders.
+ *
+ * The revalidation goes through the NORMAL endpoint, so a snapshot still inside
+ * its TTL costs one KV read rather than a rebuild. Priming all four tabs is
+ * therefore about as expensive as the old behaviour of clicking one of them.
+ */
+async function primeTabs() {
+  await Promise.allSettled([
+    loadSectors({ cached: true }),
+    loadPremium({ cached: true }),
+    loadScanner(null, { cached: true }),
+  ]);
+  // Revalidate in the background. Failures are already swallowed by each loader,
+  // which leaves the painted snapshot in place rather than blanking it.
+  Promise.allSettled([
+    loadSectors(),
+    loadPremium(),
+    loadScanner(null),
+  ]);
 }
 
 /* ─── Sorting ─── */
@@ -1615,141 +1742,234 @@ function initColumnResize() {
   tbody.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
 })();
 
-/* ─── Options recap ─── */
-let optionsData = null;
-let optionsLoading = false;
+/* ─── Premium screen ───────────────────────────────────────────────────────────
+ * Replaces the options-flow recap, which showed the nearest expiration filtered
+ * to V/OI ≥ 2×. That surfaced 0DTE and expiry-week churn — the wrong question
+ * for selling 20–45 DTE premium against earnings dates.
+ *
+ * Rows below the sellable IV-rank floor are DIMMED, never dropped. A low-IV name
+ * has to look unattractive; hiding it would make "no vol edge here" and "we have
+ * no data for this ticker" render identically.
+ */
+let premiumData = null;
+let premiumLoading = false;
 
-async function loadOptionsRecap(forceRefresh = false) {
-  if (optionsLoading) return;
+const pctOf = (v, d = 1) => v == null ? '—' : (v * 100).toFixed(d) + '%';
+
+async function loadPremium({ cached = false, force = false } = {}) {
+  const el = document.getElementById('premium-content');
   const symbols = getWatchlist();
   if (!symbols.length) {
-    document.getElementById('options-content').innerHTML =
-      '<div style="padding:40px;text-align:center;color:var(--ink-3)">Add tickers to your watchlist to see options flow.</div>';
+    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--ink-3)">Add tickers to your watchlist to screen them for premium.</div>';
     return;
   }
-  optionsLoading = true;
-  const btn = document.getElementById('options-refresh-btn');
-  if (btn) { btn.disabled = true; btn.textContent = '↺ Loading…'; }
-  document.getElementById('options-content').innerHTML =
-    '<div class="loading" style="padding:40px;text-align:center">Fetching options chains and running analysis…</div>';
+  if (premiumLoading && !cached) return;
+
+  const btn = document.getElementById('premium-refresh-btn');
+  if (!cached) {
+    premiumLoading = true;
+    if (btn) { btn.disabled = true; btn.textContent = '↺ Loading…'; }
+    // Only show a loading wall when there is nothing on screen yet — a background
+    // revalidation must not blank out the snapshot the user is already reading.
+    if (!premiumData) el.innerHTML = '<div class="loading" style="padding:40px;text-align:center">Reading option chains, implied vol and earnings dates…</div>';
+  }
+
   try {
-    const qs = symbols.join(',') + (forceRefresh ? '&refresh=1' : '');
-    const data = await apiFetch(`/options/recap?symbols=${qs}`, { cache: 'no-store' });
-    optionsData = data;
-    renderOptionsRecap(data);
+    const qs = `symbols=${symbols.join(',')}`
+      + (cached ? '&cached=1' : '')
+      + (force ? '&refresh=1' : '');
+    const data = await apiFetch(`/premium?${qs}`, { cache: 'no-store' });
+    if (cached && data.empty) return;         // nothing banked; the live call will fill it
+    premiumData = data;
+    renderPremium(data);
   } catch (e) {
-    document.getElementById('options-content').innerHTML =
-      `<div style="padding:40px;color:var(--bear)">Failed: ${e.message}</div>`;
+    if (!premiumData) el.innerHTML = `<div style="padding:40px;color:var(--bear)">Premium screen failed: ${esc(e.message)}</div>`;
   } finally {
-    optionsLoading = false;
-    if (btn) { btn.disabled = false; btn.textContent = '↺ Refresh'; }
+    if (!cached) {
+      premiumLoading = false;
+      if (btn) { btn.disabled = false; btn.textContent = '↺ Refresh'; }
+    }
   }
 }
 
-function renderStrategies(strats) {
-  if (!strats?.length) return '';
-  let html = '<div class="options-strat-head">Recommended Strategies</div>';
-  for (const s of strats.slice(0, 2)) {
-    const conf    = typeof s.confidence === 'number' ? s.confidence : null;
-    const confCls = confClass(conf);
-    html += `<div class="options-strat-row">
-      <div class="options-strat-name">${esc(s.name || '')}</div>
-      <div class="options-strat-meta">
-        <span class="options-strat-strike">${esc(s.strikes || '')}</span>
-        <span class="options-strat-exp">${esc(s.expiration || '')}</span>
-        <span class="options-strat-conf ${confCls}">${confLabel(conf)} confidence</span>
+/** The candidate table for one expiry. */
+function premCandidates(leg) {
+  if (leg.reason && !leg.candidates.length) {
+    return `<div class="prem-note${leg.reason.includes('suppressed') ? ' bad' : ''}">${esc(leg.reason)}.</div>`;
+  }
+  if (!leg.candidates.length) {
+    return '<div class="prem-note">No strike on this expiry carried both a quoted implied vol and a usable delta.</div>';
+  }
+  const rows = leg.candidates.map((c) => {
+    // Annualised ROC is what the screen sorts on, so it is the one figure
+    // highlighted; ROC is shown beside it because the annualisation is a
+    // straight-line extrapolation of a single expiry, not a realised return.
+    const arocCls = c.aroc == null ? '' : c.aroc >= 0.30 ? 'hot' : '';
+    return `<tr class="${c.sparse ? 'sparse' : ''}">
+      <td class="${c.type.toLowerCase()}">${c.type} ${c.strike}</td>
+      <td>${c.targetDelta.toFixed(2)}</td>
+      <td>${Math.abs(c.delta).toFixed(3)}</td>
+      <td>${c.otmPct.toFixed(1)}%</td>
+      <td>${c.iv.toFixed(1)}%</td>
+      <td>${c.bid == null ? '—' : '$' + c.bid.toFixed(2)}</td>
+      <td>${c.credit == null ? '—' : '$' + c.credit.toFixed(0)}</td>
+      <td>${pctOf(c.roc, 2)}</td>
+      <td class="${arocCls}">${pctOf(c.aroc, 1)}</td>
+      <td>${c.openInterest == null ? '—' : fmtVol(c.openInterest)}</td>
+    </tr>`;
+  }).join('');
+
+  const sparseNote = leg.candidates.some(c => c.sparse)
+    ? '<div class="prem-note">A greyed row means the 0.30 and 0.16 targets resolved to the same listed strike — the chain has no distinct strike between them.</div>'
+    : '';
+
+  return `<table class="prem-cands">
+    <thead><tr>
+      <th>Strike</th><th>Target Δ</th><th>Actual Δ</th><th>OTM</th><th>IV</th>
+      <th>Bid</th><th>Credit</th><th>ROC</th><th>Ann. ROC</th><th>OI</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>${sparseNote}`;
+}
+
+const LEG_LABEL = {
+  clean:        ['Earnings-free expiry', 'cyan'],
+  post:         ['First expiry after earnings', 'amber'],
+  'clean+post': ['Earnings-free and post-earnings (same expiry)', 'cyan'],
+};
+
+function premRow(r, gates) {
+  if (!r.ok) {
+    return `<div class="prem-row bad">
+      <div class="prem-head"><span class="prem-sym">${esc(r.symbol)}</span>
+      <span class="prem-chip bear">unavailable</span></div>
+      <div class="prem-note bad">${esc(r.reason || 'no data')}.</div>
+    </div>`;
+  }
+
+  const em = r.expectedMove;
+  const ivrChip = r.ivRank != null
+    ? `<span class="prem-chip ${r.sellable ? 'bull' : 'muted'}">IV rank ${(r.ivRank * 100).toFixed(0)}</span>`
+    : `<span class="prem-chip muted" title="${esc(r.rankReason || '')}">IV rank collecting ${r.historyDays}/${r.rankTargetDays}d</span>`;
+
+  // Front IV above back IV is backwardation — the earnings-crush setup. Note the
+  // sign: termStructure is front − back, so that condition is POSITIVE here,
+  // which is the reverse of how it is usually said out loud.
+  const termChip = r.termStructure == null
+    ? '<span class="prem-chip muted">no back expiry</span>'
+    : r.backwardation
+      ? `<span class="prem-chip amber" title="Front ATM IV is ${r.termStructure.toFixed(2)} points above the back expiry (term structure = front − back, so backwardation reads positive here). Front-dated premium is rich relative to back — the classic crush setup.">Backwardation +${r.termStructure.toFixed(2)}</span>`
+      : `<span class="prem-chip muted" title="Front ATM IV is below the back expiry (term structure = front − back). Normal contango — no crush edge in the front month.">Contango ${r.termStructure.toFixed(2)}</span>`;
+
+  const earn = r.earnings || {};
+  const earnChip = earn.iso
+    ? `<span class="prem-chip ${earn.insideFront ? 'bear' : 'muted'}" title="${earn.insideFront
+        ? 'This print lands on or before the front expiry, so front-expiry premium carries the event.'
+        : 'The print falls after the front expiry.'}">Earnings ${esc(earn.iso)} · ${earn.daysAway}d${earn.insideFront ? ' · inside front' : ''}</span>`
+    : `<span class="prem-chip muted" title="${esc(earn.reason || '')}">No earnings date</span>`;
+
+  const regimeChip = `<span class="prem-chip ${
+    r.regime.state === 'elevated' ? 'bull' : r.regime.state === 'depressed' ? 'bear' : 'muted'
+  }" title="${esc(r.regime.label)}${r.regime.provisional ? ' — proxy, not a rank' : ''}">${
+    r.regime.state}${r.regime.provisional ? ' (proxy)' : ''}</span>`;
+
+  const legsHtml = r.legs.map((leg) => {
+    const [label, cls] = LEG_LABEL[leg.kind] || [leg.kind, 'muted'];
+    return `<div class="prem-leg">
+      <div class="prem-leg-head">
+        <span class="prem-chip ${cls}">${esc(label)}</span>
+        <span>${esc(leg.expiry)} · ${leg.dte} DTE</span>
+        ${leg.holdsEarnings ? '<span class="prem-chip bear">holds the print</span>' : ''}
       </div>
-      <div class="options-strat-rationale">${esc(s.rationale || '')}</div>
+      ${premCandidates(leg)}
     </div>`;
-  }
-  return html;
+  }).join('');
+
+  const missing = r.cleanMissing ? `<div class="prem-note">${esc(r.cleanMissing)}.</div>` : '';
+
+  const dimReason = r.ivRank == null
+    ? `IV rank is still collecting (${r.historyDays}/${r.rankTargetDays} days), so there is no percentile to gate on — dimmed rather than ranked.`
+    : `IV rank ${(r.ivRank * 100).toFixed(0)} is below the ${gates.ivrSellMin} floor for selling premium.`;
+
+  return `<div class="prem-row ${r.sellable ? '' : 'dim'}" title="${r.sellable ? '' : esc(dimReason)}">
+    <div class="prem-head">
+      <a class="prem-sym" href="${EQUITY_URL}?t=${esc(r.symbol)}">${esc(r.symbol)}</a>
+      <span class="prem-spot">$${fmt(r.spot)}</span>
+      ${ivrChip}${regimeChip}${termChip}${earnChip}
+      <span class="prem-aroc">best ann. ROC <b>${pctOf(r.bestAroc, 1)}</b></span>
+    </div>
+    <div class="prem-metrics">
+      <div><div class="prem-metric-l">Front ATM IV</div><div class="prem-metric-v">${r.front.atmIv.toFixed(1)}%</div>
+        <div class="prem-metric-v sub">${esc(r.front.expiry)} · ${r.front.dte}d</div></div>
+      <div><div class="prem-metric-l">Back ATM IV</div><div class="prem-metric-v">${r.back ? r.back.atmIv.toFixed(1) + '%' : '—'}</div>
+        <div class="prem-metric-v sub">${r.back ? esc(r.back.expiry) + ' · ' + r.back.dte + 'd' : 'no monthly after front'}</div></div>
+      <div><div class="prem-metric-l">Term structure</div><div class="prem-metric-v ${r.backwardation ? 'am' : ''}">${r.termStructure == null ? '—' : (r.termStructure > 0 ? '+' : '') + r.termStructure.toFixed(2)}</div>
+        <div class="prem-metric-v sub">front − back</div></div>
+      <div><div class="prem-metric-l">Expected move</div><div class="prem-metric-v">±${em.pct.toFixed(2)}%</div>
+        <div class="prem-metric-v sub">±$${em.dollars.toFixed(2)} by ${esc(em.expiry)}</div></div>
+      <div><div class="prem-metric-l">HV30</div><div class="prem-metric-v">${r.hv30 == null ? '—' : r.hv30.toFixed(1) + '%'}</div>
+        <div class="prem-metric-v sub">IV/HV ${r.ivHvRatio == null ? '—' : r.ivHvRatio.toFixed(2) + '×'}</div></div>
+    </div>
+    ${legsHtml}${missing}
+  </div>`;
 }
 
-function renderOptionsRecap(data) {
-  const { tickers, synthesis, ts } = data;
-  const tsStr = ts ? new Date(ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' }) : '';
-  const fmtN  = n => n >= 1e6 ? '$' + (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? '$' + (n/1e3).toFixed(0) + 'K' : '<$1K';
+function renderPremium(data) {
+  const el = document.getElementById('premium-content');
+  setBadge('premium-badge', data._meta);
 
-  let html = '';
-
-  if (synthesis?.overall) {
-    html += `<div class="options-synthesis">
-      <div class="options-synthesis-label">Claude's Read · ${tsStr}</div>
-      <div class="options-synthesis-text">${esc(synthesis.overall)}</div>
-    </div>`;
-  }
-
-  if (!tickers?.length) {
-    html += '<div style="color:var(--ink-3);padding:20px">No options data returned.</div>';
-    document.getElementById('options-content').innerHTML = html;
+  const rows = data.rows || [];
+  if (!rows.length) {
+    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--ink-3)">No rows returned.</div>';
     return;
   }
 
-  html += '<div class="options-grid">';
-  for (const t of tickers) {
-    const pcCls   = t.pcRatio == null ? '' : t.pcRatio < 0.8 ? 'bull' : t.pcRatio > 1.2 ? 'bear' : '';
-    const pcArrow = t.pcRatio == null ? '' : t.pcRatio < 0.8 ? '↑ ' : t.pcRatio > 1.2 ? '↓ ' : '';
-    const narrative = synthesis?.tickers?.[t.symbol];
+  const gates = data.gates || { ivrSellMin: 50, ivrHigh: 70 };
+  const sellable = rows.filter(r => r.sellable).length;
+  const rateLine = data.rate?.value != null
+    ? `risk-free ${(data.rate.value * 100).toFixed(2)}% (FRED DGS3MO${data.rate.asOf ? ' as of ' + esc(data.rate.asOf) : ''}${data.rate.stale ? ', stale' : ''})`
+    : `<span style="color:var(--bear)">no risk-free rate — deltas suppressed: ${esc(data.rate?.reason || 'unavailable')}</span>`;
 
-    let unusualHtml = '';
-    if (t.unusual?.length) {
-      unusualHtml = `<div class="options-unusual-head">Unusual Activity <span style="color:var(--ink-3);font-size:9px;font-weight:400">(DTE ≥ 5)</span></div>`;
-      for (const u of t.unusual) {
-        const cls = u.type === 'CALL' ? 'up' : 'dn';
-        unusualHtml += `<div class="options-unusual-row">
-          <span class="${cls}">${u.type}</span>
-          <span>$${u.strike}</span>
-          <span style="color:var(--ink-3)">${u.dte != null ? u.dte + 'd' : '—'}</span>
-          <span>${fmt(u.vol)}</span>
-          <span style="color:var(--ink-2)">${u.volOiRatio >= 99 ? 'new OI' : u.volOiRatio + '× V/OI'}</span>
-          <span style="color:var(--amber)">${fmtN(u.notional)}</span>
-        </div>`;
-      }
-    }
+  const legend = `<div class="prem-legend">
+    Expected move = spot × ATM IV × √(dte/365) — the one-sigma move the front expiry is pricing.
+    Term structure = front ATM IV − back ATM IV, so <b>backwardation reads positive</b> here and marks the
+    earnings-crush setup.<br>
+    Candidate strikes are the listed contracts nearest 0.30 and 0.16 delta, OTM only, delta from
+    Black-Scholes on each strike's <i>own</i> implied vol · ${rateLine}.<br>
+    Credit is the <b>bid</b>, not the mid — what a seller can actually hit.
+    ROC = credit / (strike × 100 − credit), the cash-secured basis on both sides; on the call side that is the
+    naked-margin equivalent, not the cost of shares in a covered call. Annualised ROC = ROC × 365/DTE, a
+    straight-line extrapolation of one expiry, not a realised return.<br>
+    ${rows.length - sellable} of ${rows.length} rows are dimmed: IV rank below ${gates.ivrSellMin} or not yet
+    established. They are shown rather than hidden so a thin-premium name reads as unattractive instead of missing.
+  </div>`;
 
-    html += `<div class="options-card">
-      <div class="options-card-header">
-        <div>
-          <a class="options-sym" href="${EQUITY_URL}?t=${esc(t.symbol)}">${esc(t.symbol)}</a>
-          ${t.price != null ? `<span class="options-price">$${fmt(t.price)}</span>` : ''}
-        </div>
-        <div>
-          <span style="font-family:var(--mono);font-size:9px;color:var(--ink-3);margin-right:4px">P/C</span>
-          <span class="options-pc-badge ${pcCls}">${t.pcRatio != null ? pcArrow + t.pcRatio : '—'}</span>
-        </div>
-      </div>
-      <div class="options-stats">
-        <div class="options-stat"><div class="options-stat-label">Calls</div><div class="options-stat-val" style="color:var(--bull)">${fmt(t.totalCallVol)}</div></div>
-        <div class="options-stat"><div class="options-stat-label">Puts</div><div class="options-stat-val" style="color:var(--bear)">${fmt(t.totalPutVol)}</div></div>
-        <div class="options-stat"><div class="options-stat-label">Call OI</div><div class="options-stat-val">${fmt(t.totalCallOI)}</div></div>
-        <div class="options-stat"><div class="options-stat-label">Put OI</div><div class="options-stat-val">${fmt(t.totalPutOI)}</div></div>
-        <div class="options-stat"><div class="options-stat-label">OI P/C</div><div class="options-stat-val ${t.pcOiRatio != null ? (t.pcOiRatio < 0.8 ? 'up' : t.pcOiRatio > 1.2 ? 'dn' : '') : ''}">${t.pcOiRatio ?? '—'}</div></div>
-      </div>
-      ${unusualHtml}
-      ${narrative ? `<div class="options-narrative">${esc(narrative)}</div>` : ''}
-      ${renderStrategies(synthesis?.strategies?.[t.symbol])}
-    </div>`;
-  }
-  html += '</div>';
-  document.getElementById('options-content').innerHTML = html;
+  el.innerHTML = legend + rows.map(r => premRow(r, gates)).join('');
 }
 
-document.getElementById('options-refresh-btn').addEventListener('click', () => loadOptionsRecap(true));
+document.getElementById('premium-refresh-btn').addEventListener('click', () => loadPremium({ force: true }));
 
 /* ─── Sectors ─── */
 let sectorsLoading = false;
 
-async function loadSectors(force = false) {
-  if (sectorsLoading) return;
-  sectorsLoading = true;
+let sectorsData = null;
+
+async function loadSectors({ cached = false, force = false } = {}) {
+  if (sectorsLoading && !cached) return;
   const btn = document.getElementById('sectors-refresh-btn');
-  btn.disabled = true;
-  btn.textContent = '↺ Loading…';
+  if (!cached) {
+    sectorsLoading = true;
+    btn.disabled = true;
+    btn.textContent = '↺ Loading…';
+  }
   const grid = document.getElementById('sectors-grid');
 
   try {
-    const url = '/market/sectors' + (force ? '?refresh=1' : '');
+    const url = '/market/sectors' + (cached ? '?cached=1' : force ? '?refresh=1' : '');
     const data = await apiFetch(url);
+    if (cached && data.empty) return;   // nothing banked; the live call fills it
+    sectorsData = data;
+    setBadge('sectors-badge', data._meta);
 
     if (data.ts) {
       const d = new Date(data.ts);
@@ -1794,15 +2014,19 @@ async function loadSectors(force = false) {
     }).join('');
   } catch (e) {
     console.error('[sectors]', e.message);
-    grid.innerHTML = '<div class="loading" style="grid-column:1/-1;color:var(--bear)">Failed to load sector data.</div>';
+    // Never blank a snapshot the user is already reading because the background
+    // revalidation failed — that turns a working stale view into an error.
+    if (!sectorsData) grid.innerHTML = '<div class="loading" style="grid-column:1/-1;color:var(--bear)">Failed to load sector data.</div>';
   } finally {
-    sectorsLoading = false;
-    btn.disabled = false;
-    btn.textContent = '↺ Refresh';
+    if (!cached) {
+      sectorsLoading = false;
+      btn.disabled = false;
+      btn.textContent = '↺ Refresh';
+    }
   }
 }
 
-document.getElementById('sectors-refresh-btn').addEventListener('click', () => loadSectors(true));
+document.getElementById('sectors-refresh-btn').addEventListener('click', () => loadSectors({ force: true }));
 
 /* ─── Scanner ─── */
 let scannerData = null;
@@ -1949,8 +2173,8 @@ const SCANNER_COPY = {
   },
 };
 
-async function loadScanner(preset) {
-  if (scannerLoading) return;
+async function loadScanner(preset, { cached = false, force = false } = {}) {
+  if (scannerLoading && !cached) return;
   if (preset) scannerPreset = preset;
   const isGolden = scannerPreset === 'goldencross';
   const copy = SCANNER_COPY[scannerPreset] || SCANNER_COPY._default;
@@ -1960,17 +2184,23 @@ async function loadScanner(preset) {
   document.getElementById('scanner-legend-golden').style.display = isGolden ? '' : 'none';
   document.getElementById('scanner-legend-momentum').style.display = isGolden ? 'none' : '';
 
-  scannerLoading = true;
   const btn = document.getElementById('scanner-refresh-btn');
-  btn.disabled = true; btn.textContent = '↺ Loading…';
-  const el = document.getElementById('scanner-content');
-  el.innerHTML = `<div class="loading" style="padding:40px;text-align:center;">${copy.loading}</div>`;
+  const el  = document.getElementById('scanner-content');
+  if (!cached) {
+    scannerLoading = true;
+    btn.disabled = true; btn.textContent = '↺ Loading…';
+    // Only wipe the pane when there is nothing to look at yet.
+    if (!scannerData) el.innerHTML = `<div class="loading" style="padding:40px;text-align:center;">${copy.loading}</div>`;
+  }
 
   try {
+    const q = cached ? 'cached=1' : force ? 'refresh=1' : '';
     const data = isGolden
-      ? await apiFetch('/market/golden-cross')
-      : await apiFetch('/market/scanner?preset=' + encodeURIComponent(scannerPreset));
+      ? await apiFetch('/market/golden-cross' + (q ? '?' + q : ''))
+      : await apiFetch('/market/scanner?preset=' + encodeURIComponent(scannerPreset) + (q ? '&' + q : ''));
+    if (cached && data.empty) return;
     scannerData = data;
+    setBadge('scanner-badge', data._meta);
     if (data.ts) {
       const d = new Date(data.ts);
       document.getElementById('scanner-ts').textContent =
@@ -1979,18 +2209,22 @@ async function loadScanner(preset) {
     if (isGolden) renderGoldenCross(data); else renderScanner(data);
   } catch (e) {
     console.error('[scanner]', e.message);
-    el.innerHTML = '<div class="loading" style="padding:40px;text-align:center;color:var(--bear)">Failed to load scanner. Try Refresh.</div>';
+    if (!scannerData) el.innerHTML = '<div class="loading" style="padding:40px;text-align:center;color:var(--bear)">Failed to load scanner. Try Refresh.</div>';
   } finally {
-    scannerLoading = false;
-    btn.disabled = false; btn.textContent = '↺ Refresh';
+    if (!cached) {
+      scannerLoading = false;
+      btn.disabled = false; btn.textContent = '↺ Refresh';
+    }
   }
 }
 
-document.getElementById('scanner-refresh-btn').addEventListener('click', () => loadScanner());
+document.getElementById('scanner-refresh-btn').addEventListener('click', () => loadScanner(null, { force: true }));
 document.querySelectorAll('.scan-preset').forEach(b => {
   b.addEventListener('click', () => {
     document.querySelectorAll('.scan-preset').forEach(x => x.classList.toggle('active', x === b));
-    loadScanner(b.dataset.preset);
+    // Switching preset changes which snapshot is relevant, so drop the old one.
+    scannerData = null;
+    loadScanner(b.dataset.preset, { cached: true }).then(() => loadScanner(b.dataset.preset));
   });
 });
 
@@ -2012,6 +2246,13 @@ async function init() {
     loadIPOs(),
     loadWeekAhead(),
   ]);
+
+  // Then paint every other tab from its snapshot and revalidate behind it.
+  primeTabs();
+
+  // Age the badges on a timer: "stale" that only appears on a page load would
+  // announce itself at exactly the moment it is least likely to be true.
+  setInterval(sweepStaleBadges, 30_000);
 
   // Auto-refresh
   setInterval(loadMarketStrip, 60_000);
