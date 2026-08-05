@@ -139,6 +139,17 @@ replaced. Nothing generates numbers any more.
   figure and the only source with the 6-period history the MoM chart needs; Yahoo carries a single
   unofficial snapshot. When FINRA is down the card renders Yahoo **labelled an estimate**, and the
   badge says Yahoo — it must never borrow FINRA's name.
+
+  **Never send `sortFields` on `settlementDate`.** It is the dataset's *partition* field
+  (`/metadata/group/otcMarket/name/consolidatedShortInterest` lists `partitionFields`), and sorting a
+  partition field without a partition equality filter is a hard 400. This cost a deploy cycle to find.
+  The query filters by `symbolCode` + a `dateRangeFilters` window and sorts in the Worker instead.
+  The symbol field is **`symbolCode`** — `symbol` 400s with "fields are not available in this dataset".
+  `Accept: application/json` is required on both the token and query calls.
+
+  Failures log the full request (token redacted), FINRA's response body, and the `/metadata` field
+  list; successes log row 0's keys. Keep all of that — a 400 with a swallowed body is unfixable
+  guesswork, and the one cycle it took to fix this was entirely down to those two log lines.
 - **`/api/13f/:ticker` — SEC EDGAR 13F-HR.** `SUPER_INVESTORS` holds 20 verified manager CIKs.
 
 **SEC EDGAR requires a real contact email in the User-Agent** (`SEC_UA`) or it 403s everything.

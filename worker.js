@@ -1758,11 +1758,16 @@ async function finraToken(env) {
 
   const r = await fetch(FINRA_TOKEN_URL, {
     method: 'POST',
-    headers: { 'Authorization': `Basic ${btoa(`${id}:${secret}`)}` },
+    headers: { 'Authorization': `Basic ${btoa(`${id}:${secret}`)}`, 'Accept': 'application/json' },
   });
-  if (!r.ok) throw new Error(`FINRA auth ${r.status}`);
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    console.error(`[finra] auth failed ${r.status} at ${FINRA_TOKEN_URL}: ${String(t).slice(0, 300)}`);
+    throw new Error(`FINRA auth ${r.status}`);
+  }
   const d = await r.json();
   if (!d?.access_token) throw new Error('FINRA auth returned no token');
+  console.log(`[finra] auth ok, token expires in ${d.expires_in || '?'}s`);
 
   const exp = Date.now() + Math.max(60, (d.expires_in || 1800) - 60) * 1000;
   try {
@@ -1772,29 +1777,118 @@ async function finraToken(env) {
   return d.access_token;
 }
 
+/**
+ * Field names CONFIRMED against a live 200 response, not taken from prose.
+ *
+ * Row 0 of otcMarket/consolidatedShortInterest returns:
+ *   stockSplitFlag, previousShortPositionQuantity, averageDailyVolumeQuantity,
+ *   issueName, currentShortPositionQuantity, changePreviousNumber,
+ *   accountingYearMonthNumber, settlementDate, marketClassCode, symbolCode,
+ *   daysToCoverQuantity, issuerServicesGroupExchangeCode, revisionFlag, changePercent
+ *
+ * The first name in each list is the confirmed one; the rest are documented
+ * aliases kept as a cushion in case the dataset is versioned. The row-0 key log
+ * below stays in place — it is what turned a blind 400 into a one-cycle fix.
+ */
+const FINRA_FIELDS = {
+  settlementDate: ['settlementDate', 'settleDate', 'settlementDt'],
+  shares:         ['currentShortPositionQuantity', 'shortVolume', 'currentShortPosition'],
+  priorShares:    ['previousShortPositionQuantity', 'previousShortVolume', 'previousShortPosition'],
+  avgDailyVolume: ['averageDailyVolumeQuantity', 'avgDailyVolume', 'averageDailyVolume'],
+  daysToCover:    ['daysToCoverQuantity', 'daystoCover', 'daysToCover'],
+};
+// Confirmed from FINRA's own /metadata endpoint, not from documentation prose:
+// the dataset exposes `symbolCode`, and `symbol` 400s with "fields are not
+// available in this dataset". The original 400 was never this field — it was
+// sortFields on `settlementDate`, which metadata lists under partitionFields
+// and which therefore cannot be sorted without a partition equality filter.
+const FINRA_SYMBOL_FIELD = 'symbolCode';
+
+/** Log the request that failed, minus the bearer token. A blind 400 is unfixable. */
+function logFinraFailure(url, body, status, respText) {
+  console.error('[finra] query failed', JSON.stringify({
+    status,
+    url,
+    method: 'POST',
+    headers: { Authorization: 'Bearer <redacted>', 'Content-Type': 'application/json', Accept: 'application/json' },
+    body,
+    response: String(respText || '').slice(0, 800),
+  }));
+}
+
+/** Ask FINRA what this dataset's fields actually are; purely diagnostic. */
+async function logFinraMetadata(token) {
+  const url = FINRA_DATA_URL.replace('/data/group/', '/metadata/group/');
+  try {
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
+    const t = await r.text();
+    console.error(`[finra] metadata ${r.status} from ${url}: ${t.slice(0, 2500)}`);
+  } catch (e) {
+    console.error(`[finra] metadata probe failed: ${e.message}`);
+  }
+}
+
 async function fetchFinraShort(ticker, env) {
   const token = await finraToken(env);
+  const sym = ticker.toUpperCase();
+
+  // No sortFields: FINRA restricts sorting to partitioned fields and rejects the
+  // request otherwise. A date window plus a client-side sort gets the same six
+  // settlements without depending on that restriction.
+  const today = etToday();
+  const body = {
+    limit: 60,
+    compareFilters: [{ fieldName: FINRA_SYMBOL_FIELD, fieldValue: sym, compareType: 'EQUAL' }],
+    dateRangeFilters: [{ fieldName: FINRA_FIELDS.settlementDate[0], startDate: isoAddDays(today, -400), endDate: today }],
+  };
+
   const r = await fetch(FINRA_DATA_URL, {
     method: 'POST',
-    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      limit: SHORT_PERIODS,
-      compareFilters: [{ fieldName: 'symbolCode', fieldValue: ticker.toUpperCase(), compareType: 'EQUAL' }],
-      sortFields: ['-settlementDate'],
-    }),
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',      // documented as required; its absence alone can 400
+    },
+    body: JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`FINRA query ${r.status}`);
-  const rows = await r.json();
-  if (!Array.isArray(rows) || !rows.length) throw new Error('FINRA returned no rows for this symbol');
+
+  if (!r.ok) {
+    const text = await r.text().catch(() => '');
+    logFinraFailure(FINRA_DATA_URL, body, r.status, text);
+    if (r.status === 400) await logFinraMetadata(token);
+    // Carry FINRA's own words into the reason so the card is diagnostic too.
+    let detail = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    try {
+      const j = JSON.parse(text);
+      detail = (j.message || j.error || j.errorMessage || detail).toString().slice(0, 160);
+    } catch (_) {}
+    throw new Error(`FINRA query ${r.status}${detail ? ` — ${detail}` : ''}`);
+  }
+
+  const payload = await r.json();
+  const rows = Array.isArray(payload) ? payload : (payload?.data || payload?.results || []);
+  if (!rows.length) throw new Error(`FINRA returned no short-interest rows for ${sym}`);
+
+  // One line that makes the next field-name surprise a five-second fix.
+  console.log(`[finra] ${sym}: ${rows.length} rows; row0 keys = ${Object.keys(rows[0]).join(',')}`);
 
   const num = v => { const n = Number(v); return Number.isFinite(n) ? n : null; };
-  return rows.map(row => ({
-    settlementDate: row.settlementDate || null,
-    shares:         num(row.currentShortPositionQuantity),
-    priorShares:    num(row.previousShortPositionQuantity),
-    avgDailyVolume: num(row.averageDailyVolumeQuantity),
-    daysToCover:    num(row.daysToCoverQuantity),
-  })).filter(x => x.settlementDate);
+  const pick = (row, names) => {
+    for (const n of names) if (row[n] != null && row[n] !== '') return row[n];
+    return null;
+  };
+
+  return rows
+    .map(row => ({
+      settlementDate: pick(row, FINRA_FIELDS.settlementDate),
+      shares:         num(pick(row, FINRA_FIELDS.shares)),
+      priorShares:    num(pick(row, FINRA_FIELDS.priorShares)),
+      avgDailyVolume: num(pick(row, FINRA_FIELDS.avgDailyVolume)),
+      daysToCover:    num(pick(row, FINRA_FIELDS.daysToCover)),
+    }))
+    .filter(x => x.settlementDate)
+    .sort((a, b) => String(b.settlementDate).localeCompare(String(a.settlementDate)))
+    .slice(0, SHORT_PERIODS);
 }
 
 async function handleShortInterest(ticker, params, origin, env, ctx) {
