@@ -475,27 +475,68 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .tab-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
 
 /* ── Premium screen ──────────────────────────────────────────────────────────
-   One row per watchlist ticker. Rows the vol regime does not support are dimmed
-   rather than dropped: a low-IV name has to look unattractive, and hiding it
-   would make the absence of a candidate indistinguishable from missing data. */
-.prem-row { background: var(--bg-1); border: 1px solid var(--line); border-radius: 8px; padding: 14px 18px; margin-bottom: 10px; }
-.prem-row.dim { opacity: 0.44; }
-.prem-row.dim:hover { opacity: 0.9; }
-.prem-row.bad { border-color: rgba(242,95,92,0.28); }
-.prem-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; }
-.prem-sym { font-family: var(--mono); font-weight: 600; font-size: 15px; color: var(--cyan); text-decoration: none; }
-.prem-sym:hover { color: var(--ink-0); }
-.prem-spot { font-family: var(--mono); font-size: 12px; color: var(--ink-1); }
+   Collapsed to one summary line per ticker; click to expand. Every row rendered
+   as a full-height block made a 22-name watchlist several screens of scrolling
+   with no way to compare rows against each other.
+
+   Rows the vol gate does not support are dimmed rather than dropped: a low-IV
+   name has to look unattractive, and hiding it would make the absence of a
+   candidate indistinguishable from missing data. Rows with no data at all are
+   recessive instead — a different state, deliberately styled differently. */
+.prem-controls { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.prem-count { font-family: var(--mono); font-size: 10px; color: var(--ink-3); margin-left: auto; }
+
+.prem-head-row, .prem-line {
+  display: grid;
+  grid-template-columns: 18px 68px 74px 72px 92px 78px 68px 84px 30px;
+  align-items: center; gap: 8px;
+}
+.prem-head-row { padding: 0 12px 6px; border-bottom: 1px solid var(--line); margin-bottom: 6px; }
+.prem-head-row .hcol {
+  font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase;
+  letter-spacing: 0.05em; cursor: pointer; user-select: none; text-align: right;
+}
+.prem-head-row .hcol:hover { color: var(--ink-1); }
+.prem-head-row .hcol.sorted { color: var(--cyan); }
+.prem-head-row .hcol.symbol { grid-column: 2; text-align: left; }
+.prem-head-row .hcol.pad { cursor: default; }
+
+.prem-row { background: var(--bg-1); border: 1px solid var(--line); border-radius: 6px; margin-bottom: 4px; }
+.prem-row.open { border-color: rgba(94,197,234,0.3); }
+.prem-line { padding: 9px 12px; cursor: pointer; }
+.prem-line:hover { background: var(--bg-2); }
+.prem-line.dim { opacity: 0.5; }
+.prem-line.dim:hover { opacity: 1; }
+.prem-line.recessive { opacity: 0.42; cursor: default; grid-template-columns: 18px 68px 90px 1fr 30px; }
+.prem-line.recessive:hover { opacity: 0.75; background: none; }
+.prem-caret { font-size: 9px; color: var(--ink-3); }
+.prem-sym { font-family: var(--mono); font-weight: 600; font-size: 13px; color: var(--cyan); text-decoration: none; text-align: left; }
+.prem-sym:hover { color: var(--ink-0); text-decoration: underline; }
+.prem-col { font-family: var(--mono); font-size: 11px; color: var(--ink-1); text-align: right; white-space: nowrap; }
+.prem-col.ivr.good { color: var(--bull); }
+.prem-col.ivr.proxy { color: var(--ink-3); }
+.prem-col.term.am { color: var(--amber); }
+.prem-col.earn.bear { color: var(--bear); }
+.prem-col.muted { color: var(--ink-3); }
+.prem-col.aroc { color: var(--ink-0); font-weight: 600; }
+.prem-col.aroc.hot { color: var(--bull); }
+.prem-reason { font-family: var(--sans); font-size: 10px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prem-refresh {
+  font-family: var(--mono); font-size: 11px; line-height: 1; padding: 3px 5px; cursor: pointer;
+  background: var(--bg-2); color: var(--ink-3); border: 1px solid var(--line); border-radius: 3px;
+}
+.prem-refresh:hover { color: var(--cyan); border-color: var(--cyan); }
+.prem-refresh.busy { color: var(--amber); }
+.prem-detail { padding: 4px 14px 14px; border-top: 1px solid var(--line-soft); }
+
 .prem-chip { font-family: var(--mono); font-size: 9px; padding: 2px 7px; border-radius: 3px; background: var(--bg-3); color: var(--ink-2); letter-spacing: 0.04em; white-space: nowrap; }
 .prem-chip.bull  { background: rgba(35,209,139,0.16);  color: var(--bull); }
 .prem-chip.bear  { background: rgba(242,95,92,0.16);   color: var(--bear); }
 .prem-chip.amber { background: rgba(244,183,64,0.16);  color: var(--amber); }
 .prem-chip.cyan  { background: rgba(94,197,234,0.14);  color: var(--cyan); }
 .prem-chip.muted { color: var(--ink-3); }
-.prem-aroc { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
-.prem-aroc b { color: var(--bull); font-size: 14px; }
 
-.prem-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.prem-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); gap: 10px; margin: 12px 0; }
 .prem-metric-l { font-family: var(--mono); font-size: 9px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
 .prem-metric-v { font-family: var(--mono); font-size: 13px; color: var(--ink-0); }
 .prem-metric-v.sub { font-size: 10px; color: var(--ink-3); }
@@ -1743,81 +1784,123 @@ function initColumnResize() {
 })();
 
 /* ─── Premium screen ───────────────────────────────────────────────────────────
- * Replaces the options-flow recap, which showed the nearest expiration filtered
- * to V/OI ≥ 2×. That surfaced 0DTE and expiry-week churn — the wrong question
- * for selling 20–45 DTE premium against earnings dates.
+ * One collapsed summary line per ticker; click to expand the candidate table.
+ * Every ticker rendered as a full-height block made the tab unnavigable — a
+ * 22-name watchlist was several screens of scrolling with no way to compare rows.
  *
- * Rows below the sellable IV-rank floor are DIMMED, never dropped. A low-IV name
- * has to look unattractive; hiding it would make "no vol edge here" and "we have
- * no data for this ticker" render identically.
+ * Data comes from /api/premium/batch, which reads KV and makes no outbound calls.
+ * The chain fetches happen in a cron sweep sliced across firings, because
+ * Cloudflare's subrequest cap is per invocation and a whole watchlist does not
+ * fit in one. The per-row ↻ hits /api/premium/:ticker?refresh=1 — one ticker is
+ * ~5 subrequests and safe on its own.
  */
 let premiumData = null;
 let premiumLoading = false;
+let premiumSort = { col: 'symbol', dir: 1 };
+
+const PREM_OPEN_KEY = 'trading_dash_premium_open';
+const PREM_SORT_KEY = 'trading_dash_premium_sort';
 
 const pctOf = (v, d = 1) => v == null ? '—' : (v * 100).toFixed(d) + '%';
 
-async function loadPremium({ cached = false, force = false } = {}) {
+/* Expanded rows survive a refresh — collapsing everything on every reload was
+ * its own navigation problem. sessionStorage, not localStorage: this is
+ * "where was I", not a durable preference. */
+function premOpenSet() {
+  try { return new Set(JSON.parse(sessionStorage.getItem(PREM_OPEN_KEY)) || []); }
+  catch (_) { return new Set(); }
+}
+function premOpenSave(set) {
+  try { sessionStorage.setItem(PREM_OPEN_KEY, JSON.stringify([...set])); } catch (_) {}
+}
+function premSortLoad() {
+  try {
+    const s = JSON.parse(sessionStorage.getItem(PREM_SORT_KEY));
+    if (s && typeof s.col === 'string' && (s.dir === 1 || s.dir === -1)) premiumSort = s;
+  } catch (_) {}
+}
+function premSortSave() {
+  try { sessionStorage.setItem(PREM_SORT_KEY, JSON.stringify(premiumSort)); } catch (_) {}
+}
+
+async function loadPremium({ force = false } = {}) {
   const el = document.getElementById('premium-content');
   const symbols = getWatchlist();
   if (!symbols.length) {
     el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--ink-3)">Add tickers to your watchlist to screen them for premium.</div>';
     return;
   }
-  if (premiumLoading && !cached) return;
+  if (premiumLoading) return;
+  premiumLoading = true;
 
   const btn = document.getElementById('premium-refresh-btn');
-  if (!cached) {
-    premiumLoading = true;
-    if (btn) { btn.disabled = true; btn.textContent = '↺ Loading…'; }
-    // Only show a loading wall when there is nothing on screen yet — a background
-    // revalidation must not blank out the snapshot the user is already reading.
-    if (!premiumData) el.innerHTML = '<div class="loading" style="padding:40px;text-align:center">Reading option chains, implied vol and earnings dates…</div>';
-  }
+  if (btn) { btn.disabled = true; btn.textContent = '↺ Loading…'; }
+  if (!premiumData) el.innerHTML = '<div class="loading" style="padding:40px;text-align:center">Reading the banked premium screen…</div>';
 
   try {
-    const qs = `symbols=${symbols.join(',')}`
-      + (cached ? '&cached=1' : '')
-      + (force ? '&refresh=1' : '');
-    const data = await apiFetch(`/premium?${qs}`, { cache: 'no-store' });
-    if (cached && data.empty) return;         // nothing banked; the live call will fill it
+    // Pure KV read: no outbound calls, so watchlist length cannot break it.
+    const data = await apiFetch(`/premium/batch?symbols=${symbols.join(',')}`, { cache: 'no-store' });
     premiumData = data;
     renderPremium(data);
   } catch (e) {
     if (!premiumData) el.innerHTML = `<div style="padding:40px;color:var(--bear)">Premium screen failed: ${esc(e.message)}</div>`;
   } finally {
-    if (!cached) {
-      premiumLoading = false;
-      if (btn) { btn.disabled = false; btn.textContent = '↺ Refresh'; }
-    }
+    premiumLoading = false;
+    if (btn) { btn.disabled = false; btn.textContent = '↺ Refresh'; }
   }
 }
 
-/** The candidate table for one expiry. */
+/** Rebuild one ticker on demand — the only path that spends subrequests. */
+async function refreshPremiumRow(sym) {
+  const btn = document.querySelector(`[data-prem-refresh="${sym}"]`);
+  if (btn) { btn.textContent = '⋯'; btn.classList.add('busy'); }
+  try {
+    const { row } = await apiFetch(`/premium/${encodeURIComponent(sym)}?refresh=1`, { cache: 'no-store' });
+    if (!row) throw new Error('no row returned');
+    const i = premiumData.rows.findIndex(r => r.symbol === sym);
+    if (i >= 0) premiumData.rows[i] = row; else premiumData.rows.push(row);
+    premiumData.missing = (premiumData.missing || []).filter(m => m.symbol !== sym);
+    // Show the result of an explicit refresh rather than leaving it collapsed.
+    const open = premOpenSet(); open.add(sym); premOpenSave(open);
+    renderPremium(premiumData);
+  } catch (e) {
+    if (btn) { btn.textContent = '!'; btn.title = `Refresh failed: ${e.message}`; btn.classList.remove('busy'); }
+  }
+}
+
+/* ── Status presentation ─────────────────────────────────────────────────────
+ * These used to render identically as dim red, which conflated a fact about our
+ * scheduler with a finding about the ticker. They are different things and the
+ * user has to be able to act on them differently: `pending` resolves itself,
+ * `no-iv` never will, `error` is worth retrying. */
+const PREM_STATUS = {
+  pending:      { label: 'not computed', cls: 'muted', hint: 'Waiting on the scheduled sweep. The ↻ button rebuilds this one ticker now.' },
+  'no-options': { label: 'no options',   cls: 'muted', hint: 'This ticker has no listed options at all — nothing to screen.' },
+  'no-iv':      { label: 'no IV',        cls: 'amber', hint: 'Options are listed but the front expiry quotes no usable implied vol. Too thin to price — a real finding about the name, not a fetch problem.' },
+  error:        { label: 'fetch failed', cls: 'bear',  hint: 'The upstream fetch failed. Usually transient — try ↻.' },
+};
+
 function premCandidates(leg) {
   if (leg.reason && !leg.candidates.length) {
-    return `<div class="prem-note${leg.reason.includes('suppressed') ? ' bad' : ''}">${esc(leg.reason)}.</div>`;
+    return `<div class="prem-note${/suppressed/.test(leg.reason) ? ' bad' : ''}">${esc(leg.reason)}.</div>`;
   }
   if (!leg.candidates.length) {
     return '<div class="prem-note">No strike on this expiry carried both a quoted implied vol and a usable delta.</div>';
   }
-  const rows = leg.candidates.map((c) => {
-    // Annualised ROC is what the screen sorts on, so it is the one figure
-    // highlighted; ROC is shown beside it because the annualisation is a
-    // straight-line extrapolation of a single expiry, not a realised return.
-    const arocCls = c.aroc == null ? '' : c.aroc >= 0.30 ? 'hot' : '';
-    return `<tr class="${c.sparse ? 'sparse' : ''}">
+  const rows = leg.candidates.map((c) => `
+    <tr class="${c.sparse ? 'sparse' : ''}">
       <td class="${c.type.toLowerCase()}">${c.type} ${c.strike}</td>
       <td>${c.targetDelta.toFixed(2)}</td>
       <td>${Math.abs(c.delta).toFixed(3)}</td>
+      <td title="Delta-derived approximation under a lognormal assumption — 1 − |Δ| — not a backtested frequency.">${c.pop == null ? '—' : (c.pop * 100).toFixed(0) + '%'}</td>
       <td>${c.otmPct.toFixed(1)}%</td>
       <td>${c.iv.toFixed(1)}%</td>
       <td>${c.bid == null ? '—' : '$' + c.bid.toFixed(2)}</td>
       <td>${c.credit == null ? '—' : '$' + c.credit.toFixed(0)}</td>
       <td>${pctOf(c.roc, 2)}</td>
-      <td class="${arocCls}">${pctOf(c.aroc, 1)}</td>
+      <td class="${c.aroc != null && c.aroc >= 0.30 ? 'hot' : ''}">${pctOf(c.aroc, 1)}</td>
       <td>${c.openInterest == null ? '—' : fmtVol(c.openInterest)}</td>
-    </tr>`;
-  }).join('');
+    </tr>`).join('');
 
   const sparseNote = leg.candidates.some(c => c.sparse)
     ? '<div class="prem-note">A greyed row means the 0.30 and 0.16 targets resolved to the same listed strike — the chain has no distinct strike between them.</div>'
@@ -1825,7 +1908,7 @@ function premCandidates(leg) {
 
   return `<table class="prem-cands">
     <thead><tr>
-      <th>Strike</th><th>Target Δ</th><th>Actual Δ</th><th>OTM</th><th>IV</th>
+      <th>Strike</th><th>Target Δ</th><th>Actual Δ</th><th>POP</th><th>OTM</th><th>IV</th>
       <th>Bid</th><th>Credit</th><th>ROC</th><th>Ann. ROC</th><th>OI</th>
     </tr></thead>
     <tbody>${rows}</tbody>
@@ -1838,41 +1921,53 @@ const LEG_LABEL = {
   'clean+post': ['Earnings-free and post-earnings (same expiry)', 'cyan'],
 };
 
-function premRow(r, gates) {
-  if (!r.ok) {
-    return `<div class="prem-row bad">
-      <div class="prem-head"><span class="prem-sym">${esc(r.symbol)}</span>
-      <span class="prem-chip bear">unavailable</span></div>
-      <div class="prem-note bad">${esc(r.reason || 'no data')}.</div>
+/** The always-visible one-line summary. */
+function premSummary(r, open) {
+  const st = !r.ok ? (PREM_STATUS[r.status] || PREM_STATUS.error) : null;
+
+  if (st) {
+    return `<div class="prem-line recessive" data-prem-row="${esc(r.symbol)}">
+      <span class="prem-caret"></span>
+      <a class="prem-sym" href="${EQUITY_URL}?t=${esc(r.symbol)}" onclick="event.stopPropagation()">${esc(r.symbol)}</a>
+      <span class="prem-chip ${st.cls}" title="${esc(st.hint)}">${esc(st.label)}</span>
+      <span class="prem-reason" title="${esc(r.reason || '')}">${esc(r.reason || st.hint)}</span>
+      <button class="prem-refresh" data-prem-refresh="${esc(r.symbol)}" title="Rebuild just this ticker (~5 subrequests)">↻</button>
     </div>`;
   }
 
+  const ivr = r.ivRank != null
+    ? `<span class="prem-col ivr ${r.sellable ? 'good' : ''}">IVR ${(r.ivRank * 100).toFixed(0)}</span>`
+    : `<span class="prem-col ivr proxy" title="IV rank needs 60 days of history; ${r.historyDays}/${r.rankTargetDays} collected. Showing the IV/HV30 proxy instead.">${
+        r.ivHvRatio != null ? `IV/HV ${r.ivHvRatio.toFixed(2)}×` : 'no rank'}</span>`;
+
+  const term = r.termStructure == null
+    ? '<span class="prem-col term muted">—</span>'
+    : `<span class="prem-col term ${r.backwardation ? 'am' : 'muted'}" title="${
+        r.backwardation
+          ? `Front ATM IV is ${r.termStructure.toFixed(2)} points above the back expiry. Term structure is front − back, so backwardation reads positive here — the earnings-crush setup.`
+          : 'Front ATM IV is below the back expiry (term structure = front − back). Normal contango.'
+      }">${r.backwardation ? '◤' : '◢'} ${(r.termStructure > 0 ? '+' : '') + r.termStructure.toFixed(2)}</span>`;
+
+  const dte = r.daysToEarnings == null
+    ? '<span class="prem-col earn muted" title="No scheduled earnings date from Yahoo.">—</span>'
+    : `<span class="prem-col earn ${r.earnings?.insideFront ? 'bear' : ''}" title="Earnings ${esc(r.earnings?.iso || '')}${r.earnings?.insideFront ? ' — inside the front expiry' : ''}">E−${r.daysToEarnings}d</span>`;
+
+  return `<div class="prem-line ${r.sellable === false ? 'dim' : ''}" data-prem-row="${esc(r.symbol)}">
+    <span class="prem-caret">${open ? '▾' : '▸'}</span>
+    <a class="prem-sym" href="${EQUITY_URL}?t=${esc(r.symbol)}" onclick="event.stopPropagation()">${esc(r.symbol)}</a>
+    <span class="prem-col spot">$${fmt(r.spot)}</span>
+    <span class="prem-col iv" title="Front expiry ${esc(r.front.expiry)} · ${r.front.dte}d">${r.front.atmIv.toFixed(1)}%</span>
+    <span title="${esc(r.sellableReason || '')}">${ivr}</span>
+    ${term}
+    ${dte}
+    <span class="prem-col aroc ${r.bestAroc != null && r.bestAroc >= 0.30 ? 'hot' : ''}" title="Best annualised ROC across this row's candidate strikes.">${pctOf(r.bestAroc, 1)}</span>
+    <button class="prem-refresh" data-prem-refresh="${esc(r.symbol)}" title="Rebuild just this ticker (~5 subrequests)">↻</button>
+  </div>`;
+}
+
+/** The expanded detail, built only for rows that are actually open. */
+function premDetail(r) {
   const em = r.expectedMove;
-  const ivrChip = r.ivRank != null
-    ? `<span class="prem-chip ${r.sellable ? 'bull' : 'muted'}">IV rank ${(r.ivRank * 100).toFixed(0)}</span>`
-    : `<span class="prem-chip muted" title="${esc(r.rankReason || '')}">IV rank collecting ${r.historyDays}/${r.rankTargetDays}d</span>`;
-
-  // Front IV above back IV is backwardation — the earnings-crush setup. Note the
-  // sign: termStructure is front − back, so that condition is POSITIVE here,
-  // which is the reverse of how it is usually said out loud.
-  const termChip = r.termStructure == null
-    ? '<span class="prem-chip muted">no back expiry</span>'
-    : r.backwardation
-      ? `<span class="prem-chip amber" title="Front ATM IV is ${r.termStructure.toFixed(2)} points above the back expiry (term structure = front − back, so backwardation reads positive here). Front-dated premium is rich relative to back — the classic crush setup.">Backwardation +${r.termStructure.toFixed(2)}</span>`
-      : `<span class="prem-chip muted" title="Front ATM IV is below the back expiry (term structure = front − back). Normal contango — no crush edge in the front month.">Contango ${r.termStructure.toFixed(2)}</span>`;
-
-  const earn = r.earnings || {};
-  const earnChip = earn.iso
-    ? `<span class="prem-chip ${earn.insideFront ? 'bear' : 'muted'}" title="${earn.insideFront
-        ? 'This print lands on or before the front expiry, so front-expiry premium carries the event.'
-        : 'The print falls after the front expiry.'}">Earnings ${esc(earn.iso)} · ${earn.daysAway}d${earn.insideFront ? ' · inside front' : ''}</span>`
-    : `<span class="prem-chip muted" title="${esc(earn.reason || '')}">No earnings date</span>`;
-
-  const regimeChip = `<span class="prem-chip ${
-    r.regime.state === 'elevated' ? 'bull' : r.regime.state === 'depressed' ? 'bear' : 'muted'
-  }" title="${esc(r.regime.label)}${r.regime.provisional ? ' — proxy, not a rank' : ''}">${
-    r.regime.state}${r.regime.provisional ? ' (proxy)' : ''}</span>`;
-
   const legsHtml = r.legs.map((leg) => {
     const [label, cls] = LEG_LABEL[leg.kind] || [leg.kind, 'muted'];
     return `<div class="prem-leg">
@@ -1886,18 +1981,10 @@ function premRow(r, gates) {
   }).join('');
 
   const missing = r.cleanMissing ? `<div class="prem-note">${esc(r.cleanMissing)}.</div>` : '';
+  const gate = r.sellableReason ? `<div class="prem-note">${esc(r.sellableReason)}</div>` : '';
+  const age = r.ts ? `<div class="prem-note">Chain data as of ${new Date(r.ts).toLocaleString()}.</div>` : '';
 
-  const dimReason = r.ivRank == null
-    ? `IV rank is still collecting (${r.historyDays}/${r.rankTargetDays} days), so there is no percentile to gate on — dimmed rather than ranked.`
-    : `IV rank ${(r.ivRank * 100).toFixed(0)} is below the ${gates.ivrSellMin} floor for selling premium.`;
-
-  return `<div class="prem-row ${r.sellable ? '' : 'dim'}" title="${r.sellable ? '' : esc(dimReason)}">
-    <div class="prem-head">
-      <a class="prem-sym" href="${EQUITY_URL}?t=${esc(r.symbol)}">${esc(r.symbol)}</a>
-      <span class="prem-spot">$${fmt(r.spot)}</span>
-      ${ivrChip}${regimeChip}${termChip}${earnChip}
-      <span class="prem-aroc">best ann. ROC <b>${pctOf(r.bestAroc, 1)}</b></span>
-    </div>
+  return `<div class="prem-detail">
     <div class="prem-metrics">
       <div><div class="prem-metric-l">Front ATM IV</div><div class="prem-metric-v">${r.front.atmIv.toFixed(1)}%</div>
         <div class="prem-metric-v sub">${esc(r.front.expiry)} · ${r.front.dte}d</div></div>
@@ -1909,9 +1996,48 @@ function premRow(r, gates) {
         <div class="prem-metric-v sub">±$${em.dollars.toFixed(2)} by ${esc(em.expiry)}</div></div>
       <div><div class="prem-metric-l">HV30</div><div class="prem-metric-v">${r.hv30 == null ? '—' : r.hv30.toFixed(1) + '%'}</div>
         <div class="prem-metric-v sub">IV/HV ${r.ivHvRatio == null ? '—' : r.ivHvRatio.toFixed(2) + '×'}</div></div>
+      <div><div class="prem-metric-l">Earnings</div><div class="prem-metric-v">${r.earnings?.iso ? esc(r.earnings.iso) : '—'}</div>
+        <div class="prem-metric-v sub">${r.earnings?.iso ? (r.earnings.insideFront ? 'inside front expiry' : `in ${r.daysToEarnings}d`) : esc(r.earnings?.reason || '')}</div></div>
     </div>
-    ${legsHtml}${missing}
+    ${legsHtml}${missing}${gate}${age}
   </div>`;
+}
+
+const PREM_SORTS = {
+  symbol: { label: 'Ticker',    get: r => r.symbol,          dirDefault:  1, text: true },
+  spot:   { label: 'Spot',      get: r => r.spot,            dirDefault: -1 },
+  iv:     { label: 'Front IV',  get: r => r.front?.atmIv,    dirDefault: -1 },
+  ivr:    { label: 'IV rank',   get: r => r.ivRank,          dirDefault: -1 },
+  term:   { label: 'Term',      get: r => r.termStructure,   dirDefault: -1 },
+  earn:   { label: 'Earnings',  get: r => r.daysToEarnings,  dirDefault:  1 },
+  aroc:   { label: 'Ann. ROC',  get: r => r.bestAroc,        dirDefault: -1 },
+};
+
+function sortPremiumRows(rows) {
+  const spec = PREM_SORTS[premiumSort.col] || PREM_SORTS.symbol;
+  const dir  = premiumSort.dir;
+  return [...rows].sort((a, b) => {
+    // Unavailable rows always sink, whatever the sort — they have no values to
+    // compare and they are not what the screen is for.
+    if (a.ok !== b.ok) return a.ok ? -1 : 1;
+    const av = spec.get(a), bv = spec.get(b);
+    if (spec.text) return String(av).localeCompare(String(bv)) * dir;
+    // Nulls last in BOTH directions: a missing value is not a small value.
+    if (av == null && bv == null) return a.symbol.localeCompare(b.symbol);
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    return (av - bv) * dir || a.symbol.localeCompare(b.symbol);
+  });
+}
+
+function setPremiumSort(col) {
+  const spec = PREM_SORTS[col];
+  if (!spec) return;
+  premiumSort = premiumSort.col === col
+    ? { col, dir: -premiumSort.dir }
+    : { col, dir: spec.dirDefault };
+  premSortSave();
+  renderPremium(premiumData);
 }
 
 function renderPremium(data) {
@@ -1919,35 +2045,89 @@ function renderPremium(data) {
   setBadge('premium-badge', data._meta);
 
   const rows = data.rows || [];
-  if (!rows.length) {
-    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--ink-3)">No rows returned.</div>';
+  const missing = (data.missing || []).map(m => ({ ...m, ok: false, legs: [], bestAroc: null }));
+  const all = [...rows, ...missing];
+  if (!all.length) {
+    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--ink-3)">No tickers to screen.</div>';
     return;
   }
 
-  const gates = data.gates || { ivrSellMin: 50, ivrHigh: 70 };
-  const sellable = rows.filter(r => r.sellable).length;
-  const rateLine = data.rate?.value != null
-    ? `risk-free ${(data.rate.value * 100).toFixed(2)}% (FRED DGS3MO${data.rate.asOf ? ' as of ' + esc(data.rate.asOf) : ''}${data.rate.stale ? ', stale' : ''})`
-    : `<span style="color:var(--bear)">no risk-free rate — deltas suppressed: ${esc(data.rate?.reason || 'unavailable')}</span>`;
+  const open = premOpenSet();
+  const gates = data.gates || { ivrSellMin: 50, ratioSellMin: 1 };
+
+  const head = Object.entries(PREM_SORTS).map(([key, spec]) => {
+    const on = premiumSort.col === key;
+    return `<span class="prem-col hcol ${key} ${on ? 'sorted' : ''}" data-prem-sort="${key}">${spec.label}${
+      on ? (premiumSort.dir === 1 ? ' ▲' : ' ▼') : ''}</span>`;
+  }).join('');
+
+  const okRows   = all.filter(r => r.ok).length;
+  const dimRows  = all.filter(r => r.ok && r.sellable === false).length;
+  const queued   = data.queued;
 
   const legend = `<div class="prem-legend">
-    Expected move = spot × ATM IV × √(dte/365) — the one-sigma move the front expiry is pricing.
-    Term structure = front ATM IV − back ATM IV, so <b>backwardation reads positive</b> here and marks the
-    earnings-crush setup.<br>
-    Candidate strikes are the listed contracts nearest 0.30 and 0.16 delta, OTM only, delta from
-    Black-Scholes on each strike's <i>own</i> implied vol · ${rateLine}.<br>
-    Credit is the <b>bid</b>, not the mid — what a seller can actually hit.
-    ROC = credit / (strike × 100 − credit), the cash-secured basis on both sides; on the call side that is the
-    naked-margin equivalent, not the cost of shares in a covered call. Annualised ROC = ROC × 365/DTE, a
-    straight-line extrapolation of one expiry, not a realised return.<br>
-    ${rows.length - sellable} of ${rows.length} rows are dimmed: IV rank below ${gates.ivrSellMin} or not yet
-    established. They are shown rather than hidden so a thin-premium name reads as unattractive instead of missing.
+    Rows come from the banked screen — chain data is refreshed by a scheduled sweep (${data.batchSize || 6} tickers
+    per run, twice-daily full passes), because Cloudflare caps outbound requests per invocation and a whole
+    watchlist does not fit in one. <b>↻ on a row</b> rebuilds that one ticker immediately.
+    ${queued ? `<b>${queued}</b> ticker${queued === 1 ? '' : 's'} still queued for the current pass.` : ''}<br>
+    Term structure = front ATM IV − back ATM IV, so <b>backwardation reads positive</b> (◤) and marks the
+    earnings-crush setup. Expected move = spot × ATM IV × √(dte/365).
+    Candidates are the listed strikes nearest 0.30 and 0.16 delta, OTM only, delta from Black-Scholes on each
+    strike's own implied vol. POP = 1 − |Δ|, a delta-derived approximation, not a backtested frequency.
+    Credit is the <b>bid</b>; ROC = credit / (strike × 100 − credit); annualised ROC = ROC × 365/DTE.<br>
+    ${dimRows} of ${okRows} priced rows are dimmed — IV rank below ${gates.ivrSellMin}, or the IV/HV30 proxy
+    below ${Number(gates.ratioSellMin ?? 1).toFixed(2)}× while the rank is still collecting. Hover a row for
+    which of the two applied and the actual number.
   </div>`;
 
-  el.innerHTML = legend + rows.map(r => premRow(r, gates)).join('');
+  const controls = `<div class="prem-controls">
+    <button class="wl-btn" id="prem-expand-all">Expand all</button>
+    <button class="wl-btn" id="prem-collapse-all">Collapse all</button>
+    <span class="prem-count">${okRows} priced · ${all.length - okRows} unavailable</span>
+  </div>`;
+
+  const body = sortPremiumRows(all).map((r) => {
+    const isOpen = r.ok && open.has(r.symbol);
+    return `<div class="prem-row ${isOpen ? 'open' : ''}">
+      ${premSummary(r, isOpen)}
+      ${isOpen ? premDetail(r) : ''}
+    </div>`;
+  }).join('');
+
+  el.innerHTML = legend + controls
+    + `<div class="prem-head-row">${head}<span class="prem-col hcol pad"></span></div>`
+    + body;
 }
 
+/* Delegated: the row list is re-rendered wholesale on every sort and refresh, so
+ * per-element listeners would have to be rebound each time. */
+document.getElementById('premium-content').addEventListener('click', (e) => {
+  const refresh = e.target.closest('[data-prem-refresh]');
+  if (refresh) { e.stopPropagation(); refreshPremiumRow(refresh.dataset.premRefresh); return; }
+
+  const sortBtn = e.target.closest('[data-prem-sort]');
+  if (sortBtn) { setPremiumSort(sortBtn.dataset.premSort); return; }
+
+  if (e.target.closest('#prem-expand-all')) {
+    premOpenSave(new Set((premiumData?.rows || []).filter(r => r.ok).map(r => r.symbol)));
+    renderPremium(premiumData); return;
+  }
+  if (e.target.closest('#prem-collapse-all')) {
+    premOpenSave(new Set());
+    renderPremium(premiumData); return;
+  }
+
+  const line = e.target.closest('[data-prem-row]');
+  if (!line || line.classList.contains('recessive')) return;
+  const sym = line.dataset.premRow;
+  const open = premOpenSet();
+  if (open.has(sym)) open.delete(sym); else open.add(sym);
+  premOpenSave(open);
+  renderPremium(premiumData);
+});
+
 document.getElementById('premium-refresh-btn').addEventListener('click', () => loadPremium({ force: true }));
+premSortLoad();
 
 /* ─── Sectors ─── */
 let sectorsLoading = false;

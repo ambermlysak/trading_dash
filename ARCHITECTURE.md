@@ -71,12 +71,23 @@ in this codebase and shipped:
    so the same formula would produce a plausible-looking number measuring nothing at all. Those cards
    render **n/a** with the reason, not a figure. The temptation is always to fill the cell — a blank
    looks like a bug and a number looks like work — but a wrong number is the more expensive of the two.
-11. **An input that is unavailable is not defaulted to a convenient value.** Black-Scholes delta needs
+11. **"We have not looked yet" is not the same as "there is nothing there."** The premium screen
+   rendered four different situations as one dim red block: no row computed yet, no options listed,
+   options listed but nothing priced, and a failed fetch. Only the third is a finding about the
+   ticker; the first is a fact about our own scheduler and the fourth is worth retrying. Collapsing
+   them cost the user the ability to act on any of them — and it made a scheduling gap look like a
+   verdict on the stock. Every unavailable state now carries its own `status` and says which it is.
+12. **A gate whose input does not exist yet must not read as a verdict.** `sellable` was
+   `ivRank != null && ivRank >= 50`, so a null rank — the state for the first 60 days of collection —
+   counted as failing. The whole screen greyed out for three months, which reads as "nothing here is
+   worth selling" rather than "we cannot tell yet". The gate is now tri-state, falls through to the
+   IV/HV30 proxy while the rank collects, and names the number that decided it on hover.
+13. **An input that is unavailable is not defaulted to a convenient value.** Black-Scholes delta needs
    a risk-free rate. With FRED unreachable and nothing banked, every delta is **suppressed** rather
    than computed at `r = 0`: that substitution is worth about a full delta point at 30 DTE, which is
    enough to change which strike the screen selects, and it would be invisible on screen. Same rule as
    3, applied to an input rather than an output.
-12. **The same rule applies to what the model is asked for, not just what the code computes.**
+14. **The same rule applies to what the model is asked for, not just what the code computes.**
    The Midday Pulse had a "Day Trade" bucket. No bad calculation sat behind it — but the model was
    being asked for same-session ideas while holding only daily bars and a delayed quote, so any
    entry, stop or intraday timing it emitted was invented. The absence of a bad calculation is not

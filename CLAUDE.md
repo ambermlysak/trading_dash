@@ -51,7 +51,8 @@ All data flows through the Worker. CORS is enforced via `ALLOWED_ORIGINS` allowl
 GET  /api/quote/:ticker           Yahoo quoteSummary (multi-module) + Alpaca price overlay
 GET  /api/chart/:ticker           Yahoo v8 OHLCV (?range=1y&interval=1d)
 GET  /api/options/:ticker         Yahoo v7 options chain
-GET  /api/premium?symbols=        Premium-selling screen (term structure, expected move, delta strikes)
+GET  /api/premium/batch?symbols=  Premium screen, KV only — zero outbound calls
+GET  /api/premium/:ticker         One ticker (?refresh=1 rebuilds it, ~5 subrequests)
 GET  /api/insider/:ticker         SEC EDGAR Form 4, last 90 days (12h KV)
 GET  /api/short/:ticker           FINRA consolidated short interest, 6 settlements (Yahoo fallback)
 GET  /api/13f/:ticker             Super-investor 13F holdings, from a KV reverse index
@@ -372,7 +373,8 @@ daily:midday       — 11:30am cron midday pulse (narrative, topics, tomorrow, t
 daily:eod          — 1:15pm cron EOD summary
 analysis:{TICKER}  — on-demand per-ticker Claude analysis
 iv:{TICKER}:{DATE} — daily front-month ATM IV sample, feeds ivRank (400d TTL; atmIv/spot/dte also in KV metadata)
-premium:{SYMBOLS}  — premium screen snapshot, keyed on the sorted symbol list (15min TTL, kept 2h for stale-while-revalidate)
+premium:{TICKER}   — one premium-screen row, written by the sliced cron sweep (3d TTL)
+premium:queue      — tickers still awaiting refresh this pass (deliberately outside the premium:{TICKER} space)
 econ:dgs3mo        — FRED 3-month T-bill, the risk-free rate for Black-Scholes (refreshed 12h, kept 7d)
 cik:map            — SEC ticker→CIK map (30d TTL)
 insider:{TICKER}   — parsed Form 4 report (12h TTL)
@@ -392,7 +394,7 @@ rec:{TICKER}       — recommendation history, one entry per PT trading day (up 
 recfwd:last        — PT date of the last forward-return fill (dedup; outside the rec: prefix on purpose)
 ```
 
-**Cron trigger:** a single `*/15 13-22 * * 1-5` UTC cron; `scheduled()` dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), EOD summary + IV sample sweep (1:15pm PT), and the forward-return fill (2pm PT). Each job uses a KV timestamp check with a 2-hour dedup window to avoid double-runs; the two jobs added later (`recordWatchlistIv`, `fillForwardReturns`) use a PT-date key instead, since they should run once a day rather than once per window.
+**Cron trigger:** a single `*/15 12-22 * * 1-5` UTC cron; `scheduled()` dispatches by Pacific wall-clock time to the premium sweep (5am PT seed, 1:45pm PT re-seed, a 6-ticker drain on every other non-heavy firing), the morning briefing (6am PT), midday pulse (11:30am PT), EOD summary + IV sample sweep (1:15pm PT), and the forward-return fill (2pm PT). **Anything added here shares the invocation's subrequest budget with whatever else that firing runs** — check `heavyFiring` before adding work. Each job uses a KV timestamp check with a 2-hour dedup window to avoid double-runs; the two jobs added later (`recordWatchlistIv`, `fillForwardReturns`) use a PT-date key instead, since they should run once a day rather than once per window.
 
 **Recommendation log: one entry per ticker per trading day.** `synthesize()` fires on every page
 load, and `handleLogRec()` used to append unconditionally — so a ticker opened a dozen times in a
@@ -451,10 +453,60 @@ chain data and was never part of this.
   not the cost of shares in a covered call; the legend says so, because the same number under two
   capital bases would not be comparable.
 
-Rows sort by `bestAroc` (the best annualised ROC among the row's candidates), nulls last. Rows below
-`IVR_SELL_MIN` — or with no IV rank yet — are **dimmed, never hidden**: a thin-premium name has to
-look unattractive, and hiding it makes "no vol edge here" and "no data for this ticker" render
-identically.
+**The screen is fed by a cron sweep, not by the request.** Cloudflare caps subrequests **per
+invocation** — 50 on Workers Free, 1000 on Paid — and one ticker costs a *measured* ~4.8 outbound
+fetches (1 expiry list + 1 quoteSummary for earnings + ~2.8 dated expiry chains, plus ~3 fixed for
+crumb/rate/spark). A 22-name watchlist is ~110, which is what killed the original fan-out. **Chunking
+inside a handler does nothing for this** — the cap is per invocation, not per chunk. Re-measure with a
+counting `fetch` wrapper before changing the batch size; do not estimate it.
+
+So the work is sliced across cron firings:
+
+- `seedPremiumQueue()` writes the whole watchlist to `premium:queue` at two anchors — **5:00am PT**
+  (pre-open) and **1:45pm PT** (after the close). The cron window starts at **12:00 UTC** so 5am PT
+  exists under PDT as well as PST; at 13:00 UTC it only existed in winter.
+- `drainPremiumQueue()` runs on every *other* firing and refreshes `PREMIUM_CRON_BATCH` (6) tickers —
+  ~33 subrequests, inside the strict 50 bound and therefore correct on either plan. A 22-name
+  watchlist completes in 4 firings, within the hour.
+- It **skips any firing that already runs a heavy job** (briefing, midday, EOD, forward-fill, 13F).
+  `ctx.waitUntil` does not get its own budget — it shares the invocation's — so draining alongside the
+  13F build (~61 SEC round trips by itself) would recreate the exact failure this design removes.
+- The queue is **advanced before** the batch runs. If an invocation dies mid-batch the next firing
+  moves on instead of retrying the same six forever and never reaching the rest of the watchlist.
+
+`GET /api/premium/batch` then reads KV and makes **zero outbound calls**, so watchlist length cannot
+break it; tickers with no banked row come back in `missing[]` with a reason rather than vanishing.
+`GET /api/premium/:ticker?refresh=1` rebuilds one ticker (~5 subrequests, safe anywhere) and backs the
+per-row ↻ control.
+
+**Row `status` distinguishes three failures that used to render identically as dim red:**
+`ok` · `no-options` (nothing listed — nothing to screen) · `no-iv` (options listed but the front expiry
+quotes no usable IV — a real finding about a thin name, which will not fix itself) · `error` (the fetch
+failed; transient, worth retrying). `pending` is never stored — it is what the batch endpoint reports
+for a ticker the sweep has not reached. Conflating "we have not looked yet" with "this name has no
+tradeable options" hides both.
+
+**The sellable gate is tri-state, and null rank is not a fail.** It was
+`ivRank != null && ivRank * 100 >= IVR_SELL_MIN`, which treats a null rank as below-threshold — and
+since `ivRank` is null until 60 days of history exist, that dimmed *every row on the tab* for the whole
+collection window. The proxy was already computed and already drove the regime chip; the gate simply
+never consulted it. `sellableFrom()` now returns `{sellable, basis, reason}` with `basis` of
+`rank` → `proxy` → `none`, and `sellable: null` for "no basis to judge", which renders neutral rather
+than unattractive. `RATIO_SELL_MIN` (1.0) is the proxy analogue of "at or above the median": IV is
+pricing at least as much movement as the stock has actually realised. `sellableReason` names the
+number that decided it, so "IVR 34" and "rank collecting, proxy 0.94×" are distinguishable on hover.
+
+Rows sort by `bestAroc` (the best annualised ROC among the row's candidates), nulls last. Rows failing
+the gate are **dimmed, never hidden**: a thin-premium name has to look unattractive, and hiding it
+makes "no vol edge here" and "no data for this ticker" render identically.
+
+**The tab is a collapsed list.** Every ticker as a full-height block made a 22-name watchlist several
+screens of scrolling with no way to compare rows. Each row is one summary line — ticker, spot, front
+IV, IV rank or proxy, term-structure chip, days to earnings, best annualised ROC — and expands on
+click. Headers sort on any of those (alphabetical by default, annualised ROC descending being the
+useful one); unavailable rows always sink regardless of sort, and nulls sort last in **both**
+directions because a missing value is not a small value. Expanded state persists per ticker in
+`sessionStorage` — it is "where was I", not a durable preference.
 
 The Scanner tab hosts four presets. Three (Momentum, Pre-Market Gappers, All Movers) hit
 `/api/market/scanner` and share `renderScanner()`; the Golden Cross Setup preset hits

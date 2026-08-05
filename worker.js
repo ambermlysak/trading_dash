@@ -926,11 +926,86 @@ async function handleOptions(ticker, params, origin, env) {
    one expiry, and the row says so rather than printing a duplicate.
    ══════════════════════════════════════════════════════════════════════════ */
 
-const PREM_TTL_MS      = 900_000;        // 15 min — the chain is 15-min delayed anyway
 const PREM_MIN_DTE     = 21;             // "20–45 DTE": first monthly at least this far out
 const PREM_TARGETS     = [0.30, 0.16];   // the two short-strike deltas this screen selects
-const PREM_MAX_SYMBOLS = 30;
-const PREM_SCHEMA      = 1;              // bump when the row shape changes, to retire caches
+const PREM_MAX_SYMBOLS = 60;
+const PREM_SCHEMA      = 2;              // bump when the row shape changes, to retire cached rows
+
+/* ── Subrequest budget ───────────────────────────────────────────────────────
+   MEASURED, not estimated: one ticker costs ~4.8 outbound fetches — 1 expiry
+   list, 1 quoteSummary for the earnings date, and ~2.8 dated expiry chains
+   (front, back, clean monthly, post-earnings monthly, minus whatever dedupes).
+   A 6-ticker probe came to 30 fetches: 6 base + 6 quoteSummary + 17 dated + 1
+   spark. Fixed overhead is ~3 (crumb, FRED rate, one spark per 20 symbols).
+
+   Cloudflare caps subrequests PER INVOCATION — 50 on Workers Free, 1000 on
+   Paid. A 22-name watchlist is ~110, which is why the old fan-out died. Note
+   the cap is per *invocation*, not per chunk: chunking inside one handler does
+   nothing for it, which is why the sweep is spread across cron firings below.
+
+   PREMIUM_CRON_BATCH is sized against the *stricter* bound so it is correct on
+   either plan: 6 × 4.8 + 3 ≈ 33, comfortably inside 50 and nowhere near 1000. */
+const PREMIUM_CRON_BATCH = 6;
+const PREMIUM_QUEUE_KEY  = 'premium:queue';   // outside the premium:{TICKER} space on purpose
+const PREMIUM_ROW_TTL    = 3 * 24 * 3600;     // rows outlive a long weekend
+const PREMIUM_FRESH_MS   = 8 * 3600_000;      // past this the UI calls a row stale
+
+/* Row status, so the UI can tell three different failures apart. They used to
+   render identically as dim red, which conflated "we have not looked yet" with
+   "this name has no tradeable options" — the second is a real finding about a
+   ticker, the first is a fact about our own scheduler.
+     ok          — row computed
+     no-options  — ticker has no listed options at all
+     no-iv       — options exist but the front expiry quotes no usable IV
+                   (thin names: the chain is listed but nothing is priced)
+     error       — the fetch itself failed; transient, worth retrying
+   `pending` is never stored: it is what the batch endpoint reports for a ticker
+   with no KV row yet. */
+
+/** Premium-selling gate.
+ *
+ *  `sellable` used to be `ivRank != null && ivRank * 100 >= IVR_SELL_MIN`, which
+ *  treats a null rank as a FAIL. IV rank is null until 60 days of history exist,
+ *  so that dimmed every row on the tab for the entire collection window — three
+ *  months of a screen that renders as if nothing were worth selling.
+ *
+ *  The proxy was already computed and already drove the regime chip; the gate
+ *  simply never consulted it. It does now. `RATIO_SELL_MIN` of 1.0 is the proxy
+ *  analogue of "at or above the median": implied vol is pricing at least as much
+ *  movement as the stock has actually realised. It is a coarser instrument than a
+ *  percentile and is labelled a proxy everywhere it surfaces.
+ *
+ *  Three outcomes, not two — `null` means "no basis to judge", which is neither
+ *  a pass nor a fail and must not render as unattractive. */
+const RATIO_SELL_MIN = 1.0;
+
+function sellableFrom(ivRank, ivHvRatio, historyDays) {
+  if (ivRank != null) {
+    const pts = ivRank * 100;
+    const ok  = pts >= IVR_SELL_MIN;
+    return {
+      sellable: ok, basis: 'rank',
+      reason: ok
+        ? `IV rank ${pts.toFixed(0)} is at or above the ${IVR_SELL_MIN} floor for selling premium`
+        : `IV rank ${pts.toFixed(0)} is below the ${IVR_SELL_MIN} floor for selling premium`,
+    };
+  }
+  if (ivHvRatio != null) {
+    const ok = ivHvRatio >= RATIO_SELL_MIN;
+    return {
+      sellable: ok, basis: 'proxy',
+      reason: `IV rank still collecting (${historyDays}/${IV_RANK_MIN_DAYS}d needed) — gating on the `
+            + `IV/HV30 proxy instead: ${ivHvRatio.toFixed(2)}× is ${ok ? 'at or above' : 'below'} `
+            + `${RATIO_SELL_MIN.toFixed(2)}×, meaning implied vol is pricing ${ok ? 'more' : 'less'} `
+            + `movement than this name has actually realised. A proxy, not a percentile.`,
+    };
+  }
+  return {
+    sellable: null, basis: 'none',
+    reason: 'No IV rank yet and no IV/HV30 proxy either — there is no basis to judge whether '
+          + 'premium is rich here, so the row is neither recommended nor dismissed.',
+  };
+}
 
 /** Next *scheduled* earnings date as ISO, or null.
  *  Same field the watchlist's Earnings column reads, deliberately — two tabs
@@ -1001,6 +1076,10 @@ function pickCandidates(chainExp, spot, rate, expUnix) {
         type: type.toUpperCase(),
         strike: o.strike,
         delta: +delta.toFixed(4),
+        // Single short strike, so POP is exactly the case 1 − |Δ| describes.
+        // Delta-derived under a lognormal assumption, not a measured frequency —
+        // the card says so.
+        pop: +(1 - Math.abs(delta)).toFixed(4),
         iv: +(o.impliedVolatility * 100).toFixed(2),
         bid, credit,
         openInterest: o.openInterest ?? null,
@@ -1035,19 +1114,26 @@ function pickCandidates(chainExp, spot, rate, expUnix) {
   return out;
 }
 
-/** One screen row. Never throws — a failed ticker reports why and the sweep continues. */
+/** One screen row. Never throws — a failed ticker reports why and the sweep continues.
+ *  `status` distinguishes a transient fetch error from a genuine finding about the
+ *  ticker; see the status taxonomy above. */
 async function premiumRow(sym, rate, hv30, env) {
-  const fail = reason => ({ symbol: sym, ok: false, reason, legs: [], bestAroc: null });
+  const fail = (status, reason) => ({
+    symbol: sym, ok: false, status, reason, legs: [], bestAroc: null,
+    schema: PREM_SCHEMA, ts: Date.now(),
+  });
 
   let base;
   try {
     base = await yahooAuth(`/v7/finance/options/${encodeURIComponent(sym)}`, '', env);
-  } catch (e) { return fail(`options chain unavailable: ${e.message}`); }
+  } catch (e) { return fail('error', `options chain fetch failed: ${e.message}`); }
 
   const res  = base?.optionChain?.result?.[0];
   const spot = res?.quote?.regularMarketPrice;
   const exps = (res?.expirationDates || []).slice().sort((a, b) => a - b);
-  if (!res || !Number.isFinite(spot) || !exps.length) return fail('no listed options');
+  if (!res || !Number.isFinite(spot) || !exps.length) {
+    return fail('no-options', 'no listed options for this ticker');
+  }
 
   // Earnings is a separate module; a failure here costs the earnings flag and the
   // post-earnings leg, not the whole row.
@@ -1093,7 +1179,13 @@ async function premiumRow(sym, rate, hv30, env) {
 
   const frontIv = frontChain ? atmIvFor(frontChain, spot) : null;
   const backIv  = backChain  ? atmIvFor(backChain,  spot) : null;
-  if (!frontIv) return fail('no usable implied vol on the front expiry');
+  // A real finding, not a failure of ours: the chain is listed but nothing on the
+  // front expiry is priced. Thin names sit here permanently.
+  if (!frontIv) {
+    return fail('no-iv',
+      `options are listed but the front expiry (${expiryIso(frontExp)}, ${dteOf(frontExp)}d) quotes `
+      + 'no usable implied vol — too thin to price');
+  }
 
   const frontDte = dteOf(frontExp);
   const snap = {
@@ -1161,9 +1253,14 @@ async function premiumRow(sym, rate, hv30, env) {
   const arocs    = allCands.map(c => c.aroc).filter(Number.isFinite);
   const bestAroc = arocs.length ? Math.max(...arocs) : null;
 
+  const gate = sellableFrom(ivRank, ivHvRatio, historyDays);
+
   return {
     symbol: sym,
     ok: true,
+    status: 'ok',
+    schema: PREM_SCHEMA,
+    ts: Date.now(),
     spot: +spot.toFixed(2),
     front: snap.front,
     back:  snap.back,
@@ -1194,107 +1291,230 @@ async function premiumRow(sym, rate, hv30, env) {
     regime,
     // Dimmed, never hidden: a low-IV name should look unattractive rather than
     // vanish, so the absence of candidates is visibly a judgement and not a gap.
-    sellable: ivRank != null && ivRank * 100 >= IVR_SELL_MIN,
+    // `sellable` is tri-state — null means there is no basis to judge, which is
+    // not the same as failing the gate and must not render as unattractive.
+    sellable:     gate.sellable,
+    sellableBasis: gate.basis,      // 'rank' | 'proxy' | 'none'
+    sellableReason: gate.reason,    // shown on hover, and it names the actual number
     legs,
     cleanMissing,
     bestAroc,
+    daysToEarnings: earnIso
+      ? Math.round((Date.parse(earnIso + 'T00:00:00Z') - Date.parse(etToday() + 'T00:00:00Z')) / 86_400_000)
+      : null,
   };
 }
 
-async function handlePremium(params, origin, env, ctx) {
+/* ── Per-ticker KV storage ───────────────────────────────────────────────────
+   One key per ticker, so the batch endpoint is a pure KV read and the refresh
+   path can be sliced across invocations. The old combined key
+   (`premium:{SORTED,SYMBOL,LIST}`) is gone: it made the cache a function of
+   which tickers you happened to ask for together, so adding one name to the
+   watchlist invalidated the whole screen. */
+const premiumKey = sym => `premium:${sym.toUpperCase()}`;
+
+async function storePremiumRow(row, env) {
+  try {
+    await env?.REC_LOG?.put(premiumKey(row.symbol), JSON.stringify(row), { expirationTtl: PREMIUM_ROW_TTL });
+  } catch (e) { console.warn(`[premium] ${row.symbol} KV write failed:`, e.message); }
+}
+
+async function readPremiumRow(sym, env) {
+  try {
+    const row = await env?.REC_LOG?.get(premiumKey(sym), 'json');
+    // A row written under an older shape renders as blanks rather than failing
+    // loudly, so retire it and let the caller report it as pending.
+    return row && row.schema === PREM_SCHEMA ? row : null;
+  } catch (_) { return null; }
+}
+
+/** Refresh exactly one ticker and bank it. ~5 subrequests — safe anywhere. */
+async function refreshPremiumTicker(sym, env, shared = null) {
+  const rate = shared?.rate ?? (await riskFreeRate(env));
+  let hv30 = shared?.hv?.get(sym);
+  if (hv30 === undefined) {
+    try {
+      const closes = await yahoo(`/v8/finance/chart/${encodeURIComponent(sym)}`, '?range=3mo&interval=1d');
+      hv30 = historicalVol(closes?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [], IV_HV_WINDOW);
+    } catch (_) { hv30 = null; }
+  }
+  const row = await premiumRow(sym, rate.rate, hv30, env);
+  row.rate = {
+    value: rate.rate, asOf: rate.asOf ?? null,
+    stale: !!rate.stale, reason: rate.reason || null,
+  };
+  await storePremiumRow(row, env);
+  return row;
+}
+
+/* ── Cron sweep, sliced across firings ───────────────────────────────────────
+   The subrequest cap is per INVOCATION, so chunking inside one handler buys
+   nothing — a 22-name sweep is ~110 fetches however it is arranged internally,
+   and on Workers Free that dies at 50.
+
+   So the sweep is a queue drained across the cron firings that already exist.
+   An anchor time (pre-open, and again after the close) seeds the queue with the
+   whole watchlist; every firing — anchor included — drains up to
+   PREMIUM_CRON_BATCH tickers. At 6 per firing on the quarter-hourly cron, a
+   22-name watchlist completes in 4 firings — within the hour — and each
+   invocation spends ~33 subrequests.
+
+   No self-dispatch: a Worker fetching its own public URL to fan out would work,
+   but it needs the deployed hostname as configuration and fails silently when
+   that drifts. The queue needs nothing but KV. */
+async function seedPremiumQueue(env, reason) {
+  let tickers = [...DEFAULT_WATCHLIST];
+  try {
+    const saved = await env?.REC_LOG?.get('watchlist:tickers', 'json');
+    if (Array.isArray(saved) && saved.length) {
+      tickers = [...new Set([...saved, ...DEFAULT_WATCHLIST].map(t => String(t).toUpperCase()))];
+    }
+  } catch (_) {}
+  tickers = tickers.slice(0, PREM_MAX_SYMBOLS);
+  try {
+    await env?.REC_LOG?.put(PREMIUM_QUEUE_KEY, JSON.stringify({ tickers, seededAt: Date.now(), reason }));
+    console.log(`[premium] queue seeded with ${tickers.length} tickers (${reason})`);
+  } catch (e) { console.warn('[premium] queue seed failed:', e.message); }
+  return tickers;
+}
+
+/** Drain up to PREMIUM_CRON_BATCH tickers. Runs on every cron firing. */
+async function drainPremiumQueue(env) {
+  let queue = null;
+  try { queue = await env?.REC_LOG?.get(PREMIUM_QUEUE_KEY, 'json'); } catch (_) {}
+  const pending = Array.isArray(queue?.tickers) ? queue.tickers : [];
+  if (!pending.length) return;
+
+  const batch = pending.slice(0, PREMIUM_CRON_BATCH);
+  const rest  = pending.slice(PREMIUM_CRON_BATCH);
+
+  // Write the shortened queue FIRST. If the batch below blows its budget or the
+  // invocation is killed, the next firing moves on instead of retrying the same
+  // six tickers forever and never reaching the rest of the watchlist.
+  try {
+    await env?.REC_LOG?.put(PREMIUM_QUEUE_KEY, JSON.stringify({ ...queue, tickers: rest }));
+  } catch (e) { console.warn('[premium] queue advance failed:', e.message); }
+
+  // Shared across the batch so they are paid for once, not once per ticker.
+  const rate = await riskFreeRate(env);
+  const hv = new Map();
+  try {
+    const closes = await yahooSparkCloses(batch, '3mo');
+    for (const [sym, c] of closes) hv.set(sym, historicalVol(c, IV_HV_WINDOW));
+  } catch (_) {}
+
+  let ok = 0;
+  for (const sym of batch) {
+    try {
+      const row = await refreshPremiumTicker(sym, env, { rate, hv });
+      if (row.ok) ok++;
+    } catch (e) {
+      console.warn(`[premium] ${sym} refresh failed:`, e.message);
+      await storePremiumRow({
+        symbol: sym, ok: false, status: 'error', reason: `refresh failed: ${e.message}`,
+        legs: [], bestAroc: null, schema: PREM_SCHEMA, ts: Date.now(),
+      }, env);
+    }
+  }
+  console.log(`[premium] drained ${batch.length} (${ok} ok), ${rest.length} left in queue`);
+}
+
+/* ── GET /api/premium/batch?symbols= ─────────────────────────────────────────
+   Reads KV and makes ZERO outbound calls, so it cannot hit the subrequest cap
+   no matter how long the watchlist is. Tickers with no banked row come back in
+   `missing` with a reason, rather than being silently absent. */
+async function handlePremiumBatch(params, origin, env) {
   const symbols = (params.get('symbols') || '')
     .split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, PREM_MAX_SYMBOLS);
   if (!symbols.length) return err('symbols required', 400, origin);
 
-  const force      = params.get('refresh') === '1';
-  const cachedOnly = params.get('cached')  === '1';
-  const cacheKey   = `premium:${symbols.slice().sort().join(',')}`;
+  const rows = [], missing = [];
+  await Promise.all(symbols.map(async (sym) => {
+    const row = await readPremiumRow(sym, env);
+    if (row) rows.push(row);
+    else missing.push({ symbol: sym, status: 'pending' });
+  }));
 
-  let cached = null;
-  try { cached = await env?.REC_LOG?.get(cacheKey, 'json'); } catch (_) {}
-  if (cached && cached.schema !== PREM_SCHEMA) cached = null;
+  // How much of the queue is still outstanding tells the UI whether a pending
+  // ticker is genuinely coming or whether nothing has ever been scheduled.
+  let queued = null, seededAt = null;
+  try {
+    const q = await env?.REC_LOG?.get(PREMIUM_QUEUE_KEY, 'json');
+    queued = Array.isArray(q?.tickers) ? q.tickers.length : null;
+    seededAt = q?.seededAt ?? null;
+  } catch (_) {}
 
-  // Stale-while-revalidate: `cached=1` returns whatever is banked without ever
-  // rebuilding, so a tab can paint instantly and refresh behind itself.
-  if (cachedOnly) {
-    if (!cached) {
-      return json({
-        rows: [], symbols, schema: PREM_SCHEMA, empty: true, ts: null,
-        _meta: srcMeta('Yahoo options chain', {
-          ok: false, ttlSeconds: PREM_TTL_MS / 1000,
-          note: 'no snapshot banked yet — refreshing',
-        }),
-      }, 200, origin);
-    }
-    return json(cached, 200, origin);
+  for (const m of missing) {
+    m.reason = queued
+      ? `not yet computed — ${queued} ticker${queued === 1 ? '' : 's'} still queued for the scheduled sweep`
+      : 'not yet computed — the scheduled sweep has not covered this ticker yet';
   }
 
-  if (!force && cached && Date.now() - (cached.ts || 0) < PREM_TTL_MS) {
-    return json(cached, 200, origin);
-  }
+  rows.sort((a, b) => a.symbol.localeCompare(b.symbol));
 
-  await getYahooCrumb(env).catch(() => {});
+  const oldest = rows.length ? Math.min(...rows.map(r => r.ts || 0)) : null;
+  const rate   = rows.find(r => r.rate)?.rate || null;
 
-  // One rate for the whole sweep. Null means FRED gave us nothing and has nothing
-  // banked — every delta is then suppressed rather than computed at r = 0, which
-  // is a 1-point delta error at 30 DTE, not a neutral default.
-  const rate = await riskFreeRate(env);
-
-  // HV30 for the ratio proxy: close-only, 20 symbols per request, no crumb — two
-  // subrequests for a whole watchlist instead of one per ticker.
-  const closesBySymbol = await yahooSparkCloses(symbols, '3mo').catch(() => new Map());
-  const hvBySymbol = new Map();
-  for (const [sym, closes] of closesBySymbol) hvBySymbol.set(sym, historicalVol(closes, IV_HV_WINDOW));
-
-  const rows = [];
-  const CHUNK = 4;
-  for (let i = 0; i < symbols.length; i += CHUNK) {
-    const settled = await Promise.allSettled(symbols.slice(i, i + CHUNK).map(
-      sym => premiumRow(sym, rate.rate, hvBySymbol.get(sym), env),
-    ));
-    settled.forEach((r, j) => rows.push(
-      r.status === 'fulfilled'
-        ? r.value
-        : { symbol: symbols[i + j], ok: false, reason: r.reason?.message || 'row failed', legs: [], bestAroc: null },
-    ));
-  }
-
-  // Best annualised ROC on the row decides the order — a row carries up to four
-  // candidates per expiry and the screen ranks by the best one available.
-  rows.sort((a, b) => {
-    if (a.bestAroc == null && b.bestAroc == null) return a.symbol.localeCompare(b.symbol);
-    if (a.bestAroc == null) return 1;
-    if (b.bestAroc == null) return -1;
-    return b.bestAroc - a.bestAroc;
-  });
-
-  const okCount = rows.filter(r => r.ok).length;
-  const payload = {
-    rows,
+  return json({
+    rows, missing,
     symbols,
     schema: PREM_SCHEMA,
     ts: Date.now(),
     minDte: PREM_MIN_DTE,
     targetDeltas: PREM_TARGETS,
-    gates: REGIME_GATES,
-    rate: {
-      value: rate.rate, pct: rate.pct ?? null, asOf: rate.asOf ?? null,
-      source: rate.rate != null ? 'FRED DGS3MO' : null,
-      stale: !!rate.stale, reason: rate.reason || null,
-    },
-    _meta: srcMeta('Yahoo options chain', {
+    gates: { ...REGIME_GATES, ratioSellMin: RATIO_SELL_MIN },
+    rate,
+    queued, queueSeededAt: seededAt,
+    batchSize: PREMIUM_CRON_BATCH,
+    _meta: srcMeta('Yahoo options chain (KV snapshot)', {
       delayed: true,
-      ttlSeconds: PREM_TTL_MS / 1000,
-      note: `${okCount}/${symbols.length} chains · deltas Black-Scholes`
-          + (rate.rate != null ? ` at r=${(rate.rate * 100).toFixed(2)}%` : ' suppressed — no risk-free rate')
-          + ` · ${YAHOO_DELAY_NOTE}`,
+      ttlSeconds: PREMIUM_FRESH_MS / 1000,
+      // The as-of that matters is the OLDEST row on screen, not this read.
+      asOf: oldest ? new Date(oldest).toISOString().slice(0, 16).replace('T', ' ') : null,
+      ok: rows.length > 0,
+      note: `${rows.length}/${symbols.length} banked`
+          + (missing.length ? ` · ${missing.length} pending` : '')
+          + ` · refreshed by the scheduled sweep, ${PREMIUM_CRON_BATCH} tickers per run`,
     }),
-  };
+  }, 200, origin);
+}
 
-  const write = env?.REC_LOG?.put(cacheKey, JSON.stringify(payload), { expirationTtl: 7200 })
-    ?.catch(() => {});
-  if (ctx && write) ctx.waitUntil(write);
-  return json(payload, 200, origin);
+/* ── GET /api/premium/:ticker ────────────────────────────────────────────────
+   One ticker on demand: ~5 subrequests, safely inside the cap on any plan.
+   This is what the per-row refresh control calls. Without `?refresh=1` it just
+   reads KV. */
+async function handlePremiumTicker(ticker, params, origin, env, ctx) {
+  const sym = String(ticker || '').toUpperCase();
+  if (!sym) return err('ticker required', 400, origin);
+
+  if (params.get('refresh') !== '1') {
+    const row = await readPremiumRow(sym, env);
+    if (row) return json({ row, cached: true, _meta: premiumRowMeta(row) }, 200, origin);
+    return json({
+      row: null, cached: true,
+      missing: { symbol: sym, status: 'pending', reason: 'not yet computed — pass ?refresh=1 to build it now' },
+      _meta: srcMeta('Yahoo options chain (KV snapshot)', {
+        ok: false, ttlSeconds: PREMIUM_FRESH_MS / 1000, note: 'no banked row',
+      }),
+    }, 200, origin);
+  }
+
+  await getYahooCrumb(env).catch(() => {});
+  const row = await refreshPremiumTicker(sym, env);
+  return json({ row, cached: false, _meta: premiumRowMeta(row) }, 200, origin);
+}
+
+function premiumRowMeta(row) {
+  return srcMeta('Yahoo options chain', {
+    delayed: true,
+    ok: !!row?.ok,
+    ttlSeconds: PREMIUM_FRESH_MS / 1000,
+    asOf: row?.ts ? new Date(row.ts).toISOString().slice(0, 16).replace('T', ' ') : null,
+    note: row?.ok
+      ? `${row.legs?.length || 0} expir${(row.legs?.length || 0) === 1 ? 'y' : 'ies'}`
+        + (row.rate?.value != null ? ` · r=${(row.rate.value * 100).toFixed(2)}%` : ' · deltas suppressed')
+      : (row?.reason || 'unavailable'),
+  });
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -5162,7 +5382,12 @@ export default {
         case 'quote':    return await handleQuote(sub, origin, env);
         case 'chart':    return await handleChart(sub, url.searchParams, origin);
         case 'options': return await handleOptions(sub, url.searchParams, origin, env);
-        case 'premium': return await handlePremium(url.searchParams, origin, env, ctx);
+        case 'premium':
+          // `batch` reads KV only — zero outbound calls, so the watchlist length
+          // cannot push it into the subrequest cap. A bare ticker refreshes one
+          // name, which is ~5 subrequests and safe on any plan.
+          if (sub === 'batch') return await handlePremiumBatch(url.searchParams, origin, env);
+          return await handlePremiumTicker(sub, url.searchParams, origin, env, ctx);
         case 'iv':       return await handleIv(sub, url.searchParams, origin, env, ctx);
         case 'insider':  return await handleInsider(sub, url.searchParams, origin, env, ctx);
         case 'short':    return await handleShortInterest(sub, url.searchParams, origin, env, ctx);
@@ -5254,6 +5479,32 @@ export default {
     // generator's own KV dedup prevents double-runs across adjacent firings.
     const pt = new Date(new Date(event.scheduledTime).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
     const h = pt.getHours(), m = pt.getMinutes();
+
+    /* Premium sweep. Two anchors seed the whole watchlist — 5:00am PT (pre-open)
+     * and 1:45pm PT (after the close) — and every OTHER firing drains a slice,
+     * because the subrequest cap is per invocation and one invocation cannot
+     * cover a whole watchlist. 21–45 DTE structures do not need fresher chain
+     * data than twice a day.
+     *
+     * The drain deliberately skips any firing that already runs one of the heavy
+     * jobs below. `waitUntil` does not get its own budget — it shares the
+     * invocation's — so draining alongside the morning briefing would put both
+     * at risk of the same cap this whole restructure exists to avoid. */
+    const heavyFiring =
+      (h === 6  && m < 30) ||                 // morning briefing
+      ((h === 11 && m >= 30) || h === 12) ||  // midday pulse
+      (h === 13 && m >= 15 && m < 45) ||      // EOD summary + IV sweep
+      (h === 14 && m < 30) ||                 // forward-return fill
+      (h === 15 && m < 30);                   // 13F index (~61 SEC round trips on its own)
+
+    if (h === 5 && m < 15) {
+      ctx.waitUntil(seedPremiumQueue(env, 'pre-open').then(() => drainPremiumQueue(env)));
+    } else if (h === 13 && m >= 45) {
+      ctx.waitUntil(seedPremiumQueue(env, 'post-close').then(() => drainPremiumQueue(env)));
+    } else if (!heavyFiring) {
+      ctx.waitUntil(drainPremiumQueue(env));
+    }
+
     if (h === 6 && m < 30) {
       ctx.waitUntil(generateDailySnapshot(env));       // 6:00am PT morning briefing
     } else if ((h === 11 && m >= 30) || h === 12) {
