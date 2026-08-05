@@ -366,15 +366,9 @@ short interest, the watchlist, cron-driven refresh) and have been removed. So ha
 Strategy POP, which now ships — Black-Scholes delta in the Worker, a `pop` strike
 ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
 
-1. **Lock down `/api/claude`.** ⚠ **This is the one with a live cost.** The route
-   has *no authentication*: `isAllowedOrigin()` returns `true` when the `Origin`
-   header is absent or `"null"`, so any non-browser client — curl, a script,
-   anything — reaches it and spends the owner's Anthropic key. Verified: a POST
-   with no `Origin` is routed and handled. It is an open proxy in front of a
-   billable API. Options, cheapest first: require a shared secret header the two
-   pages send; move synthesis fully server-side so the route can be deleted; or
-   put Cloudflare Access in front of it. Until then the key is exposed to anyone
-   who finds the Worker URL.
+1. ~~**Lock down `/api/claude`**~~ — **done**, in four layers. See the residual-risk
+   section below for what those layers do *not* cover, which is the part worth
+   reading.
 
 2. **Confirmed-vs-estimated earnings dates.** Yahoo returns
    `earningsDateIsEstimate` and nothing in the codebase reads it. Every earnings
@@ -424,6 +418,68 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    arrives, unify these first — they are the most drift-prone duplication left.
 
 ---
+
+## Security posture and residual risk
+
+`POST /api/claude` was an unauthenticated passthrough that forwarded caller-supplied
+`messages` to Anthropic on the owner's key. Four layers now sit in front of AI
+spend. **None of them is authentication**, and the honest summary is that they
+convert an unbounded liability into a bounded one — they do not make the Worker
+secure.
+
+### What each layer actually does
+
+| Layer | Stops | Does **not** stop |
+|---|---|---|
+| **1. No passthrough.** Callers name a task + ticker; prompts are built in `worker.js` | The endpoint having any value as a free LLM. This is the only *structural* fix here | Someone burning your quota generating equity analyses of random tickers |
+| **2. Origin allowlist**, absent Origin now rejected | Hostile web pages using the Worker through a visitor's browser; scanners that send no headers | `curl -H 'Origin: https://ambermlysak.github.io'`. Origin is client-set and forging it is one flag |
+| **3. Shared secret** `x-dash-key` | Opportunistic abuse of a URL found in a network trace or a repo search | Anyone who opens devtools or reads `index.html`, which is public on GitHub Pages. **The secret is in the client bundle by design** |
+| **4. Rate limits**, 40/IP/hour + 200/day global | The bill being unbounded. This is the layer that actually protects money | A determined attacker rotating IPs, who still gets 200 calls/day out of you |
+
+### What remains open, concretely
+
+- **The secret is public.** Anyone who views source on the GitHub Pages site has it.
+  Layer 3 raises the effort from "curl the URL" to "read one JS file". That is a
+  real reduction in drive-by risk and nothing more. Treat it as a speed bump with
+  a rotation procedure, not a credential.
+- **Origin is forgeable in one flag.** Layer 2 is meaningful only against browsers,
+  which honour it, and against lazy scanners, which do not set it.
+- **The global daily cap is the real ceiling, and it is not zero.** 200 calls/day
+  × ~6500 output tokens × $25/MTok ≈ **$32/day worst case** if someone with the
+  secret decides to spend it. Over a month that is ~$960. If that is unacceptable,
+  lower `AI_RATE_GLOBAL_DAY` — it is the only number that bounds this.
+- **Rate limiting is approximate.** KV has no atomic increment, so the counter is
+  read-modify-write and concurrent requests undercount. A burst can overshoot the
+  ceiling before the count catches up. It is a ceiling, not a valve.
+- **A KV failure degrades to the secret alone.** If the counter read or write
+  throws, the request proceeds and logs a warning. Failing closed on a KV blip
+  would take the app down; the tradeoff is that a KV outage removes the ceilings.
+- **KV write quota is itself attackable.** The Free plan allows 1,000 KV writes/day
+  and the limiter writes two per gated request. Sustained hammering can exhaust
+  that quota, which breaks the counters *and* the app's own caching. The rate limit
+  bounds Anthropic spend, not KV spend.
+- **Cron spend is outside all of this.** The scheduled jobs call `workerClaude()`
+  directly and are bounded by their schedule, not by the gate. That is deliberate —
+  they have no request to authenticate — but it means the ceilings describe
+  request-path spend only.
+- **Nothing here authenticates a *user*.** There are no accounts and no sessions.
+  Every visitor to the public page is the same principal.
+
+### What would actually close it
+
+In increasing order of effort:
+
+1. **Cloudflare Access** in front of the Worker — real identity, ~free at this
+   scale, and the only item on this list that is genuinely authentication.
+2. **Move synthesis fully server-side and delete the request path**, letting the
+   cron own all generation. The page would read KV only, and there would be no
+   AI endpoint to abuse.
+3. **Anthropic-side spend caps** as the backstop that does not depend on this
+   Worker being correct.
+
+Until one of those is in place, the accurate statement is: *the endpoint is no
+longer an open LLM proxy, and worst-case spend is bounded at roughly $32/day by a
+limiter that a determined attacker can still reach.*
 
 ## Visual design notes
 

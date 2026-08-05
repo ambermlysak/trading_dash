@@ -51,6 +51,7 @@ crons = ["*/15 13-22 * * 1-5"]
 Set the secrets:
 
 ```bash
+npx wrangler secret put AI_GATE_SECRET       # REQUIRED — gates AI + KV-write paths
 npx wrangler secret put ANTHROPIC_API_KEY    # required — all Claude synthesis
 npx wrangler secret put FRED_API_KEY         # macro release dates + the DGS3MO risk-free rate
 npx wrangler secret put FINRA_CLIENT_ID      # official short interest
@@ -74,8 +75,12 @@ Set `API_BASE` near the top of **both** `index.html` and `dashboard.html`:
 const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 ```
 
-Push to GitHub Pages, or open the files locally — the Worker is CORS-enabled for
-`https://ambermlysak.github.io` and `localhost`.
+Paste the `AI_GATE_SECRET` value into `DASH_KEY` at the top of the script block in
+both files as well.
+
+Push to GitHub Pages. **Opening the files from `file://` no longer works** — that
+sends `Origin: null`, which the Worker rejects. For local testing serve them over
+http (`npx http-server -p 8123`); `http://localhost:*` is allowlisted.
 
 ### 3. Local development
 
@@ -92,6 +97,7 @@ FOMC-only econ calendar, Yahoo-estimate short interest instead of FINRA, and emp
 Claude cards. Create `.dev.vars` with the same keys to test those paths:
 
 ```
+AI_GATE_SECRET="..."
 ANTHROPIC_API_KEY="..."
 FRED_API_KEY="..."
 FINRA_CLIENT_ID="..."
@@ -146,9 +152,18 @@ the data is past its refresh window.
   before it is written — it has caused two silent failures already. See
   `CLAUDE.md`.
 - Yahoo data is 15 minutes delayed. Alpaca overlays real-time prices when keyed.
-- **`POST /api/claude` is currently unauthenticated** — it is reachable without an
-  `Origin` header and spends the owner's Anthropic key. Locking it down is the
-  top item in `ARCHITECTURE.md`'s "Not yet done".
+- **`POST /api/claude` has been removed** (returns 410). It was an unauthenticated
+  passthrough that forwarded arbitrary prompts on the owner's Anthropic key.
+  Replaced by `POST /api/ai/:type/:ticker`, where the caller names a task and a
+  ticker and the prompt is built server-side. Four layers now gate AI spend —
+  no passthrough, an origin allowlist, a shared `x-dash-key` secret, and rate
+  limits of 40/IP/hour and 200/day. **None of it is authentication**; read the
+  residual-risk section in `ARCHITECTURE.md` before relying on it.
+- **`AI_GATE_SECRET` must be set or every AI endpoint 503s** — the gate fails
+  closed on purpose. Set it on the Worker and paste the same value into `DASH_KEY`
+  in both HTML files.
+- **`file://` no longer works.** That sends `Origin: null`, which is now rejected.
+  Serve the pages over http for local testing (`npx http-server -p 8123`).
 - The recommendation track record starts populating on first use; calibration
   appears once 10 entries have a resolved 20-session outcome.
 - Not investment advice. For research only.

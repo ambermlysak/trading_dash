@@ -30,6 +30,8 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   watchlist:tickers   — saved watchlist; also seeds scan universes
 #   rec:{TICKER}        — recommendation history, one entry per PT trading day
 #   recfwd:last         — PT date of last forward-return fill (dedup)
+#   ratelimit:ai:global:{DAY}   — global AI request counter (25h TTL)
+#   ratelimit:ai:ip:{IP}:{HOUR} — per-IP AI request counter (2h TTL)
 
 [triggers]
 # Single cron (plan limit: 5 triggers max). Fires every 15 min in a UTC window
@@ -49,6 +51,9 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 crons = ["*/15 13-22 * * 1-5"]
 
 # Required secrets (set via: npx wrangler secret put <NAME>):
+#   AI_GATE_SECRET     — REQUIRED. Shared secret gating every AI-spend and KV-write
+#                        endpoint. Fails CLOSED: unset means those routes 503.
+#                        Must match DASH_KEY in index.html and dashboard.html.
 #   ANTHROPIC_API_KEY  — Anthropic API key
 #   ALPACA_KEY         — Alpaca API key ID (optional, improves price + news quality)
 #   ALPACA_SECRET      — Alpaca API secret key

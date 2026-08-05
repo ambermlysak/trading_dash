@@ -332,9 +332,164 @@ function econPromptLines(events) {
 }
 
 /* ── CORS ── */
+/**
+ * Origin allowlist — **defense in depth, not authentication.**
+ *
+ * `Origin` is set by the browser and is trivially forged by anything that is not
+ * a browser: `curl -H 'Origin: https://ambermlysak.github.io'` passes this check
+ * completely. It stops a hostile *web page* from using the Worker via a user's
+ * browser, and it stops opportunistic scanners that do not bother to set a
+ * header. It stops nothing else. Never treat a passing origin as an identity.
+ *
+ * This used to `return true` when `Origin` was absent or the literal `'null'`,
+ * which meant every non-browser client on earth was allowed — the exact hole
+ * that left `/api/claude` open. **An absent Origin now fails.**
+ *
+ * Consequence worth knowing: opening `index.html` from `file://` sends
+ * `Origin: null` and is now rejected. Serve the pages over http for local dev
+ * (`npx http-server -p 8123`) — `http://localhost:*` is allowlisted.
+ */
 function isAllowedOrigin(origin) {
-  if (!origin || origin === 'null') return true;
+  if (!origin || origin === 'null') return false;
   return ALLOWED_ORIGINS.some(o => origin === o || origin.startsWith(o + ':'));
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SPEND GATE
+
+   Every request path that can reach `workerClaude()` bills the owner's Anthropic
+   key. `/api/claude` was the worst of these — an unauthenticated passthrough
+   that forwarded arbitrary `messages` — but it was never the only one. These all
+   spend on the request path:
+
+     POST /api/ai/:type/:ticker      synthesis (replaces /api/claude)
+     GET  /api/earnings/:ticker      ~1800 answer tokens on a cache miss
+     GET  /api/market/sectors        ~3500, on ?refresh=1 or a cold cache
+     GET  /api/market/week-ahead     ~2000 on a cold cache
+     GET  /api/market/scanner        ~500 for catalyst tagging
+     GET  /api/daily                 ~2500 when the snapshot is stale/incomplete
+     GET  /api/watchlist/batch       ~700 PER UNCACHED TICKER, up to 30 a request
+
+   That last one was the second-worst hole: 30 arbitrary symbols in one
+   unauthenticated GET fans out to 30 Claude calls.
+
+   Three checks, applied in cost order — cheapest rejection first:
+     1. shared secret header  (no KV read)
+     2. global daily ceiling  (1 KV read)
+     3. per-IP hourly ceiling (1 KV read)
+
+   None of this is authentication. See the residual-risk note in ARCHITECTURE.md;
+   the limits are what actually bound the bill.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const AI_SECRET_HEADER = 'x-dash-key';
+
+/* Ceilings. Sized from real use: the crons spend ~30 calls/day between them
+   (4 briefings + ~22 watchlist analyses + sectors), and interactive use adds
+   maybe 30–50 — a heavy session is ~15 tickers, one synthesis each. So 40/hour
+   per IP is roughly 3× a busy hour, and 200/day globally is ~3× a busy day.
+
+   The global cap is the one that actually bounds the bill, because rotating IPs
+   defeats the per-IP cap and costs an attacker nothing. Worst case at 200 calls
+   × ~6500 output tokens (answer + thinking headroom) × $25/MTok ≈ $32/day. That
+   is the number to move if the exposure feels wrong — not the per-IP one. */
+const AI_RATE_PER_IP_HOUR = 40;
+const AI_RATE_GLOBAL_DAY  = 200;
+
+/** Constant-time string compare. `===` on a secret leaks length and prefix
+ *  through timing; over the internet that is mostly theoretical, but the correct
+ *  version is three lines. */
+function safeEqual(a, b) {
+  const x = String(a ?? ''), y = String(b ?? '');
+  if (x.length !== y.length) return false;
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x.charCodeAt(i) ^ y.charCodeAt(i);
+  return diff === 0;
+}
+
+const utcHourBucket = () => new Date().toISOString().slice(0, 13);  // YYYY-MM-DDTHH
+const utcDayBucket  = () => new Date().toISOString().slice(0, 10);  // YYYY-MM-DD
+
+/**
+ * Gate a request that is about to spend Anthropic credit.
+ * Returns `null` to proceed, or a `Response` to return instead.
+ *
+ * **Fails closed.** With `AI_GATE_SECRET` unset every AI path 503s rather than
+ * running unauthenticated — a security control that silently disables itself on
+ * a missing config is not a control. The error names the missing secret so the
+ * cause is obvious rather than looking like an outage.
+ */
+/** Secret only, no rate limiting — for endpoints that WRITE KV but do not spend
+ *  Anthropic credit. Storage abuse and data poisoning are cheaper problems than
+ *  a billed API, but an unauthenticated write that later renders on a card is
+ *  still a way to put someone else's text on the page. */
+function requireSecret(request, env, origin) {
+  const expected = env?.AI_GATE_SECRET;
+  if (!expected) {
+    return err('Write endpoints are disabled: AI_GATE_SECRET is not configured on this Worker.', 503, origin);
+  }
+  if (!safeEqual(request.headers.get(AI_SECRET_HEADER), expected)) {
+    return err('missing or invalid API key', 401, origin);
+  }
+  return null;
+}
+
+/** Boolean form of the gate, for opportunistic background spends inside handlers
+ *  whose *data* must still be served to everyone. `/api/daily` and
+ *  `/api/watchlist/batch` both return a useful payload from cache regardless;
+ *  what they must not do for an unauthenticated caller is kick off generation.
+ *  Rejecting the whole endpoint would break the page for no security gain. */
+async function maySpend(request, env) {
+  return (await aiGuard(request, env, '')) === null;
+}
+
+async function aiGuard(request, env, origin) {
+  const expected = env?.AI_GATE_SECRET;
+  if (!expected) {
+    console.error('[aiGuard] AI_GATE_SECRET is not set — refusing to spend unauthenticated');
+    return err('AI endpoints are disabled: AI_GATE_SECRET is not configured on this Worker. '
+             + 'Set it with `npx wrangler secret put AI_GATE_SECRET`.', 503, origin);
+  }
+  if (!safeEqual(request.headers.get(AI_SECRET_HEADER), expected)) {
+    return err('missing or invalid API key', 401, origin);
+  }
+
+  const kv = env?.REC_LOG;
+  if (!kv) return null;   // no KV bound: secret alone still applies
+
+  const ip     = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const dayKey = `ratelimit:ai:global:${utcDayBucket()}`;
+  const ipKey  = `ratelimit:ai:ip:${ip}:${utcHourBucket()}`;
+
+  try {
+    const [dayRaw, ipRaw] = await Promise.all([kv.get(dayKey), kv.get(ipKey)]);
+    const dayN = Number(dayRaw) || 0;
+    const ipN  = Number(ipRaw)  || 0;
+
+    if (dayN >= AI_RATE_GLOBAL_DAY) {
+      console.warn(`[aiGuard] global daily cap hit: ${dayN}/${AI_RATE_GLOBAL_DAY}`);
+      return json({ error: `daily AI request ceiling reached (${AI_RATE_GLOBAL_DAY}). Resets at 00:00 UTC.`,
+                    retryAfter: 'next UTC day' }, 429, origin);
+    }
+    if (ipN >= AI_RATE_PER_IP_HOUR) {
+      return json({ error: `hourly AI request ceiling reached (${AI_RATE_PER_IP_HOUR} per IP). Try again next hour.`,
+                    retryAfter: 'next UTC hour' }, 429, origin);
+    }
+
+    // Read-modify-write, so concurrent requests can undercount. KV is eventually
+    // consistent and has no atomic increment; a small overshoot under burst is
+    // accepted deliberately rather than pretending otherwise. TTLs are one bucket
+    // plus slack so the keys expire themselves.
+    await Promise.all([
+      kv.put(dayKey, String(dayN + 1), { expirationTtl: 90_000 }),
+      kv.put(ipKey,  String(ipN  + 1), { expirationTtl: 7_200 }),
+    ]);
+  } catch (e) {
+    // A KV failure must not become a free pass. The secret already passed, so
+    // proceed — but say so, because it means the ceilings are not being enforced.
+    console.warn('[aiGuard] rate-limit bookkeeping failed, proceeding on secret alone:', e.message);
+  }
+  return null;
 }
 
 const cors = (origin = '') => ({
@@ -2808,31 +2963,328 @@ async function handlePeers(ticker, origin) {
   return json(data, 200, origin);
 }
 
-async function handleClaude(request, env, origin) {
-  if (!env.ANTHROPIC_API_KEY) return err('ANTHROPIC_API_KEY not configured', 500, origin);
-  const body    = await request.json();
-  // Callers size max_tokens for the answer; add reasoning headroom on their behalf
-  // so the frontend never has to know Opus 5 spends part of the cap on thinking.
-  // A caller-supplied output_config (i.e. a json_schema) is merged with — not
-  // replaced by — the effort setting, so both survive into the request.
-  const payload = {
-    model:      CLAUDE_MODEL,
-    max_tokens: (body.max_tokens ?? 1500) + CLAUDE_THINKING_HEADROOM,
-    messages:   body.messages,
-    ...CLAUDE_REASONING,
-    output_config: { ...CLAUDE_REASONING.output_config, ...(body.output_config || {}) },
-    ...(body.system ? { system: body.system } : {}),
-  };
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method:  'POST',
-    headers: {
-      'Content-Type':      'application/json',
-      'x-api-key':         env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
+/* ═══════════════════════════════════════════════════════════════════════════
+   STRUCTURED AI ENDPOINTS  (POST /api/ai/:type/:ticker)
+
+   Replaces `POST /api/claude`, which accepted a caller-supplied `messages` array
+   and forwarded it to Anthropic. That made the Worker a general-purpose LLM
+   proxy on the owner's key: anyone with the URL could generate anything at all,
+   and no amount of rate limiting changes what a single request is worth to an
+   abuser.
+
+   Here the caller chooses a **task name and a ticker**. Nothing else. Every
+   prompt is assembled in this file from data the Worker fetches itself, so the
+   most a caller can do is ask for an equity analysis of a symbol — which is what
+   the app does anyway. The endpoint has no value as a free LLM even to someone
+   holding a valid key.
+
+   Adding a task means adding an entry to AI_TASKS with its own `build()`. Never
+   add a parameter that reaches the prompt as free text; if a task needs caller
+   input, constrain it to an enum here.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* Indicators the synthesis prompt quotes. `index.html` computes these
+   client-side for the charts; the Worker needs its own copy because the prompt
+   is no longer built there. Same formulas — if one changes, change both. */
+function emaArr(values, period) {
+  const out = new Array(values.length).fill(null);
+  if (values.length < period) return out;
+  let seed = 0;
+  for (let i = 0; i < period; i++) seed += values[i];
+  out[period - 1] = seed / period;
+  const k = 2 / (period + 1);
+  for (let i = period; i < values.length; i++) out[i] = values[i] * k + out[i - 1] * (1 - k);
+  return out;
+}
+
+function smaArr(values, period) {
+  const out = new Array(values.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    sum += values[i];
+    if (i >= period) sum -= values[i - period];
+    if (i >= period - 1) out[i] = sum / period;
+  }
+  return out;
+}
+
+function macdHist(closes) {
+  const ef = emaArr(closes, 12), es = emaArr(closes, 26);
+  const line = closes.map((_, i) => (ef[i] != null && es[i] != null) ? ef[i] - es[i] : null);
+  const sig  = emaArr(line.map(v => v ?? 0), 9);
+  const last = line.length - 1;
+  return (line[last] != null && sig[last] != null) ? line[last] - sig[last] : null;
+}
+
+/** Bollinger %B — where price sits in the band, 0 at the lower, 100 at the upper. */
+function bollingerPctB(closes, period = 20, mult = 2) {
+  if (closes.length < period) return null;
+  const mid = smaArr(closes, period);
+  const i = closes.length - 1;
+  if (mid[i] == null) return null;
+  let sum = 0;
+  for (let j = i - period + 1; j <= i; j++) sum += (closes[j] - mid[i]) ** 2;
+  const sd = Math.sqrt(sum / period);
+  if (!sd) return 50;
+  const upper = mid[i] + mult * sd, lower = mid[i] - mult * sd;
+  return ((closes[i] - lower) / (upper - lower)) * 100;
+}
+
+function stochasticKD(highs, lows, closes, kPeriod = 14, dPeriod = 3) {
+  if (closes.length < kPeriod) return { k: null, d: null };
+  const k = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (i < kPeriod - 1) { k.push(null); continue; }
+    let h = -Infinity, l = Infinity;
+    for (let j = i - kPeriod + 1; j <= i; j++) {
+      if (highs[j] > h) h = highs[j];
+      if (lows[j]  < l) l = lows[j];
+    }
+    k.push(h === l ? 50 : ((closes[i] - l) / (h - l)) * 100);
+  }
+  const d = smaArr(k.map(v => v ?? 0), dPeriod);
+  return { k: k[k.length - 1], d: d[d.length - 1] };
+}
+
+function cciLast(highs, lows, closes, period = 20) {
+  if (closes.length < period) return null;
+  const tp = closes.map((c, i) => (highs[i] + lows[i] + c) / 3);
+  const m  = smaArr(tp, period);
+  const i  = tp.length - 1;
+  if (m[i] == null) return null;
+  let dev = 0;
+  for (let j = i - period + 1; j <= i; j++) dev += Math.abs(tp[j] - m[i]);
+  const md = dev / period;
+  return md === 0 ? 0 : (tp[i] - m[i]) / (0.015 * md);
+}
+
+const AI_FACTOR_SCHEMA = {
+  type: 'object',
+  properties: {
+    score:     { type: 'integer' },
+    note:      { type: 'string' },
+    narrative: { type: 'string' },
+  },
+  required: ['score', 'note', 'narrative'],
+  additionalProperties: false,
+};
+
+const AI_SYNTHESIS_SCHEMA = {
+  type: 'object',
+  properties: {
+    rating:     { type: 'string', enum: ['BUY', 'HOLD', 'SELL'] },
+    confidence: { type: 'integer' },
+    trend:      { type: 'string' },
+    pattern:    { type: 'string' },
+    action:     { type: 'string' },
+    summary:    { type: 'string' },
+    factors: {
+      type: 'object',
+      properties: {
+        technical:   AI_FACTOR_SCHEMA,
+        fundamental: AI_FACTOR_SCHEMA,
+        sentiment:   AI_FACTOR_SCHEMA,
+        analyst:     AI_FACTOR_SCHEMA,
+        insider:     AI_FACTOR_SCHEMA,
+        macro:       AI_FACTOR_SCHEMA,
+      },
+      required: ['technical', 'fundamental', 'sentiment', 'analyst', 'insider', 'macro'],
+      additionalProperties: false,
     },
-    body: JSON.stringify(payload),
-  });
-  return json(await r.json(), r.status, origin);
+    thesis: { type: 'string' },
+  },
+  required: ['rating', 'confidence', 'trend', 'pattern', 'action', 'summary', 'factors', 'thesis'],
+  additionalProperties: false,
+};
+
+/** Gather everything the synthesis prompt quotes. ~5 subrequests. */
+async function gatherSynthesisFacts(sym, env) {
+  const [chartRes, quoteRes, ivRes, newsRes, insiderRes, shortRes] = await Promise.allSettled([
+    yahoo(`/v8/finance/chart/${encodeURIComponent(sym)}`, '?range=1y&interval=1d'),
+    yahooAuth(`/v10/finance/quoteSummary/${encodeURIComponent(sym)}`,
+      '?modules=price,summaryDetail,defaultKeyStatistics,financialData,recommendationTrend,assetProfile', env),
+    ivSnapshot(sym, env).catch(() => null),
+    yahoo('/v1/finance/search', `?q=${encodeURIComponent(sym)}&quotesCount=0&newsCount=8`).catch(() => null),
+    env?.REC_LOG?.get(`insider:${sym}`, 'json') ?? Promise.resolve(null),
+    env?.REC_LOG?.get(`short:${sym}`, 'json') ?? Promise.resolve(null),
+  ]);
+
+  const facts = { symbol: sym };
+
+  if (chartRes.status === 'fulfilled') {
+    const r = chartRes.value?.chart?.result?.[0];
+    const q = r?.indicators?.quote?.[0] || {};
+    const idx = (r?.timestamp || []).map((_, i) => q.close?.[i] != null ? i : -1).filter(i => i >= 0);
+    const closes = idx.map(i => q.close[i]);
+    const highs  = idx.map(i => q.high[i]  ?? q.close[i]);
+    const lows   = idx.map(i => q.low[i]   ?? q.close[i]);
+    facts.price = r?.meta?.regularMarketPrice ?? closes[closes.length - 1] ?? null;
+    if (closes.length >= 30) {
+      const st = stochasticKD(highs, lows, closes);
+      facts.ind = {
+        rsi:    computeRSI(closes),
+        macdH:  macdHist(closes),
+        bbPos:  bollingerPctB(closes),
+        stochK: st.k, stochD: st.d,
+        cci:    cciLast(highs, lows, closes),
+        hv30:   historicalVol(closes, IV_HV_WINDOW),
+        ...(highs.length >= 5 ? computeSR(highs, lows) : {}),
+      };
+    }
+  }
+
+  if (quoteRes.status === 'fulfilled') {
+    const r  = quoteRes.value?.quoteSummary?.result?.[0] || {};
+    const fd = r.financialData || {}, ks = r.defaultKeyStatistics || {}, sd = r.summaryDetail || {};
+    facts.sector = r.assetProfile?.sector ?? null;
+    facts.analyst = {
+      low: fd.targetLowPrice?.raw ?? null, mean: fd.targetMeanPrice?.raw ?? null,
+      high: fd.targetHighPrice?.raw ?? null,
+      trend: r.recommendationTrend?.trend?.[0] ?? null,
+    };
+    facts.fundamentals = {
+      'Trailing P/E':  sd.trailingPE?.raw ?? null,
+      'Forward P/E':   ks.forwardPE?.raw ?? null,
+      'Price/Book':    ks.priceToBook?.raw ?? null,
+      'Profit margin': fd.profitMargins?.raw ?? null,
+      'Rev growth':    fd.revenueGrowth?.raw ?? null,
+      'ROE':           fd.returnOnEquity?.raw ?? null,
+      'Debt/Equity':   fd.debtToEquity?.raw ?? null,
+      'Market cap':    r.price?.marketCap?.raw ?? null,
+      'Short % float': ks.shortPercentOfFloat?.raw ?? null,
+    };
+  }
+
+  facts.iv = ivRes.status === 'fulfilled' ? ivRes.value : null;
+  facts.news = newsRes.status === 'fulfilled'
+    ? (newsRes.value?.news || []).slice(0, 8).map(n => n.title).filter(Boolean) : [];
+  facts.insider = insiderRes.status === 'fulfilled' ? insiderRes.value : null;
+  facts.short   = shortRes.status === 'fulfilled' ? shortRes.value : null;
+
+  // IV rank rides along only when the history supports it, exactly as the page did.
+  if (facts.iv?.front?.atmIv != null && env?.REC_LOG) {
+    const hist = await ivHistory(sym, env).catch(() => []);
+    Object.assign(facts.iv, ivRankFrom(hist, facts.iv.front.atmIv));
+  }
+  return facts;
+}
+
+/** The synthesis prompt. Built here, from `facts` — never from caller input. */
+function buildSynthesisPrompt(sym, f) {
+  const n = (v, d = 1) => (v == null || !Number.isFinite(v)) ? 'n/a' : Number(v).toFixed(d);
+  const i = f.ind || {};
+
+  // Implied vol is stated only when it exists, and IV rank only once its history
+  // supports it — an absent rank is reported as absent rather than approximated,
+  // so the model cannot cite a number nothing measured.
+  const ivl = f.iv?.front?.atmIv != null
+    ? [
+        `Front ATM IV: ${n(f.iv.front.atmIv)}% (${f.iv.front.expiry}, ${f.iv.front.dte} DTE)`,
+        f.iv.back ? `Back ATM IV: ${n(f.iv.back.atmIv)}% (${f.iv.back.expiry})` : 'Back month: not available',
+        f.iv.back ? `Term structure: ${(f.iv.front.atmIv - f.iv.back.atmIv) >= 0 ? '+' : ''}${
+          n(f.iv.front.atmIv - f.iv.back.atmIv)} pts (${
+          f.iv.front.atmIv - f.iv.back.atmIv > 0 ? 'backwardation' : 'contango'})` : null,
+        f.iv.ivRank != null
+          ? `IV rank: ${(f.iv.ivRank * 100).toFixed(0)} (over ${f.iv.historyDays} days collected)`
+          : `IV rank: NOT AVAILABLE — only ${f.iv.historyDays ?? 0} days of IV history collected, `
+            + `${IV_RANK_MIN_DAYS} needed. Do not estimate or infer an IV rank.`,
+      ].filter(Boolean).join('\n')
+    : 'No implied-volatility reading available for this ticker. Do not infer one from the realized-vol figure below.';
+
+  const fundLines = Object.entries(f.fundamentals || {})
+    .filter(([, v]) => v != null).map(([k, v]) => `${k}: ${v}`).join('\n') || 'not available';
+
+  const a = f.analyst || {};
+  const t = a.trend;
+  const ins = f.insider?.summary || f.insider || {};
+  const si  = f.short?.latest || {};
+
+  return `You are a sell-side equity research analyst. Produce an OVERALL RATING for ${sym} given the data below.
+
+PRICE: $${n(f.price, 2)}${f.sector ? ` · Sector: ${f.sector}` : ''}
+
+TECHNICAL:
+RSI=${n(i.rsi)}, MACD hist=${n(i.macdH, 3)}, Bollinger %B=${n(i.bbPos, 0)}%, Stochastic K/D=${n(i.stochK, 0)}/${n(i.stochD, 0)}, CCI=${n(i.cci, 0)}, HV30 (30d realized vol)=${n(i.hv30)}%
+Support=$${n(i.support, 2)}, Resistance=$${n(i.resist, 2)}
+
+VOLATILITY (implied, from the options chain — distinct from the HV30 realized figure above):
+${ivl}
+
+ANALYST:
+Targets: low $${n(a.low, 2)}, mean $${n(a.mean, 2)}, high $${n(a.high, 2)}
+Recs: ${t ? `SBuy ${t.strongBuy}, Buy ${t.buy}, Hold ${t.hold}, Sell ${t.sell}, SSell ${t.strongSell}` : 'n/a'}
+
+FUNDAMENTALS:
+${fundLines}
+
+INSIDER (last 90 days, SEC Form 4): buys=${ins.buyCount ?? ins.buys ?? 'n/a'}, sells=${ins.sellCount ?? ins.sells ?? 'n/a'}
+SHORT INTEREST: ${si.shortPercentFloat != null ? n(si.shortPercentFloat) + '% of float' : 'n/a'}${si.daysToCover != null ? `, DTC=${n(si.daysToCover)}` : ''}
+
+RECENT HEADLINES:
+${f.news.length ? f.news.map(h => `- ${h}`).join('\n') : '- none retrieved'}
+
+TASK:
+Return JSON matching the provided schema.
+- rating: BUY | HOLD | SELL
+- confidence: 0-100 integer
+- trend: under 10 words describing the current trend
+- pattern: chart pattern name (e.g. Bull flag, Double bottom)
+- action: actionable phrase (e.g. Buy dips to $85, Hold above $200)
+- summary: 2-sentence trader summary
+- factors: technical, fundamental, sentiment, analyst, insider, macro — each with
+  score 0-100 (0=very bearish, 50=neutral, 100=very bullish), a note under 8 words,
+  and a 2-3 sentence narrative
+- thesis: 2 paragraphs, 60-100 words total, plain prose, no bullet points
+
+Base every claim on the data above. Where a figure is marked n/a or NOT AVAILABLE,
+say so rather than estimating it.`;
+}
+
+/* The task registry. A caller names a key here; it cannot supply prompt text. */
+const AI_TASKS = {
+  synthesis: {
+    maxTokens: 2500,
+    schema: AI_SYNTHESIS_SCHEMA,
+    cacheKey: sym => `analysis:${sym}`,
+    cacheTtl: 172_800,
+    build: async (sym, env) => buildSynthesisPrompt(sym, await gatherSynthesisFacts(sym, env)),
+  },
+};
+
+async function handleAi(type, ticker, request, origin, env, ctx) {
+  const task = AI_TASKS[String(type || '').toLowerCase()];
+  if (!task) {
+    return err(`unknown analysis type. Supported: ${Object.keys(AI_TASKS).join(', ')}`, 404, origin);
+  }
+  // Symbol shape is constrained here, not trusted: it lands in a URL and in the
+  // prompt, and "ticker" is the only caller-controlled value in this whole path.
+  const sym = String(ticker || '').toUpperCase();
+  if (!/^[A-Z][A-Z.\-]{0,9}$/.test(sym)) return err('invalid ticker', 400, origin);
+
+  const gate = await aiGuard(request, env, origin);
+  if (gate) return gate;
+
+  if (!env?.ANTHROPIC_API_KEY) return err('ANTHROPIC_API_KEY not configured', 503, origin);
+
+  try {
+    const prompt = await task.build(sym, env);
+    const text   = await workerClaude(prompt, env, task.maxTokens, task.schema);
+    const result = JSON.parse(text);
+
+    if (task.cacheKey && env?.REC_LOG) {
+      ctx?.waitUntil(env.REC_LOG.put(task.cacheKey(sym), JSON.stringify({ ...result, ts: Date.now() }),
+        { expirationTtl: task.cacheTtl }).catch(() => {}));
+    }
+    return json({
+      ticker: sym, type, analysis: result, ts: Date.now(),
+      _meta: srcMeta('Claude synthesis', {
+        ttlSeconds: task.cacheTtl, note: `${type} · prompt built server-side`,
+      }),
+    }, 200, origin);
+  } catch (e) {
+    console.error(`[ai:${type}] ${sym} failed:`, e.message);
+    return err(`analysis failed: ${e.message}`, 502, origin);
+  }
 }
 
 /* ── Recommendation forward-log ──────────────────────────────────────────────
@@ -3294,7 +3746,7 @@ function scannerNormalize(q) {
   };
 }
 
-async function handleScanner(searchParams, origin, env, ctx) {
+async function handleScanner(searchParams, origin, env, ctx, request) {
   const preset = SCANNER_PRESETS[searchParams.get('preset')] ? searchParams.get('preset') : 'momentum';
   const cfg    = SCANNER_PRESETS[preset];
   const KV_KEY = `scanner:${preset}`;
@@ -3368,7 +3820,9 @@ async function handleScanner(searchParams, origin, env, ctx) {
   // Float is scored, not gated — high-float active names stay in the list.
 
   // ── Stage 2b: AI-tag catalysts (one batched Claude call) ──
-  if (candidates.length && env?.ANTHROPIC_API_KEY) {
+  // Gated: the scan itself is free, the catalyst tagging is not. An ungated
+  // caller still gets the full ranked list, just without catalyst strings.
+  if (candidates.length && env?.ANTHROPIC_API_KEY && await maySpend(request, env)) {
     try {
       // Pull a headline for each candidate in parallel
       const heads = await Promise.allSettled(candidates.map(async (c) => {
@@ -3726,7 +4180,7 @@ async function handleWatchlistSave(request, origin, env) {
   return json({ ok: true, count: tickers.length }, 200, origin);
 }
 
-async function handleWatchlistBatch(symbols, origin, env, ctx) {
+async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
   const tickers = symbols.split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, 30);
   if (!tickers.length) return err('symbols required', 400, origin);
 
@@ -3918,7 +4372,10 @@ async function handleWatchlistBatch(symbols, origin, env, ctx) {
   // Fire on-demand Claude analysis for tickers that have no cached entry.
   // Runs after the response is sent so it doesn't block the client.
   const needsAnalysis = tickers.filter(t => stocks[t] && !stocks[t].recommendation && !stocks[t].error);
-  if (needsAnalysis.length > 0 && ctx && env?.ANTHROPIC_API_KEY) {
+  // THE fan-out: up to 30 uncached symbols in one request became 30 Claude calls.
+  // The row data is served either way; only the analysis spend is gated.
+  const allowedToSpend = await maySpend(request, env);
+  if (needsAnalysis.length > 0 && ctx && env?.ANTHROPIC_API_KEY && allowedToSpend) {
     ctx.waitUntil((async () => {
       for (let i = 0; i < needsAnalysis.length; i += 5) {
         await Promise.allSettled(
@@ -4014,7 +4471,7 @@ async function handleWatchlistAuction(symbols, origin, env, ctx) {
   return json(result, 200, origin);
 }
 
-async function handleDailyGet(origin, env, ctx) {
+async function handleDailyGet(origin, env, ctx, request) {
   try {
     const [snapshotRes, eodRes, middayRes] = await Promise.allSettled([
       env?.REC_LOG?.get('daily:snapshot', 'json'),
@@ -4052,7 +4509,8 @@ async function handleDailyGet(origin, env, ctx) {
       const isStale    = Date.now() - (snapshot.ts || 0) > 43_200_000;
       // Regenerate in background if the cron missed (stale) OR left an empty/failed
       // snapshot (incomplete) — the latter recovers a blank briefing on first visit.
-      if (ctx && env?.ANTHROPIC_API_KEY && (isStale || !isComplete)) {
+      // The cached briefing is served to anyone; only the REGENERATION is gated.
+      if (ctx && env?.ANTHROPIC_API_KEY && (isStale || !isComplete) && await maySpend(request, env)) {
         ctx.waitUntil(generateDailySnapshot(env));
       }
       // Signal "still preparing" when there's nothing useful yet, so the UI shows a
@@ -4069,8 +4527,8 @@ async function handleDailyGet(origin, env, ctx) {
     }
   } catch (_) {}
 
-  // No morning snapshot — kick off generation
-  if (ctx && env?.ANTHROPIC_API_KEY) {
+  // No morning snapshot — kick off generation, if this caller is allowed to spend.
+  if (ctx && env?.ANTHROPIC_API_KEY && await maySpend(request, env)) {
     ctx.waitUntil(generateDailySnapshot(env));
   }
   return json({
@@ -5455,18 +5913,49 @@ export default {
         case 'search':   return await handleSearch(url.searchParams.get('q') || '', origin);
         case 'news':     return await handleNews(sub, origin, env);
         case 'peers':    return await handlePeers(sub, origin);
-        case 'claude':   return await handleClaude(request, env, origin);
-        case 'log-rec':  return await handleLogRec(request, env, origin);
+        // The general-purpose passthrough is GONE. It accepted arbitrary
+        // `messages` and forwarded them on the owner's key. Kept as an explicit
+        // 410 so anyone still pointing at it gets an answer, not a silent 404.
+        case 'claude':
+          return err('POST /api/claude has been removed. Use POST /api/ai/:type/:ticker — '
+                   + 'prompts are built server-side and callers cannot supply prompt text.', 410, origin);
+        case 'ai':
+          if (request.method !== 'POST') return err('method not allowed', 405, origin);
+          return await handleAi(sub, parts[3], request, origin, env, ctx);
+        case 'log-rec': {
+          // Writes the forward log the calibration card scores. Poisoning it
+          // would corrupt the hit rate and Brier score silently.
+          const g = requireSecret(request, env, origin);
+          if (g) return g;
+          return await handleLogRec(request, env, origin);
+        }
         case 'track':    return await handleTrack(sub, env, origin);
-        case 'earnings': return await handleEarningsAnalysis(sub, url.searchParams, origin, env, ctx);
-        case 'daily':    return await handleDailyGet(origin, env, ctx);
+        case 'earnings': {
+          // Cache miss or ?refresh=1 spends Anthropic credit, so it takes the gate.
+          const g = await aiGuard(request, env, origin);
+          if (g) return g;
+          return await handleEarningsAnalysis(sub, url.searchParams, origin, env, ctx);
+        }
+        case 'daily':    return await handleDailyGet(origin, env, ctx, request);
         case 'market':
           if (sub === 'snapshot')    return await handleMarketSnapshot(origin, env);
           if (sub === 'movers')      return await handleMarketMovers(origin, env);
           if (sub === 'ipos')        return await handleMarketIPOs(origin, env);
-          if (sub === 'week-ahead')  return await handleWeekAhead(origin, env);
-          if (sub === 'sectors')    return await handleMarketSectors(origin, env, ctx, url.searchParams);
-          if (sub === 'scanner')    return await handleScanner(url.searchParams, origin, env, ctx);
+          if (sub === 'week-ahead') {
+            const g = await aiGuard(request, env, origin);
+            if (g) return g;
+            return await handleWeekAhead(origin, env);
+          }
+          if (sub === 'sectors') {
+            // Only ?refresh=1 forces a regenerate; a warm read is free and ungated
+            // so the tab still paints for anyone the gate would reject.
+            if (url.searchParams.get('refresh') === '1') {
+              const g = await aiGuard(request, env, origin);
+              if (g) return g;
+            }
+            return await handleMarketSectors(origin, env, ctx, url.searchParams);
+          }
+          if (sub === 'scanner')    return await handleScanner(url.searchParams, origin, env, ctx, request);
           if (sub === 'golden-cross') return await handleGoldenCross(origin, env, url.searchParams);
           if (sub === 'econ-calendar') return await handleEconCalendar(url.searchParams, origin, env);
           return err('unknown market route', 404, origin);
@@ -5477,6 +5966,10 @@ export default {
             return cached ? json(cached, 200, origin) : err('not found', 404, origin);
           }
           if (request.method === 'POST') {
+            // Was an unauthenticated KV write: anyone could store text that then
+            // rendered as this ticker's analysis on the watchlist card.
+            const g = requireSecret(request, env, origin);
+            if (g) return g;
             const body = await request.json().catch(() => null);
             if (!body) return err('invalid json', 400, origin);
             await env?.REC_LOG?.put(
@@ -5487,18 +5980,26 @@ export default {
             return json({ ok: true }, 200, origin);
           }
           if (request.method === 'DELETE') {
+            const g = requireSecret(request, env, origin);
+            if (g) return g;
             await env?.REC_LOG?.delete(`analysis:${sub.toUpperCase()}`);
             return json({ ok: true }, 200, origin);
           }
           return err('method not allowed', 405, origin);
         case 'watchlist':
           if (sub === 'batch') return await handleWatchlistBatch(
-            url.searchParams.get('symbols') || '', origin, env, ctx,
+            url.searchParams.get('symbols') || '', origin, env, ctx, request,
           );
           if (sub === 'auction') return await handleWatchlistAuction(
             url.searchParams.get('symbols') || '', origin, env, ctx,
           );
-          if (sub === 'save' && request.method === 'POST') return await handleWatchlistSave(request, origin, env);
+          if (sub === 'save' && request.method === 'POST') {
+            // Writes watchlist:tickers, which seeds the cron sweeps — so an
+            // unauthenticated write here also steers what the crons spend on.
+            const g = requireSecret(request, env, origin);
+            if (g) return g;
+            return await handleWatchlistSave(request, origin, env);
+          }
           return err('unknown watchlist route', 404, origin);
         case 'admin':
           if (sub === 'refresh-daily' && request.method === 'POST') {

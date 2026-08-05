@@ -994,9 +994,29 @@ function crossCell(s) {
   return `<td class="x-cell ${cls}" title="${esc(tip)}">${mark} ${golden ? 'Golden' : 'Death'} ${fmt(gap, 1)}%${arrow}</td>`;
 }
 
+/* DASH_KEY is a shared secret the Worker requires on every endpoint that spends
+ * Anthropic credit or writes KV. It is NOT authentication: this file is public
+ * on GitHub Pages, so anyone who reads source has it. It stops opportunistic
+ * scanning and drive-by abuse of a URL found in a network trace, and nothing
+ * more. The rate limits are what actually bound the bill — see the residual-risk
+ * note in ARCHITECTURE.md. Must match the Worker's AI_GATE_SECRET. */
+const DASH_KEY = 'REPLACE_WITH_YOUR_AI_GATE_SECRET';
+
 async function apiFetch(path, opts = {}) {
-  const r = await fetch(API_BASE + path, opts);
-  if (!r.ok) throw new Error(`API ${r.status}: ${path}`);
+  const r = await fetch(API_BASE + path, {
+    ...opts,
+    headers: { 'x-dash-key': DASH_KEY, ...(opts.headers || {}) },
+  });
+  if (!r.ok) {
+    // Distinguish the gate from an outage, so a blank card does not read as
+    // "the upstream data source is down".
+    if (r.status === 401) throw new Error('API key rejected — DASH_KEY does not match the Worker’s AI_GATE_SECRET');
+    if (r.status === 429) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.error || 'Rate limit reached — try again later');
+    }
+    throw new Error(`API ${r.status}: ${path}`);
+  }
   return r.json();
 }
 
@@ -1386,7 +1406,9 @@ let wlSyncTimer = null;
 function syncWatchlistToServer(tickers) {
   clearTimeout(wlSyncTimer);
   wlSyncTimer = setTimeout(() => {
-    fetch(API_BASE + '/watchlist/save', {
+    // Through apiFetch so the shared key rides along — this write seeds the
+    // cron sweeps, so it is gated like any other KV write.
+    apiFetch('/watchlist/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tickers: tickers || getWatchlist() }),

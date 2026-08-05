@@ -970,10 +970,34 @@ const state = {
 
 /* ============================================================
    API
+
+   DASH_KEY is a shared secret the Worker requires on any endpoint that spends
+   Anthropic credit or writes KV. It is NOT authentication and is not treated as
+   such anywhere: it sits in this file, which is public on GitHub Pages, so
+   anyone who reads source has it. What it stops is the realistic threat —
+   opportunistic scanners and drive-by abuse of a URL found in a network trace.
+   It buys nothing against someone who has actually looked. The rate limits are
+   what bound the bill; see the residual-risk note in ARCHITECTURE.md.
+
+   Rotate it with `npx wrangler secret put AI_GATE_SECRET` and update it here.
    ============================================================ */
+const DASH_KEY = 'REPLACE_WITH_YOUR_AI_GATE_SECRET';
+
 async function api(path, opts = {}) {
-  const r = await fetch(`${API_BASE}${path}`, opts);
-  if (!r.ok) throw new Error(`API ${r.status} on ${path}`);
+  const r = await fetch(`${API_BASE}${path}`, {
+    ...opts,
+    headers: { 'x-dash-key': DASH_KEY, ...(opts.headers || {}) },
+  });
+  if (!r.ok) {
+    // 401/429 are the gate talking, not an outage — say which so a failed card
+    // does not read as "Yahoo is down".
+    if (r.status === 401) throw new Error('API key rejected — check DASH_KEY matches the Worker’s AI_GATE_SECRET');
+    if (r.status === 429) {
+      const body = await r.json().catch(() => ({}));
+      throw new Error(body.error || 'Rate limit reached — try again later');
+    }
+    throw new Error(`API ${r.status} on ${path}`);
+  }
   return r.json();
 }
 
@@ -986,7 +1010,6 @@ const fetchShort   = (t) => api(`/short/${t}`);
 const fetch13F     = (t) => api(`/13f/${t}`);
 const fetchNews    = (t) => api(`/news/${t}`);
 const searchTicker = (q) => api(`/search?q=${encodeURIComponent(q)}`);
-const claudeCall   = (body) => api('/claude', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
 const logRec       = (body) => api('/log-rec', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
 const fetchTrack   = (t) => api(`/track/${t}`);
 
@@ -3165,159 +3188,41 @@ function renderTrack(entries, calibration) {
  * discouraged, so there are no fences, no preamble, and no escaping accidents.
  * Note the API's schema subset rejects min/max and length constraints — the
  * 0-100 range for scores stays in the prompt text as guidance. */
-const FACTOR_SCHEMA = {
-  type: 'object',
-  properties: {
-    score:     { type: 'integer' },
-    note:      { type: 'string' },
-    narrative: { type: 'string' },
-  },
-  required: ['score', 'note', 'narrative'],
-  additionalProperties: false,
-};
-
-const SYNTHESIS_SCHEMA = {
-  type: 'object',
-  properties: {
-    rating:     { type: 'string', enum: ['BUY', 'HOLD', 'SELL'] },
-    confidence: { type: 'integer' },
-    trend:      { type: 'string' },
-    pattern:    { type: 'string' },
-    action:     { type: 'string' },
-    summary:    { type: 'string' },
-    factors: {
-      type: 'object',
-      properties: {
-        technical:   FACTOR_SCHEMA,
-        fundamental: FACTOR_SCHEMA,
-        sentiment:   FACTOR_SCHEMA,
-        analyst:     FACTOR_SCHEMA,
-        insider:     FACTOR_SCHEMA,
-        macro:       FACTOR_SCHEMA,
-      },
-      required: ['technical', 'fundamental', 'sentiment', 'analyst', 'insider', 'macro'],
-      additionalProperties: false,
-    },
-    thesis: { type: 'string' },
-  },
-  required: ['rating', 'confidence', 'trend', 'pattern', 'action', 'summary', 'factors', 'thesis'],
-  additionalProperties: false,
-};
+/* FACTOR_SCHEMA and SYNTHESIS_SCHEMA used to live here, because this page built
+ * the synthesis prompt and passed its own output schema to /api/claude. Both
+ * moved into worker.js (AI_FACTOR_SCHEMA / AI_SYNTHESIS_SCHEMA) when the prompt
+ * did — the schema has to sit with the prompt it constrains, and leaving a copy
+ * here would be two definitions of one contract, drifting apart silently. */
 
 async function synthesize(ticker, lastPrice) {
-  // Let the options chain land before building the prompt — the IV block below
-  // is worth the wait, and reading state.data.iv mid-flight would send nulls.
-  try { await state.ivPromise; } catch (_) {}
-  if (ticker !== state.ticker) return;
-
-  const ind = state.data.indicators || {};
-  const an = state.data.analyst || {};
-  const fund = state.data.fundamentals || {};
-  const ins = state.data.insider || {};
-  const news = state.data.news || [];
-  const si = state.data.shortInterest || {};
-
-  const newsTitles = news.map(n => `- ${n.title}`).join('\n');
-
-  // IV is stated only when it exists, and IV rank only once its history supports
-  // it — an absent rank is reported as absent rather than approximated, so the
-  // model cannot cite a number nothing measured.
-  const ivd = state.data.iv;
-  const ivl = (ivd && ivd.front?.atmIv != null)
-    ? [
-        `Front ATM IV: ${ivd.front.atmIv.toFixed(1)}% (${ivd.front.expiry}, ${ivd.front.dte} DTE)`,
-        ivd.back ? `Back ATM IV: ${ivd.back.atmIv.toFixed(1)}% (${ivd.back.expiry})` : 'Back month: not available',
-        ivd.termStructure != null ? `Term structure: ${ivd.termStructure >= 0 ? '+' : ''}${ivd.termStructure.toFixed(1)} pts (${ivd.termStructure > 0 ? 'backwardation' : 'contango'})` : null,
-        ivd.ivHvRatio != null ? `IV/HV30: ${ivd.ivHvRatio.toFixed(2)}×` : null,
-        ivd.ivRank != null
-          ? `IV rank: ${(ivd.ivRank * 100).toFixed(0)} (over ${ivd.historyDays} days collected)`
-          : `IV rank: NOT AVAILABLE — only ${ivd.historyDays} days of IV history collected, ${ivd.rankMinDays} needed. Do not estimate or infer an IV rank.`,
-      ].filter(Boolean).join('\n')
-    : 'No implied-volatility reading available for this ticker. Do not infer one from the realized-vol figure above.';
-
-  const prompt = `You are a sell-side equity research analyst. Produce an OVERALL RATING for ${ticker} given the data below.
-
-PRICE: $${fmt.price(lastPrice)}
-
-TECHNICAL:
-RSI=${ind.rsi?.toFixed(1)}, MACD hist=${ind.macdHist?.toFixed(3)}, Bollinger %B=${ind.bbPos?.toFixed(0)}%, Stochastic K/D=${ind.stochK?.toFixed(0)}/${ind.stochD?.toFixed(0)}, CCI=${ind.cci?.toFixed(0)}, HV30 (30d realized vol)=${ind.hv30?.toFixed(1)}%
-Support=$${ind.support?.toFixed(2)}, Resistance=$${ind.resist?.toFixed(2)}
-
-VOLATILITY (implied, from the options chain — distinct from the HV30 realized figure above):
-${ivl}
-
-ANALYST:
-Targets: low $${an.tgtLow}, mean $${an.tgtMean}, high $${an.tgtHigh}, mean upside ${an.upside?.toFixed(1)}%
-Recs: ${an.recTrend ? `SBuy ${an.recTrend.strongBuy}, Buy ${an.recTrend.buy}, Hold ${an.recTrend.hold}, Sell ${an.recTrend.sell}, SSell ${an.recTrend.strongSell}` : 'n/a'}
-
-FUNDAMENTALS:
-${Object.entries(fund).map(([k,v]) => `${k}: ${v}`).join('\n')}
-
-INSIDER (6mo): buys=${ins.buys}, sells=${ins.sells}, net shares=${fmt.big(ins.netShares)}
-SHORT INTEREST: ${si.si}% of float, DTC=${si.dtc}
-
-RECENT HEADLINES:
-${newsTitles}
-
-TASK:
-Return STRICT JSON (no markdown fences, no preamble) with keys:
-{
-  "rating": "BUY" | "HOLD" | "SELL",
-  "confidence": 0–100 integer,
-  "trend": "<10-word current trend description>",
-  "pattern": "<chart pattern name, e.g. Bull flag, Double bottom>",
-  "action": "<actionable phrase, e.g. Buy dips to $85, Hold above $200>",
-  "summary": "<2-sentence trader summary>",
-  "factors": {
-    "technical":   { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on the technical picture" },
-    "fundamental": { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on valuation and fundamentals" },
-    "sentiment":   { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on sentiment and positioning" },
-    "analyst":     { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on analyst views and price targets" },
-    "insider":     { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on insider activity and what it signals" },
-    "macro":       { "score": 0–100, "note": "<8 words", "narrative": "2-3 sentences on macro backdrop and key risk factors" }
-  },
-  "thesis": "<2 paragraphs, 60–100 words total, plain prose, no bullet points>"
-}
-
-Score interpretation: 0=very bearish, 50=neutral, 100=very bullish.`;
-
+  /* The prompt used to be assembled here and POSTed to /api/claude as a raw
+   * `messages` array. That made the Worker a general-purpose LLM proxy on the
+   * owner's key — anyone with the URL could generate anything.
+   *
+   * Now the client names a task and a ticker. Nothing else crosses the wire.
+   * The Worker gathers its own data (chart, quote, IV, news, insider, short
+   * interest), builds the prompt from a template in worker.js, applies the
+   * schema, parses the result and writes the KV cache itself. There is no way
+   * for this page — or anyone impersonating it — to influence the prompt text.
+   */
   try {
-    const resp = await claudeCall({
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 2500,
-      output_config: { format: { type: 'json_schema', schema: SYNTHESIS_SCHEMA } },
-    });
-    let text = '';
-    for (const block of (resp.content || [])) {
-      if (block.type === 'text') text += block.text;
-    }
-    // The schema guarantees the shape, but a hit token ceiling still truncates —
-    // say so plainly rather than surfacing a JSON offset the reader can't act on.
-    if (resp.stop_reason === 'max_tokens') {
-      throw new Error('Response hit the token limit before finishing — raise max_tokens.');
-    }
-    const result = JSON.parse(text.trim());
-    // Only render if user hasn't navigated away to a different ticker mid-flight
-    if (ticker !== state.ticker) return;
+    const { analysis: result } = await api(`/ai/synthesis/${encodeURIComponent(ticker)}`, { method: 'POST' });
+    if (ticker !== state.ticker) return;   // navigated away mid-flight
+
     renderSynthesis(result, lastPrice);
-    const _badge = document.getElementById('synth-cache-badge');
-    if (_badge) _badge.remove();
-    // Save to KV so WL shows the same rating
+    document.getElementById('synth-cache-badge')?.remove();
+
+    // The Worker already wrote analysis:{TICKER}, so the watchlist sees the same
+    // rating without this page needing a KV write of its own.
     try {
-      await api('/analysis/' + ticker, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(result),
-      });
-    } catch (e) { console.warn('analysis cache write failed', e); }
-    // forward-log
-    try {
-      await logRec({ ticker, rating: result.rating, confidence: result.confidence, price: lastPrice, factors: result.factors });
+      await logRec({ ticker, rating: result.rating, confidence: result.confidence,
+                     price: lastPrice, factors: result.factors });
     } catch (e) { console.warn('log-rec failed', e); }
     return result;
   } catch (e) {
     console.error('Synthesis failed', e);
-    document.getElementById('synth-narrative').innerHTML = `<p style="color:var(--bear);">Synthesis failed: ${e.message}. Check Worker logs and ANTHROPIC_API_KEY binding.</p>`;
+    document.getElementById('synth-narrative').innerHTML =
+      `<p style="color:var(--bear);">Synthesis failed: ${esc(e.message)}</p>`;
   }
 }
 

@@ -84,6 +84,74 @@ every hand-built `new Response(JSON.stringify(...))`. **The bytes were always
 correct; only the declaration was missing.** Never "fix" this by replacing the
 characters with ASCII — that hides the fault and loses the typography.
 
+### 4. The spend gate: `/api/claude` is gone
+
+`POST /api/claude` accepted a caller-supplied `messages` array and forwarded it to
+Anthropic on the owner's key. It had **no authentication** — `isAllowedOrigin()`
+returned `true` when `Origin` was absent, so any non-browser client with the URL
+could generate anything at all. It is now a **410** pointing at the replacement.
+
+**Never reintroduce a path where the caller supplies prompt text.** Rate limiting
+does not help: the value of an open LLM proxy is per-request, and one request is
+already worth stealing. The structural fix is that a caller can only name a *task*
+and a *ticker*:
+
+```
+POST /api/ai/:type/:ticker      types: see AI_TASKS in worker.js
+```
+
+`AI_TASKS.synthesis.build()` gathers its own data (chart, quote, IV, news,
+insider, short interest) and assembles the prompt from a template in `worker.js`.
+The ticker is regex-constrained (`/^[A-Z][A-Z.\-]{0,9}$/`) because it is the only
+caller-controlled value that reaches the prompt. Adding a task means adding an
+`AI_TASKS` entry with its own `build()`; if a task needs caller input, constrain
+it to an enum in the Worker rather than passing text through.
+
+**`/api/claude` was never the only exposure.** Seven request paths could reach
+`workerClaude()`. All are now gated:
+
+| Path | Gate | Why that gate |
+|---|---|---|
+| `POST /api/ai/:type/:ticker` | `aiGuard` — reject | the endpoint exists to spend |
+| `GET /api/earnings/:ticker` | `aiGuard` — reject | button-triggered, ~1800 tokens on a miss |
+| `GET /api/market/week-ahead` | `aiGuard` — reject | ~2000 tokens on a cold cache |
+| `GET /api/market/sectors?refresh=1` | `aiGuard` — reject | ~3500 tokens; a warm read stays ungated so the tab still paints |
+| `GET /api/market/scanner` | `maySpend` — degrade | the ranked list is served either way; only catalyst tagging is skipped |
+| `GET /api/daily` | `maySpend` — degrade | the cached briefing is served; only regeneration is gated |
+| `GET /api/watchlist/batch` | `maySpend` — degrade | **was the second-worst hole**: 30 uncached symbols in one request fanned out to 30 Claude calls |
+
+The `maySpend` paths degrade rather than reject on purpose — their *data* must
+reach the page regardless, and rejecting the endpoint would break the dashboard
+for no security gain.
+
+Three KV-write routes also took `requireSecret` (secret, no rate limit):
+`POST /api/analysis/:ticker` and its `DELETE` (anyone could store text that then
+rendered as a ticker's analysis), `POST /api/watchlist/save` (seeds what the crons
+spend on), and `POST /api/log-rec` (poisoning it corrupts the Brier score silently).
+
+**The gate fails closed.** With `AI_GATE_SECRET` unset, every AI path 503s with a
+message naming the missing secret. A security control that disables itself on a
+missing config is not a control — but it does mean **AI features stay dark until
+you set the secret after deploying**.
+
+```bash
+# generate one, then set it on the Worker
+node -e "console.log(crypto.randomUUID().replace(/-/g,'') + crypto.randomUUID().replace(/-/g,''))"
+npx wrangler secret put AI_GATE_SECRET
+```
+
+Then paste the same value into `DASH_KEY` at the top of the script block in
+**both** `index.html` and `dashboard.html`. It is sent as `x-dash-key`.
+
+Ceilings live next to the gate: `AI_RATE_PER_IP_HOUR` (40) and
+`AI_RATE_GLOBAL_DAY` (200). The **global** one is what bounds the bill, because
+rotating IPs defeats the per-IP one for free. 200 × ~6500 output tokens ×
+$25/MTok ≈ **$32/day worst case** — that is the number to move if the exposure
+feels wrong.
+
+**None of this is authentication.** Read the residual-risk section in
+`ARCHITECTURE.md` before assuming any of it stops a motivated attacker.
+
 ---
 
 ## Deploy & develop
@@ -97,6 +165,8 @@ npx wrangler kv namespace create REC_LOG   # NOT `kv:namespace` — that syntax 
                                            # deprecated. Copy the id into wrangler.toml
 
 # Secrets (deployed environment)
+npx wrangler secret put AI_GATE_SECRET      # REQUIRED — gates every AI + KV-write path;
+                                            #   without it those endpoints 503 (fail closed)
 npx wrangler secret put ANTHROPIC_API_KEY   # required — all Claude synthesis
 npx wrangler secret put FRED_API_KEY        # macro release dates AND the DGS3MO risk-free rate
 npx wrangler secret put FINRA_CLIENT_ID     # official short interest
@@ -124,6 +194,7 @@ locally — a local run with no `.dev.vars` shows:
 To test those paths locally, create `.dev.vars` with the same keys:
 
 ```
+AI_GATE_SECRET="..."
 ANTHROPIC_API_KEY="..."
 FRED_API_KEY="..."
 FINRA_CLIENT_ID="..."
@@ -138,7 +209,7 @@ After deploying, set `API_BASE` near the top of both HTML files to your Worker U
 const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 ```
 
-The HTML files can be opened locally or hosted on GitHub Pages — the Worker is CORS-enabled for `https://ambermlysak.github.io` and `localhost`.
+The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
 There is no build step. The only check is `node bs-delta.check.mjs`, which prints
 computed vs expected for the Black-Scholes delta rather than asserting.
@@ -163,7 +234,8 @@ GET  /api/iv/:ticker              ATM implied vol (front/back), term structure, 
 GET  /api/search?q=               Ticker autocomplete
 GET  /api/news/:ticker            Alpaca news → Yahoo fallback
 GET  /api/peers/:ticker           Yahoo recommendationsBySymbol
-POST /api/claude                  Anthropic Messages API proxy
+POST /api/ai/:type/:ticker        Structured AI task; prompt built server-side
+POST /api/claude                  REMOVED — returns 410. Was an open LLM proxy.
 POST /api/log-rec                 Append BUY/HOLD/SELL rating to KV
 GET  /api/track/:ticker           Read rating history from KV
 GET  /api/market/snapshot         Index + futures + commodities strip
