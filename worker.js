@@ -347,10 +347,23 @@ const cors = (origin = '') => ({
   'Vary': 'Origin',
 });
 
+/* `charset=utf-8` is not decoration.
+ *
+ * Every string this Worker emits is UTF-8, and plenty of them carry en dashes,
+ * em dashes, `·`, `≥` and `×` — the FOMC label "Jul 28–29" among them. Served as
+ * bare `application/json`, the charset is unstated, and anything that falls back
+ * to Latin-1 renders those three bytes (E2 80 93) as "â" instead of "–". That is
+ * exactly the mojibake that was showing up in the econ-calendar notes.
+ *
+ * The bytes were always correct; only the declaration was missing. Fix it here,
+ * at the one place every response is built — never by swapping the characters for
+ * ASCII, which hides the fault and loses the typography. */
+const JSON_CT = 'application/json; charset=utf-8';
+
 const json = (data, status = 200, origin = '') =>
   new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json', ...cors(origin) },
+    headers: { 'Content-Type': JSON_CT, ...cors(origin) },
   });
 
 const err = (msg, status = 500, origin = '') => json({ error: msg }, status, origin);
@@ -5414,7 +5427,7 @@ export default {
     if (!isAllowedOrigin(origin)) {
       return new Response(JSON.stringify({ error: 'Forbidden' }), {
         status:  403,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': JSON_CT },
       });
     }
 
@@ -5492,24 +5505,24 @@ export default {
             const adminToken = await env?.REC_LOG?.get('admin:token');
             const auth = request.headers.get('Authorization') || '';
             if (!adminToken || auth !== `Bearer ${adminToken}`) {
-              return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+              return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': JSON_CT } });
             }
             try { await env?.REC_LOG?.delete('daily:snapshot'); } catch (_) {}
             await generateDailySnapshot(env);
-            return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': 'application/json' } });
+            return new Response(JSON.stringify({ ok: true }), { headers: { 'Content-Type': JSON_CT } });
           }
           if (sub === 'refresh-midday' && request.method === 'POST') {
             const adminToken = await env?.REC_LOG?.get('admin:token');
             const auth = request.headers.get('Authorization') || '';
             if (!adminToken || auth !== `Bearer ${adminToken}`) {
-              return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+              return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': JSON_CT } });
             }
             // Await synchronously: the pipeline exceeds the ~30s fetch-context
             // waitUntil budget, so a fire-and-forget refresh would be killed mid-run.
             try { await env?.REC_LOG?.delete('daily:midday'); } catch (_) {}
             await generateMiddaySnapshot(env);
             const saved = await env?.REC_LOG?.get('daily:midday', 'json');
-            return new Response(JSON.stringify({ ok: !!saved }), { headers: { 'Content-Type': 'application/json' } });
+            return new Response(JSON.stringify({ ok: !!saved }), { headers: { 'Content-Type': JSON_CT } });
           }
           return err('unknown admin route', 404, origin);
         default:         return err('unknown route', 404, origin);

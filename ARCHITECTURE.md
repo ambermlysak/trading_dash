@@ -3,20 +3,63 @@
 ## Repo layout
 
 ```
-stock-research/
-├── dashboard.html       # Macro landing view (market, midday, scanner, watchlist, sectors, premium)
-├── index.html           # Per-ticker research page (dark fintech aesthetic, 16 sections)
-├── worker.js            # Cloudflare Worker (Yahoo/SEC/FINRA/FRED proxy + Claude API + KV)
-├── bs-delta.check.mjs   # Black-Scholes delta check — prints computed vs expected, no build step
+trading_dash/
+├── dashboard.html       # Macro landing view — 6 tabs (market, midday, scanner,
+│                        #   watchlist, sectors, premium)
+├── index.html           # Per-ticker research page — hero + 14 numbered cards
+├── worker.js            # Cloudflare Worker: Yahoo / SEC EDGAR / FINRA / FRED /
+│                        #   Alpaca proxy, Claude calls, KV persistence, cron jobs
+├── wrangler.toml        # Worker config: KV binding, cron trigger, secret inventory
+├── bs-delta.check.mjs   # Black-Scholes delta check — prints computed vs expected
+├── package.json         # wrangler devDependency only; there is no build step
+├── .dev.vars            # LOCAL SECRETS — gitignored, absent on a fresh clone
 ├── ARCHITECTURE.md      # this file
+├── CLAUDE.md            # working rules; read its constraints block first
 └── README.md            # quick start
 ```
 
-## How it differs from `dashboard_v10`
+Both HTML files are standalone: no bundler, no module system, no framework. Shared
+logic between them is therefore either duplicated deliberately (`setBadge`) or
+moved into the Worker and shipped in the payload (`volRegime`, gate thresholds).
 
-This is a **per-ticker research page**, not a portfolio macro tracker. Every interaction starts with selecting a ticker (search bar in the top bar) and the entire page rebuilds against that symbol. Layout is bento-grid; centerpiece is the AI Synthesis card with the BUY/HOLD/SELL verdict and confidence ring.
+## The two pages
 
-The Worker pattern is deliberately the same as `dashboard_v10` — Yahoo proxy + Claude pass-through, model identifier `claude-sonnet-4-5` (the dated variant returns auth errors, per past sessions). New addition: a KV-backed forward log for the recommendation track record.
+**`dashboard.html`** — six tabs, all deep-linkable by hash:
+
+| Tab | Contents | Data path |
+|---|---|---|
+| Market | Index/futures/commodities strip, 6am Claude briefing, EOD card, Friday week-ahead, news cards, pre/post-market movers (≥ ±10%), IPO calendar, watchlist signals | loads on page load |
+| Midday | 11:30am PT pulse: session narrative, topics, next-day events, short-term ideas, big movers | `daily:midday` via `/api/daily` |
+| Scanner | Momentum / HOD · Pre-Market Gappers · All Movers · **Golden Cross Setup** | first three `/api/market/scanner`; golden cross has its own endpoint and renderer |
+| Watchlist | 14 columns, sortable, expandable rows, one consolidated Recommendation | `/api/watchlist/batch` |
+| Sectors | 11 SPDR sectors, ETF change + Claude opportunity/avoid per sector | `/api/market/sectors`, 4h KV |
+| **Premium** | Short-premium screen: collapsed rows, expand to fetch | `/api/premium/batch` (KV only) + `/api/premium/:ticker` on expand |
+
+The Premium tab replaced an "Options" tab that showed a V/OI unusual-activity
+recap of the nearest expiration. That view is deleted, not moved — it answered
+"what traded today", and at the nearest expiration the answer is mostly 0DTE churn.
+It is the only tab that fetches on interaction rather than on load; Sectors and
+Scanner paint a KV snapshot immediately and revalidate behind it, so no tab
+requires a click to show data.
+
+**`index.html`** — per-ticker deep dive. Hero strip (price, change, market cap,
+P/E, sector, exchange, AI verdict + confidence ring) over numbered cards:
+
+```
+01 Price & Performance            09 Analyst Opinion
+02 Catalysts & Earnings           10 Super-Investor Holdings
+03 Short Interest                 11 Technical Analysis
+04 Insider Trades                 12 Sentiment Analysis
+05 Options Volume · V/OI Screen   13 Fundamentals & Valuation
+06 Recommended Option Strategies  15 Recommendation History
+07 Swing Setups · EMA Crossover      News Flow
+```
+
+**08 is missing on purpose.** It was the dark-pool card, which was fabricated and
+was deleted rather than renumbered. The gap is a deliberate scar; do not reuse the
+number. 14 is the AI Synthesis card, which renders in the hero rather than inline.
+
+---
 
 ---
 
@@ -104,90 +147,101 @@ in this codebase and shipped:
    the presence of a basis. It is now "Short-Term", horizon 2–10 trading days, and the prompt
    forbids intraday levels and timing outright. Before asking Claude for a number, check that the
    data to ground it is actually in the prompt.
+16. **A `catch` must not absorb an infrastructure failure into a domain-failure shape.**
+   `build13FIndex` wrapped each manager in a try/catch that logged and continued. When it hit the
+   50-subrequest cap the error was swallowed four times and the function **returned normally with
+   16 of 20 managers**, which was written to KV as a complete index. Worse, the dropped managers were
+   stored in the *same shape* as a manager who genuinely filed nothing, so the card read
+   **"16/20 managers filed"** — reporting our own budget exhaustion as a fact about the managers.
+   The truth was "16/20 fetched, 4 dropped by our own cap." Two Sigma's real 5.9M-share AAPL
+   position was missing from the card for as long as that shipped. A catch that lets a loop continue
+   is fine; one that cannot distinguish "this item failed" from "we ran out of budget and every
+   remaining item will fail" is not.
+17. **An error message must not misattribute its own cause.** APP and CRCL rendered
+   "no usable implied vol on the front expiry" — a specific, plausible claim about thin options on
+   those two names. The real cause was subrequest exhaustion partway through the sweep. Both compute
+   fine once the fan-out is removed. An error string that names a *domain* reason for an
+   *infrastructure* failure is worse than a generic one, because it terminates the investigation:
+   nobody re-checks a ticker the app has confidently declared untradeable.
+18. **Verify identifiers against the source, never from memory or documentation consensus.**
+   Two separate incidents. 7 of 18 super-investor CIKs were written from memory and pointed at real
+   but *unrelated* managers — the "Third Point" CIK returned Two Sigma, "ARK" returned ValueAct.
+   A wrong CIK does not error; it silently attributes one manager's book to another. Check
+   `data.sec.gov/submissions/CIK{n}.json` and confirm both the name and that `13F-HR` appears.
+   Separately, a **working** FINRA field name (`symbolCode`) was changed to a broken one (`symbol`)
+   because three documentation sources agreed it should be `symbol`. The live API is the
+   authority; documentation consensus is not evidence.
+19. **A non-zero-baseline chart must label its min and max on the axis.** Suppressing the baseline
+   exaggerates movement, so the reader has to be able to see the scale. `sparkline()` draws them as
+   required elements, not options. (This is the visual half of rule 8; it is restated because it is
+   the part that gets dropped when someone reuses the helper.)
+20. **`CLAUDE.md` takes precedence over general platform or skill documentation.** Where generic
+   guidance conflicts with a project rule here, the project rule wins. General documentation does
+   not know this account is on the Workers Free plan, does not know which cron hours fall outside
+   the trigger window, and does not know which of these numbers have already been wrong on screen.
 
 ## Section-by-section data source map
 
-For every component in the spec, this table shows what powers it in the **free prototype** and what to upgrade to once budget allows. "Light tier" is the ~$77/mo recommended stack you flagged for the production version.
+**Everything on both pages runs on real data.** There are no mock generators left
+in the codebase — the last two (`mockShortInterest`, `mockUnusualOptions`) turned
+out to be dead code their cards never called, and the one genuinely fabricated
+section (dark pool) was deleted rather than replaced.
 
-| # | Component | Free prototype source | Coverage today | Light-tier upgrade ($77/mo) | Pro upgrade |
-|---|---|---|---|---|---|
-| 1 | Current price + SMA 20/50/200 | Yahoo `chart` (15-min delayed) → SMA computed client-side | **full** | Polygon real-time | Polygon Advanced |
-| 1 | 5D / 1M / 1Y / 5Y performance | Yahoo `chart` historical | **full** | — | — |
-| 2 | Next earnings date | Yahoo `calendarEvents` | **full** | — | — |
-| 2 | Catalysts (Fed, CPI, geo) | FOMC from Fed's published calendar; CPI/PPI/PCE/jobs/retail from **FRED** | **full** | — | Bloomberg Event Calendar |
-| 3 | Short interest 6mo MoM | **FINRA** consolidated short interest, 6 settlements (Yahoo estimate as labelled fallback) | **full** | — | **Ortex** ($35–80/mo) for daily |
-| 4 | Insider trades + flags | **SEC EDGAR Form 4** — real transaction codes, prices, post-txn holdings | **full** | — | Verafin / SecForm4.com |
-| 5 | Options volume · V/OI screen | Yahoo chain volume + open interest | **real, but not flow** — no side classification, no sweep detection | **Unusual Whales** ($48/mo) for true flow | Cheddar Flow ($75) + UW |
-| 5 | Premium screen (dashboard) | Yahoo chain + `/api/premium/:ticker`, on demand one ticker at a time — ATM IV term structure, expected move, 0.30/0.16-delta strikes, ROC, POP | **full** | — | ORATS for a historical IV surface |
-| 6 | Recommended option strategies | Computed client-side from RSI + IV regime (`/api/iv`) + analyst upside; POP from Worker-side Black-Scholes delta | **rules-based, full** | OptionStrat API ($) | tastytrade backtest data |
-| 7 | Day trade signals (ORB, VWAP) | **Removed** — needs intraday bars, was computed from daily | **not shipped** | **Polygon Stocks Starter** ($29) for intraday | Polygon Advanced ($199) |
-| 7 | Swing signals (EMA crossover) | Computed client-side from daily closes | **full** | — | — |
-| 8 | Dark pool 5d volumes | **REMOVED** — was fabricated, no free source exists | **not shipped** | **Unusual Whales** dark pool tab | Cheddar Flow Pro |
-| 9 | Analyst targets + recs | Yahoo `financialData` + `recommendationTrend` | **full** | FactSet Estimates (paid) | Visible Alpha |
-| 9 | Recent upgrades/downgrades | Yahoo `upgradeDowngradeHistory` | **full** | Benzinga Pro ($177) | — |
-| 10 | Super-investor 13F | **SEC EDGAR 13F-HR**, 20 verified manager CIKs, name-based CUSIP mapping, index built 4 managers per cron firing | **partial — ~2 in 3 positions map to a ticker; card states how many managers are indexed** | **WhaleWisdom Premium** ($30/mo) for full CUSIP coverage | Dataroma + WW Pro |
-| 11 | Technical indicators (RSI, MACD, Bollinger, Stoch, CCI, HV30) | Computed client-side from Yahoo OHLC | **full** | Same — local compute is correct | — |
-| 11 | Implied volatility (ATM IV, term structure, IV/HV30) | Yahoo options chain via `/api/iv` | **full** | — | — |
-| 11 | Option greeks (delta) | **Computed** — Black-Scholes in the Worker; Yahoo's chain carries no greeks. Risk-free rate from FRED `DGS3MO` | **full** | — | Broker greeks (tastytrade / IBKR) |
-| 11 | IV rank | Worker-collected daily IV history in KV | **collecting — null until 60 days** | Same | Historical IV surface (ORATS / IVolatility) |
-| 11 | Support/resistance | Local extrema detection (60-bar lookback) | **functional** | TrendSpider API ($) | — |
-| 11 | Chart with patterns + 30d projection | TradingView Lightweight Charts + linear regression | **functional** | Add ML projection via Claude | Quantcast / Aiera |
-| 12 | Sentiment (news, insiders, mood) | **Claude synthesis** of news headlines + insider data | **full** | Add Benzinga news firehose | RavenPack ($$$$) |
-| 13 | Fundamentals + valuation | Yahoo `financialData` + `defaultKeyStatistics` | **full** | **FMP** ($14) for 30+ years history | Tikr Terminal ($30) |
-| 13 | Peer comparison | Claude infers in synthesis (sector context) | **partial** | FMP `sector-pe` endpoint | Tikr screener |
-| 14 | Overall rating + confidence + factors | **Claude synthesis** with structured JSON output; confidence shown as Low/Moderate/High, never a % | **full** | Same | Same |
-| 15 | Recommendation history | **Cloudflare KV forward-log** (writes on every synthesis) | **full** | Same | Same |
-| 16 | News flow | Yahoo `search` newsCount=15 | **functional** | Benzinga ($177) or NewsAPI ($) | Bloomberg Terminal feed |
+The "Pro upgrade" column is gone. Free official sources — SEC EDGAR, FINRA, FRED —
+now cover every row that column existed to fix, and keeping a paid recommendation
+next to a working free source invites replacing something that already works.
+Where a paid feed would still add something real, it is named in the notes.
 
-Bold rows are the highest-leverage upgrades — biggest data quality jump per dollar spent.
+| # | Component | Source today | State | Worth paying for? |
+|---|---|---|---|---|
+| 1 | Price, SMA 20/50/200 | Yahoo `chart`, 15-min delayed; Alpaca overlays real-time when keyed | **real** | Polygon Starter ($29) for true real-time |
+| 1 | 5D/1M/1Y/5Y performance | Yahoo `chart` historical | **real** | — |
+| 2 | Next earnings date | Yahoo `calendarEvents.earnings.earningsDate[0]` | **real** | — |
+| 2 | Macro catalysts (FOMC, CPI, PPI, PCE, jobs, retail) | **FOMC** from the Fed's published calendar (hand-maintained `FOMC_MEETINGS`); **all statistical releases from FRED**, IDs resolved by name at runtime | **real** | — |
+| 3 | Short interest, 6 settlements | **FINRA** consolidated short interest — the official biweekly figure. Yahoo single-snapshot fallback, labelled an estimate and badged Yahoo | **real** | Ortex ($35–80) for daily rather than biweekly |
+| 4 | Insider trades | **SEC EDGAR Form 4** — real transaction codes, so an open-market buy (`P`) is distinguishable from a grant (`A`) or option exercise (`M`) | **real** | — |
+| 5 | Options volume · V/OI screen | Yahoo chain volume + open interest | **real data, but not flow** — no side classification, no sweep detection. The card says so. | Unusual Whales ($48) for true flow |
+| 6 | Option strategies + POP | Rule-based from RSI + `volRegime()` + analyst upside; POP from Worker-side Black-Scholes delta on each strike's own IV | **real** | — |
+| 7 | Swing signals (EMA crossover) | Computed client-side from Yahoo daily closes | **real** | — |
+| 7 | ~~Day-trade signals (ORB, VWAP)~~ | **Removed.** Both were computed from *daily* bars, which cannot express either — "ORB High" was just yesterday's high | **not shipped** | Polygon Starter ($29) for intraday bars would make them possible |
+| 8 | ~~Dark pool prints~~ | **Deleted.** Fabricated, and no free source exists | **not shipped** | Unusual Whales dark-pool tab |
+| 9 | Analyst targets + recommendations | Yahoo `financialData` + `recommendationTrend` | **real** | — |
+| 9 | Recent upgrades/downgrades | Yahoo `upgradeDowngradeHistory` | **real** | Benzinga Pro ($177) for a firehose |
+| 10 | Super-investor 13F | **SEC EDGAR 13F-HR**, 20 verified manager CIKs, index built 4 managers per cron firing | **real, partial mapping** — ~2 in 3 positions resolve to a ticker; card states how many managers are indexed and when the last full pass completed | WhaleWisdom ($30) for full CUSIP coverage |
+| 11 | Technical indicators (RSI, MACD, Bollinger, Stoch, CCI, **HV30**) | Computed client-side from Yahoo OHLC | **real** | — |
+| 11 | **Implied volatility** (ATM IV front/back, term structure, IV/HV30) | **Yahoo options chain via `/api/iv`** — *not* OHLC. IV cannot be derived from price history; the thing that used to be called "IV" here was a close-to-close stdev and is now labelled HV30 | **real** | — |
+| 11 | IV rank | Worker-collected daily IV samples in KV (`iv:{TICKER}:{DATE}`) | **collecting** — null until 60 days, never estimated | Historical IV surface (ORATS / IVolatility) for instant history |
+| 11 | Option greeks (delta) | **Computed** — Black-Scholes in the Worker; Yahoo's chain carries no greeks. Risk-free rate from FRED `DGS3MO` | **real** | Broker greeks (tastytrade / IBKR) |
+| 11 | Support/resistance | Local extrema detection, 60-bar lookback | **functional** | — |
+| 11 | Chart + 30d projection | TradingView Lightweight Charts + linear regression | **functional** | — |
+| 12 | Sentiment | Claude synthesis over news headlines + real insider data | **real** | RavenPack ($$$$) |
+| 13 | Fundamentals + valuation | Yahoo `financialData` + `defaultKeyStatistics` | **real** | FMP ($14) for 30+ years of history |
+| 13 | Peer comparison | Claude infers sector context in synthesis | **partial** | FMP `sector-pe` |
+| 14 | Overall rating + confidence | Claude synthesis, JSON schema; confidence renders Low/Moderate/High, never a % | **real** | — |
+| 15 | Recommendation history + calibration | Cloudflare KV forward log; `fwd5`/`fwd20` filled by a 2pm PT cron; hit rate and Brier score once n ≥ 10 | **real** | — |
+| 16 | News flow | Alpaca news when keyed, Yahoo `search` otherwise | **real** | Benzinga ($177) |
+| — | Premium screen (dashboard) | Yahoo chain via `/api/premium/:ticker`, one ticker per request: term structure, expected move, 0.30/0.16-delta strikes, credit, ROC, annualised ROC, POP | **real** | ORATS for a historical IV surface |
 
----
+## If you ever want to pay for data
 
-## Recommended paid stack by tier
+The free stack now covers everything except intraday bars and true options flow.
+What is left is genuinely not obtainable free:
 
-### Light tier ($77/mo) — for production launch to a few users
-
-| Service | Plan | Cost | Replaces |
-|---|---|---|---|
-| Polygon.io | Stocks Starter | $29/mo | Yahoo for real-time prices, intraday, fundamentals |
-| Unusual Whales | Standard | $48/mo | Mock options flow + dark pool sections |
-| **Total** | | **$77/mo** | Sections 1, 5, 7, 8 upgraded to real |
-
-Optional add-ons under $30:
-- WhaleWisdom Premium ($30) → real 13F holdings (section 10)
-- FMP ($14) → deeper fundamentals + peer screening (section 13)
-
-A practical Light+ at ~$120/mo: Polygon + UW + WhaleWisdom + FMP. That's all 16 sections on real data except SEC EDGAR (which is free anyway — see below).
-
-### Pro tier ($400+/mo) — when other users are paying
-
-| Service | Cost | Replaces |
+| Service | Cost | What it would actually add |
 |---|---|---|
-| Polygon Stocks Advanced | $199 | Real-time L2 quotes, news, full options |
-| Unusual Whales Pro | $75 | Full options flow + dark pool |
-| Benzinga Pro API | $177 | Premium news + analyst actions firehose |
-| Ortex | $35 | Real-time short interest with squeeze score |
-| **Total** | **$486/mo** | Institutional-grade across the board |
+| Polygon.io Stocks Starter | $29/mo | **Intraday bars.** The only thing that would bring back opening-range breakout and VWAP, which were deleted because daily bars cannot express them. Also real-time rather than 15-min-delayed prices. |
+| Unusual Whales | $48/mo | **Real options flow** — side classification and sweep detection, which the V/OI screen explicitly does not do. Also a dark-pool feed, the one deleted section with no free substitute. |
+| WhaleWisdom Premium | $30/mo | **Full CUSIP→ticker coverage** for 13F, taking mapping from ~2 in 3 to complete and resolving dual-class properly. |
+| FMP | $14/mo | 30+ years of fundamentals and a real peer screener. |
+| ORATS / IVolatility | $$ | **Historical IV surface** — would make IV rank meaningful immediately instead of after 60 days of self-collected samples. |
+| Ortex | $35–80/mo | Daily short interest rather than FINRA's biweekly settlement. |
 
-### What you should always wire (free, just takes effort)
-
-These are best-in-class data sources that cost nothing — the only reason they're stubbed in the prototype is they need dedicated parsers. Each is worth doing in v2:
-
-~~1. SEC EDGAR Form 4~~ — **done.** `/api/insider/:ticker`.
-~~2. SEC EDGAR 13F-HR~~ — **done.** `/api/13f/:ticker`. CUSIP mapping remains partial.
-~~3. FINRA short interest~~ — **done.** `/api/short/:ticker`, via the FINRA API rather than the file.
-~~4. FRED~~ — **done.** Release dates for CPI/PPI/PCE/jobs/retail feed the catalyst calendar.
-
-Remaining free win: a real CUSIP→ticker table would take 13F coverage from ~2/3 to complete.
-SEC's `company_tickers.json` has no CUSIPs and no share-class detail, which is the binding constraint.
-
-If you want, the next session I'll wire SEC EDGAR + FINRA into the Worker — that alone takes the prototype from ~70% real data to ~90% real data with zero monthly cost.
-
----
+Nothing here replaces something already working. SEC EDGAR, FINRA and FRED are
+free, authoritative, and already wired.
 
 ## Cloudflare Worker setup
 
-### Required bindings
+### Bindings
 
 ```toml
 # wrangler.toml
@@ -198,39 +252,78 @@ compatibility_date = "2024-09-01"
 [[kv_namespaces]]
 binding = "REC_LOG"
 id = "<your-kv-namespace-id>"
+
+[triggers]
+crons = ["*/15 13-22 * * 1-5"]
 ```
 
-### Required secret
+The cron window must cover the target Pacific hours under **both** PDT and PST —
+see the constraints block in `CLAUDE.md`. A job whose UTC hour falls outside the
+window does not error; it simply never runs, for half the year.
+
+### Secrets
 
 ```bash
-wrangler secret put ANTHROPIC_API_KEY
+npx wrangler kv namespace create REC_LOG    # NOT kv:namespace — deprecated syntax
+
+npx wrangler secret put ANTHROPIC_API_KEY   # required — all Claude synthesis
+npx wrangler secret put FRED_API_KEY        # macro release dates AND the DGS3MO risk-free rate
+npx wrangler secret put FINRA_CLIENT_ID     # official short interest
+npx wrangler secret put FINRA_CLIENT_SECRET #   (FINRA_API_KEY / _SECRET also accepted)
+npx wrangler secret put ALPACA_KEY          # optional — real-time price + news archive
+npx wrangler secret put ALPACA_SECRET
+npx wrangler deploy
 ```
 
-### Deploy
+SEC EDGAR needs no key, but `SEC_UA` in `worker.js` must carry a real contact
+email or EDGAR 403s every request.
 
-```bash
-wrangler kv:namespace create REC_LOG       # → put the id in wrangler.toml
-wrangler deploy
-```
+**`wrangler dev` does not see deployed secrets** — it reads `.dev.vars`, which is
+gitignored. A local run without it shows no premium candidate strikes (no
+risk-free rate → deltas suppressed), a FOMC-only econ calendar, Yahoo-estimate
+short interest, and empty Claude cards. That is the expected degradation, not a
+bug.
 
-Then update `API_BASE` in `index.html` to your Worker URL (e.g. `https://stock-research-worker.you.workers.dev/api`) and push to GitHub Pages.
+Then set `API_BASE` at the top of **both** HTML files to your Worker URL and push
+to GitHub Pages.
 
 ### Endpoints
 
-All return JSON, all CORS-enabled.
+All return `application/json; charset=utf-8`, all CORS-enabled via
+`ALLOWED_ORIGINS`, all carrying `_meta` for the provenance badge.
 
 ```
-GET  /api/quote/:ticker           Yahoo quoteSummary (multi-module)
-GET  /api/chart/:ticker           ?range=1y&interval=1d
-GET  /api/options/:ticker         ?date=<unix>
-GET  /api/iv/:ticker              ATM implied vol, term structure, IV rank, POP strike ladder
-GET  /api/premium?symbols=        Premium-selling screen: term structure, expected move, delta strikes
-GET  /api/search?q=apple          Ticker search
-GET  /api/news/:ticker            Yahoo news feed
-GET  /api/peers/:ticker           Yahoo recommendationsBySymbol
-POST /api/claude                  Body: {messages, max_tokens?, system?}
-POST /api/log-rec                 Body: {ticker, rating, confidence, price, factors}
-GET  /api/track/:ticker           Read past rating snapshots
+GET  /api/quote/:ticker            Yahoo quoteSummary (multi-module) + Alpaca overlay
+GET  /api/chart/:ticker            ?range=1y&interval=1d
+GET  /api/options/:ticker          ?date=<unix>
+GET  /api/iv/:ticker               ATM IV front/back, term structure, IV rank, HV30, POP ladder
+GET  /api/premium/batch?symbols=   Premium screen — KV read only, zero outbound calls
+GET  /api/premium/:ticker          One ticker (?refresh=1 forces, ?cached=1 never fetches)
+GET  /api/insider/:ticker          SEC EDGAR Form 4, last 90 days
+GET  /api/short/:ticker            FINRA consolidated short interest (Yahoo fallback)
+GET  /api/13f/:ticker              Super-investor 13F, from the KV reverse index
+GET  /api/earnings/:ticker         Last report: numbers, price reaction, call coverage
+GET  /api/search?q=apple           Ticker search
+GET  /api/news/:ticker             Alpaca news → Yahoo fallback
+GET  /api/peers/:ticker            Yahoo recommendationsBySymbol
+POST /api/claude                   {messages, max_tokens?, system?, output_config?}  ⚠ unauthenticated
+POST /api/log-rec                  {ticker, rating, confidence, price, factors}
+GET  /api/track/:ticker            Rating history + calibration
+GET  /api/daily                    Morning briefing + EOD + midday, from KV
+GET  /api/market/snapshot          Index / futures / commodities strip
+GET  /api/market/movers            Pre-market and day movers (≥ ±10%)
+GET  /api/market/ipos              Upcoming IPO calendar
+GET  /api/market/sectors           11 SPDR sectors + Claude picks   (?cached=1)
+GET  /api/market/scanner?preset=   Momentum scanner, 5 Pillars      (?cached=1)
+GET  /api/market/golden-cross      Golden-cross setups, EMA + SMA   (?cached=1)
+GET  /api/market/econ-calendar     FOMC + FRED release dates
+GET  /api/market/week-ahead        Friday-only week preview
+GET  /api/watchlist/batch          Bulk fundamentals + RSI + SMA cross + Claude analysis
+GET  /api/watchlist/auction        Closing-auction block trades
+POST /api/watchlist/save           Persist the watchlist for the cron jobs
+GET|POST|DELETE /api/analysis/:t   Per-ticker Claude analysis cache
+POST /api/admin/refresh-daily      Bearer-token gated (admin:token in KV)
+POST /api/admin/refresh-midday     Bearer-token gated
 ```
 
 ---
@@ -266,37 +359,88 @@ The prototype implements **forward-logging from day one**:
 
 ---
 
-## Things deliberately NOT done in v1
+## Not yet done
 
-These are reasonable next-session targets:
+Items 1, 2, 5 and 6 of the original list are **done** (SEC EDGAR Form 4 + 13F, FINRA
+short interest, the watchlist, cron-driven refresh) and have been removed. So has
+Strategy POP, which now ships — Black-Scholes delta in the Worker, a `pop` strike
+ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
 
-1. **SEC EDGAR Form 4 / 13F-HR direct** — biggest free data win, just needs ticker→CIK lookup + XML parsing.
-2. **FINRA short interest CSV** — biweekly file pull, replace mock generator.
-3. **Pattern recognition on the chart** — the spec mentions "chart with pattern drawings" (head & shoulders, cup & handle, etc.). Lightweight Charts supports custom drawings; recognition itself is a Claude vision call against a chart screenshot, or rules-based code.
-4. **Backfill of recommendation history** — replay synthesis as-of past dates so the track record card has data on day one.
-5. **Watchlist** — multi-ticker overview that links into the research page.
-6. **Cron-driven auto-refresh** — Cloudflare Cron Triggers wake the Worker nightly to refresh top tickers.
-7. ~~**Strategy POP**~~ — **done.** Black-Scholes delta is computed in the Worker (`bsDelta()`) and
-   `/api/iv/:ticker` returns a `pop` strike ladder: real listed strikes, each with a delta from that
-   strike's *own* implied vol. The strategy cards snap their leg to the nearest listed strike and
-   render 1 − |Δ| (both short deltas for the condor). Debit structures show `n/a` — see honesty
-   rule 10.
-8. **"Hist Win"** — still `—`, and still needs a real backtest of the structure on the underlying.
-   Do not ship it before that exists; it is the measured claim POP is not, and the two sit side by
-   side precisely so the difference is visible.
-9. **A real backtest engine** — what would fill Hist Win. Needs historical option chains (ORATS /
-   IVolatility), which none of the free sources carry.
-10. **Two `setBadge()` implementations.** `index.html` and `dashboard.html` each carry one, byte-for-byte
-   equivalent. There is no build step and no module system, so the alternatives were a duplicated
-   function or a third HTTP request for a shared script. If a bundler ever arrives, unify these first —
-   they are the most drift-prone duplication left in the repo.
+1. **Lock down `/api/claude`.** ⚠ **This is the one with a live cost.** The route
+   has *no authentication*: `isAllowedOrigin()` returns `true` when the `Origin`
+   header is absent or `"null"`, so any non-browser client — curl, a script,
+   anything — reaches it and spends the owner's Anthropic key. Verified: a POST
+   with no `Origin` is routed and handled. It is an open proxy in front of a
+   billable API. Options, cheapest first: require a shared secret header the two
+   pages send; move synthesis fully server-side so the route can be deleted; or
+   put Cloudflare Access in front of it. Until then the key is exposed to anyone
+   who finds the Worker URL.
+
+2. **Confirmed-vs-estimated earnings dates.** Yahoo returns
+   `earningsDateIsEstimate` and nothing in the codebase reads it. Every earnings
+   date on the catalyst card, the watchlist column and the premium screen's
+   `insideFront` flag is presented with equal confidence whether the company has
+   confirmed the date or Yahoo guessed it from last year's pattern. That matters
+   most exactly where it is used hardest: the premium screen picks a "clean"
+   expiry by asking whether earnings falls inside it, and an estimated date can be
+   off by a week. Surface the flag and let the expiry selection say when it is
+   working from an estimate.
+
+3. **Position awareness.** The app knows nothing about what is actually held, so
+   every recommendation is written as if from flat. Missing: cost basis, days to
+   long-term capital gains, open option legs, and wash-sale windows. A SELL on a
+   lot 20 days from LTCG, or a covered call written against shares already assigned
+   elsewhere, is advice that ignores the constraints that matter most. This is the
+   largest gap between the tool and how it is actually used.
+
+4. **13F dual-class CUSIP resolution.** Mapping is by issuer name via
+   `normIssuer()`, which deliberately strips `CL`/`CLASS`/`A`–`C` tokens, so
+   GOOGL/GOOG and BRK.A/BRK.B collapse to one normalised name and resolve to
+   whichever ticker SEC's `company_tickers.json` happens to list first
+   (`if (!byName.has(n))` — first wins). **There is no hardcoded override map**, in
+   this or any other form; if you came here expecting one, it does not exist. About
+   1 in 3 positions fail to map at all. A real CUSIP table would fix both problems;
+   SEC's ticker file carries no CUSIPs and no share-class detail, which is the
+   binding constraint.
+
+5. **`Hist Win` backtest.** The stat stays blank pending a real backtest of each
+   structure on the underlying. It sits beside POP so the difference between a
+   formula and a measurement stays visible. Needs historical option chains (ORATS /
+   IVolatility) — no free source carries them.
+
+6. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
+   Lightweight Charts supports custom drawings; recognition would be rules-based
+   code or a Claude vision call against a chart screenshot.
+
+7. **Backfill of recommendation history.** The forward log only grows from first
+   use. RSI/MACD/Bollinger/analyst inputs are all reproducible from Yahoo history,
+   so a replay script could synthesise "what would the model have said on date X".
+   Roughly 100 lines of Node, and it would make the calibration card useful
+   immediately rather than after 10 resolved entries.
+
+8. **Two `setBadge()` implementations.** `index.html` and `dashboard.html` each
+   carry one, byte-for-byte equivalent. No build step and no module system, so the
+   alternatives were duplication or a third HTTP request. If a bundler ever
+   arrives, unify these first — they are the most drift-prone duplication left.
 
 ---
 
 ## Visual design notes
 
-- **Fonts**: Fraunces (display serif), Geist (body), JetBrains Mono (numbers). Serif headers in fintech are deliberately rare — gives an editorial-research feel rather than terminal-clone.
-- **Aesthetic**: "Trading floor at midnight" — deep charcoal base (`#0a0a0c`), warm off-white text (`#f5f1eb`), restrained accent palette. Subtle grain overlay + soft radial gradients for atmosphere.
-- **Colors**: green `#23d18b` / red `#f25f5c` for bull/bear (slightly muted, not neon), amber `#f4b740` for neutral, cyan `#5ec5ea` for data accent, violet `#b48ead` for "mock data" markers.
-- **Centerpiece**: AI Synthesis card uses an italic Fraunces verdict ("BUY", "HOLD", "SELL") at 56px, with a circular SVG confidence ring next to it. The rating also appears in the top hero strip for quick reference.
-- **Mock data markers**: every section relying on stubs has a small violet "Sample · upgrade: X" tag in its header, making the upgrade path obvious to any user.
+- **Fonts**: Fraunces (display serif), Geist (body), JetBrains Mono (numbers). Serif headers in
+  fintech are deliberately rare — it reads as editorial research rather than terminal clone.
+- **Aesthetic**: "trading floor at midnight" — deep charcoal base (`#0a0a0c`), warm off-white text
+  (`#f5f1eb`), restrained accents. Subtle grain overlay and soft radial gradients.
+- **Colours** are CSS custom properties in `:root`; never hardcode a hex. `--bull` `#23d18b` /
+  `--bear` `#f25f5c` (muted, not neon), `--amber` `#f4b740` neutral and stale, `--cyan` `#5ec5ea`
+  data accent, `--violet` `#b48ead`, `--bg-0..3` background layers, `--ink-0..3` text.
+- **`--violet` no longer means "mock data".** It marked the "Sample · upgrade: X" badges, which are
+  gone along with the mock sections. It is now just an accent — earnings news tags, the week-ahead
+  badge, options trade labels in the Midday pulse, and the earnings-unavailable panel. Nothing in
+  the UI signals "this data is fake", because nothing is.
+- **Provenance instead**: `.src-tag` on every card header, rendered from the `_meta` a fetch
+  returned. Cyan when fresh, amber when the source is delayed or our copy is stale, red when the
+  fetch failed. Never hand-written in markup — see honesty rule 5.
+- **Centerpiece**: the AI Synthesis card, italic Fraunces verdict at 56px with a circular SVG
+  confidence ring. The ring is drawn in **three discrete steps** (Low / Moderate / High) so the arc
+  cannot be read back as a percentage — see honesty rule 6.

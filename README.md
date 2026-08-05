@@ -1,24 +1,39 @@
 # Equity Research Terminal
 
-A one-page-per-ticker research dashboard built around 16 components: price action with SMA position, performance windows, earnings + macro catalysts, short interest, insider trades, options volume, swing trade signals (EMA crossovers), recommended option strategies, analyst targets + recent actions, super-investor 13F holdings, technical analysis with chart projections, sentiment, fundamentals + valuation, an AI-synthesized BUY/HOLD/SELL with confidence and factor breakdown, and a forward-logged recommendation track record.
+A two-page equity research terminal backed by a single Cloudflare Worker.
+
+- **`dashboard.html`** — macro landing view with six tabs: Market, Midday, Scanner,
+  Watchlist, Sectors and Premium (a short-premium options screen).
+- **`index.html`** — per-ticker deep dive: price and performance, catalysts and
+  earnings, short interest, insider trades, an options V/OI screen, rule-based
+  option strategies with a computed probability of profit, swing setups, analyst
+  targets, super-investor 13F holdings, technical analysis, sentiment,
+  fundamentals, an AI-synthesised BUY/HOLD/SELL, and a forward-logged
+  recommendation track record with calibration.
 
 ## Stack
 
-- **Frontend**: Single HTML file (`index.html`). TradingView Lightweight Charts + custom SVG. Fraunces / Geist / JetBrains Mono fonts.
-- **Backend**: Cloudflare Worker (`worker.js`) — proxies Yahoo Finance, calls Claude API, persists rating history to KV.
-- **AI**: Claude Opus 5 for sentiment scoring + overall rating synthesis, with a JSON schema rather than a prompt instruction.
+- **Frontend** — two standalone HTML files. No bundler, no framework, no build
+  step. TradingView Lightweight Charts plus custom SVG. Fraunces / Geist /
+  JetBrains Mono.
+- **Backend** — one Cloudflare Worker (`worker.js`) proxying Yahoo Finance, SEC
+  EDGAR, FINRA, FRED and Alpaca; calling the Anthropic API; and persisting to
+  Workers KV.
+- **AI** — Claude Opus 5 (`const CLAUDE_MODEL = 'claude-opus-5'` in `worker.js`)
+  for sentiment scoring and the overall rating, with a JSON schema rather than a
+  prompt instruction.
 
 ## Quick start
 
 ### 1. Deploy the Worker
 
 ```bash
-npm install -g wrangler
-wrangler login
-wrangler kv:namespace create REC_LOG    # copy the returned id
+npm install
+npx wrangler login
+npx wrangler kv namespace create REC_LOG    # copy the returned id
 ```
 
-Edit `wrangler.toml`:
+Put the id in `wrangler.toml`:
 
 ```toml
 name = "stock-research-worker"
@@ -28,53 +43,112 @@ compatibility_date = "2024-09-01"
 [[kv_namespaces]]
 binding = "REC_LOG"
 id = "<paste-the-id-here>"
+
+[triggers]
+crons = ["*/15 13-22 * * 1-5"]
 ```
 
-Then:
+Set the secrets:
 
 ```bash
-wrangler secret put ANTHROPIC_API_KEY    # paste your key
-wrangler deploy
+npx wrangler secret put ANTHROPIC_API_KEY    # required — all Claude synthesis
+npx wrangler secret put FRED_API_KEY         # macro release dates + the DGS3MO risk-free rate
+npx wrangler secret put FINRA_CLIENT_ID      # official short interest
+npx wrangler secret put FINRA_CLIENT_SECRET
+npx wrangler secret put ALPACA_KEY           # optional — real-time prices, news archive
+npx wrangler secret put ALPACA_SECRET
+
+npx wrangler deploy
 ```
 
-Note the Worker URL printed at the end (e.g. `https://stock-research-worker.you.workers.dev`).
+SEC EDGAR needs no key, but `SEC_UA` in `worker.js` must carry a real contact
+email or EDGAR returns 403 for every request.
+
+Note the Worker URL printed at the end.
 
 ### 2. Wire up the frontend
 
-In `index.html`, find the `API_BASE` constant near the top of the script block and replace with your Worker URL:
+Set `API_BASE` near the top of **both** `index.html` and `dashboard.html`:
 
 ```js
 const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 ```
 
-Push to GitHub Pages (or open `index.html` locally — note: opening directly will work because the Worker is CORS-enabled).
+Push to GitHub Pages, or open the files locally — the Worker is CORS-enabled for
+`https://ambermlysak.github.io` and `localhost`.
 
-### 3. Use it
+### 3. Local development
 
-- Type a ticker into the search bar (e.g. `PLTR`, `NVDA`) and hit Enter — or pick from the autocomplete.
-- The full page rebuilds: price/SMA, performance, catalysts, technical chart with indicator overlays, fundamentals, analyst targets, options strategies, trade signals, news, and the AI synthesis at top.
-- The AI Synthesis card runs a few seconds after the rest of the page loads (Claude call). Each synthesis is logged to KV.
+```bash
+npx wrangler dev     # Worker on localhost:8787
+npx wrangler tail    # live logs from the deployed Worker
+```
 
-## What's real, what's stubbed
+**`wrangler dev` cannot see deployed secrets.** It reads `.dev.vars` in the repo
+root, which is gitignored and so absent on a fresh clone. Without it a local run
+degrades in specific, expected ways — no premium candidate strikes (no risk-free
+rate, so Black-Scholes deltas are suppressed rather than computed at `r = 0`), a
+FOMC-only econ calendar, Yahoo-estimate short interest instead of FINRA, and empty
+Claude cards. Create `.dev.vars` with the same keys to test those paths:
 
-See `ARCHITECTURE.md` for the section-by-section data source map and the paid-API upgrade path. Short version:
+```
+ANTHROPIC_API_KEY="..."
+FRED_API_KEY="..."
+FINRA_CLIENT_ID="..."
+FINRA_CLIENT_SECRET="..."
+```
 
-- **Real Yahoo data**: prices, SMAs, performance windows, fundamentals, analyst targets, recent up/downgrades, news, earnings dates, technical indicators, implied vol + option chains, trade signals
-- **Real SEC / FINRA / FRED data**: Form 4 insider trades, super-investor 13F holdings, consolidated short interest, macro release dates
-- **Computed here**: all technical indicators, HV30, Black-Scholes delta and POP (Yahoo carries no greeks)
-- **Claude-generated**: sentiment scores, overall rating + confidence + factor breakdown + thesis paragraphs
-- **Nothing is stubbed.** The dark-pool card was deleted rather than faked — no free source exists for it. Every card names the source it actually called and when it last called it; a source that fails renders "unavailable" with the reason, never a generated number.
+There is no test suite. The one check is `node bs-delta.check.mjs`, which prints
+computed vs expected for the Black-Scholes delta against Hull's published worked
+example, an independent series-erf implementation and put-call parity.
+
+## What's real
+
+**Everything.** There are no mock generators in the codebase.
+
+- **Yahoo Finance** — prices (15-min delayed), OHLCV, fundamentals, analyst
+  targets, upgrades/downgrades, earnings dates, options chains, news fallback
+- **SEC EDGAR** — Form 4 insider transactions with real transaction codes; 13F-HR
+  holdings for 20 verified super-investor CIKs
+- **FINRA** — official biweekly consolidated short interest, six settlements
+- **FRED** — CPI/PPI/PCE/jobs/retail release dates, and the DGS3MO 3-month T-bill
+  used as the risk-free rate for Black-Scholes
+- **Alpaca** (optional) — real-time price overlay and the news archive
+- **Computed locally** — RSI, MACD, Bollinger, Stochastic, CCI, HV30, EMA
+  crossovers, support/resistance; and in the Worker, Black-Scholes delta and the
+  probability of profit derived from it
+- **Claude** — sentiment scores, the overall rating with confidence and factor
+  breakdown, sector picks, and the daily briefings
+
+Two things were **removed rather than faked**: the dark-pool card (fabricated, and
+no free source exists) and the opening-range-breakout / VWAP signals (both were
+computed from daily bars, which cannot express either). Section 08 is missing from
+`index.html`'s numbering as a deliberate scar.
+
+Where a source fails, the card renders "unavailable" with the reason — never a
+generated number. Every card shows what it called and when, and turns amber once
+the data is past its refresh window.
 
 ## Files
 
-- `index.html` — the dashboard
+- `dashboard.html` — macro landing view
+- `index.html` — per-ticker research page
 - `worker.js` — Cloudflare Worker
-- `ARCHITECTURE.md` — full data source map, upgrade path, design notes
-- `README.md` — this file
+- `wrangler.toml` — Worker config: KV binding, cron trigger, secret inventory
+- `bs-delta.check.mjs` — Black-Scholes delta check
+- `CLAUDE.md` — working rules; **read the constraints block first**
+- `ARCHITECTURE.md` — data source map, honesty rules, what is deliberately not done
 
 ## Notes
 
-- Yahoo Finance data is delayed 15 minutes. For real-time, swap to Polygon (already proxied through the Worker — just add a new handler).
-- Claude model identifier is locked to `claude-opus-5` in `worker.js`.
-- Recommendation track record (section 15) starts populating on first use. For backfilled history, see the "next steps" section in `ARCHITECTURE.md`.
+- **The Worker is on the Cloudflare Free plan: 50 subrequests per invocation.**
+  Any new feature that fans out across tickers must be budgeted against this
+  before it is written — it has caused two silent failures already. See
+  `CLAUDE.md`.
+- Yahoo data is 15 minutes delayed. Alpaca overlays real-time prices when keyed.
+- **`POST /api/claude` is currently unauthenticated** — it is reachable without an
+  `Origin` header and spends the owner's Anthropic key. Locking it down is the
+  top item in `ARCHITECTURE.md`'s "Not yet done".
+- The recommendation track record starts populating on first use; calibration
+  appears once 10 entries have a resolved 20-session outcome.
 - Not investment advice. For research only.
