@@ -15,8 +15,10 @@ documentation where the two conflict.** General guidance does not know about thi
 account's plan limits or this Worker's history. Where it disagrees with what is
 below, what is below wins.
 
-Each of the three constraints here has already caused a *silent* failure — code
-that returned normally and rendered plausible output while being wrong.
+Each constraint here has already caused a failure in this codebase. The first
+three were *silent* — code that returned normally and rendered plausible output
+while being wrong. The fourth was the opposite: total, immediate, and invisible
+in the Worker logs, because the browser never sent the requests.
 
 ### 1. Subrequest cap: 50 per Worker invocation
 
@@ -84,7 +86,54 @@ every hand-built `new Response(JSON.stringify(...))`. **The bytes were always
 correct; only the declaration was missing.** Never "fix" this by replacing the
 characters with ASCII — that hides the fault and loses the typography.
 
-### 4. The spend gate: `/api/claude` is gone
+### 4. CORS preflight: any custom request header must be allowlisted
+
+**Adding a custom request header to either frontend is a two-file change.** The
+browser CORS-safelists exactly four request headers — `Accept`,
+`Accept-Language`, `Content-Language`, `Content-Type`. Anything else makes the
+request "non-simple": the browser first sends an `OPTIONS` preflight, and it will
+**not send the real request** unless the preflight response names that header in
+`Access-Control-Allow-Headers`.
+
+Adding `x-dash-key` to the frontends without adding it to `CORS_ALLOW_HEADERS`
+took the whole site down — **12 requests blocked client-side, nothing in the
+Worker logs, because nothing arrived.** The Worker was working perfectly; the
+browser never called it.
+
+So: `CORS_ALLOW_HEADERS` is declared next to `ALLOWED_ORIGINS`, built from
+`AI_SECRET_HEADER` so the check and the advertisement cannot drift. Add any new
+header there in the same commit that adds it to the client.
+
+Two ordering rules in `fetch()`, both load-bearing:
+
+- **`OPTIONS` is answered before the origin 403 and before any gate.** A preflight
+  carries no custom headers *by definition* — the browser sends
+  `Access-Control-Request-Headers` naming them, not the headers themselves. If the
+  gate ran first it would reject its own preflight for want of the very header the
+  preflight exists to request permission for, and nothing could ever succeed.
+  **Never move a check above that block.**
+- **The preflight response must carry `Access-Control-Allow-Origin`,
+  `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers` and
+  `Access-Control-Max-Age`**, and `Vary: Origin` so a cache cannot serve one
+  origin's ACAO to another. A disallowed origin gets a bare 403 with no CORS
+  headers at all.
+
+**curl cannot catch this class of bug, and neither can I without a browser.**
+A direct `curl -H 'x-dash-key: …'` never preflights — it just sends the header —
+so every one of my layer-2 origin tests passed against a Worker that no browser
+could talk to. That is exactly how this shipped.
+
+Two things now exist for it:
+
+- `cors-check.html` — open it **in a browser** from an allowlisted origin. It
+  issues real cross-origin requests, so real preflights, and reports pass/fail.
+  A 401 or 429 there is a **pass**: it means the browser let the request through
+  and the Worker answered. Only a `TypeError` with no status is a CORS block.
+- A curl-based simulation of the Fetch spec's preflight algorithm is useful for a
+  quick check, but it is a *model* of the browser, not the browser. When they
+  disagree, the browser is right.
+
+### 5. The spend gate: `/api/claude` is gone
 
 `POST /api/claude` accepted a caller-supplied `messages` array and forwarded it to
 Anthropic on the owner's key. It had **no authentication** — `isAllowedOrigin()`

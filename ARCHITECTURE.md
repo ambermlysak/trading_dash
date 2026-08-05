@@ -11,6 +11,7 @@ trading_dash/
 │                        #   Alpaca proxy, Claude calls, KV persistence, cron jobs
 ├── wrangler.toml        # Worker config: KV binding, cron trigger, secret inventory
 ├── bs-delta.check.mjs   # Black-Scholes delta check — prints computed vs expected
+├── cors-check.html      # Open in a BROWSER to verify CORS preflight; curl cannot
 ├── package.json         # wrangler devDependency only; there is no build step
 ├── .dev.vars            # LOCAL SECRETS — gitignored, absent on a fresh clone
 ├── ARCHITECTURE.md      # this file

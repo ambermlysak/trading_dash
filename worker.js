@@ -30,6 +30,25 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1',
 ];
 
+/* ── The preflight contract ──────────────────────────────────────────────────
+   `x-dash-key` is the gate header the frontend sends. It is NOT one of the four
+   CORS-safelisted request headers (Accept, Accept-Language, Content-Language,
+   Content-Type), so the browser issues an `OPTIONS` preflight before every real
+   request and refuses to send it unless the response advertises the header in
+   `Access-Control-Allow-Headers`.
+
+   It did not, and the whole site went dark: 12 requests blocked client-side,
+   before the Worker was ever reached. Nothing in the Worker logs, because
+   nothing arrived.
+
+   **Any custom request header added anywhere in either frontend must be added to
+   CORS_ALLOW_HEADERS.** This is declared beside ALLOWED_ORIGINS, and the gate
+   header name is defined here rather than next to the gate so the two cannot
+   drift — `AI_SECRET_HEADER` is the single source of truth for both the check
+   and the preflight advertisement. */
+const AI_SECRET_HEADER = 'x-dash-key';
+const CORS_ALLOW_HEADERS = ['Content-Type', AI_SECRET_HEADER].join(', ');
+
 const CLAUDE_MODEL = 'claude-opus-5';
 
 /* Opus 5 thinks by default, and `max_tokens` caps thinking + answer together —
@@ -382,7 +401,6 @@ function isAllowedOrigin(origin) {
    the limits are what actually bound the bill.
    ══════════════════════════════════════════════════════════════════════════ */
 
-const AI_SECRET_HEADER = 'x-dash-key';
 
 /* Ceilings, denominated in **Claude calls** — not requests. See the `cost`
    handling in aiGuard: one /api/watchlist/batch can queue 30 analyses, so a
@@ -513,12 +531,16 @@ async function aiGuard(request, env, origin, { cost = 1 } = {}) {
   return null;
 }
 
+/* `Access-Control-Allow-Origin` echoes the caller's origin when it is allowlisted.
+   It used to fall back to ALLOWED_ORIGINS[0] otherwise, which told an unallowed
+   caller which origin IS allowed — pointless, since the browser blocks on the
+   mismatch anyway. Now a disallowed origin simply gets no ACAO at all.
+   `Vary: Origin` is required: without it a cache can serve one origin's ACAO to
+   another. */
 const cors = (origin = '') => ({
-  'Access-Control-Allow-Origin': isAllowedOrigin(origin)
-    ? (origin && origin !== 'null' ? origin : '*')
-    : ALLOWED_ORIGINS[0],
-  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  ...(isAllowedOrigin(origin) ? { 'Access-Control-Allow-Origin': origin } : {}),
+  'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
+  'Access-Control-Allow-Headers': CORS_ALLOW_HEADERS,
   'Access-Control-Max-Age': '86400',
   'Vary': 'Origin',
 });
@@ -5902,8 +5924,20 @@ export default {
   async fetch(request, env, ctx) {
     const origin = request.headers.get('Origin') || '';
 
+    /* Preflight is answered FIRST, before the origin 403 and before any gate.
+     *
+     * This ordering is load-bearing: a preflight carries no custom headers by
+     * definition — the browser sends `Access-Control-Request-Headers` naming
+     * them, not the headers themselves. So if the gate ran before this, it would
+     * reject its own preflight for want of the very header the preflight exists
+     * to ask permission for, and nothing could ever succeed. Never move a check
+     * above this block. */
     if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: cors(origin) });
+      if (!isAllowedOrigin(origin)) {
+        // No CORS headers at all — the browser blocks, which is the intent.
+        return new Response(null, { status: 403 });
+      }
+      return new Response(null, { status: 204, headers: cors(origin) });
     }
 
     if (!isAllowedOrigin(origin)) {

@@ -142,6 +142,7 @@ the data is past its refresh window.
 - `worker.js` — Cloudflare Worker
 - `wrangler.toml` — Worker config: KV binding, cron trigger, secret inventory
 - `bs-delta.check.mjs` — Black-Scholes delta check
+- `cors-check.html` — open in a browser to verify CORS preflight against the Worker
 - `CLAUDE.md` — working rules; **read the constraints block first**
 - `ARCHITECTURE.md` — data source map, honesty rules, what is deliberately not done
 

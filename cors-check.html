@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>CORS preflight check</title>
+<style>
+  :root { --bg:#0a0a0c; --ink:#f5f1eb; --dim:#8b8680; --ok:#23d18b; --bad:#f25f5c; --amber:#f4b740; --line:#26252a; }
+  body { background:var(--bg); color:var(--ink); font:14px/1.6 ui-monospace,"JetBrains Mono",monospace; margin:0; padding:28px; }
+  h1 { font-size:18px; font-weight:500; margin:0 0 4px; }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:20px; }
+  .origin { color:var(--amber); }
+  table { border-collapse:collapse; width:100%; max-width:900px; margin-top:14px; }
+  th { text-align:left; font-size:10px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); font-weight:400; padding:0 10px 6px; }
+  td { padding:5px 10px; border-top:1px solid var(--line); font-size:12px; vertical-align:top; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .dim { color:var(--dim); }
+  .verdict { margin-top:22px; padding:14px 18px; border-radius:6px; border:1px solid var(--line); max-width:900px; }
+  .verdict.pass { border-color:rgba(35,209,139,.4); background:rgba(35,209,139,.07); }
+  .verdict.fail { border-color:rgba(242,95,92,.4); background:rgba(242,95,92,.07); }
+  code { color:var(--amber); }
+  button { font:inherit; background:#17161a; color:var(--ink); border:1px solid var(--line); border-radius:4px; padding:6px 14px; cursor:pointer; }
+  button:hover { border-color:var(--ok); }
+</style>
+</head>
+<body>
+
+<h1>CORS preflight check</h1>
+<div class="sub">
+  Issues <b>real cross-origin requests</b> from this page to the Worker. Because
+  <code>x-dash-key</code> is not a CORS-safelisted header, each one triggers a genuine browser
+  preflight — the exact mechanism that curl cannot exercise and that took the site down.<br>
+  Page origin: <span class="origin" id="origin"></span> &nbsp;·&nbsp; Worker: <span class="origin" id="target"></span>
+</div>
+
+<button id="run">Re-run</button>
+<table><thead><tr><th>Request</th><th>Result</th><th>Detail</th></tr></thead><tbody id="rows"></tbody></table>
+<div class="verdict" id="verdict"></div>
+
+<script>
+/* Point this at the same Worker the dashboard uses. */
+const API_BASE = 'https://stock-research-worker.ambermlysak.workers.dev/api';
+
+/* Any value works — this checks the PREFLIGHT, which happens before the Worker
+   ever sees the key. A 401 from the gate is a PASS here: it means the browser
+   allowed the request through and the Worker answered. */
+const DASH_KEY = 'cors-preflight-probe';
+
+const CASES = [
+  ['GET  /iv/AAPL',            '/iv/AAPL',            { method: 'GET' }],
+  ['GET  /quote/AAPL',         '/quote/AAPL',         { method: 'GET' }],
+  ['GET  /daily',              '/daily',              { method: 'GET' }],
+  ['GET  /market/snapshot',    '/market/snapshot',    { method: 'GET' }],
+  ['GET  /premium/batch',      '/premium/batch?symbols=AAPL', { method: 'GET' }],
+  ['POST /ai/synthesis/AAPL',  '/ai/synthesis/AAPL',  { method: 'POST' }],
+  ['POST /log-rec',            '/log-rec',            { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }],
+];
+
+document.getElementById('origin').textContent = location.origin;
+document.getElementById('target').textContent = API_BASE;
+
+async function run() {
+  const rows = document.getElementById('rows');
+  const verdict = document.getElementById('verdict');
+  rows.innerHTML = ''; verdict.className = 'verdict'; verdict.textContent = 'running…';
+
+  let blocked = 0, reached = 0;
+  for (const [label, path, opts] of CASES) {
+    const tr = document.createElement('tr');
+    let result, detail, cls;
+    try {
+      const r = await fetch(API_BASE + path, {
+        ...opts,
+        headers: { 'x-dash-key': DASH_KEY, ...(opts.headers || {}) },
+      });
+      // Any HTTP status means the preflight succeeded and the request was sent.
+      reached++;
+      result = 'reached Worker'; cls = 'ok';
+      detail = `HTTP ${r.status}` + (r.status === 401 ? ' — gate rejected the probe key, which is expected and proves CORS is fine'
+                : r.status === 429 ? ' — rate limited, still proves CORS is fine' : '');
+    } catch (e) {
+      // A TypeError with no status is what a CORS block looks like from JS.
+      blocked++;
+      result = 'BLOCKED'; cls = 'bad';
+      detail = `${e.name}: ${e.message} — check the console for the CORS message`;
+    }
+    tr.innerHTML = `<td>${label}</td><td class="${cls}">${result}</td><td class="dim">${detail}</td>`;
+    rows.appendChild(tr);
+  }
+
+  if (blocked === 0) {
+    verdict.className = 'verdict pass';
+    verdict.innerHTML = `<b class="ok">PASS</b> — all ${reached} requests cleared preflight and reached the Worker.
+      The <code>x-dash-key</code> header is correctly advertised in <code>Access-Control-Allow-Headers</code>
+      for origin <code>${location.origin}</code>.`;
+  } else {
+    verdict.className = 'verdict fail';
+    verdict.innerHTML = `<b class="bad">FAIL</b> — ${blocked} of ${CASES.length} requests were blocked before reaching
+      the Worker. The Worker is not advertising <code>x-dash-key</code> in <code>Access-Control-Allow-Headers</code>
+      for this origin, or this origin is not in <code>ALLOWED_ORIGINS</code>. Deploy the Worker
+      (<code>npx wrangler deploy</code>) and re-run.`;
+  }
+}
+
+document.getElementById('run').addEventListener('click', run);
+run();
+</script>
+</body>
+</html>
