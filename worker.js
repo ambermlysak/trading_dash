@@ -384,17 +384,31 @@ function isAllowedOrigin(origin) {
 
 const AI_SECRET_HEADER = 'x-dash-key';
 
-/* Ceilings. Sized from real use: the crons spend ~30 calls/day between them
-   (4 briefings + ~22 watchlist analyses + sectors), and interactive use adds
-   maybe 30–50 — a heavy session is ~15 tickers, one synthesis each. So 40/hour
-   per IP is roughly 3× a busy hour, and 200/day globally is ~3× a busy day.
+/* Ceilings, denominated in **Claude calls** — not requests. See the `cost`
+   handling in aiGuard: one /api/watchlist/batch can queue 30 analyses, so a
+   request-denominated ceiling would authorise ~30× what it appeared to.
 
-   The global cap is the one that actually bounds the bill, because rotating IPs
-   defeats the per-IP cap and costs an attacker nothing. Worst case at 200 calls
-   × ~6500 output tokens (answer + thinking headroom) × $25/MTok ≈ $32/day. That
-   is the number to move if the exposure feels wrong — not the per-IP one. */
+   Cron spend does NOT count against these. The scheduled jobs call workerClaude
+   directly, having no request to authenticate, so the crons' ~30 calls/day are
+   on top of whatever the ceiling permits. These bound REQUEST-PATH spend only.
+
+   Sizing: interactive use is roughly one synthesis per ticker opened, plus the
+   occasional earnings click and sectors refresh. A heavy session is ~15 tickers.
+   60/day is about 4× that; 40/hour per IP is deliberately left higher than the
+   daily figure so a single burst is limited by the day, not the hour.
+
+   The global cap is what bounds the bill — rotating IPs defeats the per-IP one
+   for free. Worst case, every call taking the most expensive gated route
+   (generateSectors at 3500 answer + 4000 thinking headroom = 7500 output):
+
+       60 × 7500 = 450,000 output tokens = 0.45 MTok × $25 = $11.25
+       plus input, ~3000 tok/call → 0.18 MTok × $5             = $0.90
+                                                        total ≈ $12/day
+
+   That is the number to move if the exposure still feels wrong — not the per-IP
+   one, which an attacker simply routes around. */
 const AI_RATE_PER_IP_HOUR = 40;
-const AI_RATE_GLOBAL_DAY  = 200;
+const AI_RATE_GLOBAL_DAY  = 60;
 
 /** Constant-time string compare. `===` on a secret leaks length and prefix
  *  through timing; over the internet that is mostly theoretical, but the correct
@@ -439,11 +453,11 @@ function requireSecret(request, env, origin) {
  *  `/api/watchlist/batch` both return a useful payload from cache regardless;
  *  what they must not do for an unauthenticated caller is kick off generation.
  *  Rejecting the whole endpoint would break the page for no security gain. */
-async function maySpend(request, env) {
-  return (await aiGuard(request, env, '')) === null;
+async function maySpend(request, env, cost = 1) {
+  return (await aiGuard(request, env, '', { cost })) === null;
 }
 
-async function aiGuard(request, env, origin) {
+async function aiGuard(request, env, origin, { cost = 1 } = {}) {
   const expected = env?.AI_GATE_SECRET;
   if (!expected) {
     console.error('[aiGuard] AI_GATE_SECRET is not set — refusing to spend unauthenticated');
@@ -466,13 +480,20 @@ async function aiGuard(request, env, origin) {
     const dayN = Number(dayRaw) || 0;
     const ipN  = Number(ipRaw)  || 0;
 
-    if (dayN >= AI_RATE_GLOBAL_DAY) {
-      console.warn(`[aiGuard] global daily cap hit: ${dayN}/${AI_RATE_GLOBAL_DAY}`);
-      return json({ error: `daily AI request ceiling reached (${AI_RATE_GLOBAL_DAY}). Resets at 00:00 UTC.`,
+    // `cost` is how many Claude calls this request is about to make, not how many
+    // requests it is. They are not the same number: one /api/watchlist/batch can
+    // fan out to 30 analyses. Counting requests would have let a 60/day ceiling
+    // authorise 1,800 calls — the ceiling has to be denominated in the thing that
+    // costs money.
+    if (dayN + cost > AI_RATE_GLOBAL_DAY) {
+      console.warn(`[aiGuard] global daily cap: ${dayN} + ${cost} > ${AI_RATE_GLOBAL_DAY}`);
+      return json({ error: `daily AI call ceiling reached (${AI_RATE_GLOBAL_DAY} calls). Resets at 00:00 UTC.`,
+                    used: dayN, requested: cost, limit: AI_RATE_GLOBAL_DAY,
                     retryAfter: 'next UTC day' }, 429, origin);
     }
-    if (ipN >= AI_RATE_PER_IP_HOUR) {
-      return json({ error: `hourly AI request ceiling reached (${AI_RATE_PER_IP_HOUR} per IP). Try again next hour.`,
+    if (ipN + cost > AI_RATE_PER_IP_HOUR) {
+      return json({ error: `hourly AI call ceiling reached (${AI_RATE_PER_IP_HOUR} calls per IP). Try again next hour.`,
+                    used: ipN, requested: cost, limit: AI_RATE_PER_IP_HOUR,
                     retryAfter: 'next UTC hour' }, 429, origin);
     }
 
@@ -481,8 +502,8 @@ async function aiGuard(request, env, origin) {
     // accepted deliberately rather than pretending otherwise. TTLs are one bucket
     // plus slack so the keys expire themselves.
     await Promise.all([
-      kv.put(dayKey, String(dayN + 1), { expirationTtl: 90_000 }),
-      kv.put(ipKey,  String(ipN  + 1), { expirationTtl: 7_200 }),
+      kv.put(dayKey, String(dayN + cost), { expirationTtl: 90_000 }),
+      kv.put(ipKey,  String(ipN  + cost), { expirationTtl: 7_200 }),
     ]);
   } catch (e) {
     // A KV failure must not become a free pass. The secret already passed, so
@@ -4374,8 +4395,11 @@ async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
   const needsAnalysis = tickers.filter(t => stocks[t] && !stocks[t].recommendation && !stocks[t].error);
   // THE fan-out: up to 30 uncached symbols in one request became 30 Claude calls.
   // The row data is served either way; only the analysis spend is gated.
-  const allowedToSpend = await maySpend(request, env);
-  if (needsAnalysis.length > 0 && ctx && env?.ANTHROPIC_API_KEY && allowedToSpend) {
+  // Order matters: `maySpend` INCREMENTS the counter, so asking before we know
+  // there is anything to analyse would charge an ordinary cached page load
+  // against the daily ceiling. Charge for exactly the number of analyses queued.
+  const willAnalyse = needsAnalysis.length > 0 && ctx && env?.ANTHROPIC_API_KEY;
+  if (willAnalyse && await maySpend(request, env, needsAnalysis.length)) {
     ctx.waitUntil((async () => {
       for (let i = 0; i < needsAnalysis.length; i += 5) {
         await Promise.allSettled(
