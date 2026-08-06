@@ -264,6 +264,39 @@ Both frontends carry their own copy of the constant (`index.html`,
 `dashboard.html`) and both must be updated together — `index.html` alone leaves
 the whole dashboard 401ing.
 
+**Check what the local server is actually serving before debugging the page.**
+`http-server` serves `.`, and its command line does not record which directory
+that was. A run started from a **stale copy of the project** served a 148,135-byte
+`index.html` from Aug 4 — the same app, same title, but 3,082 lines with
+`API_BASE` at line 865 — which **predates the gate entirely**: zero occurrences of
+`DASH_KEY`, zero of `x-dash-key`. So the page sent no gate header, the Worker
+returned a perfectly correct 401, and it was indistinguishable on screen from a
+wrong secret. Meanwhile every curl test passed, because curl read the key from the
+*working-tree* file rather than the one being served.
+
+Compare the served bytes to the file on disk before trusting anything about the
+page:
+
+```bash
+curl -s http://localhost:8123/index.html | wc -c;  wc -c < index.html
+curl -s http://localhost:8123/index.html | grep -c x-dash-key   # 0 == pre-gate copy
+```
+
+A byte-count mismatch means you are debugging a different file. Line endings do
+not explain a large gap — CRLF→LF on this file is ~3.5KB, not 33KB.
+
+Symptom→cause, since three different faults produce the same 401:
+
+| Symptom | Cause |
+|---|---|
+| 401, page sends **no** `x-dash-key` | serving a pre-gate copy — wrong directory |
+| 401, header sent but value is `YOUR_STRING_HERE` | placeholder never replaced, or Pages not rebuilt |
+| 401, header sent with a real 64-char key | genuine mismatch with `AI_GATE_SECRET` |
+| **503**, not 401 | `AI_GATE_SECRET` unset on the Worker — a config fault, not a key fault |
+
+Start `http-server` with an explicit path, never `.`, and confirm the port is
+serving this repo before concluding anything about the key.
+
 ---
 
 ## Deploy & develop
