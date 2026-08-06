@@ -224,6 +224,46 @@ they call `workerClaude()` directly, so their ~30 calls/day sit on top.
 **None of this is authentication.** Read the residual-risk section in
 `ARCHITECTURE.md` before assuming any of it stops a motivated attacker.
 
+### 6. `DASH_KEY` is only live once it is pushed to GitHub Pages
+
+Editing `DASH_KEY` in the working tree changes nothing the browser sees. The
+pages are served by **GitHub Pages from the last pushed commit**, so the fix is
+`git push`, not the edit. This has produced the same dead end twice:
+
+- Commit `35206f0`, *"Set AI gate secret in frontend"*, replaced the placeholder
+  `REPLACE_WITH_YOUR_AI_GATE_SECRET` with **another placeholder**,
+  `YOUR_STRING_HERE`. The message asserts a step that did not happen, which is
+  worse than no commit at all — the log becomes evidence against the real cause.
+- The real key was then pasted into both files correctly and the site still
+  failed **identically**, because the change was staged and never committed. The
+  live page was still serving `YOUR_STRING_HERE`.
+
+So when a gate failure survives a `DASH_KEY` edit, **check the deployed bytes
+before re-checking the value**:
+
+```bash
+curl -s https://ambermlysak.github.io/trading_dash/index.html | grep -m1 '^const DASH_KEY'
+```
+
+Separate the two questions, because they have different fixes and the symptom is
+one 401 either way:
+
+| Question | Test | Fix |
+|---|---|---|
+| Does the key match `AI_GATE_SECRET`? | `curl -H 'x-dash-key: …' …/api/earnings/AAPL?facts=1` → 200 vs 401 | repaste / rotate the secret |
+| Are the right bytes deployed? | curl the live Pages HTML, grep `DASH_KEY` | `git push` |
+
+`?facts=1` is the probe to use: it passes the gate in the router **before**
+`handleEarningsAnalysis` decides not to call Claude, so it tests the gate at
+**zero Anthropic spend**. It still costs one unit of `AI_RATE_GLOBAL_DAY`. Never
+probe the gate with `POST /api/analysis/:ticker` or `/api/watchlist/save` — they
+pass the gate by *writing KV*, so a successful test corrupts a card or reseeds
+what the crons spend on.
+
+Both frontends carry their own copy of the constant (`index.html`,
+`dashboard.html`) and both must be updated together — `index.html` alone leaves
+the whole dashboard 401ing.
+
 ---
 
 ## Deploy & develop
@@ -983,4 +1023,38 @@ Never use git push --force, never rewrite published history, never commit secret
 
 If a push fails, report the error rather than working around it.
 
-Deployment stays manual — do not run npx wrangler deploy unless I explicitly ask.
+Deployment requires approval — do not run npx wrangler deploy without asking for approval.
+
+Kill background processes when a task completes. Don't leave wrangler dev, wrangler tail, or http servers running between tasks.
+
+Add a "Verification standard" section to CLAUDE.md:
+
+## Verification standard
+
+Before reporting a task complete, state which checks were run and print the actual values. "Verified" without a number is not verification. This applies to every numeric output, every identifier taken from an external source, and every calculation.
+
+Print, don't assert. Show computed values alongside expected values, with deviations. The Black-Scholes check was trustworthy because it printed 0.52160473 against 0.52200000; a claim that it passed would not have been.
+
+Check against a different source than the one being tested. Cross-check a formula against a different algorithm, an identifier against the live API, a field name against the live response. Documentation consensus is not verification — three sources agreed on the wrong FINRA field name while the live API had the right one in our own code.
+
+Name the verification method's blind spot. curl cannot catch CORS preflight failures. A DOM shim cannot catch CSS layout problems. Local dev without .dev.vars cannot exercise live-credential paths. When the available method can't reach the failure mode, say so explicitly rather than reporting a pass — a bug shipped this session because preflight was modeled by hand instead of observed in a browser.
+
+Verify against a second case before declaring success. One passing ticker is a coincidence; three is a pattern.
+
+## Before every task
+
+Read CLAUDE.md and ARCHITECTURE.md first. Do not work from assumptions carried over from earlier in a session or from my prompt — I have been wrong about what exists in this codebase multiple times (a 13F override map that doesn't exist, a cached risk-free rate that wasn't there, mock generators that were dead code, the term-structure sign). If my instruction contradicts the code, say so before acting.
+
+Check any change against the Free-plan subrequest cap (50 per invocation) and the cron window trap (must cover both PST and PDT offsets). Both have caused silent failures.
+
+## After every task
+
+Update the docs in the same task, not later. Any new KV key, constant, secret, endpoint, or threshold goes into CLAUDE.md as it is created. Docs that lag the code are how a session starts by acting on false premises.
+
+Report what you could not verify, separately and explicitly. That section has been the most useful part of every report this session.
+
+Kill background processes. No wrangler dev, wrangler tail, or http servers left running between tasks.
+
+## Adding a new failure mode
+
+When a bug is found, add a rule naming the specific failure that produced it. Rules tied to a concrete incident are followed; abstract ones are not.
