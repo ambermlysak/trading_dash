@@ -1000,7 +1000,7 @@ function crossCell(s) {
  * scanning and drive-by abuse of a URL found in a network trace, and nothing
  * more. The rate limits are what actually bound the bill — see the residual-risk
  * note in ARCHITECTURE.md. Must match the Worker's AI_GATE_SECRET. */
-const DASH_KEY = 'YOUR_STRING_HERE';
+const DASH_KEY = 'd4ae600c39f544c886fdfb43bd1a06d332900650ac414b28885447f3cf56b5da';
 
 async function apiFetch(path, opts = {}) {
   const r = await fetch(API_BASE + path, {
