@@ -60,35 +60,68 @@ try {
   console.error('[instr] could not wrap globalThis.fetch:', e.message);
 }
 
+/* ── EVERY function below swallows its own failures ──────────────────────────
+   These exist to *observe* the cron jobs. A measuring device that can break the
+   thing it measures is worse than no measuring device: an exception inside
+   instrumentation would take out the morning briefing, which is the exact
+   outcome all of this was added to make visible.
+
+   So the contract is: instrumentation failure degrades to a MISSING or
+   `measured:false` `_instr` field, and never to a missing briefing. Nothing here
+   may throw, and `allSettledCounted` may never reject where `Promise.allSettled`
+   would not. */
+
 function instrReset(scope) {
-  INSTR.fetches = 0; INSTR.rejected = 0; INSTR.scope = scope;
-}
-/** Baseline, so one job's cost separates from the whole invocation's. */
-const instrMark = () => ({ f: INSTR.fetches, r: INSTR.rejected });
-/** Cost of the work done since `mark`. `phase` says how far the job actually got. */
-function instrSince(mark, phase) {
-  return {
-    extFetches:        INSTR.fetches - mark.f,
-    settledRejected:   INSTR.rejected - mark.r,
-    invocationFetches: INSTR.fetches,
-    scope:             INSTR.scope,
-    measured:          INSTR.wrapped,
-    phase,
-  };
+  try { INSTR.fetches = 0; INSTR.rejected = 0; INSTR.scope = scope; }
+  catch (e) { console.warn('[instr] reset failed:', e.message); }
 }
 
-/** `Promise.allSettled` that counts — and logs — the rejections nobody reads. */
+/** Baseline, so one job's cost separates from the whole invocation's. */
+function instrMark() {
+  try { return { f: INSTR.fetches, r: INSTR.rejected }; }
+  catch (e) { console.warn('[instr] mark failed:', e.message); return null; }
+}
+
+/** Cost of the work done since `mark`. `phase` says how far the job actually got.
+ *  Returns a `measured:false` stub rather than throwing — this call sits inside
+ *  the JSON.stringify of a KV put, so a throw here would lose the payload. */
+function instrSince(mark, phase) {
+  try {
+    if (!mark) return { measured: false, phase, note: 'no baseline captured' };
+    return {
+      extFetches:        INSTR.fetches - mark.f,
+      settledRejected:   INSTR.rejected - mark.r,
+      invocationFetches: INSTR.fetches,
+      scope:             INSTR.scope,
+      measured:          INSTR.wrapped,
+      phase,
+    };
+  } catch (e) {
+    console.warn('[instr] since failed:', e.message);
+    return { measured: false, phase, note: 'instrumentation error' };
+  }
+}
+
+/** `Promise.allSettled` that counts — and logs — the rejections nobody reads.
+ *  The counting is wrapped separately from the await: `Promise.allSettled` never
+ *  rejects, and neither may this, or a bookkeeping slip becomes a job failure. */
 async function allSettledCounted(promises, label) {
   const results = await Promise.allSettled(promises);
-  const bad = results.filter(r => r.status === 'rejected');
-  if (bad.length) {
-    INSTR.rejected += bad.length;
-    console.warn(`[instr] ${label}: ${bad.length}/${results.length} rejected · first: ${bad[0].reason?.message || bad[0].reason}`);
+  try {
+    const bad = results.filter(r => r.status === 'rejected');
+    if (bad.length) {
+      INSTR.rejected += bad.length;
+      console.warn(`[instr] ${label}: ${bad.length}/${results.length} rejected · first: ${bad[0].reason?.message || bad[0].reason}`);
+    }
+  } catch (e) {
+    console.warn(`[instr] count failed for ${label}:`, e.message);
   }
   return results;
 }
 
-/** Stamp a finished job's instrumentation onto an already-written KV payload. */
+/** Stamp a finished job's instrumentation onto an already-written KV payload.
+ *  Fully swallowed: this runs AFTER the payload is safely stored, so the worst
+ *  case is a stored `_instr` that still reads `phase: "briefing"`. */
 async function stampInstr(env, key, mark, phase, ttlSeconds) {
   try {
     const cur = await env?.REC_LOG?.get(key, 'json');
@@ -288,7 +321,7 @@ function ptParts(pt) {
    'NYSE_HOLIDAYS_THROUGH': the provided value is not of type 'function or
    ExportedHandler'" and the runtime never came up. So the constants are handed
    out through an accessor rather than exported as values. */
-export { ptParts, tradingDayStatus, allSettledCounted };
+export { ptParts, tradingDayStatus, allSettledCounted, instrMark, instrSince };
 export const cronGateCalendar = () => ({
   holidays: NYSE_HOLIDAYS,
   through:  NYSE_HOLIDAYS_THROUGH,

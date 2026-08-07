@@ -88,6 +88,26 @@ never moves it, which is exactly the distinction above. `instrMark()` /
   watchlist and sector fan-out and re-stamped after, so a stored payload still
   reading `briefing` means the job died partway. Truncation describes itself.
 
+**Instrumentation may never break what it measures.** A measuring device that can
+take out the morning briefing is worse than no measuring device — it would cause
+exactly the outcome it exists to make visible. So every function in that block
+swallows its own failures:
+
+- `instrSince()` returns a `{ measured: false, note }` stub rather than throwing.
+  It is called **inside the `JSON.stringify` of a KV put**, so a throw would lose
+  the whole payload.
+- `allSettledCounted()` wraps the counting separately from the `await`.
+  `Promise.allSettled` never rejects and neither may this, or a bookkeeping slip
+  becomes a job failure.
+- `instrMark()` returns `null` on failure; `instrSince(null, …)` handles it.
+- `stampInstr()` is fully wrapped and runs *after* the payload is stored, so its
+  worst case is a stored `_instr` still reading `phase: "briefing"`.
+
+The contract is: **instrumentation failure degrades to a missing or
+`measured:false` `_instr` field, never to a missing briefing.** `node
+cron-gate.check.mjs` proves it with forced faults — a null baseline and a
+rejection whose `reason` throws on property access.
+
 ### 2. The cron expression is a coarse wakeup — put no calendar logic in it
 
 The trigger is `*/15 13-22 * * *`: every 15 minutes, UTC hours 13–22, **every

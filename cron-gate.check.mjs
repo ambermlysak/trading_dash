@@ -12,7 +12,10 @@
    wrangler.toml — that is precisely the layer that failed last time, and only a
    deployed heartbeat can confirm it. */
 
-import { ptParts, tradingDayStatus, cronGateCalendar, allSettledCounted, instrPeek } from './worker.js';
+import {
+  ptParts, tradingDayStatus, cronGateCalendar,
+  allSettledCounted, instrPeek, instrMark, instrSince,
+} from './worker.js';
 
 // Handed out through an accessor because workerd only permits FUNCTION named
 // exports — exporting the Set and the string directly stopped the runtime from
@@ -109,6 +112,54 @@ console.log('allSettledCounted — forced-failure check');
               `  rejected=${results.filter(r => r.status === 'rejected').length}` +
               `  counter delta=${delta}  expected=2  ${delta === 2 ? 'ok' : 'MISMATCH'}`);
   if (delta !== 2) process.exitCode = 1;
+}
+
+/* ── Instrumentation must never break what it measures ──────────────────────
+   The contract: an instrumentation failure degrades to a missing or
+   `measured:false` _instr field, never to a lost payload or a rejected job. */
+console.log('\ninstrumentation containment — forced-fault checks');
+{
+  let ok = true;
+
+  // 1. instrSince with no baseline. This call sits inside the JSON.stringify of
+  //    a KV put, so throwing here would lose the whole briefing.
+  try {
+    const stub = instrSince(null, 'briefing');
+    const good = stub && stub.measured === false && stub.phase === 'briefing';
+    console.log(`  instrSince(null)                 -> ${JSON.stringify(stub)}  ${good ? 'ok' : 'MISMATCH'}`);
+    if (!good) ok = false;
+  } catch (e) {
+    console.log(`  instrSince(null)                 -> THREW ${e.message}  MISMATCH`); ok = false;
+  }
+
+  // 2. A rejection whose reason explodes on property access. Promise.allSettled
+  //    never rejects; neither may allSettledCounted.
+  const poison = new Proxy({}, { get() { throw new Error('poisoned reason'); } });
+  try {
+    const res = await allSettledCounted(
+      [Promise.resolve(1), Promise.reject(poison)],
+      'selftest:poisoned',
+    );
+    const good = Array.isArray(res) && res.length === 2 &&
+                 res[0].status === 'fulfilled' && res[1].status === 'rejected';
+    console.log(`  allSettledCounted(poisoned)      -> resolved, ${res.length} results, statuses ` +
+                `[${res.map(r => r.status).join(', ')}]  ${good ? 'ok' : 'MISMATCH'}`);
+    if (!good) ok = false;
+  } catch (e) {
+    console.log(`  allSettledCounted(poisoned)      -> REJECTED ${e.message}  MISMATCH`); ok = false;
+  }
+
+  // 3. instrMark must not throw either; it is the first line of each generator.
+  try {
+    const m = instrMark();
+    const good = m && typeof m.f === 'number';
+    console.log(`  instrMark()                      -> ${JSON.stringify(m)}  ${good ? 'ok' : 'MISMATCH'}`);
+    if (!good) ok = false;
+  } catch (e) {
+    console.log(`  instrMark()                      -> THREW ${e.message}  MISMATCH`); ok = false;
+  }
+
+  if (!ok) process.exitCode = 1;
 }
 
 console.log('\nHoliday table:', NYSE_HOLIDAYS.size, 'dates, runway through', NYSE_HOLIDAYS_THROUGH);
