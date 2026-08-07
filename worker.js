@@ -328,6 +328,23 @@ export const cronGateCalendar = () => ({
 });
 export const instrPeek = () => ({ ...INSTR });
 
+// TODO(2026-08-10): remove this constant together with the second entry in
+// `crons` in wrangler.toml. The two are a pair; deleting one without the other
+// is the drift this codebase keeps getting caught by.
+//
+// The temporary diagnostic trigger, matched EXACTLY as wrangler.toml spells it.
+// scheduled() suppresses dispatch for firings carrying this expression: the
+// probe exists to prove invocations happen and to exercise the weekend gate,
+// and neither needs it to run a job.
+//
+// Matched by allowlisting the PROBE rather than by "anything that is not the
+// primary cron" on purpose. If Cloudflare ever reports a normalized expression
+// string, an allowlist-the-probe test fails toward the probe dispatching —
+// bounded, and exactly the behaviour before this guard existed. The inverted
+// test would fail toward the REAL cron being suppressed and nothing running at
+// all, which is the far more expensive direction to be wrong in.
+const PROBE_CRON = '*/5 * * * *';
+
 /** Is this a NYSE trading day? Weekend or full-day holiday means no dispatch. */
 function tradingDayStatus(isoDate, dow) {
   if (dow === 0 || dow === 6)      return { open: false, reason: 'weekend' };
@@ -6341,6 +6358,25 @@ export default {
        run for weeks without anyone being able to see it. */
     if (!day.open) {
       console.log(`[cron] ${at} · ${via} · not a trading day (${day.reason}) · branch=none`);
+      return;
+    }
+
+    // TODO(2026-08-10): remove with PROBE_CRON and the second `crons` entry.
+    //
+    // Diagnostic probe: log and return WITHOUT dispatching. It fires every 5
+    // minutes with no hour restriction, so on a trading day it lands inside the
+    // dispatch windows three times as often as the real trigger. Each generator's
+    // KV dedup absorbs that on a successful run — but a failed morning briefing
+    // deliberately leaves its cache incomplete so it retries, and the probe would
+    // turn a 2-attempt retry into 6 (~150 Claude calls instead of ~50). Monday
+    // 6:00am PT is the first real observation of the day-of-week fix, and that
+    // run has to be clean.
+    //
+    // Placed AFTER the trading-day gate so weekend and holiday firings still take
+    // the branch=none path above and keep proving the gate works — which is half
+    // of what the probe is for.
+    if (event.cron === PROBE_CRON) {
+      console.log(`[cron] ${at} · ${via} · trading day · branch=none (probe · dispatch suppressed)`);
       return;
     }
 
