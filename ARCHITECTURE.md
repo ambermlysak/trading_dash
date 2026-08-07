@@ -11,6 +11,10 @@ trading_dash/
 │                        #   Alpaca proxy, Claude calls, KV persistence, cron jobs
 ├── wrangler.toml        # Worker config: KV binding, cron trigger, secret inventory
 ├── bs-delta.check.mjs   # Black-Scholes delta check — prints computed vs expected
+├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
+│                        #   both DST regimes; prints computed vs expected
+├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
+│                        #   both DST regimes; prints computed vs expected
 ├── cors-check.html      # Open in a BROWSER to verify CORS preflight; curl cannot
 ├── package.json         # wrangler devDependency only; there is no build step
 ├── .dev.vars            # LOCAL SECRETS — gitignored, absent on a fresh clone
@@ -122,7 +126,8 @@ in this codebase and shipped:
    them cost the user the ability to act on any of them — and it made a scheduling gap look like a
    verdict on the stock. Every unavailable state now carries its own `status` and says which it is.
 12. **A swallowed error is worse than a loud one when it changes what the data means.**
-   `build13FIndex` needed ~61 SEC round trips against a 50-subrequest cap. It never failed — a
+   `build13FIndex` needed ~61 SEC round trips against the 50-subrequest cap then in force. It
+   never failed — a
    per-manager `try/catch` absorbed the cap error and the function returned normally with 16 of 20
    managers, which was then written to KV and rendered as a complete answer. The dropped managers
    were stored in the same shape as a manager who genuinely filed nothing, so the card said "16/20
@@ -150,7 +155,7 @@ in this codebase and shipped:
    data to ground it is actually in the prompt.
 16. **A `catch` must not absorb an infrastructure failure into a domain-failure shape.**
    `build13FIndex` wrapped each manager in a try/catch that logged and continued. When it hit the
-   50-subrequest cap the error was swallowed four times and the function **returned normally with
+   50-subrequest cap then in force, the error was swallowed four times and the function **returned normally with
    16 of 20 managers**, which was written to KV as a complete index. Worse, the dropped managers were
    stored in the *same shape* as a manager who genuinely filed nothing, so the card read
    **"16/20 managers filed"** — reporting our own budget exhaustion as a fact about the managers.
@@ -178,7 +183,7 @@ in this codebase and shipped:
    the part that gets dropped when someone reuses the helper.)
 20. **`CLAUDE.md` takes precedence over general platform or skill documentation.** Where generic
    guidance conflicts with a project rule here, the project rule wins. General documentation does
-   not know this account is on the Workers Free plan, does not know which cron hours fall outside
+   not know this account is on Workers Paid, does not know which cron hours fall outside
    the trigger window, and does not know which of these numbers have already been wrong on screen.
 
 ## Section-by-section data source map
@@ -255,12 +260,14 @@ binding = "REC_LOG"
 id = "<your-kv-namespace-id>"
 
 [triggers]
-crons = ["*/15 13-22 * * 1-5"]
+crons = ["*/15 13-22 * * *"]
 ```
 
-The cron window must cover the target Pacific hours under **both** PDT and PST —
-see the constraints block in `CLAUDE.md`. A job whose UTC hour falls outside the
-window does not error; it simply never runs, for half the year.
+The expression is a coarse wakeup only — every day, no calendar logic. `scheduled()`
+gates on the Pacific trading day (weekends + `NYSE_HOLIDAYS`) and dispatches by
+Pacific wall-clock. The UTC hour range must still cover the target Pacific hours
+under **both** PDT and PST. See rules #2 and #7 in `CLAUDE.md`: a `1-5` in the
+day-of-week field meant Sun–Thu, not Mon–Fri, and no job ran on a Friday for weeks.
 
 ### Secrets
 

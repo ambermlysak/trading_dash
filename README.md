@@ -45,7 +45,7 @@ binding = "REC_LOG"
 id = "<paste-the-id-here>"
 
 [triggers]
-crons = ["*/15 13-22 * * 1-5"]
+crons = ["*/15 13-22 * * *"]
 ```
 
 Set the secrets:
@@ -104,7 +104,8 @@ FINRA_CLIENT_ID="..."
 FINRA_CLIENT_SECRET="..."
 ```
 
-There is no test suite. The one check is `node bs-delta.check.mjs`, which prints
+There is no test suite. Two checks exist — `node cron-gate.check.mjs` (cron
+trading-day gate) and `node bs-delta.check.mjs`, which prints
 computed vs expected for the Black-Scholes delta against Hull's published worked
 example, an independent series-erf implementation and put-call parity.
 
@@ -142,13 +143,14 @@ the data is past its refresh window.
 - `worker.js` — Cloudflare Worker
 - `wrangler.toml` — Worker config: KV binding, cron trigger, secret inventory
 - `bs-delta.check.mjs` — Black-Scholes delta check
+- `cron-gate.check.mjs` — cron trading-day gate check (weekends, NYSE holidays, both DST regimes)
 - `cors-check.html` — open in a browser to verify CORS preflight against the Worker
 - `CLAUDE.md` — working rules; **read the constraints block first**
 - `ARCHITECTURE.md` — data source map, honesty rules, what is deliberately not done
 
 ## Notes
 
-- **The Worker is on the Cloudflare Free plan: 50 subrequests per invocation.**
+- **The Worker is on Cloudflare Workers Paid: 10,000 subrequests per invocation** (settable via `limits.subrequests`). External `fetch()` and KV/binding calls are *different* buckets — see rule #1 in `CLAUDE.md`.
   Any new feature that fans out across tickers must be budgeted against this
   before it is written — it has caused two silent failures already. See
   `CLAUDE.md`.

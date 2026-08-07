@@ -24,6 +24,83 @@
  *   ANTHROPIC_API_KEY  ALPACA_KEY  ALPACA_SECRET
  */
 
+/* ── Instrumentation: external subrequests + swallowed failures ──────────────
+   TWO DIFFERENT BUCKETS. The old rule #1 conflated them and that was wrong even
+   under the Free plan:
+
+     • external `fetch()` — Yahoo, SEC EDGAR, FINRA, FRED, Alpaca, Anthropic.
+       This is the metered subrequest bucket. On Workers Paid the default is
+       10,000 per invocation (settable via `limits.subrequests` in wrangler.toml).
+     • KV / R2 / D1 / Durable Object binding calls — `env.REC_LOG.get/put/delete`
+       and friends. These do NOT travel over `globalThis.fetch` and are accounted
+       against a different bucket entirely.
+
+   So the counter below wraps `globalThis.fetch` ONLY, and therefore measures
+   exactly the external bucket. A KV read never moves it. That is deliberate: it
+   is the number you budget fan-out against, uncontaminated by cache traffic.
+
+   `settledRejected` exists because `Promise.allSettled` discards rejections.
+   Every truncated cron run in this codebase reported `errors: 0` in Cloudflare's
+   telemetry while silently dropping a third of its work — the 13F index shipped
+   16 of 20 managers that way. Truncation has to describe itself.
+
+   Scope note: the counter is per-isolate and reset at the top of `scheduled()`.
+   An isolate can also serve requests, so a page load landing mid-cron inflates
+   `invocationFetches`. The per-job `extFetches` delta is the number to trust,
+   and `scope` records which reset it was measured against. */
+const INSTR = { fetches: 0, rejected: 0, scope: 'none', wrapped: false };
+
+try {
+  const _nativeFetch = globalThis.fetch.bind(globalThis);
+  globalThis.fetch = (...args) => { INSTR.fetches++; return _nativeFetch(...args); };
+  INSTR.wrapped = true;
+} catch (e) {
+  // Never let instrumentation take the Worker down. `wrapped:false` rides along
+  // in every payload so a zero count can't be misread as "made no calls".
+  console.error('[instr] could not wrap globalThis.fetch:', e.message);
+}
+
+function instrReset(scope) {
+  INSTR.fetches = 0; INSTR.rejected = 0; INSTR.scope = scope;
+}
+/** Baseline, so one job's cost separates from the whole invocation's. */
+const instrMark = () => ({ f: INSTR.fetches, r: INSTR.rejected });
+/** Cost of the work done since `mark`. `phase` says how far the job actually got. */
+function instrSince(mark, phase) {
+  return {
+    extFetches:        INSTR.fetches - mark.f,
+    settledRejected:   INSTR.rejected - mark.r,
+    invocationFetches: INSTR.fetches,
+    scope:             INSTR.scope,
+    measured:          INSTR.wrapped,
+    phase,
+  };
+}
+
+/** `Promise.allSettled` that counts — and logs — the rejections nobody reads. */
+async function allSettledCounted(promises, label) {
+  const results = await Promise.allSettled(promises);
+  const bad = results.filter(r => r.status === 'rejected');
+  if (bad.length) {
+    INSTR.rejected += bad.length;
+    console.warn(`[instr] ${label}: ${bad.length}/${results.length} rejected · first: ${bad[0].reason?.message || bad[0].reason}`);
+  }
+  return results;
+}
+
+/** Stamp a finished job's instrumentation onto an already-written KV payload. */
+async function stampInstr(env, key, mark, phase, ttlSeconds) {
+  try {
+    const cur = await env?.REC_LOG?.get(key, 'json');
+    if (!cur) return;
+    cur._instr = instrSince(mark, phase);
+    await env?.REC_LOG?.put(key, JSON.stringify(cur), { expirationTtl: ttlSeconds });
+    console.log(`[instr] ${key} · ${JSON.stringify(cur._instr)}`);
+  } catch (e) {
+    console.warn(`[instr] stamp failed for ${key}:`, e.message);
+  }
+}
+
 const ALLOWED_ORIGINS = [
   'https://ambermlysak.github.io',
   'http://localhost',
@@ -145,6 +222,87 @@ const SECTOR_STOCKS = {
  * two years ahead each summer, BLS publishes the next year each fall.
  */
 const ECON_CALENDAR_THROUGH = '2027-12-08'; // last date covered by the tables below
+
+/* ── NYSE trading-day calendar ───────────────────────────────────────────────
+ * Full-day closures. The cron dispatcher skips these, so no job spends a Claude
+ * call narrating a session that never happened.
+ *
+ * VERIFIED 2026-08-07, two independent ways, because a hand-typed calendar is
+ * exactly the class of constant that has been wrong here before (7 of 18
+ * super-investor CIKs, and the hardcoded FRED release IDs):
+ *   1. NYSE Group's published 2025–2027 holiday calendar.
+ *   2. Re-derived from the observance rules — Easter computus for Good Friday;
+ *      a holiday on Saturday observed the preceding Friday, on Sunday the
+ *      following Monday; New Year's Day exempt from the Saturday rule.
+ * Both produced the same 13 dates, with no extras and none missing.
+ *
+ * Forward-looking only: 2026 starts in August because everything earlier is in
+ * the past and the gate is never asked about it.
+ *
+ * EARLY CLOSES ARE NOT MODELLED, AND THAT HAS A CONSEQUENCE. The NYSE closes at
+ * 1:00pm ET — 10:00am PT — the day after Thanksgiving and on Christmas Eve. In
+ * this window that is 2026-11-27, 2026-12-24 and 2027-11-26. On those days the
+ * 11:30am PT midday pulse runs POST-CLOSE and will describe a finished session
+ * as though it were still mid-session, and the 1:15pm PT EOD job runs 3h15m
+ * after the bell rather than 15 minutes after it. Flagged deliberately; not
+ * fixed here.
+ *
+ * Note 2027-12-24 is a FULL closure (Christmas Day observed, since Dec 25 2027
+ * is a Saturday), not an early close — two of the three sources consulted got
+ * that one backwards.
+ */
+const NYSE_HOLIDAYS = new Set([
+  // 2026
+  '2026-09-07', // Labor Day
+  '2026-11-26', // Thanksgiving
+  '2026-12-25', // Christmas Day
+  // 2027
+  '2027-01-01', // New Year's Day
+  '2027-01-18', // Martin Luther King, Jr. Day
+  '2027-02-15', // Washington's Birthday
+  '2027-03-26', // Good Friday
+  '2027-05-31', // Memorial Day
+  '2027-06-18', // Juneteenth observed (Jun 19 is a Saturday)
+  '2027-07-05', // Independence Day observed (Jul 4 is a Sunday)
+  '2027-09-06', // Labor Day
+  '2027-11-25', // Thanksgiving
+  '2027-12-24', // Christmas Day observed (Dec 25 is a Saturday)
+]);
+const NYSE_HOLIDAYS_THROUGH = '2027-12-31'; // past this the gate can only see weekends
+
+/** PT calendar date + weekday, read off the SAME Date object the dispatch uses. */
+function ptParts(pt) {
+  const p2 = n => String(n).padStart(2, '0');
+  return {
+    iso: `${pt.getFullYear()}-${p2(pt.getMonth() + 1)}-${p2(pt.getDate())}`,
+    dow: pt.getDay(),                       // 0 = Sunday … 6 = Saturday
+  };
+}
+
+/* Named exports purely so the cron gate is testable outside the Worker runtime;
+   workerd only ever dispatches through the default export.
+
+   EVERY NAMED EXPORT MUST BE A FUNCTION. workerd validates the module's exports
+   at startup and refuses to boot on anything else — exporting the Set and the
+   string directly produced "Incorrect type for map entry
+   'NYSE_HOLIDAYS_THROUGH': the provided value is not of type 'function or
+   ExportedHandler'" and the runtime never came up. So the constants are handed
+   out through an accessor rather than exported as values. */
+export { ptParts, tradingDayStatus, allSettledCounted };
+export const cronGateCalendar = () => ({
+  holidays: NYSE_HOLIDAYS,
+  through:  NYSE_HOLIDAYS_THROUGH,
+});
+export const instrPeek = () => ({ ...INSTR });
+
+/** Is this a NYSE trading day? Weekend or full-day holiday means no dispatch. */
+function tradingDayStatus(isoDate, dow) {
+  if (dow === 0 || dow === 6)      return { open: false, reason: 'weekend' };
+  if (NYSE_HOLIDAYS.has(isoDate))  return { open: false, reason: 'nyse-holiday' };
+  // Past the table's runway every weekday looks open, including holidays. Say so
+  // rather than letting the calendar expire silently.
+  return { open: true, reason: 'weekday', calendarStale: isoDate > NYSE_HOLIDAYS_THROUGH };
+}
 
 // Two-day meetings; the rate decision lands at 2:00pm ET on the second day.
 // sep = meeting also publishes the Summary of Economic Projections ("dot plot").
@@ -5318,6 +5476,7 @@ Include 6–10 events total. Order chronologically Mon→Fri.`;
 
 /* ── Cron: daily snapshot ── */
 async function generateDailySnapshot(env) {
+  const mark = instrMark();
   // FRED supplies the statistical-release dates; FOMC comes from the hardcoded table.
   const fredEvents = (await getEconReleases(env)).events;
   // Dedup: skip only if a *complete* snapshot was generated in the last 2 hours.
@@ -5334,9 +5493,12 @@ async function generateDailySnapshot(env) {
     }
   } catch (_) {}
 
-  // Clear yesterday's EOD and midday pulse so pre-market context takes over
-  try { await env?.REC_LOG?.delete('daily:eod'); } catch (_) {}
-  try { await env?.REC_LOG?.delete('daily:midday'); } catch (_) {}
+  // NOTE: yesterday's EOD and midday pulse are cleared AFTER the new snapshot is
+  // safely written, not here. This block used to delete them up front, before it
+  // knew whether the briefing would generate at all — so a Claude failure, a
+  // Yahoo outage or an exception anywhere below left the page with no morning
+  // briefing AND no close recap. A stale-but-labelled recap beats a blank card.
+  // See the delete beside the successful `put` further down.
 
   // Gather macro news
   let newsLines = '';
@@ -5360,9 +5522,9 @@ async function generateDailySnapshot(env) {
   let marketLines = '';
   try {
     const tickers = Object.keys(SNAPSHOT_SYMBOLS);
-    const results = await Promise.allSettled(
+    const results = await allSettledCounted(
       tickers.map(t => yahoo(`/v8/finance/chart/${encodeURIComponent(t)}`, '?range=1d&interval=1d')),
-    );
+    'snapshot:index-charts');
     marketLines = tickers.map((t, i) => {
       if (results[i].status !== 'fulfilled') return null;
       const meta      = results[i].value?.chart?.result?.[0]?.meta || {};
@@ -5425,10 +5587,17 @@ Return ONLY valid JSON, no markdown fences.`;
   if (hasContent) {
     await env?.REC_LOG?.put(
       'daily:snapshot',
-      JSON.stringify({ ...snapshot, ts: Date.now() }),
+      JSON.stringify({ ...snapshot, ts: Date.now(), _instr: instrSince(mark, 'briefing') }),
       { expirationTtl: 172800 },
     );
     console.log('[cron] daily snapshot saved');
+
+    // Only now is it safe to drop yesterday's close recap and midday pulse: the
+    // new pre-market briefing exists to replace them. Doing this before the
+    // generation (as it used to) meant any failure below wiped the recap and
+    // replaced it with nothing.
+    try { await env?.REC_LOG?.delete('daily:eod'); } catch (_) {}
+    try { await env?.REC_LOG?.delete('daily:midday'); } catch (_) {}
   } else {
     const existingComplete = existingSnapshot &&
       ((existingSnapshot.newsCards?.length || 0) > 0 || existingSnapshot.opportunity);
@@ -5458,6 +5627,12 @@ Return ONLY valid JSON, no markdown fences.`;
   } catch (e) {
     console.error('[cron] sectors pre-warm error:', e.message);
   }
+
+  // Re-stamp with the WHOLE job's cost. The inline `_instr` above only covers the
+  // briefing itself, because that write happens before the watchlist and sector
+  // fan-out. `phase` is the tell: a stored payload still reading `briefing` means
+  // this function never reached the end.
+  await stampInstr(env, 'daily:snapshot', mark, 'complete', 172800);
 }
 
 /* ── Cron: refresh per-ticker watchlist analysis ──
@@ -5476,15 +5651,16 @@ async function refreshWatchlistAnalyses(env) {
   tickers = tickers.slice(0, 60); // safety cap on subrequest volume
 
   for (let i = 0; i < tickers.length; i += 5) {
-    await Promise.allSettled(
+    await allSettledCounted(
       tickers.slice(i, i + 5).map(t => refreshTickerAnalysis(t, env)),
-    );
+    'snapshot:watchlist-analyses');
   }
   console.log(`[cron] ${tickers.length} watchlist analyses refreshed`);
 }
 
 /* ── Cron: end-of-day summary (1:15pm PT, ~15 min after market close) ── */
 async function generateEODSummary(env) {
+  const mark = instrMark();
   // FRED supplies the statistical-release dates; FOMC comes from the hardcoded table.
   const fredEvents = (await getEconReleases(env)).events;
   try {
@@ -5499,9 +5675,9 @@ async function generateEODSummary(env) {
   let marketLines = '';
   try {
     const tickers = Object.keys(SNAPSHOT_SYMBOLS);
-    const results = await Promise.allSettled(
+    const results = await allSettledCounted(
       tickers.map(t => yahoo(`/v8/finance/chart/${encodeURIComponent(t)}`, '?range=1d&interval=1d')),
-    );
+    'eod:index-charts');
     marketLines = tickers.map((t, i) => {
       if (results[i].status !== 'fulfilled') return null;
       const meta  = results[i].value?.chart?.result?.[0]?.meta || {};
@@ -5567,7 +5743,7 @@ If you reference an FOMC meeting or CPI release, use ONLY the macro calendar abo
 
   await env?.REC_LOG?.put(
     'daily:eod',
-    JSON.stringify({ ...eod, ts: Date.now() }),
+    JSON.stringify({ ...eod, ts: Date.now(), _instr: instrSince(mark, 'complete') }),
     { expirationTtl: 86400 },
   );
   console.log('[cron] eod summary saved');
@@ -5579,6 +5755,7 @@ If you reference an FOMC meeting or CPI release, use ONLY the macro calendar abo
    drawn from the watchlist, and big movers (≥10% + volume) regardless of
    watchlist status. Served via /api/daily as `midday`. */
 async function generateMiddaySnapshot(env) {
+  const mark = instrMark();
   // FRED supplies the statistical-release dates; FOMC comes from the hardcoded table.
   const fredEvents = (await getEconReleases(env)).events;
   // Dedup: skip only if a complete midday pulse was generated in the last 2 hours
@@ -5597,9 +5774,9 @@ async function generateMiddaySnapshot(env) {
   let marketLines = '';
   try {
     const tickers = Object.keys(SNAPSHOT_SYMBOLS);
-    const results = await Promise.allSettled(
+    const results = await allSettledCounted(
       tickers.map(t => yahoo(`/v8/finance/chart/${encodeURIComponent(t)}`, '?range=1d&interval=1d')),
-    );
+    'midday:index-charts');
     marketLines = tickers.map((t, i) => {
       if (results[i].status !== 'fulfilled') return null;
       const meta  = results[i].value?.chart?.result?.[0]?.meta || {};
@@ -5615,10 +5792,10 @@ async function generateMiddaySnapshot(env) {
   // Yahoo predefined screeners carry regularMarketVolume, so one pass gets both.
   const bigMovers = [];
   try {
-    const [gr, lr] = await Promise.allSettled([
+    const [gr, lr] = await allSettledCounted([
       fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=day_gainers&count=25', { headers: YAHOO_HEADERS }),
       fetch('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true&scrIds=day_losers&count=25',  { headers: YAHOO_HEADERS }),
-    ]);
+    ], 'midday:movers');
     for (const res of [gr, lr]) {
       if (res.status !== 'fulfilled' || !res.value.ok) continue;
       const d = await res.value.json();
@@ -5665,9 +5842,9 @@ async function generateMiddaySnapshot(env) {
   const CHUNK = 5;
   for (let i = 0; i < tickers.length; i += CHUNK) {
     const batch = tickers.slice(i, i + CHUNK);
-    const results = await Promise.allSettled(
+    const results = await allSettledCounted(
       batch.map(t => yahooAuth(`/v10/finance/quoteSummary/${t}`, '?modules=price,calendarEvents', env)),
-    );
+    'midday:quote-batch');
     for (let j = 0; j < batch.length; j++) {
       if (results[j].status !== 'fulfilled') continue;
       const r   = results[j].value?.quoteSummary?.result?.[0] || {};
@@ -5771,7 +5948,7 @@ Return ONLY valid JSON.`;
 
   await env?.REC_LOG?.put(
     'daily:midday',
-    JSON.stringify({ ...midday, bigMovers: bigMovers.slice(0, 12), ts: Date.now() }),
+    JSON.stringify({ ...midday, bigMovers: bigMovers.slice(0, 12), ts: Date.now(), _instr: instrSince(mark, 'complete') }),
     { expirationTtl: 86400 },
   );
   console.log('[cron] midday pulse saved');
@@ -5805,9 +5982,9 @@ async function generateSectors(env) {
   const stockTickers = [...new Set(Object.values(SECTOR_STOCKS).flat())];
   const allTickers   = [...etfTickers, ...stockTickers];
 
-  const results = await Promise.allSettled(
+  const results = await allSettledCounted(
     allTickers.map(t => yahoo(`/v8/finance/chart/${encodeURIComponent(t)}`, '?range=1d&interval=1d')),
-  );
+  'sectors:etf-charts');
 
   const priceMap = {};
   allTickers.forEach((t, i) => {
@@ -6093,31 +6270,66 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    // One */15 cron covers all jobs (plan limit: 5 triggers). Dispatch on
-    // Pacific wall-clock time so DST needs no separate UTC schedules; each
-    // generator's own KV dedup prevents double-runs across adjacent firings.
-    const pt = new Date(new Date(event.scheduledTime).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
-    const h = pt.getHours(), m = pt.getMinutes();
+    // ── The cron expression is a COARSE WAKEUP AND NOTHING ELSE ──────────────
+    // Every 15 min, UTC hours 13-22, ALL days. Every date and time decision is
+    // made here, in code, against Pacific wall-clock. The expression carries no
+    // day, no date, no month, and it must stay that way.
+    //
+    // It used to end in `1-5`, read as Mon-Fri. Cloudflare's day-of-week field
+    // is 1-indexed with 1 = Sunday, so `1-5` actually meant Sun-Thu: no cron
+    // ever ran on a Friday, and a full morning briefing burned every Sunday for
+    // a market that was closed. Confirmed from invocation telemetry across
+    // 2026-07-26 .. 2026-08-07 — every Sunday fired, both Fridays did not.
+    //
+    // The lesson is not "use 2-6". It is that cron-expression semantics are not
+    // testable from here and this dispatcher's are, so the expression gets to
+    // decide only how often we wake up. Everything else is a function call.
+    //
+    // Each generator's own KV dedup still prevents double-runs across the
+    // adjacent firings inside a branch's window.
+    instrReset('scheduled');
 
+    const pt = new Date(new Date(event.scheduledTime).toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
+    const { iso, dow } = ptParts(pt);           // same Date object — one time basis
+    const h = pt.getHours(), m = pt.getMinutes();
+    const day = tradingDayStatus(iso, dow);
+
+    const dowName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dow];
+    const at = `${iso} ${dowName} ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')} PT`;
+
+    /* Log on EVERY invocation, skips included. A no-op that prints
+       "Sat — skipped" is falsifiable; silence is what let the wrong day-of-week
+       run for weeks without anyone being able to see it. */
+    if (!day.open) {
+      console.log(`[cron] ${at} · not a trading day (${day.reason}) · branch=none`);
+      return;
+    }
+
+    let branch = 'idle';                        // in-window wakeup with no job due
     if (h === 6 && m < 30) {
+      branch = 'morning-briefing';
       ctx.waitUntil(generateDailySnapshot(env));       // 6:00am PT morning briefing
     } else if ((h === 11 && m >= 30) || h === 12) {
+      branch = 'midday-pulse';
       ctx.waitUntil(generateMiddaySnapshot(env));      // 11:30am PT midday pulse (retries to 1pm; KV dedup skips once complete)
     } else if (h === 13 && m >= 15 && m < 45) {
+      branch = 'eod+iv-sweep';
       ctx.waitUntil(generateEODSummary(env));          // 1:15pm PT EOD summary
       ctx.waitUntil(recordWatchlistIv(env));           // 1:15pm PT bank one IV sample per watchlist name
     } else if (h === 14 && m < 30) {
+      branch = 'forward-returns';
       ctx.waitUntil(fillForwardReturns(env));          // 2:00pm PT resolve 5/20-session forward returns
     } else if (h === 10) {
-      // 10:00am PT, not 3:00pm: at 3pm PT the UTC hour is 22 under PDT but 23
-      // under PST, and the cron window ends at 22 — so this job silently never
-      // ran for the whole winter half of the year. 10am PT is 17:00/18:00 UTC,
-      // inside the window in both regimes.
-      //
       // Fires on all four firings of the hour: a slice is only 4 managers, so
       // four slices a day completes a 20-manager pass in ~1.3 days. 13F-HR lands
       // 45 days after quarter end, so that is ample.
+      branch = '13f-slice';
       ctx.waitUntil(refresh13FIndexIfStale(env));      // 10:00am PT 13F index slice
     }
+
+    console.log(
+      `[cron] ${at} · trading day · branch=${branch}` +
+      (day.calendarStale ? ` · WARN holiday calendar ends ${NYSE_HOLIDAYS_THROUGH}, holidays no longer skipped` : ''),
+    );
   },
 };

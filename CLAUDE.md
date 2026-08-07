@@ -20,43 +20,132 @@ three were *silent* — code that returned normally and rendered plausible outpu
 while being wrong. The fourth was the opposite: total, immediate, and invisible
 in the Worker logs, because the browser never sent the requests.
 
-### 1. Subrequest cap: 50 per Worker invocation
+### 1. Subrequest budget: 10,000 per invocation — and it is two buckets, not one
 
-This account is on the **Cloudflare Workers Free plan**. Every `fetch()` a Worker
-makes is a subrequest, and the cap is **per invocation, not per chunk** — chunking
-inside one handler buys nothing at all.
+This account is on **Workers Paid**. Since Cloudflare's **2026-02-11** change the
+default is **10,000 subrequests per invocation**, configurable via
+`limits.subrequests` in `wrangler.toml`. The **50** that used to sit in this slot
+was the Free-plan figure and no longer applies. The cap is still **per
+invocation, not per chunk** — chunking inside one handler has never bought
+anything.
 
-Measured costs, not estimates:
+**The larger correction: this rule used to count the wrong thing.** It said "every
+`fetch()` a Worker makes is a subrequest" and then budgeted KV traffic against the
+same ceiling. Those are separate buckets, and that was wrong under the Free plan
+too:
 
-| work | subrequests |
+| call | bucket |
+|---|---|
+| external `fetch()` — Yahoo, SEC EDGAR, FINRA, FRED, Alpaca, Anthropic | **subrequests** (10,000/invocation) |
+| `env.REC_LOG.get/put/delete`, and any R2 / D1 / Durable Object binding | **binding operations** — accounted separately, *not* subrequests |
+
+A handler that reads 40 KV keys and fetches 3 URLs costs **3** against the
+subrequest budget, not 43.
+
+Measured costs. These are still the numbers to budget fan-out against — the
+ceiling moved, the arithmetic did not. All figures are **external fetches**:
+
+| work | external fetches |
 |---|---|
 | one premium ticker | **~4.8** (1 expiry list + 1 quoteSummary + ~2.8 dated chains) |
 | one 13F manager | **3** (submissions.json + filing index.json + info table) |
 | fixed overhead per invocation | ~3 (Yahoo crumb, FRED rate, one spark per 20 symbols) |
+| one EOD summary | **12**, measured 2026-08-07 (11 index charts + 1 news search) |
 
-**Budget any new fan-out feature against this before writing it.** Two silent
-failures have come from not doing so:
+Two silent failures came from not budgeting. Both were real under the 50 cap;
+both would fit comfortably now, and both are still worth reading because the
+*failure shape* is what matters:
 
-- The premium screen fanned out the whole watchlist (~110 subrequests). Most rows
+- The premium screen fanned out the whole watchlist (~110 fetches). Most rows
   rendered "options chain unavailable", which read like a data problem with those
   tickers. It was ours.
 - `build13FIndex` needed ~61 and **did not fail** — a per-manager `catch`
   swallowed the cap error and it returned 16 of 20 managers, written to KV as
   though complete.
 
-To re-measure, wrap `globalThis.fetch` with a counter and reset it at the top of
-the handler. Do not estimate.
+**`ctx.waitUntil` does not get its own budget.** It shares the invocation's, so
+two jobs dispatched on the same cron firing share one ceiling.
 
-### 2. Cron window must cover both PST and PDT
+**Measure, do not estimate.** `worker.js` now does this permanently: `INSTR` wraps
+`globalThis.fetch` at module load and counts **external calls only** — a KV read
+never moves it, which is exactly the distinction above. `instrMark()` /
+`instrSince()` bracket a job, and the result rides along as `_instr` on
+`daily:snapshot`, `daily:midday` and `daily:eod`:
 
-`scheduled()` dispatches on **Pacific wall-clock time**, but the cron trigger is
-expressed in **UTC**. A Pacific hour maps to two different UTC hours across the
-year, so a job whose UTC hour falls outside the trigger window **silently does not
-run for half the year**. Nothing errors; the job simply never fires.
+```json
+"_instr": { "extFetches": 12, "settledRejected": 0, "invocationFetches": 12,
+            "scope": "scheduled", "measured": true, "phase": "complete" }
+```
 
-Current window is `*/15 13-22 * * 1-5`, which covers **6:00am–3:00pm PDT** and
-**5:00am–2:00pm PST**. Before scheduling anything, check the target Pacific hour in
-*both* regimes:
+- `extFetches` — this job's external calls. The number to budget against.
+- `settledRejected` — promises its `Promise.allSettled` blocks swallowed. See
+  rule #7; `errors: 0` in Cloudflare's telemetry is not evidence of success.
+- `invocationFetches` — whole-invocation total, which is what the ceiling
+  actually meters. Larger than `extFetches` when two jobs share a firing.
+- `measured` — whether the `globalThis.fetch` wrap installed. **A zero count with
+  `measured: false` means "not instrumented", not "made no calls."**
+- `phase` — `briefing` or `complete`. `daily:snapshot` is written before the
+  watchlist and sector fan-out and re-stamped after, so a stored payload still
+  reading `briefing` means the job died partway. Truncation describes itself.
+
+### 2. The cron expression is a coarse wakeup — put no calendar logic in it
+
+The trigger is `*/15 13-22 * * *`: every 15 minutes, UTC hours 13–22, **every
+day**. It decides *how often we wake up* and nothing else. Which day, which date,
+which job — all of that is decided in `scheduled()`, in code, against Pacific
+wall-clock time.
+
+**Do not put a day-of-week, day-of-month or month back into the expression.**
+
+This rule used to be scoped to *hours* ("the window must cover both PST and PDT"),
+and the failure that forced the rewrite was the same mistake one field over.
+
+The expression used to end in `1-5`, which reads as Mon–Fri under standard cron
+(`0` = Sunday). **Cloudflare's day-of-week field is 1-indexed with 1 = Sunday**, so
+`1-5` actually meant **Sun–Thu**. The consequences ran for weeks:
+
+- No cron job ever ran on a **Friday** — no morning briefing, no midday pulse, no
+  EOD recap, no IV sample. Friday is a 20% hole in the `iv:{TICKER}:{DATE}` series
+  that `ivRank` is being built from.
+- A full morning briefing burned every **Sunday** — ~25 Claude calls narrating a
+  market that was closed — and, because `generateDailySnapshot` deleted
+  `daily:eod` up front, it wiped Friday's close recap every Sunday morning.
+
+Verified from `workersInvocationsAdaptive` telemetry over 2026-07-26 … 2026-08-07:
+every Sunday fired, both Fridays did not. Sunday firing is the decisive
+observation — under standard cron semantics Sunday (`0`) is outside `1-5` and
+should never have fired at all.
+
+**`2-6` would have been correct and is still the wrong fix.** The lesson is not
+which magic numbers to type. It is that a cron expression's semantics are not
+testable from this repo, and `scheduled()`'s are: `node cron-gate.check.mjs` runs
+the real gate over Fridays, weekends, holidays and both DST regimes and prints
+computed against expected. Anything the dispatcher decides can be tested before
+deploy. Anything the expression decides cannot.
+
+**The gate skips NYSE holidays, not just weekends.** `NYSE_HOLIDAYS` in
+`worker.js` holds full-day closures through `NYSE_HOLIDAYS_THROUGH`
+(`2027-12-31`), verified two independent ways — NYSE Group's published calendar
+and a re-derivation from the observance rules (Easter computus for Good Friday;
+Saturday holidays observed the preceding Friday, Sunday holidays the following
+Monday; New Year's Day exempt from the Saturday rule). Extend it before the
+runway runs out; past `NYSE_HOLIDAYS_THROUGH` every weekday reads as open and the
+dispatcher logs a `WARN`.
+
+**Early closes are not modelled, and that is a known gap.** The NYSE closes at
+1:00pm ET / **10:00am PT** the day after Thanksgiving and on Christmas Eve
+(2026-11-27, 2026-12-24, 2027-11-26 in the current table). On those days the
+11:30am PT midday pulse runs **post-close** and describes a finished session as
+though it were live, and the 1:15pm PT EOD job runs 3h15m after the bell instead
+of 15 minutes after it. Flagged deliberately; not fixed.
+
+The **UTC hour range is still load-bearing**, for the original reason:
+`scheduled()` dispatches on **Pacific wall-clock time**, but the trigger is
+expressed in **UTC**, and a Pacific hour maps to two different UTC hours across
+the year. A job whose UTC hour falls outside the window **silently does not run
+for half the year**. `13-22` covers **6:00am–3:00pm PDT** and **5:00am–2:00pm
+PST**. Before scheduling anything, check the target Pacific hour in *both*
+regimes:
 
 ```
 PT hour  →  UTC under PDT (UTC-7)  |  UTC under PST (UTC-8)
@@ -66,12 +155,10 @@ PT hour  →  UTC under PDT (UTC-7)  |  UTC under PST (UTC-8)
  3:00pm  →  22:00  ✓               |  23:00  ✗ outside
 ```
 
-This has bitten twice. A premium pre-open anchor at 5:00am PT only existed under
-PST. The 13F job sat at 3:00pm PT and had **never executed under PST** — it now
-runs at 10:00am PT (17:00/18:00 UTC), inside the window in both regimes.
-
-Also: `ctx.waitUntil` does **not** get its own subrequest budget. It shares the
-invocation's. Two jobs on the same firing share one cap.
+That one has bitten twice too. A premium pre-open anchor at 5:00am PT only
+existed under PST. The 13F job sat at 3:00pm PT and had **never executed under
+PST** — it now runs at 10:00am PT (17:00/18:00 UTC), inside the window in both
+regimes.
 
 ### 3. Encoding: declare `charset=utf-8` on every JSON response
 
@@ -297,6 +384,41 @@ Symptom→cause, since three different faults produce the same 401:
 Start `http-server` with an explicit path, never `.`, and confirm the port is
 serving this repo before concluding anything about the key.
 
+### 7. A job that never runs produces no evidence — log every dispatch decision
+
+Rule #2 is about *why* the Friday cron was wrong. This one is about why it took
+**weeks** to notice, which is the more expensive half.
+
+A cron that does not fire writes nothing. No error, no warning, no log line, no
+`errors` count in Cloudflare's telemetry — the same silence as a healthy idle
+system. There was nothing to grep for, because the absence of a thing is not a
+thing. The bug was eventually found only by pulling `workersInvocationsAdaptive`
+and noticing a **missing** quarter-hourly heartbeat on two Fridays: a diagnosis
+built from a hole in a chart, not from any output the app produced.
+
+`scheduled()` therefore logs on **every** invocation, skips included:
+
+```
+[cron] 2026-08-07 Fri 06:00 PT · trading day · branch=morning-briefing
+[cron] 2026-08-08 Sat 06:00 PT · not a trading day (weekend) · branch=none
+[cron] 2026-09-07 Mon 06:00 PT · not a trading day (nyse-holiday) · branch=none
+```
+
+Every line carries the PT date, the PT weekday, the holiday verdict and the
+branch taken. **A no-op that logs "Sat — skipped" is falsifiable; silence is
+not.** `wrangler tail` on a Friday morning is now a one-line check.
+
+The same principle applies inside the jobs. `Promise.allSettled` discards
+rejections, so a truncated run reports `errors: 0` while dropping a third of its
+work — that is how `build13FIndex` shipped 16 of 20 managers and how the IV sweep
+banked 16 of 22 tickers. Fan-out in the cron generators goes through
+`allSettledCounted(promises, label)`, which logs the rejections and totals them
+into `_instr.settledRejected` on the stored payload (rule #1).
+
+**When adding a scheduled job or a fan-out: give it a branch name in the log line
+and a counted `allSettled`.** A job whose only evidence of running is its own
+success is a job you cannot debug when it stops.
+
 ---
 
 ## Deploy & develop
@@ -356,7 +478,10 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. The only check is `node bs-delta.check.mjs`, which prints
+There is no build step. Two checks exist, both of which print computed vs
+expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
+gate, over weekends / NYSE holidays / both DST regimes) and
+`node bs-delta.check.mjs`, which prints
 computed vs expected for the Black-Scholes delta rather than asserting.
 
 ## Architecture
@@ -513,7 +638,7 @@ fail loudly; it silently attributes one manager's book to another. Check
 
 **The 13F index is built a few managers at a time, and the old version silently truncated.**
 `build13FIndex()` walked all 20 managers in one invocation: 1 fetch for the issuer-name table plus 3
-SEC round trips each = **61, against a 50-subrequest cap**. It did not fail. `fetch13F` is wrapped in a
+SEC round trips each = **61, against the 50-subrequest cap in force at the time** (now 10,000; see rule #1). It did not fail. `fetch13F` is wrapped in a
 per-manager `try/catch` that logs and continues, so the cap error was swallowed four times and the
 function **returned normally with 16 of 20 managers** — and `refresh13FIndex` wrote that partial index
 to KV as if complete. The four dropped managers were recorded as `{ ok: false }`, the same shape used
@@ -770,11 +895,45 @@ their own `const TTL = <number>`, which shadowed it silently and turned
 the badge. They are now **`CRUMB_TTL`, `SCAN_TTL`, `GOLDEN_TTL`, `IPO_TTL`**. Any
 new local cache window needs its own name.
 
-**Cron trigger:** a single `*/15 13-22 * * 1-5` UTC cron; `scheduled()` dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), EOD summary + IV sample sweep (1:15pm PT), the forward-return fill (2pm PT), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
+**Cron trigger:** a single `*/15 13-22 * * *` UTC cron — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), EOD summary + IV sample sweep (1:15pm PT), the forward-return fill (2pm PT), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
 
 **Check the UTC hour in both DST regimes before scheduling anything.** The 13F job used to run at 3pm PT, which is 22:00 UTC under PDT but **23:00 under PST** — outside this window — so it silently never ran for the winter half of the year. It moved to 10am PT (17:00/18:00 UTC), inside the window in both. Every other job was already safe; this one was not.
 
 **Anything added here shares the invocation's subrequest budget with whatever else that firing runs.** `ctx.waitUntil` does not get its own. Each job uses a KV timestamp check with a 2-hour dedup window to avoid double-runs; the two jobs added later (`recordWatchlistIv`, `fillForwardReturns`) use a PT-date key instead, since they should run once a day rather than once per window.
+
+**The dispatch helpers, and the one time basis.** `ptParts(pt)` returns
+`{ iso, dow }` read off the *same* `Date` object `scheduled()` already builds from
+`event.scheduledTime` — do not add a second derivation (`ptDate()`, a fresh
+`Intl` call, `etToday()`) inside the dispatcher, because two ways of computing
+"today in Pacific" is how they drift. `tradingDayStatus(iso, dow)` returns
+`{ open, reason, calendarStale }` with `reason` one of `weekend` /
+`nyse-holiday` / `weekday`. Both are covered by `node cron-gate.check.mjs`.
+
+**`generateDailySnapshot()` deletes `daily:eod` and `daily:midday` only after the
+new snapshot is successfully written.** It used to delete them at the top, before
+it knew whether the briefing would generate at all — so a Claude failure, a Yahoo
+outage or any exception below left the page with no morning briefing *and* no
+close recap. A stale-but-labelled recap beats a blank card. This is a distinct
+bug from the cron day-of-week one; fixing the cron would have hidden it rather
+than fixed it, because on a correct schedule the delete is followed within
+seconds by a successful write.
+
+**Every named export in `worker.js` must be a function.** `workerd` validates the
+module's exports at startup and refuses to boot on anything else. Exporting
+`NYSE_HOLIDAYS` (a `Set`) and `NYSE_HOLIDAYS_THROUGH` (a string) so the check
+script could import them produced:
+
+```
+service core:user:stock-research-worker: Uncaught TypeError: Incorrect type for
+map entry 'NYSE_HOLIDAYS_THROUGH': the provided value is not of type 'function
+or ExportedHandler'.
+The Workers runtime failed to start.
+```
+
+The runtime never came up — a total outage, caught only because `wrangler dev`
+was run before deploying. Constants are therefore handed to the test through
+accessor **functions** (`cronGateCalendar()`, `instrPeek()`). `workerd` only ever
+dispatches through the default export; the named ones exist purely for testing.
 
 **Recommendation log: one entry per ticker per trading day.** `synthesize()` fires on every page
 load, and `handleLogRec()` used to append unconditionally — so a ticker opened a dozen times in a
@@ -859,9 +1018,11 @@ chain data and was never part of this.
   capital bases would not be comparable.
 
 **The screen loads on demand, one ticker per request.** Cloudflare caps subrequests **per
-invocation** and this account is on **Workers Free: 50**. One ticker costs a *measured* ~4.8 outbound
-fetches (1 expiry list + 1 quoteSummary for earnings + ~2.8 dated expiry chains); a 22-name watchlist
-is ~110 and cannot be done in one invocation at all. **Chunking inside a handler does nothing for
+invocation**. One ticker costs a *measured* ~4.8 outbound fetches (1 expiry list + 1 quoteSummary
+for earnings + ~2.8 dated expiry chains); a 22-name watchlist is ~110. That did not fit under the
+old Workers Free cap of 50 and comfortably fits the current 10,000 (rule #1) — **the on-demand
+design is retained on purpose and is not to be changed without a decision**: the screen is used one
+or two names at a time, and the Yahoo crumb rate-limits long before the subrequest budget does. **Chunking inside a handler does nothing for
 this** — the cap is per invocation, not per chunk. Re-measure with a counting `fetch` wrapper before
 changing anything here; do not estimate it.
 
@@ -1078,7 +1239,7 @@ Verify against a second case before declaring success. One passing ticker is a c
 
 Read CLAUDE.md and ARCHITECTURE.md first. Do not work from assumptions carried over from earlier in a session or from my prompt — I have been wrong about what exists in this codebase multiple times (a 13F override map that doesn't exist, a cached risk-free rate that wasn't there, mock generators that were dead code, the term-structure sign). If my instruction contradicts the code, say so before acting.
 
-Check any change against the Free-plan subrequest cap (50 per invocation) and the cron window trap (must cover both PST and PDT offsets). Both have caused silent failures.
+Check any change against the subrequest budget (rule #1 — 10,000 per invocation, and KV/binding calls are a *different* bucket from external `fetch()`) and against rule #2: no calendar logic in the cron expression, and any new Pacific hour must fall inside the UTC window under **both** PST and PDT. Both have caused silent failures.
 
 ## After every task
 

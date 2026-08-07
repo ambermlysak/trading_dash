@@ -34,21 +34,34 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   ratelimit:ai:ip:{IP}:{HOUR} — per-IP AI request counter (2h TTL)
 
 [triggers]
-# Single cron (plan limit: 5 triggers max). Fires every 15 min in a UTC window
-# covering all PT jobs in both DST regimes; scheduled() dispatches by
-# Pacific wall-clock time:
+# THIS EXPRESSION IS A COARSE WAKEUP AND NOTHING ELSE.
+#
+# It says "every 15 minutes, UTC hours 13-22, every day". It does NOT encode
+# which days to run — scheduled() in worker.js decides that, in code, against
+# Pacific wall-clock time, and skips weekends and NYSE holidays there.
+#
+# DO NOT put a day-of-week, day-of-month or month back in this expression.
+# It used to end in `1-5`, which reads as Mon-Fri under standard cron.
+# Cloudflare's day-of-week field is 1-indexed with 1 = Sunday, so `1-5` actually
+# meant Sun-Thu: no job ever ran on a Friday, and a full Claude morning briefing
+# burned every Sunday for a closed market. That went unnoticed for weeks because
+# a cron that does not fire logs nothing at all. `2-6` would happen to be
+# correct today and is still the wrong fix — the point is that this file cannot
+# express a calendar rule you can test, and scheduled() can.
+#
+# The UTC hour range is still load-bearing, because a Pacific hour maps to two
+# UTC hours across DST. 13-22 covers 6:00am-3:00pm PDT and 5:00am-2:00pm PST,
+# so every PT job below is inside the window in both regimes:
 #   Morning briefing — 6:00am PT   (13:00 UTC PDT / 14:00 UTC PST)
 #   Midday pulse     — 11:30am PT  (18:30 UTC PDT / 19:30 UTC PST)
 #   EOD summary      — 1:15pm PT   (20:15 UTC PDT / 21:15 UTC PST)
 #   IV history sweep — 1:15pm PT   (runs alongside the EOD job; own daily dedup key)
 #   Forward-ret fill — 2:00pm PT   (21:00 UTC PDT / 22:00 UTC PST; own daily dedup key)
-#   13F index slice  — 10:00am PT  (4 managers per firing, ~13 subrequests)
+#   13F index slice  — 10:00am PT  (4 managers per firing, ~13 external fetches)
 #                      NOT 3:00pm PT: that is 23:00 UTC under PST, outside this
 #                      window, so the job never ran for half the year.
-# The premium screen is deliberately NOT here — it loads on demand, one ticker
-# per request, because a whole watchlist does not fit in one invocation.
 # Each job deduplicates via KV timestamp check (2-hour window).
-crons = ["*/15 13-22 * * 1-5"]
+crons = ["*/15 13-22 * * *"]
 
 # Required secrets (set via: npx wrangler secret put <NAME>):
 #   AI_GATE_SECRET     — REQUIRED. Shared secret gating every AI-spend and KV-write
