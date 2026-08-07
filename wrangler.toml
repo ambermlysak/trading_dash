@@ -99,7 +99,27 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #                      NOT 3:00pm PT: that is 23:00 UTC under PST, outside this
 #                      window, so the job never ran for half the year.
 # Each job deduplicates via KV timestamp check (2-hour window).
-crons = ["*/15 13-22 * * *"]
+#
+# ── TEMPORARY DIAGNOSTIC PROBE — REMOVE MONDAY 2026-08-10, BEFORE 6:00am PT ───
+# TODO(2026-08-10): delete the "*/5 * * * *" entry below. It is a throwaway.
+#
+# Why it exists: three consecutive post-deploy boundaries (13:00/13:15/13:30 PT)
+# produced no [cron] line — but observability logs were off at the time, so that
+# silence is uninterpretable, not evidence. The probe fires every 5 minutes with
+# no hour restriction so evidence accumulates across the weekend rather than
+# waiting for Monday 6am, and it exercises the weekend gate path (Sat/Sun must
+# log "not a trading day (weekend) · branch=none", no dispatch, no KV writes).
+# Both firings are separable in the log: scheduled() prints controller.cron.
+#
+# REMOVE IT BEFORE MONDAY 6:00am PT. On a TRADING day this probe triples the
+# firings inside every dispatch window (3 per 15 min instead of 1), and each
+# generator's KV dedup is what stops that from tripling the work. Dedup holds
+# on a SUCCESSFUL run — but a FAILED morning briefing leaves the cache
+# incomplete by design so it retries, and the probe turns that 2-attempt retry
+# into 6. At ~25 Claude calls per briefing pass that is the difference between
+# ~50 and ~150 calls on a bad morning. Harmless over a weekend, which is the
+# window it is meant to cover; not something to leave running into a weekday.
+crons = ["*/15 13-22 * * *", "*/5 * * * *"]
 
 # Required secrets (set via: npx wrangler secret put <NAME>):
 #   AI_GATE_SECRET     — REQUIRED. Shared secret gating every AI-spend and KV-write

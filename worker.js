@@ -6330,11 +6330,17 @@ export default {
     const dowName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][dow];
     const at = `${iso} ${dowName} ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')} PT`;
 
+    // Which trigger fired. With more than one cron registered the log is
+    // otherwise ambiguous — a diagnostic probe and a real firing produce the
+    // same line. `controller.cron` is the raw expression string; guard it
+    // because the local `/cdn-cgi/handler/scheduled` route allows it to be absent.
+    const via = `cron="${event.cron || '(none reported)'}"`;
+
     /* Log on EVERY invocation, skips included. A no-op that prints
        "Sat — skipped" is falsifiable; silence is what let the wrong day-of-week
        run for weeks without anyone being able to see it. */
     if (!day.open) {
-      console.log(`[cron] ${at} · not a trading day (${day.reason}) · branch=none`);
+      console.log(`[cron] ${at} · ${via} · not a trading day (${day.reason}) · branch=none`);
       return;
     }
 
@@ -6361,7 +6367,7 @@ export default {
     }
 
     console.log(
-      `[cron] ${at} · trading day · branch=${branch}` +
+      `[cron] ${at} · ${via} · trading day · branch=${branch}` +
       (day.calendarStale ? ` · WARN holiday calendar ends ${NYSE_HOLIDAYS_THROUGH}, holidays no longer skipped` : ''),
     );
   },

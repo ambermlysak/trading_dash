@@ -65,6 +65,23 @@ const CASES = [
   ['2027-12-24T14:00:00Z', 'PST', 'Christmas observed (a Friday)',      '2027-12-24', 'Fri', false, 'nyse-holiday', 'none'],
   ['2027-01-08T19:30:00Z', 'PST', 'Friday 11:30am   (midday pulse)',    '2027-01-08', 'Fri', true,  'weekday',      'midday-pulse'],
   ['2027-01-08T22:00:00Z', 'PST', 'Friday 2:00pm    (forward returns)', '2027-01-08', 'Fri', true,  'weekday',      'forward-returns'],
+
+  // ── Hours OUTSIDE the 13-22 UTC window ──────────────────────────────────
+  // The every-5-minutes diagnostic probe fires around the clock, so the
+  // dispatcher now sees Pacific hours it has never been given before: every
+  // branch is keyed to 6/10/11/12/13/14 PT, and everything else must fall
+  // through to `idle` rather than matching by accident. Note the UTC date and
+  // the PT date diverge here — 03:00Z Saturday is Friday evening in Pacific,
+  // which is a TRADING day, and 07:00Z Monday is Sunday night, which is not.
+  ['2026-08-08T03:00:00Z', 'PDT', 'UTC Sat 03:00 = Fri 8:00pm PT',      '2026-08-07', 'Fri', true,  'weekday',      'idle'],
+  ['2026-08-08T07:00:00Z', 'PDT', 'UTC Sat 07:00 = Sat 12:00am PT',     '2026-08-08', 'Sat', false, 'weekend',      'none'],
+  ['2026-08-10T06:00:00Z', 'PDT', 'UTC Mon 06:00 = Sun 11:00pm PT',     '2026-08-09', 'Sun', false, 'weekend',      'none'],
+  ['2026-08-10T07:00:00Z', 'PDT', 'UTC Mon 07:00 = Mon 12:00am PT',     '2026-08-10', 'Mon', true,  'weekday',      'idle'],
+  ['2026-08-07T09:00:00Z', 'PDT', 'Friday 2:00am    (pre-window)',      '2026-08-07', 'Fri', true,  'weekday',      'idle'],
+  ['2026-08-07T12:00:00Z', 'PDT', 'Friday 5:00am    (one hr early)',    '2026-08-07', 'Fri', true,  'weekday',      'idle'],
+  ['2026-08-07T23:00:00Z', 'PDT', 'Friday 4:00pm    (post-window)',     '2026-08-07', 'Fri', true,  'weekday',      'idle'],
+  ['2026-08-08T06:55:00Z', 'PDT', 'Fri 11:55pm PT   (day boundary)',    '2026-08-07', 'Fri', true,  'weekday',      'idle'],
+  ['2026-09-08T03:00:00Z', 'PDT', 'UTC Tue 03:00 = Labor Day 8pm PT',   '2026-09-07', 'Mon', false, 'nyse-holiday', 'none'],
 ];
 
 console.log('Cron trading-day gate — computed vs expected\n');

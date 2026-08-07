@@ -1314,3 +1314,5 @@ Kill background processes. No wrangler dev, wrangler tail, or http servers left 
 ## Adding a new failure mode
 
 When a bug is found, add a rule naming the specific failure that produced it. Rules tied to a concrete incident are followed; abstract ones are not.
+
+cron execution history doesn't exist unless observability logs are enabled, and observability.enabled seeds logs.enabled in wrangler's normalization — writing only the nested table silently disables both.
