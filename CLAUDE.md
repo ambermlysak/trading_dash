@@ -439,6 +439,48 @@ into `_instr.settledRejected` on the stored payload (rule #1).
 and a counted `allSettled`.** A job whose only evidence of running is its own
 success is a job you cannot debug when it stops.
 
+#### None of that logging exists unless observability is on
+
+`[observability] enabled = true` in `wrangler.toml` is a **prerequisite for cron
+execution history existing at all**. With it off, the log lines above are emitted
+into nothing and are not retained anywhere.
+
+That produced the worst two hours of this investigation. `wrangler tail` streams
+**live events only** — it shows what happens while you are watching, and retains
+nothing. With logging disabled, a quiet tail cannot distinguish:
+
+- the cron did not fire, from
+- the cron fired and nothing was kept.
+
+**Absence of cron lines in a tail is not evidence.** It is an unreadable
+instrument, and it was read as evidence for two hours.
+
+Know which of the two telemetry systems you are querying, because they are
+independent and only one of them needs observability:
+
+| system | needs `observability.enabled`? | what it gives you |
+|---|---|---|
+| **Workers Logs** (`wrangler tail`, dashboard log search) | **yes** — for anything retained | your own `console.log` lines, e.g. `branch=morning-briefing` |
+| **Workers Analytics** (GraphQL `workersInvocationsAdaptive`) | **no** | invocation counts, errors, subrequest totals, timestamps |
+
+The bug was ultimately found through the **analytics** side, which worked the
+whole time: a quarter-hourly invocation heartbeat present on Sun–Thu and missing
+on both Fridays. That is the fallback when logs are off — counts and timestamps,
+never message content. See the diagnosis recipe: pull
+`workersInvocationsAdaptive` for the script, bucket by second-of-minute, and look
+for the repeating offset that marks a cron firing.
+
+**Observability set in the dashboard does not survive a deploy.** `wrangler
+deploy` sends the whole config and overwrites dashboard-set values — the same
+drift that produced the cron-trigger divergence warning. Wrangler's own
+`normalizeRemoteConfigAsResolvedLocal()` skips `observability` when diffing local
+against remote, noting it "has a remote default behavior different from that of
+wrangler". So it must be in `wrangler.toml`, and it now is. Note also that
+top-level `observability.enabled` is **not** redundant with
+`observability.logs.enabled`: `normalizeObservability()` computes
+`const enabled = obs?.enabled === true ? true : false` and uses that as the
+default for `logs.enabled`.
+
 ---
 
 ## Deploy & develop

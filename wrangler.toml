@@ -2,6 +2,44 @@ name = "stock-research-worker"
 main = "worker.js"
 compatibility_date = "2024-09-01"
 
+# ── Observability ────────────────────────────────────────────────────────────
+# Mirrors what was set in the Cloudflare dashboard. It has to live here, because
+# `wrangler deploy` sends the whole config and OVERWRITES dashboard-set values —
+# the same drift that produced the cron-trigger divergence warning. Wrangler
+# knows this: normalizeRemoteConfigAsResolvedLocal() in its own source skips
+# observability when comparing local to remote, commenting that it "has a remote
+# default behavior different from that of wrangler". So a dashboard-only setting
+# survives exactly until the next deploy.
+#
+# WITHOUT THIS BLOCK THERE IS NO CRON EXECUTION HISTORY. `wrangler tail` streams
+# live events only; with logs off, a quiet tail means nothing at all — it cannot
+# distinguish "the cron did not fire" from "the cron fired and nothing was
+# retained". That ambiguity cost two hours of the day this was found.
+#
+# The top-level `enabled` is load-bearing and is NOT redundant with logs.enabled.
+# wrangler's normalizeObservability() computes
+#   const enabled = obs?.enabled === true ? true : false
+# and uses THAT as the default for logs.enabled. Omitting it here would deploy
+# `observability.enabled: false` next to `logs.enabled: true`.
+#
+# Key names verified against node_modules/wrangler/config-schema.json for the
+# pinned wrangler (4.118.0) rather than hand-translated from the docs — the
+# published TOML example omits the nested logs/traces tables entirely.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true          # keep the per-invocation summary lines
+persist = true                  # retain in the dashboard's queryable log store
+
+# Explicitly off rather than omitted: an absent value is whatever the dashboard
+# last said, which is the drift this block exists to close.
+[observability.traces]
+enabled = false
+
 [[kv_namespaces]]
 binding = "REC_LOG"
 id = "6e2feae8a08c4db0b564e5bce18d2b01"
