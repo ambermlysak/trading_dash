@@ -60,14 +60,23 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   ivsweep:last        — PT date of last cron IV sweep (dedup)
 #   fund:{TICKER}       — per-ticker Yahoo fundamentals cache (6h TTL)
 #   premium:{TICKER}    — premium-screen row, cached on demand (4h fresh, 24h retained)
+#   long:{TICKER}       — long-screen row, cached on demand (4h fresh, 24h retained)
 #   13f:cursor          — which manager the 13F pass is up to (outside 13f:index)
-#   econ:dgs3mo         — FRED 3-month T-bill, risk-free rate for Black-Scholes (12h fresh, 7d kept)
+#   econ:dgs3mo         — FRED 3-month T-bill, risk-free rate for Black-Scholes
+#                         (12h fresh, 90d kept — the long retention is the outage
+#                          path: no rate means no delta means no premium OR long
+#                          screen, so a stale print beats a blank screen)
+#   earnings:{TICKER}   — last-report earnings analysis (2d TTL)
 #   market:ipos         — IPO calendar cache (12h TTL)
+#   market:sectors      — sector summaries + opportunity/avoid picks (4h TTL)
+#   market:week-ahead   — Friday-only week-ahead preview (18h TTL)
 #   market:goldencross  — golden-cross setups (1h TTL)
 #   scanner:{preset}    — day-trading scanner results (90s TTL)
+#   auction:{DATE}:{SYMBOLS} — closing-auction block trades, keyed by ET date (20h TTL)
 #   watchlist:tickers   — saved watchlist; also seeds scan universes
 #   rec:{TICKER}        — recommendation history, one entry per PT trading day
 #   recfwd:last         — PT date of last forward-return fill (dedup)
+#   admin:token         — bearer token gating the /api/admin/* routes
 #   ratelimit:ai:global:{DAY}   — global AI request counter (25h TTL)
 #   ratelimit:ai:ip:{IP}:{HOUR} — per-IP AI request counter (2h TTL)
 
