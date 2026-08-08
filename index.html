@@ -2746,7 +2746,8 @@ async function renderSuperInvestors(ticker) {
    *
    * This used to read "N/20 managers filed", which attributed a shortfall to the
    * managers. It was ours: the index was built in one invocation costing ~61 SEC
-   * round trips against a 50-subrequest cap, the overflow was swallowed by a
+   * round trips against the Free plan's 50-subrequest cap then in force (now
+   * 10,000 on Paid), the overflow was swallowed by a
    * per-manager catch, and 4 of 20 were dropped every single time — recorded in
    * the same shape as a manager who genuinely filed nothing. The index is now
    * built a few managers per run, so a shortfall means the pass is still filling

@@ -25,19 +25,28 @@
  */
 
 /* ── Instrumentation: external subrequests + swallowed failures ──────────────
-   TWO DIFFERENT BUCKETS. The old rule #1 conflated them and that was wrong even
-   under the Free plan:
+   ONE POOL, and this comment has been wrong in both directions. It first said
+   every fetch was a subrequest and budgeted KV against the same ceiling; the
+   correction claimed they were SEPARATE buckets. Both were wrong. On Workers
+   Paid (this account since 2026-08-07) the cap is 10,000 per invocation —
+   settable via `limits.subrequests` in wrangler.toml — and it covers BOTH:
 
-     • external `fetch()` — Yahoo, SEC EDGAR, FINRA, FRED, Alpaca, Anthropic.
-       This is the metered subrequest bucket. On Workers Paid the default is
-       10,000 per invocation (settable via `limits.subrequests` in wrangler.toml).
-     • KV / R2 / D1 / Durable Object binding calls — `env.REC_LOG.get/put/delete`
-       and friends. These do NOT travel over `globalThis.fetch` and are accounted
-       against a different bucket entirely.
+     • external `fetch()` — Yahoo, SEC EDGAR, FINRA, FRED, Alpaca, Anthropic
+     • KV / R2 / D1 / Durable Object binding calls — env.REC_LOG.get/put/delete
 
-   So the counter below wraps `globalThis.fetch` ONLY, and therefore measures
-   exactly the external bucket. A KV read never moves it. That is deliberate: it
-   is the number you budget fan-out against, uncontaminated by cache traffic.
+   Cloudflare defines a subrequest as any request made "using the Fetch API or to
+   Cloudflare services like R2, KV, or D1" (verified 2026-08-08). The Free plan's
+   50-external / 1,000-service split does not apply here.
+
+   The counter below wraps `globalThis.fetch` ONLY, because binding calls do not
+   travel over it and cannot be intercepted this way. So `fetches` is a LOWER
+   BOUND on the invocation's cap cost, not the whole of it — a KV read never moves
+   it but does spend the budget. Budget external fan-out with this number and add
+   KV operations by hand.
+
+   In practice the cap is not the binding constraint anyway: Yahoo crumb
+   rate-limiting is, and it is untouched by the plan tier. Nothing that avoids
+   fan-out in this file should be relaxed because the ceiling went up.
 
    `settledRejected` exists because `Promise.allSettled` discards rejections.
    Every truncated cron run in this codebase reported `errors: 0` in Cloudflare's
@@ -1357,11 +1366,16 @@ const PREM_SCHEMA      = 2;              // bump when the row shape changes, to 
    A 6-ticker probe came to 30 fetches: 6 base + 6 quoteSummary + 17 dated + 1
    spark.
 
-   This account is on **Workers Free: 50 subrequests per invocation.** One
-   ticker is ~5, so a single on-demand fetch has an order of magnitude of head-
-   room. A whole 22-name watchlist is ~110 and cannot be done in one invocation
-   at all — and the cap is per *invocation*, not per chunk, so no amount of
-   internal chunking helps.
+   This account is on **Workers Paid: 10,000 subrequests per invocation**, one
+   pool covering external fetches AND KV binding calls. A 22-name watchlist at
+   ~110 fetches would now fit — and it is still NOT done, because the cap was
+   never the real constraint. **Yahoo crumb rate-limiting is**, and 22 concurrent
+   invocations against Yahoo get throttled regardless of plan tier. The screen is
+   also used one or two names at a time, so the fan-out solved a problem nobody
+   had. Do not restore it on the strength of the higher ceiling.
+
+   (Under the Free plan's 50 this was a hard impossibility rather than a choice,
+   and the cap is per *invocation*, not per chunk, so no internal chunking helped.)
 
    There was briefly a KV queue drained across cron firings to work around that.
    It is gone: the screen is used one or two names at a time when deciding what
@@ -1823,8 +1837,8 @@ async function handlePremiumBatch(params, origin, env) {
 
 /* ── GET /api/premium/:ticker ────────────────────────────────────────────────
    The only path in the premium screen that spends subrequests, and it spends
-   ~5 — an order of magnitude inside the 50 cap. **One ticker per invocation,
-   never more**: this is the whole reason the batch sweep is gone.
+   ~5 against a 10,000 cap. **One ticker per invocation, never more** — not for
+   the cap's sake but for Yahoo's: this is the whole reason the batch sweep is gone.
 
      (no param)   serve the cached row if it is inside PREMIUM_FRESH_MS,
                   otherwise refetch. A cache hit costs ZERO outbound calls.
@@ -2722,8 +2736,10 @@ async function fetch13F(cik) {
  */
 /* ── 13F index: built a few managers at a time ───────────────────────────────
    The old `build13FIndex` walked all 20 managers in one invocation: 1 fetch for
-   the issuer-name table plus 3 SEC round trips each = 61, against a 50-subrequest
-   cap on Workers Free.
+   the issuer-name table plus 3 SEC round trips each = 61, against the Free plan's
+   50-subrequest cap in force at the time. (The cap is now 10,000 on Paid and 61
+   would fit — the slicing stays because the *failure mode* it fixed was a
+   per-manager catch reporting partial data as complete, which no ceiling fixes.)
 
    It did not fail. `fetch13F` is wrapped in a per-manager try/catch that logs and
    continues, so the cap error was swallowed 4 times and the function returned
@@ -2740,7 +2756,7 @@ async function fetch13F(cik) {
    firings costs nothing. Per-manager holdings are kept in `byManager` and the
    ticker→managers index is derived from it, so one manager can be replaced
    without touching the others. */
-const THIRTEENF_BATCH  = 4;             // 4 × 3 + 1 = 13 subrequests — a quarter of the cap
+const THIRTEENF_BATCH  = 4;             // 4 × 3 + 1 = 13 subrequests per firing
 const THIRTEENF_CURSOR = '13f:cursor';  // deliberately outside the 13f:index key
 
 /** Issuer-name → ticker, from SEC's company_tickers.json. One fetch. */
@@ -5397,7 +5413,9 @@ async function handleWeekAhead(origin, env) {
   const weekOf = `${mon.toLocaleDateString('en-US', { month: 'long', day: 'numeric' })}–${fri.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`;
 
   // --- Fetch verified earnings dates from Yahoo for a broad set of major tickers ---
-  // 40 tickers max — keeps total subrequests (earnings + crumb + news + Claude) under 50
+  // 40 tickers max — bounds total subrequests (earnings + crumb + news + Claude).
+  // Sized under the Free plan's 50; kept at 40 because Yahoo throttles long
+  // before the current 10,000 cap does.
   const EARNINGS_WATCH = [
     // Watchlist core (22)
     'PLTR','NVDA','AMD','AAPL','AMZN','GOOGL','QUBT','TWLO','NOW','TSM',
@@ -6186,9 +6204,10 @@ export default {
         case 'chart':    return await handleChart(sub, url.searchParams, origin);
         case 'options': return await handleOptions(sub, url.searchParams, origin, env);
         case 'premium':
-          // `batch` reads KV only — zero outbound calls, so the watchlist length
-          // cannot push it into the subrequest cap. A bare ticker refreshes one
-          // name, which is ~5 subrequests and safe on any plan.
+          // `batch` reads KV only — zero outbound calls, so a long watchlist
+          // cannot put 60 tickers' worth of Yahoo traffic behind one page load.
+          // (The KV reads themselves do count against the 10,000 cap; they are
+          // just not fetches.) A bare ticker refreshes one name, ~5 subrequests.
           if (sub === 'batch') return await handlePremiumBatch(url.searchParams, origin, env);
           return await handlePremiumTicker(sub, url.searchParams, origin, env, ctx);
         case 'iv':       return await handleIv(sub, url.searchParams, origin, env, ctx);

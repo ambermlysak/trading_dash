@@ -20,30 +20,53 @@ three were *silent* — code that returned normally and rendered plausible outpu
 while being wrong. The fourth was the opposite: total, immediate, and invisible
 in the Worker logs, because the browser never sent the requests.
 
-### 1. Subrequest budget: 10,000 per invocation — and it is two buckets, not one
+### 1. Subrequest budget: 10,000 per invocation, one pool — and the cap is no longer the constraint
 
-This account is on **Workers Paid**. Since Cloudflare's **2026-02-11** change the
-default is **10,000 subrequests per invocation**, configurable via
-`limits.subrequests` in `wrangler.toml`. The **50** that used to sit in this slot
-was the Free-plan figure and no longer applies. The cap is still **per
-invocation, not per chunk** — chunking inside one handler has never bought
-anything.
+This account moved to **Workers Paid on 2026-08-07**. Since Cloudflare's
+**2026-02-11** change the paid default is **10,000 subrequests per invocation**,
+raisable to 10 million via `limits.subrequests` in `wrangler.toml`. The **50**
+that used to sit in this slot is the Free-plan figure and no longer applies
+(Free also carries a separate 1,000 ceiling on calls to Cloudflare services;
+that split is Free-only). The cap is still **per invocation, not per chunk** —
+chunking inside one handler has never bought anything.
 
-**The larger correction: this rule used to count the wrong thing.** It said "every
-`fetch()` a Worker makes is a subrequest" and then budgeted KV traffic against the
-same ceiling. Those are separate buckets, and that was wrong under the Free plan
-too:
+**It is ONE pool, and this rule has now been wrong in both directions.** The
+original said "every `fetch()` is a subrequest" and budgeted KV against the same
+ceiling. The correction over-corrected: it claimed external fetches and binding
+operations were *separate buckets*, and that a handler reading 40 KV keys and
+fetching 3 URLs cost **3**. It costs **43**. Verified 2026-08-08 against
+[developers.cloudflare.com/workers/platform/limits](https://developers.cloudflare.com/workers/platform/limits/),
+which defines a subrequest as *"any request a Worker makes using the Fetch API or
+to Cloudflare services like R2, KV, or D1"*, and lists the paid internal-services
+limit as matching the configured limit rather than sitting in its own bucket:
 
-| call | bucket |
+| call | counts against the 10,000? |
 |---|---|
-| external `fetch()` — Yahoo, SEC EDGAR, FINRA, FRED, Alpaca, Anthropic | **subrequests** (10,000/invocation) |
-| `env.REC_LOG.get/put/delete`, and any R2 / D1 / Durable Object binding | **binding operations** — accounted separately, *not* subrequests |
+| external `fetch()` — Yahoo, SEC EDGAR, FINRA, FRED, Alpaca, Anthropic | **yes** |
+| `env.REC_LOG.get/put/delete`, and any R2 / D1 / Durable Object binding | **yes — same pool** |
 
-A handler that reads 40 KV keys and fetches 3 URLs costs **3** against the
-subrequest budget, not 43.
+Do not restore the two-bucket table, and do not write a comment claiming KV reads
+are free of the cap.
 
-Measured costs. These are still the numbers to budget fan-out against — the
-ceiling moved, the arithmetic did not. All figures are **external fetches**:
+#### The cap is not what stops fan-out. Yahoo is.
+
+**Read this before treating 10,000 as permission to fan out.** Every structure in
+this codebase that avoids fan-out stays exactly as it is:
+
+- `/api/premium/batch` and `/api/long/batch` remain **KV reads with zero outbound
+  calls**; `/api/premium/:ticker` and `/api/long/:ticker` remain the only spenders.
+- **Load all is strictly sequential** on both tabs, one awaited request at a time.
+- The deleted KV queue that once drained the premium sweep across cron firings
+  **stays deleted**.
+
+The binding constraint is **Yahoo crumb rate-limiting**, which the plan change did
+not touch. Firing 22 tickers concurrently puts 22 invocations against Yahoo at
+once and gets the crumb rate-limited — a different failure from the cap and just
+as effective. The screen is also used one or two names at a time, so fetching all
+22 solves a problem nobody has.
+
+Measured costs, all **external fetches** (see the instrumentation caveat below for
+why that is now a lower bound):
 
 | work | external fetches |
 |---|---|
@@ -52,36 +75,42 @@ ceiling moved, the arithmetic did not. All figures are **external fetches**:
 | fixed overhead per invocation | ~3 (Yahoo crumb, FRED rate, one spark per 20 symbols) |
 | one EOD summary | **12**, measured 2026-08-07 (11 index charts + 1 news search) |
 
-Two silent failures came from not budgeting. Both were real under the 50 cap;
-both would fit comfortably now, and both are still worth reading because the
-*failure shape* is what matters:
+Two silent failures came from not budgeting. **Both happened under the Free plan's
+50 and both would fit comfortably now** — they are retained because the *failure
+shape* is what matters, and the shape is untouched by the ceiling moving:
 
 - The premium screen fanned out the whole watchlist (~110 fetches). Most rows
   rendered "options chain unavailable", which read like a data problem with those
   tickers. It was ours.
 - `build13FIndex` needed ~61 and **did not fail** — a per-manager `catch`
   swallowed the cap error and it returned 16 of 20 managers, written to KV as
-  though complete.
+  though complete. **A per-item `catch` that cannot tell "this item failed" from
+  "we exhausted a budget and every remaining item will fail" still reports partial
+  data as complete, at any ceiling.**
 
 **`ctx.waitUntil` does not get its own budget.** It shares the invocation's, so
 two jobs dispatched on the same cron firing share one ceiling.
 
-**Measure, do not estimate.** `worker.js` now does this permanently: `INSTR` wraps
-`globalThis.fetch` at module load and counts **external calls only** — a KV read
-never moves it, which is exactly the distinction above. `instrMark()` /
-`instrSince()` bracket a job, and the result rides along as `_instr` on
-`daily:snapshot`, `daily:midday` and `daily:eod`:
+**Measure, do not estimate.** `worker.js` does this permanently: `INSTR` wraps
+`globalThis.fetch` at module load. **It counts external calls only, so it is now a
+LOWER BOUND on what the cap meters** — KV binding calls do not travel over
+`globalThis.fetch` and cannot be seen by it, but they do count. That is a known
+gap, not a claim of completeness: budget external fetches with `extFetches` and
+add KV operations by hand. `instrMark()` / `instrSince()` bracket a job, and the
+result rides along as `_instr` on `daily:snapshot`, `daily:midday` and
+`daily:eod`:
 
 ```json
 "_instr": { "extFetches": 12, "settledRejected": 0, "invocationFetches": 12,
             "scope": "scheduled", "measured": true, "phase": "complete" }
 ```
 
-- `extFetches` — this job's external calls. The number to budget against.
+- `extFetches` — this job's external calls. A lower bound on its cap cost: KV
+  operations count against the same pool and are invisible here.
 - `settledRejected` — promises its `Promise.allSettled` blocks swallowed. See
   rule #7; `errors: 0` in Cloudflare's telemetry is not evidence of success.
-- `invocationFetches` — whole-invocation total, which is what the ceiling
-  actually meters. Larger than `extFetches` when two jobs share a firing.
+- `invocationFetches` — whole-invocation external total. Larger than `extFetches`
+  when two jobs share a firing; still excludes binding calls.
 - `measured` — whether the `globalThis.fetch` wrap installed. **A zero count with
   `measured: false` means "not instrumented", not "made no calls."**
 - `phase` — `briefing` or `complete`. `daily:snapshot` is written before the
@@ -700,7 +729,8 @@ fail loudly; it silently attributes one manager's book to another. Check
 
 **The 13F index is built a few managers at a time, and the old version silently truncated.**
 `build13FIndex()` walked all 20 managers in one invocation: 1 fetch for the issuer-name table plus 3
-SEC round trips each = **61, against the 50-subrequest cap in force at the time** (now 10,000; see rule #1). It did not fail. `fetch13F` is wrapped in a
+SEC round trips each = **61, against the Free plan's 50-subrequest cap in force at
+the time** (this account is now on Paid: 10,000, one pool — see rule #1). It did not fail. `fetch13F` is wrapped in a
 per-manager `try/catch` that logs and continues, so the cap error was swallowed four times and the
 function **returned normally with 16 of 20 managers** — and `refresh13FIndex` wrote that partial index
 to KV as if complete. The four dropped managers were recorded as `{ ok: false }`, the same shape used
@@ -1084,7 +1114,8 @@ invocation**. One ticker costs a *measured* ~4.8 outbound fetches (1 expiry list
 for earnings + ~2.8 dated expiry chains); a 22-name watchlist is ~110. That did not fit under the
 old Workers Free cap of 50 and comfortably fits the current 10,000 (rule #1) — **the on-demand
 design is retained on purpose and is not to be changed without a decision**: the screen is used one
-or two names at a time, and the Yahoo crumb rate-limits long before the subrequest budget does. **Chunking inside a handler does nothing for
+or two names at a time, and **the Yahoo crumb rate-limits long before the subrequest budget does,
+which is why the higher cap changes nothing here**. **Chunking inside a handler does nothing for
 this** — the cap is per invocation, not per chunk. Re-measure with a counting `fetch` wrapper before
 changing anything here; do not estimate it.
 

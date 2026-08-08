@@ -126,7 +126,9 @@ in this codebase and shipped:
    them cost the user the ability to act on any of them — and it made a scheduling gap look like a
    verdict on the stock. Every unavailable state now carries its own `status` and says which it is.
 12. **A swallowed error is worse than a loud one when it changes what the data means.**
-   `build13FIndex` needed ~61 SEC round trips against the 50-subrequest cap then in force. It
+   `build13FIndex` needed ~61 SEC round trips against the Free plan's 50-subrequest cap then in
+   force (this account is now on Workers Paid: 10,000 per invocation, one pool covering external
+   fetches and KV/R2/D1 binding calls alike). It
    never failed — a
    per-manager `try/catch` absorbed the cap error and the function returned normally with 16 of 20
    managers, which was then written to KV and rendered as a complete answer. The dropped managers
@@ -155,7 +157,7 @@ in this codebase and shipped:
    data to ground it is actually in the prompt.
 16. **A `catch` must not absorb an infrastructure failure into a domain-failure shape.**
    `build13FIndex` wrapped each manager in a try/catch that logged and continued. When it hit the
-   50-subrequest cap then in force, the error was swallowed four times and the function **returned normally with
+   Free plan's 50-subrequest cap then in force, the error was swallowed four times and the function **returned normally with
    16 of 20 managers**, which was written to KV as a complete index. Worse, the dropped managers were
    stored in the *same shape* as a manager who genuinely filed nothing, so the card read
    **"16/20 managers filed"** — reporting our own budget exhaustion as a fact about the managers.
@@ -469,10 +471,13 @@ secure.
 - **A KV failure degrades to the secret alone.** If the counter read or write
   throws, the request proceeds and logs a warning. Failing closed on a KV blip
   would take the app down; the tradeoff is that a KV outage removes the ceilings.
-- **KV write quota is itself attackable.** The Free plan allows 1,000 KV writes/day
-  and the limiter writes two per gated request. Sustained hammering can exhaust
-  that quota, which breaks the counters *and* the app's own caching. The rate limit
-  bounds Anthropic spend, not KV spend.
+- **KV writes are still attackable — the move to Workers Paid changed the shape of
+  it, not the exposure.** The limiter writes two KV entries per gated request. Under
+  the Free plan's 1,000 writes/day that meant sustained hammering could *exhaust the
+  quota*, breaking the counters and the app's own caching. On Paid there is no daily
+  write cliff, so the same hammering becomes *billed KV operations* instead: a
+  smaller functional risk and a new cost one. Either way the rate limit bounds
+  Anthropic spend, not KV spend.
 - **Cron spend is outside all of this.** The scheduled jobs call `workerClaude()`
   directly and are bounded by their schedule, not by the gate. That is deliberate —
   they have no request to authenticate — but it means the ceilings describe

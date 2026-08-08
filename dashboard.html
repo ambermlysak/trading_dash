@@ -1820,10 +1820,10 @@ function initColumnResize() {
  * 22-name watchlist was several screens of scrolling with no way to compare rows.
  *
  * Data comes from /api/premium/batch, which reads KV and makes no outbound calls.
- * The chain fetches happen in a cron sweep sliced across firings, because
- * Cloudflare's subrequest cap is per invocation and a whole watchlist does not
- * fit in one. The per-row ↻ hits /api/premium/:ticker?refresh=1 — one ticker is
- * ~5 subrequests and safe on its own.
+ * The chain fetches happen on expand, one ticker per request, because firing the
+ * whole watchlist at once gets Yahoo's crumb rate-limited. That constraint is
+ * unchanged by the Worker's 10,000-subrequest cap — the cap is not what stops
+ * fan-out here. The per-row ↻ hits /api/premium/:ticker?refresh=1 — ~5 subrequests.
  */
 let premiumData = null;
 let premiumLoading = false;
@@ -1870,7 +1870,7 @@ async function loadPremium() {
 
   try {
     // Cache-status read only. Zero outbound calls, so painting the whole
-    // watchlist on load costs nothing against the 50-subrequest cap.
+    // watchlist on load puts no Yahoo traffic behind a page load at all.
     const data = await apiFetch(`/premium/batch?symbols=${symbols.join(',')}`, { cache: 'no-store' });
     premiumData = data;
     renderPremium(data);
@@ -2203,8 +2203,8 @@ function renderPremium(data) {
 
   const legend = `<div class="prem-legend">
     <b>Rows load on demand — expand one to fetch it.</b> Each ticker is a single request
-    (~5 of the 50 subrequests a Worker invocation may make), so nothing is fetched on page load and the
-    whole watchlist is never fetched at once. Results cache for ${hours}h; re-expanding inside that
+    (~5 chain fetches), so nothing is fetched on page load and the
+    whole watchlist is never fetched at once — firing them together gets rate-limited upstream. Results cache for ${hours}h; re-expanding inside that
     window makes no network call at all. <b>↻</b> forces a refetch regardless of age.<br>
     Term structure = front ATM IV − back ATM IV, so <b>backwardation reads positive</b> (◤) and marks the
     earnings-crush setup. Expected move = spot × ATM IV × √(dte/365).

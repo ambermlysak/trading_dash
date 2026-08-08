@@ -150,10 +150,14 @@ the data is past its refresh window.
 
 ## Notes
 
-- **The Worker is on Cloudflare Workers Paid: 10,000 subrequests per invocation** (settable via `limits.subrequests`). External `fetch()` and KV/binding calls are *different* buckets — see rule #1 in `CLAUDE.md`.
-  Any new feature that fans out across tickers must be budgeted against this
-  before it is written — it has caused two silent failures already. See
-  `CLAUDE.md`.
+- **The Worker is on Cloudflare Workers Paid: 10,000 subrequests per invocation**
+  (settable via `limits.subrequests`). It is **one pool** — external `fetch()` and
+  KV/R2/D1 binding calls all count against it. See rule #1 in `CLAUDE.md`.
+- **The cap is not what limits fan-out; Yahoo's crumb rate-limiting is.** The
+  on-demand premium/long screens, the KV-only batch endpoints and the sequential
+  Load-all all exist for that reason and do not change with the plan tier. Budget
+  any new fan-out feature before writing it — misbudgeting has caused two silent
+  failures already.
 - Yahoo data is 15 minutes delayed. Alpaca overlays real-time prices when keyed.
 - **`POST /api/claude` has been removed** (returns 410). It was an unauthenticated
   passthrough that forwarded arbitrary prompts on the owner's Anthropic key.
