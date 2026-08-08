@@ -2085,13 +2085,19 @@ function premCandidates(leg) {
     ? '<div class="prem-note">A greyed row means the 0.30 and 0.16 targets resolved to the same listed strike — the chain has no distinct strike between them.</div>'
     : '';
 
+  // Strikes dropped for quoting an implausible IV against this expiry's own ATM.
+  // Declared rather than hidden: the exclusion is a fact about Yahoo's quote,
+  // not about the ticker, and a silently narrowed chain is unauditable.
+  const outlierNote = leg.ivOutlierNote
+    ? `<div class="prem-note">${esc(leg.ivOutlierNote)}</div>` : '';
+
   return `<table class="prem-cands">
     <thead><tr>
       <th>Strike</th><th>Target Δ</th><th>Actual Δ</th><th>POP</th><th>OTM</th><th>IV</th>
       <th>Bid</th><th>Credit</th><th>ROC</th><th>Ann. ROC</th><th>OI</th>
     </tr></thead>
     <tbody>${rows}</tbody>
-  </table>${sparseNote}`;
+  </table>${sparseNote}${outlierNote}`;
 }
 
 const LEG_LABEL = {
@@ -2510,7 +2516,7 @@ const LONG_STATUS = {
   'not-loaded': { label: 'not loaded',   cls: 'muted',  hint: 'Nothing fetched for this ticker yet. Expand the row (or press ↻) to fetch it — one ticker, one request.', loadable: true },
   'no-options': { label: 'no options',   cls: 'muted',  hint: 'This ticker has no listed options at all — nothing to screen.' },
   'no-iv':      { label: 'no IV',        cls: 'amber',  hint: 'Options are listed but the front expiry quotes no usable implied vol. Too thin to price — a finding about the name, not a fetch problem.' },
-  'no-leaps':   { label: 'no LEAPS',     cls: 'violet', hint: 'Options are listed but there is no January expiry beyond 365 DTE and no monthly at the swing horizon. Stock replacement is not available on this name — a real finding, not an error.' },
+  'no-expiries':{ label: 'no expiries',  cls: 'violet', hint: 'Options are listed but nothing on the chain is screenable — no monthly at the swing horizon and no January past the LEAPS floor.' },
   illiquid:     { label: 'illiquid',     cls: 'amber',  hint: 'Every candidate breached its bid/ask spread floor. Priced and shown anyway, because a name whose options are untradeable has to look untradeable.' },
   error:        { label: 'fetch failed', cls: 'bear',   hint: 'The upstream fetch failed. Usually transient — try ↻.' },
 };
@@ -2703,7 +2709,11 @@ function longSummary(r, open) {
     <a class="prem-sym" href="${EQUITY_URL}?t=${esc(r.symbol)}" onclick="event.stopPropagation()">${esc(r.symbol)}</a>
     <span class="prem-col spot">$${fmt(r.spot)}</span>
     <span class="prem-col iv" title="Front expiry ${esc(r.front.expiry)} · ${r.front.dte}d">${r.front.atmIv.toFixed(1)}%</span>
-    <span title="${esc(r.buyableReason || '')}">${ivr}</span>
+    <span title="${esc(r.buyableReason || '')}">${ivr}${
+      // Lane-A-scoped fact, shown on the row without failing it: the swing and
+      // vertical lanes are unaffected by this name having no LEAPS.
+      r.leapsListed === 0 ? ' <span class="long-tag noread" title="No January expiry beyond 365 DTE is listed, so Lane A (stock replacement) is unavailable on this name. The swing, vertical and calendar lanes are unaffected.">no LEAPS</span>' : ''
+    }</span>
     ${term}
     ${earn}
     <span class="prem-col beem ${r.bestBeEm != null && r.bestBeEm <= 1 ? 'good' : ''}" title="${esc(r.dimReason || 'Best (lowest) BE/EM across this row\'s swing and vertical candidates.')}">${nOrDash(r.bestBeEm, 2, '×')}</span>
@@ -2777,8 +2787,11 @@ function longDetail(r) {
         <div class="prem-metric-v sub">IV/HV ${r.ivHvRatio == null ? '—' : r.ivHvRatio.toFixed(2) + '×'}</div></div>
       <div><div class="prem-metric-l">Best BE/EM</div><div class="prem-metric-v ${r.bestBeEm != null && r.bestBeEm <= 1 ? 'up' : ''}">${nOrDash(r.bestBeEm, 2, '×')}</div>
         <div class="prem-metric-v sub">lower is better</div></div>
-      <div><div class="prem-metric-l">Risk-free</div><div class="prem-metric-v">${r.rate?.value == null ? '—' : (r.rate.value * 100).toFixed(2) + '%'}</div>
-        <div class="prem-metric-v sub">FRED DGS3MO${r.rate?.stale ? ' · stale' : ''}</div></div>
+      <div title="${esc(r.rate?.reason || 'FRED DGS3MO, refreshed every 12h.')}"><div class="prem-metric-l">Risk-free</div><div class="prem-metric-v ${r.rate?.stale ? 'am' : ''}">${r.rate?.value == null ? '—' : (r.rate.value * 100).toFixed(2) + '%'}</div>
+        <div class="prem-metric-v sub">FRED DGS3MO${
+          r.rate?.value == null ? ' · unavailable'
+          : r.rate?.stale ? ` · ${r.rate.ageDays == null ? 'stale' : r.rate.ageDays + 'd old'}`
+          : ''}</div></div>
       <div><div class="prem-metric-l">Earnings</div><div class="prem-metric-v">${r.earnings?.iso ? esc(r.earnings.iso) : '—'}</div>
         <div class="prem-metric-v sub">${r.earnings?.iso ? `in ${r.daysToEarnings}d` : esc(r.earnings?.reason || '')}</div></div>
       <div><div class="prem-metric-l">Directional read</div><div class="prem-metric-v">${esc(r.directional?.rating || 'none')}</div>
@@ -3111,6 +3124,10 @@ function renderGoldenCross(data) {
 
   // Gap bar: full = at the 5% edge, empty = crossing now.
   const gapBar = (gap, color, title) => {
+    // A null gap would divide to 0 and clamp to the 2% floor — drawing a real
+    // bar for a missing measurement. Same class as the fabricated "hit rate 0%":
+    // absent and zero must not render the same way.
+    if (gap == null || !Number.isFinite(gap)) return '<span style="color:var(--ink-3)">—</span>';
     const pct = Math.max(2, Math.min(100, gap / near * 100));
     return `<div class="range-bar-wrap" title="${title}">
       <div class="range-bar"><div class="range-bar-fill" style="width:${pct.toFixed(1)}%;background:${color}"></div></div>

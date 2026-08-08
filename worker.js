@@ -1356,6 +1356,66 @@ async function handleOptions(ticker, params, origin, env) {
 
 const PREM_MIN_DTE     = 21;             // "20–45 DTE": first monthly at least this far out
 const PREM_TARGETS     = [0.30, 0.16];   // the two short-strike deltas this screen selects
+
+/* ── IV outlier guard — SHARED by the premium and long screens ───────────────
+   Yahoo quotes an implausible implied vol on deep, untraded strikes, and it
+   corrupts strike SELECTION rather than just one displayed number. Delta is
+   monotonic in sigma for an OTM option, so an inflated quote drags a strike's
+   apparent delta up toward 0.5 — and both screens pick strikes BY delta.
+
+   Found on the long screen (AAPL 2026-09-18 420 put: IV 195.72% against a
+   24.54% ATM, open interest 0, delta 0.544, which beat the genuine
+   near-the-money put for the 0.55 target). The premium screen selects from the
+   same chains with the same delta arithmetic and had NO such guard. It has not
+   been observed picking one — its 0.30/0.16 targets sit away from the ~0.5
+   region where inflated quotes cluster — but it is plainly reachable, and a
+   bogus premium candidate is a trade you might place rather than a row you
+   might squint at. Measured on a real AAPL chain (spot 313.33, 41 DTE, ATM 24%):
+
+     strike 400 (27.7% OTM)  true delta 0.0017  ·  at 4x IV reads 0.280  -> wins 0.30
+     strike 470 (50.0% OTM)  true delta 0.0000  ·  at 4x IV reads 0.139  -> wins 0.16
+
+   So the guard lives here, above both callers, and both pass their expiry's own
+   ATM IV. RESIDUAL, stated because it is not fixed: a 2-3x inflated quote still
+   wins a target and is NOT excluded, because 2-3x is inside genuine skew on far
+   strikes and excluding it would drop real candidates. This catches broken
+   quotes, not merely optimistic ones.
+
+   This is NOT the banned "fill a missing IV from ATM" (rule §7 on the long
+   screen): nothing is substituted, the strike is dropped from SELECTION only,
+   and the count plus the worst value are reported on the card. */
+const IV_OUTLIER_MULT = 4;
+
+/** True when a strike's IV is close enough to its expiry's ATM IV to be trusted
+ *  for selection. `atmIv` and `iv` are both DECIMALS. A null/absent ATM IV
+ *  disables the guard rather than rejecting everything — no reference, no verdict. */
+function ivPlausible(iv, atmIv) {
+  if (!Number.isFinite(iv) || iv <= 0) return false;
+  if (!Number.isFinite(atmIv) || atmIv <= 0) return true;
+  return iv <= atmIv * IV_OUTLIER_MULT && iv >= atmIv / IV_OUTLIER_MULT;
+}
+
+/** Shared reporting line for excluded strikes, so both screens word it identically.
+ *
+ *  The band is two-sided and the note has to say WHICH side. An earlier version
+ *  reported only `max(iv)` as "worst", which rendered "(worst: 0%)" whenever the
+ *  exclusions were all near-zero quotes — a number that reads like a bug rather
+ *  than like the low-side rejection it actually describes. */
+function ivOutlierNote(rejects, atmIvPct) {
+  const uniq = [...new Map(rejects.map(r => [`${r.type}:${r.strike}`, r])).values()];
+  if (!uniq.length) return null;
+  const lo = atmIvPct / IV_OUTLIER_MULT, hi = atmIvPct * IV_OUTLIER_MULT;
+  const above = uniq.filter(r => r.iv > hi), below = uniq.filter(r => r.iv < lo);
+  const parts = [];
+  if (above.length) parts.push(`${above.length} above (highest ${Math.max(...above.map(r => r.iv)).toFixed(1)}%)`);
+  if (below.length) parts.push(`${below.length} below (lowest ${Math.min(...below.map(r => r.iv)).toFixed(2)}%)`);
+  return {
+    count: uniq.length,
+    note: `${uniq.length} strike${uniq.length === 1 ? '' : 's'} excluded from selection for quoting an implied `
+        + `vol outside ${lo.toFixed(1)}%–${hi.toFixed(1)}% (${IV_OUTLIER_MULT}× either side of this expiry's `
+        + `ATM IV of ${atmIvPct.toFixed(1)}%): ${parts.join(', ')}. Nothing was substituted for them.`,
+  };
+}
 const PREM_MAX_SYMBOLS = 60;
 const PREM_SCHEMA      = 2;              // bump when the row shape changes, to retire cached rows
 
@@ -1494,16 +1554,24 @@ function ivRankFrom(history, currentIv) {
  * of the shares in a covered call; the card says so, because the same number
  * under two different capital bases would not be comparable.
  */
-function pickCandidates(chainExp, spot, rate, expUnix) {
+function pickCandidates(chainExp, spot, rate, expUnix, { atmIv = null, rejects = null } = {}) {
   const dte = dteOf(expUnix);
   if (!(dte > 0) || !Number.isFinite(spot) || !Number.isFinite(rate)) return [];
   const tYears = dte / 365;
 
   const build = (list, type) => (list || [])
-    .filter(o =>
-      Number.isFinite(o?.strike) &&
-      Number.isFinite(o?.impliedVolatility) && o.impliedVolatility > 0 &&
-      (type === 'call' ? o.strike >= spot : o.strike <= spot))
+    .filter((o) => {
+      if (!Number.isFinite(o?.strike)) return false;
+      if (!Number.isFinite(o?.impliedVolatility) || o.impliedVolatility <= 0) return false;
+      // Selection guard, shared with the long screen. Delta is monotonic in
+      // sigma for an OTM option, so a broken IV quote inflates a far strike's
+      // apparent delta into the target band and displaces the real strike.
+      if (!ivPlausible(o.impliedVolatility, atmIv)) {
+        if (rejects) rejects.push({ strike: o.strike, type, iv: +(o.impliedVolatility * 100).toFixed(2) });
+        return false;
+      }
+      return type === 'call' ? o.strike >= spot : o.strike <= spot;
+    })
     .map((o) => {
       const delta = bsDelta({ spot, strike: o.strike, tYears, vol: o.impliedVolatility, rate, type });
       if (delta == null) return null;
@@ -1660,12 +1728,22 @@ async function premiumRow(sym, rate, hv30, env) {
     if (exp == null) return null;
     if (!chain) return { kind, expiry: expiryIso(exp), dte: dteOf(exp), holdsEarnings: holdsEarnings(exp),
                          candidates: [], reason: 'expiry chain did not load' };
-    return {
+    // This leg's OWN ATM IV is the reference for the outlier guard — not the
+    // row's front-expiry IV, which would be the wrong comparator for a 104-day
+    // post-earnings leg.
+    const legAtm = atmIvFor(chain, spot);
+    const rejects = [];
+    const leg = {
       kind, expiry: expiryIso(exp), dte: dteOf(exp),
       holdsEarnings: holdsEarnings(exp),
-      candidates: Number.isFinite(rate) ? pickCandidates(chain, spot, rate, exp) : [],
+      candidates: Number.isFinite(rate)
+        ? pickCandidates(chain, spot, rate, exp, { atmIv: legAtm ? legAtm.atmIv / 100 : null, rejects })
+        : [],
       reason: Number.isFinite(rate) ? null : 'no risk-free rate — deltas suppressed',
     };
+    const out = legAtm ? ivOutlierNote(rejects, legAtm.atmIv) : null;
+    if (out) { leg.ivOutliers = out.count; leg.ivOutlierNote = out.note; }
+    return leg;
   };
 
   const legs = [];
@@ -1782,7 +1860,7 @@ async function refreshPremiumTicker(sym, env, shared = null) {
   const row = await premiumRow(sym, rate.rate, hv30, env);
   row.rate = {
     value: rate.rate, asOf: rate.asOf ?? null,
-    stale: !!rate.stale, reason: rate.reason || null,
+    stale: !!rate.stale, ageDays: rate.ageDays ?? null, reason: rate.reason || null,
   };
   await storePremiumRow(row, env);
   return row;
@@ -1952,13 +2030,19 @@ const LTCG_DAYS     = 366;    // a hold longer than this can qualify for long-te
 
 /* Row status — EXTENDS the premium vocabulary rather than forking it:
      ok · no-options · no-iv · error   (identical meaning to premium)
-     no-leaps  — options listed, but no January expiry beyond 365 DTE. A real
-                 finding about the name, not an error: some names simply have no
-                 LEAPS, and that is the answer to "can I replace the stock here".
-     illiquid  — every candidate breached its spread floor. Still fully priced
-                 and still rendered; the row just has to LOOK untradeable.
+     no-expiries — options are listed but nothing on the chain is screenable: no
+                   monthly at the swing horizon and no January past the LEAPS
+                   floor. Rare and correctly attributed.
+     illiquid    — every candidate breached its spread floor. Still fully priced
+                   and still rendered; the row just has to LOOK untradeable.
    `pending` is never stored; it is what the batch endpoint reports for a ticker
-   that has never been fetched. */
+   that has never been fetched.
+
+   There is deliberately NO `no-leaps` row status. "This name has no LEAPS" is a
+   Lane A fact, not a row failure — the swing and vertical lanes are unaffected
+   by it — so it surfaces as the Lane A entry's `not-listed` reason and as
+   `leapsListed: 0` on the row, which drives a chip. A row status would have
+   blanked three working lanes to report one missing one. */
 
 /** Long-premium gate. The inverse of sellableFrom() in direction, and the SAME
  *  tri-state shape — deliberately, because the null case has already caused one
@@ -2160,32 +2244,16 @@ function longCandidate(o, ctx, type, laneId) {
   };
 }
 
-/* Yahoo quotes an implausible implied vol on deep, untraded strikes, and it
-   corrupts strike SELECTION rather than just one displayed number.
-   Observed 2026-08-08 on AAPL: the 2026-09-18 420 put quoted IV 195.72% against
-   an expiry ATM IV of 24.54% — an 8× outlier on a strike with open interest 0
-   and volume 5. Delta computed from that quote is 0.544, which beat the real
-   near-the-money put for the 0.55 target. The screen would have printed a
-   confident, fully-priced "0.55 delta swing put" struck 34% ABOVE spot, with a
-   272.9% annualised cost of carry, and every downstream number — breakeven,
-   BE/EM, P(BE), leverage — would have been arithmetically correct and
-   completely meaningless.
-
-   So a strike whose IV is an implausible multiple of its own expiry's ATM IV is
-   excluded FROM SELECTION and counted. This is not the same as §7's ban on
-   filling a missing IV from ATM: nothing is substituted here, and the exclusion
-   is reported on the card rather than silently narrowing the chain. */
-const LONG_IV_OUTLIER_MULT = 4;   // real 41-DTE skew rarely exceeds ~2.5× ATM
-
-/** Nearest listed strike to a target |delta|, restricted to one moneyness side. */
+/** Nearest listed strike to a target |delta|, restricted to one moneyness side.
+ *  The IV-outlier guard is `ivPlausible()` in the premium section above — shared
+ *  with `pickCandidates()` on purpose, because both screens select strikes BY
+ *  delta off the same chains and a second copy is how the two drift apart. */
 function nearestDelta(list, spot, rate, tYears, type, target, { itm = null, atmIv = null, rejects = null } = {}) {
   let best = null, bestGap = Infinity;
-  const hi = atmIv ? atmIv * LONG_IV_OUTLIER_MULT : null;
-  const lo = atmIv ? atmIv / LONG_IV_OUTLIER_MULT : null;
   for (const o of list || []) {
     if (!Number.isFinite(o?.strike)) continue;
     if (!Number.isFinite(o?.impliedVolatility) || o.impliedVolatility <= 0) continue;
-    if (hi != null && (o.impliedVolatility > hi || o.impliedVolatility < lo)) {
+    if (!ivPlausible(o.impliedVolatility, atmIv)) {
       if (rejects) rejects.push({ strike: o.strike, type, iv: +(o.impliedVolatility * 100).toFixed(2) });
       continue;
     }
@@ -2398,6 +2466,32 @@ function alignTagFor(rating, optType, lane) {
   };
 }
 
+/**
+ * Lane A expiry selection, factored out of longRow so it is testable without a
+ * network fixture — the same reasoning as `tradingDayStatus()` in the cron gate:
+ * anything decided in code should be checkable before deploy.
+ *
+ * §2 asks for "the January nearest 540 DTE" plus "the nearest January ≥365 DTE".
+ * With third-Friday Januaries spaced ~366 days apart those two rules select the
+ * SAME expiry on all but ~7 days a year: the near January only wins the 540
+ * target once it is already ≥358 DTE, and it clears the 365 floor at 365. So
+ * Lane A takes the two nearest Januaries past the floor — primary nearest
+ * `LEAPS_TARGET_DTE`, secondary the next one out. The secondary is frequently
+ * unlisted; that is a fact about the name, reported rather than hidden.
+ */
+function pickJanuaries(monthlies) {
+  const januaries = (monthlies || [])
+    .filter(e => new Date(e * 1000).getUTCMonth() === 0 && dteOf(e) >= LEAPS_MIN_DTE);
+  const janPrimary = januaries.length
+    ? januaries.reduce((b, e) =>
+        Math.abs(dteOf(e) - LEAPS_TARGET_DTE) < Math.abs(dteOf(b) - LEAPS_TARGET_DTE) ? e : b)
+    : null;
+  const janSecondary = janPrimary == null ? null
+    : (januaries.filter(e => e !== janPrimary)
+        .sort((a, b) => Math.abs(dteOf(a) - dteOf(janPrimary)) - Math.abs(dteOf(b) - dteOf(janPrimary)))[0] ?? null);
+  return { januaries, janPrimary, janSecondary };
+}
+
 /** One long-screen row. Never throws — a failed ticker reports why. */
 async function longRow(sym, env, { rate, premium }) {
   const fail = (status, reason) => ({
@@ -2506,23 +2600,26 @@ async function longRow(sym, env, { rate, premium }) {
 
   /* ── Expiry selection ─────────────────────────────────────────────────────── */
   const monthlies = exps.filter(isMonthlyExpiry);
-  const januaries = monthlies.filter(e => new Date(e * 1000).getUTCMonth() === 0 && dteOf(e) >= LEAPS_MIN_DTE);
-  // §2 asks for "nearest 540 DTE" and "nearest January ≥365 DTE". On most dates
-  // those collapse onto one expiry, so Lane A takes the two nearest Januaries
-  // clearing the LTCG line: primary = nearest LEAPS_TARGET_DTE, secondary = the
-  // next January out. The far one is frequently unlisted — that is a fact about
-  // the name and is reported, not hidden.
-  const janPrimary = januaries.length
-    ? januaries.reduce((b, e) => Math.abs(dteOf(e) - LEAPS_TARGET_DTE) < Math.abs(dteOf(b) - LEAPS_TARGET_DTE) ? e : b)
-    : null;
-  const janSecondary = januaries.filter(e => e !== janPrimary)
-    .sort((a, b) => Math.abs(dteOf(a) - dteOf(janPrimary)) - Math.abs(dteOf(b) - dteOf(janPrimary)))[0] ?? null;
+  const { januaries, janPrimary, janSecondary } = pickJanuaries(monthlies);
 
   const bExp1 = monthlies.find(e => dteOf(e) >= LANE_B_DTES[0]) ?? null;
   const bExp2 = monthlies.find(e => dteOf(e) >= LANE_B_DTES[1] && e !== bExp1) ?? null;
 
+  /* This was `no-leaps`, and that status has been REMOVED. It required no January
+     beyond 365 DTE AND no monthly at either swing horizon — i.e. it could only
+     fire when the name had essentially no usable expiries at all, at which point
+     "no LEAPS" names the wrong cause (honesty rule 17: an error message must not
+     misattribute itself). It also implied a row-level coverage check the screen
+     does not perform, and it would have failed the whole row over a Lane A fact
+     while Lanes B/C/D were still perfectly priceable.
+
+     The LEAPS signal it was reaching for is Lane-A-scoped and already carried
+     two ways: the lane entry reports `not-listed` with its reason, and the row
+     carries `leapsListed` (0 = this name has no LEAPS) for the summary chip. */
   if (!januaries.length && !bExp1 && !bExp2) {
-    return fail('no-leaps', `no January expiry beyond ${LEAPS_MIN_DTE} DTE and no monthly ≥${LANE_B_DTES[0]} DTE is listed`);
+    return fail('no-expiries',
+      `options are listed but there is no monthly expiry at ${LANE_B_DTES[0]}+ DTE and no January beyond `
+      + `${LEAPS_MIN_DTE} DTE — nothing on this chain to screen`);
   }
 
   // Sequential on purpose: chainFor dedupes through `loaded`, which concurrent
@@ -2586,13 +2683,8 @@ async function longRow(sym, env, { rate, premium }) {
     }
     // Reported, not hidden: an excluded strike is a fact about Yahoo's quote and
     // the user should be able to see how much of the chain it applied to.
-    const uniq = [...new Map(rejects.map(r => [`${r.type}:${r.strike}`, r])).values()];
-    if (uniq.length) {
-      entry.ivOutliers = uniq.length;
-      entry.ivOutlierNote = `${uniq.length} strike${uniq.length === 1 ? '' : 's'} excluded from selection for `
-        + `quoting an implausible implied vol against this expiry's ATM IV of ${ctx.atmIv.toFixed(1)}% `
-        + `(worst: ${uniq.reduce((a, b) => a.iv > b.iv ? a : b).iv}%). Nothing was substituted for them.`;
-    }
+    const out = ivOutlierNote(rejects, ctx.atmIv);
+    if (out) { entry.ivOutliers = out.count; entry.ivOutlierNote = out.note; }
     entry.status = entry.candidates.length ? 'ok' : 'no-iv';
     if (!entry.candidates.length) entry.reason = 'no strike on this expiry quotes both a usable IV and an ask';
     return entry;
@@ -2759,7 +2851,8 @@ async function refreshLongTicker(sym, env) {
     if (p && p.ts && Date.now() - p.ts < PREMIUM_FRESH_MS) premium = p;
   } catch (_) {}
   const row = await longRow(sym, env, { rate: rate.rate, premium });
-  row.rate = { value: rate.rate, asOf: rate.asOf ?? null, stale: !!rate.stale, reason: rate.reason || null };
+  row.rate = { value: rate.rate, asOf: rate.asOf ?? null, stale: !!rate.stale,
+               ageDays: rate.ageDays ?? null, reason: rate.reason || null };
   row.gates = {
     ivrBuyMax: IVR_BUY_MAX, ratioBuyMax: RATIO_BUY_MAX,
     spreadMaxNear: LONG_SPREAD_MAX_NEAR, spreadMaxLeaps: LONG_SPREAD_MAX_LEAPS,
@@ -3271,20 +3364,40 @@ function bsDelta({ spot, strike, tYears, vol, rate = 0, type = 'call' }) {
    call delta down and every put delta up. */
 const RATE_KV_KEY  = 'econ:dgs3mo';
 const RATE_FRESH_S = 12 * 3600;
-const RATE_KEEP_S  = 7 * 24 * 3600;
+/* Retention is 90 days, NOT the 12h freshness window and no longer the 7 days it
+   was. FRED is the single upstream that can blank an entire screen: with no rate
+   there is no Black-Scholes delta, and with no delta the premium screen has no
+   candidate strikes and the long screen has no lanes at all. Suppression is the
+   right response to *never having had* a rate — it is a terrible response to a
+   transient outage.
+
+   The 3-month T-bill is the slowest-moving input on either screen. A week-old
+   print moves a delta in the third decimal; the difference between a 7-day-old
+   rate and today's is not a difference anyone would trade on, and it is
+   categorically smaller than the difference between a rate and NO SCREEN. So the
+   cached print survives 90 days of FRED being unreachable, is flagged `stale`,
+   and carries `ageDays` so the card can say how old it is rather than implying
+   it is current. Past 90 days the key expires and deltas suppress — at which
+   point the value really would be doing more harm than good. */
+const RATE_KEEP_S  = 90 * 24 * 3600;
+
+/** Age of a stored rate in whole days, for display. */
+const rateAgeDays = ts => Number.isFinite(ts) ? Math.max(0, Math.round((Date.now() - ts) / 86_400_000)) : null;
 
 async function riskFreeRate(env) {
   let cached = null;
   try { cached = await env?.REC_LOG?.get(RATE_KV_KEY, 'json'); } catch (_) {}
   if (cached?.rate != null && Date.now() - (cached.ts || 0) < RATE_FRESH_S * 1000) {
-    return { ...cached, stale: false };
+    return { ...cached, stale: false, ageDays: rateAgeDays(cached.ts) };
   }
 
   const key = env?.FRED_API_KEY;
   if (!key) {
     return cached?.rate != null
-      ? { ...cached, stale: true, reason: 'FRED_API_KEY not configured — last stored print' }
-      : { rate: null, asOf: null, reason: 'FRED_API_KEY not configured' };
+      ? { ...cached, stale: true, ageDays: rateAgeDays(cached.ts),
+          reason: `FRED_API_KEY not configured — using the last stored print from ${cached.asOf} `
+                + `(${rateAgeDays(cached.ts)}d old). Deltas are computed from it rather than suppressed.` }
+      : { rate: null, asOf: null, ageDays: null, reason: 'FRED_API_KEY not configured and no stored print' };
   }
 
   try {
@@ -3299,12 +3412,16 @@ async function riskFreeRate(env) {
 
     const fresh = { rate: +(pct / 100).toFixed(6), pct, asOf: obs.date, ts: Date.now(), source: 'FRED DGS3MO' };
     try { await env?.REC_LOG?.put(RATE_KV_KEY, JSON.stringify(fresh), { expirationTtl: RATE_KEEP_S }); } catch (_) {}
-    return { ...fresh, stale: false };
+    return { ...fresh, stale: false, ageDays: 0 };
   } catch (e) {
     console.warn('[rate] DGS3MO fetch failed:', e.message);
+    // Degrade to the stored print for up to RATE_KEEP_S rather than blanking every
+    // delta on both screens. The age rides along so the card states it.
     return cached?.rate != null
-      ? { ...cached, stale: true, reason: `FRED unavailable (${e.message}) — last stored print` }
-      : { rate: null, asOf: null, reason: `FRED unavailable: ${e.message}` };
+      ? { ...cached, stale: true, ageDays: rateAgeDays(cached.ts),
+          reason: `FRED unavailable (${e.message}) — using the last stored print from ${cached.asOf} `
+                + `(${rateAgeDays(cached.ts)}d old). The 3-month bill moves too slowly for this to change a strike.` }
+      : { rate: null, asOf: null, ageDays: null, reason: `FRED unavailable and no stored print: ${e.message}` };
   }
 }
 

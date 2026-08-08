@@ -569,10 +569,13 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Three checks exist, all of which print computed vs
+There is no build step. Four checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
-(Black-Scholes delta), and `node nd2.check.mjs` (the Long tab's `P(BE)@exp`,
+(Black-Scholes delta), `node long-fixtures.check.mjs` (the three Long-screen paths
+live data cannot reach: `buyableFrom()`'s `rank` branch, which stays unreachable
+until 60 days of IV history exist; Lane A with **two** listed Januaries; and the
+shared `ivPlausible()` guard at its boundaries), and `node nd2.check.mjs` (the Long tab's `P(BE)@exp`,
 theta and vega — N(d2) against a reference series-erf **and** against
 e^{rT}·(−∂C/∂K) by central difference, which is a structurally different
 derivation and so catches "right arithmetic, wrong quantity"; greeks against
@@ -957,7 +960,7 @@ differs from its retention, both are given and the reason is in the notes.
 | `13f:index` | 100d | ticker→managers reverse index plus `byManager` per-manager holdings |
 | `13f:cursor` | 100d | Which manager the incremental 13F pass is up to. **Outside the `13f:index` key** so advancing the cursor never rewrites the index. |
 | `econ:fred` | 12h, or **15min** on failure | FRED release dates |
-| `econ:dgs3mo` | **7d retention / 12h freshness** | FRED 3-month T-bill — the risk-free rate for Black-Scholes. See below. |
+| `econ:dgs3mo` | **90d retention / 12h freshness** | FRED 3-month T-bill — the risk-free rate for Black-Scholes. Retention was 7d and is now 90d: FRED is the one upstream that can blank two entire screens, and a week-old bill is not a difference anyone trades on. See below. |
 | `earnings:{TICKER}` | 2d | Earnings analysis for the last report |
 | `fund:{TICKER}` | 6h | Yahoo fundamentals cache |
 | `market:ipos` | 12h | IPO calendar |
@@ -976,17 +979,28 @@ leaving nothing to render *as* stale. A 5-hour-old chain badged "stale" is more
 useful than a blank row, so `PREMIUM_FRESH_MS` (4h) drives the badge and
 revalidation while `PREMIUM_ROW_TTL` (24h) keeps the row alive to be badged.
 
-**`econ:dgs3mo` — 12h freshness, 7d retention.** The FRED integration originally
-resolved *release dates* only; `fetchFredReleaseDates()` never fetched a series
-observation, so there was no cached rate to read and this was added later.
-`riskFreeRate()` calls `/fred/series/observations?series_id=DGS3MO`. The long
-retention is the outage path: past 12h it refetches, and if FRED is unreachable it
-returns the **last stored print flagged `stale: true`** rather than nothing. With
-no stored print at all the rate is `null` and every delta is suppressed — never
-defaulted to `r = 0`, which is worth about a full delta point at 30 DTE and would
-change which strike the screen picks. DGS3MO publishes `"."` on market holidays,
-so the fetch scans the **last 10 observations** for a numeric one instead of taking
-row 0.
+**`econ:dgs3mo` — 12h freshness, 90d retention, and the gap is the whole point.**
+The FRED integration originally resolved *release dates* only; `fetchFredReleaseDates()`
+never fetched a series observation, so there was no cached rate to read and this
+was added later. `riskFreeRate()` calls `/fred/series/observations?series_id=DGS3MO`.
+
+**FRED is the single upstream that can blank two entire screens.** No rate means
+no Black-Scholes delta; no delta means the premium screen has no candidate strikes
+and the long screen has no lanes at all. Retention was **7 days**, which meant a
+FRED outage lasting longer than a week evicted the key and took both screens down
+completely. It is now **90 days**: past 12h the value refetches, and if FRED is
+unreachable the **last stored print is returned flagged `stale: true` with
+`ageDays`**, which the card renders as *"FRED DGS3MO · 9d old"* in amber. The
+3-month bill is the slowest-moving input on either screen — a week-old print moves
+a delta in the third decimal, and that is categorically smaller than the difference
+between a stale rate and no screen.
+
+Suppression is still correct for the one case it describes: **never having had a
+rate at all.** Then it is `null`, every delta is suppressed, the card reads
+*"— · unavailable"*, and nothing is defaulted to `r = 0` — worth about a full delta
+point at 30 DTE and enough to change which strike gets picked. DGS3MO publishes
+`"."` on market holidays, so the fetch scans the **last 10 observations** for a
+numeric one instead of taking row 0.
 
 **Do not declare a local `const TTL`.** `TTL` is a module-level table (`TTL.quote`,
 `TTL.scanner`, …) feeding `srcMeta({ ttlSeconds })`. Four handlers each declared
@@ -1279,8 +1293,11 @@ IV would be a plausible number measuring nothing. Cost of carry is likewise abse
 the short leg refunds part of the extrinsic, so the Lane A formula does not describe the structure.
 
 **Row status extends the Premium vocabulary** rather than forking it: `ok` · `no-options` · `no-iv` ·
-**`no-leaps`** (options listed but no January beyond 365 DTE and no monthly at the swing horizon — a
-finding about the name) · `illiquid` · `error`. `pending` is never stored.
+**`no-expiries`** (options listed but nothing screenable — no monthly at the swing horizon and no
+January past the LEAPS floor) · `illiquid` · `error`. `pending` is never stored. There is deliberately
+**no `no-leaps` row status**: "this name has no LEAPS" is a Lane A fact, carried by that lane's
+`not-listed` reason and by `leapsListed: 0` on the row, which drives a chip. Failing the whole row would
+have blanked three working lanes to report one missing one.
 
 **Liquidity floors** `LONG_SPREAD_MAX_NEAR` (0.15) and `LONG_SPREAD_MAX_LEAPS` (0.30) as spread ÷ mid,
 plus `LONG_MIN_OI` (10). A breach is **flagged and dimmed, never dropped** — a name whose options are
@@ -1297,16 +1314,40 @@ the rest **only once calibration resolves at n ≥ 10** — an unscored tag must
 
 ### Adding a rule: two failure modes found building the Long tab
 
-**1. Yahoo quotes junk implied vol on deep untraded strikes, and it corrupts strike SELECTION.**
-Observed on AAPL 2026-08-08: the 2026-09-18 **420 put quoted IV 195.72% against an expiry ATM IV of
-24.54%** — an 8× outlier on a strike with open interest 0. Delta from that quote is 0.544, which beat the
-real near-the-money put for the 0.55 target. The screen would have printed a confident, fully-priced
-"0.55Δ swing put" struck **34% above spot** with a 272.9% annualised cost of carry, and every downstream
-number would have been arithmetically correct and completely meaningless. `LONG_IV_OUTLIER_MULT` (4)
-excludes such strikes **from selection** and the lane reports how many and the worst value. This is not
-the banned "fill a missing IV from ATM" — nothing is substituted, and the exclusion is declared on the
-card. **When a metric selects among rows using a vendor-supplied number, validate that number against
-its own peers first; a bad input to a selection is invisible in the output.**
+**1. Yahoo quotes junk implied vol on deep untraded strikes, and it corrupts strike SELECTION —
+on BOTH screens.** Observed on AAPL 2026-08-08: the 2026-09-18 **420 put quoted IV 195.72% against an
+expiry ATM IV of 24.54%** — an 8× outlier on a strike with open interest 0. Delta from that quote is
+0.544, which beat the real near-the-money put for the long screen's 0.55 target. The screen would have
+printed a confident, fully-priced "0.55Δ swing put" struck **34% above spot** with a 272.9% annualised
+cost of carry, and every downstream number would have been arithmetically correct and completely
+meaningless.
+
+**The first fix was scoped to the long screen and that was wrong.** `pickCandidates()` (premium) and
+`nearestDelta()` (long) are *separate* functions selecting from the *same* chains with the *same* delta
+arithmetic, and only one of them got the guard. Delta is monotonic in sigma for an OTM option, so
+inflated quotes drag apparent delta up toward 0.5 — which is why the long screen's 0.55/0.40 targets
+were hit first and the premium screen's 0.30/0.16 were not. That is a difference in *exposure*, not in
+*correctness*. Measured on a real AAPL chain (spot 313.33, 41 DTE, ATM 24%):
+
+| strike | % OTM | true delta at ATM IV | delta at 4× IV | wins premium target |
+|---|---|---|---|---|
+| 400 | 27.7% | **0.0017** | **0.280** | 0.30 |
+| 470 | 50.0% | 0.0000 | 0.139 | 0.16 |
+
+And the junk strikes are demonstrably sitting in premium's selectable pool right now: turning the guard
+on excluded **43 strikes on AAPL and 32 on NVDA** (one quoting **973.63%**) from the *nearest* expiry
+alone, while changing zero live selections. They were not winning today; they were waiting for a day
+when the genuine strike sat marginally further from the target.
+
+The guard is therefore `ivPlausible()` / `IV_OUTLIER_MULT` (4), declared **above both callers** and
+passed each expiry's *own* ATM IV — not the row's front IV, which is the wrong comparator for a 104-day
+leg. Both screens report the exclusions on the card via `ivOutlierNote()`. **RESIDUAL, not fixed:** a
+2–3× inflated quote still wins a target and is deliberately not excluded, because 2–3× is inside
+genuine far-strike skew. This catches broken quotes, not merely optimistic ones.
+
+**When a metric SELECTS using a vendor-supplied number, validate that number against its own peers
+first — and then check every other selector fed by the same source.** A bad input to a display is one
+wrong cell; a bad input to a selection is invisible, because the output looks like an ordinary row.
 
 **2. A null rendered through arithmetic becomes a fabricated measurement.** The legend printed
 **"hit rate 0% over n=12"**. Calibration was genuinely resolved (n=12 ≥ 10) but `hitRate` was `null`,
@@ -1315,6 +1356,24 @@ because a hit rate belongs to a *rating* and that ticker had no stored rating �
 exactly what §6b forbids. **Guard the null before the arithmetic, not after: `x == null` and `x === 0`
 must never render the same way.** The state count was two (resolved / unresolved) and the truth was
 three.
+
+An audit of every `.toFixed` and `× 100` site in both HTML files followed. The only *fabricated number*
+was that one; the rest were already guarded by an early return, a ternary, or an upstream `.filter()`.
+One further site of the same class was found and fixed — `gapBar()` on the golden-cross tab, where a
+null gap divided to 0 and clamped to the 2% floor, **drawing a real bar for a missing measurement**.
+A bar is a rendered number. Note also what the audit got *wrong*: the fundamentals grid looked
+unguarded (`${v}` on a `?.raw?.toFixed()`) but line 2439 already filters with `.filter(r => r[1] != null)`,
+and `undefined != null` is false — **check the guard that is already there before adding one**, or the
+"fix" is noise and the comment beside it is a lie.
+
+**3. A status word that cannot fire is worse than no status word.** The long screen shipped a
+`no-leaps` row status whose condition required no January past 365 DTE **and** no monthly at either
+swing horizon — effectively unreachable, and if it ever had fired it would have said "no LEAPS" about a
+chain whose actual problem was having no usable expiries at all (honesty rule 17). It also implied a
+row-level coverage check the screen does not perform. It is now `no-expiries`, accurately named, and the
+LEAPS signal it was reaching for lives where it belongs: the Lane A entry's `not-listed` reason, and
+`leapsListed: 0` on the row driving a chip. **A row status must not fail three working lanes to report
+a fact about the fourth.**
 
 The Scanner tab hosts four presets. Three (Momentum, Pre-Market Gappers, All Movers) hit
 `/api/market/scanner` and share `renderScanner()`; the Golden Cross Setup preset hits

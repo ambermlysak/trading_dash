@@ -13,6 +13,8 @@ trading_dash/
 ├── bs-delta.check.mjs   # Black-Scholes delta check — prints computed vs expected
 ├── nd2.check.mjs        # Long tab P(BE)@exp = N(d2), theta, vega — three
 │                        #   independent cross-checks, prints computed vs expected
+├── long-fixtures.check.mjs # Long-screen paths live data cannot reach: the IV-rank
+│                        #   gate branch, Lane A with two Januaries, the IV guard
 ├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
 │                        #   both DST regimes; prints computed vs expected
 ├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
@@ -190,23 +192,48 @@ in this codebase and shipped:
    guidance conflicts with a project rule here, the project rule wins. General documentation does
    not know this account is on Workers Paid, does not know which cron hours fall outside
    the trigger window, and does not know which of these numbers have already been wrong on screen.
-21. **A vendor number that drives *selection* must be validated against its peers before it is used.**
-   Yahoo quoted implied vol of 195.72% on AAPL's 2026-09-18 420 put against an expiry ATM IV of 24.54%
-   — an 8× outlier on a strike with zero open interest. The Black-Scholes delta computed from it was
-   0.544, which beat the genuine near-the-money put for the Long tab's 0.55-delta target. Every number
-   downstream — breakeven, BE/EM, P(BE), leverage, a 272.9% annualised carry — was then arithmetically
-   correct and completely meaningless, describing a "0.55 delta swing put" struck 34% *above* spot. A
-   bad input to a *display* shows up as one wrong cell; a bad input to a *selection* is invisible,
-   because the output looks like a normal row. Outlier strikes are now excluded from selection with
-   the count and the worst value declared on the card — which is not the same as the banned practice
-   of filling a missing IV from ATM, since nothing is substituted.
+21. **A vendor number that drives *selection* must be validated against its peers — and then every
+   other selector fed by the same source must be checked too.** Yahoo quoted implied vol of 195.72% on
+   AAPL's 2026-09-18 420 put against an expiry ATM IV of 24.54% — an 8× outlier on a strike with zero
+   open interest. The Black-Scholes delta computed from it was 0.544, which beat the genuine
+   near-the-money put for the Long tab's 0.55-delta target. Every number downstream — breakeven, BE/EM,
+   P(BE), leverage, a 272.9% annualised carry — was then arithmetically correct and completely
+   meaningless, describing a "0.55 delta swing put" struck 34% *above* spot. A bad input to a *display*
+   shows up as one wrong cell; a bad input to a *selection* is invisible, because the output looks like
+   a normal row.
+   **The first fix covered only the Long screen, and that was the real mistake.** Premium's
+   `pickCandidates()` and Long's `nearestDelta()` are separate functions selecting from the same chains
+   with the same arithmetic. Premium had not been observed picking a junk strike only because inflated
+   IV drags apparent delta *toward 0.5*, away from its 0.30/0.16 targets — a difference in exposure,
+   not in correctness. On a real AAPL chain the 400 strike's true delta is 0.0017 and reads 0.280 at
+   4× IV, which wins the 0.30 target outright; enabling the guard excluded 43 junk strikes on AAPL and
+   32 on NVDA (one at 973.63%) that were already sitting in Premium's selectable pool. The guard is now
+   one shared `ivPlausible()` above both callers. Nothing is substituted and the exclusions are
+   declared on the card, so this is not the banned "fill a missing IV from ATM".
+23. **A status word that cannot fire is worse than no status word.** The Long screen shipped a
+   `no-leaps` row status whose condition required no January past 365 DTE *and* no monthly at either
+   swing horizon — effectively unreachable, and had it fired it would have blamed missing LEAPS for a
+   chain with no usable expiries at all (rule 17). Worse, it would have failed the whole row — blanking
+   three working lanes — to report a fact about the fourth. Renamed `no-expiries`; the LEAPS signal now
+   lives in the Lane A entry's `not-listed` reason and in `leapsListed: 0` on the row.
+24. **A single upstream must not be able to blank a whole screen when a stale value would do.**
+   The risk-free rate is cached 12h and was *retained* only 7 days, so a FRED outage longer than a week
+   evicted the key, suppressed every Black-Scholes delta, and took the premium and long screens down
+   entirely. Suppression is the right answer to *never having had* a rate (rule 14 — never default to
+   `r = 0`). It is the wrong answer to a transient outage of the slowest-moving input on the page.
+   Retention is now 90 days and the stored print is served flagged `stale` with its age rendered
+   ("FRED DGS3MO · 9d old"). **Match the failure response to the failure: "no value has ever existed"
+   and "the refresh is late" are different states and must not degrade the same way.**
 22. **A null pushed through arithmetic becomes a fabricated measurement.** The Long tab's legend
    rendered **"hit rate 0% over n=12"**. Calibration really was resolved, but `hitRate` was `null`
    because a hit rate belongs to a rating and that ticker had no stored rating — and
    `(null * 100).toFixed(0)` is `"0"`. An absent measurement silently became a measured 0% accuracy,
    the exact claim the alignment tag is forbidden from implying. The code modelled two states
    (resolved / unresolved) where there were three. Check `== null` *before* the arithmetic: a missing
-   value and a zero must never render the same way.
+   value and a zero must never render the same way. **A rendered bar is a rendered number too** — the
+   golden-cross `gapBar()` divided a null gap to 0 and clamped it to a 2% floor, drawing a real bar for
+   a missing measurement. Caught only by auditing the whole class after the first instance; a
+   `.toFixed` sweep alone would have missed it.
 
 ## Section-by-section data source map
 

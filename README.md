@@ -147,6 +147,9 @@ the data is past its refresh window.
 - `cors-check.html` — open in a browser to verify CORS preflight against the Worker
 - `nd2.check.mjs` — the Long tab's `P(BE)@exp` (N(d2)), theta and vega, cross-checked
   three independent ways; prints computed vs expected
+- `long-fixtures.check.mjs` — the Long-screen paths live data cannot reach yet:
+  the IV-rank gate branch, Lane A with two listed Januaries, and the shared
+  IV-outlier guard at its boundaries
 - `CLAUDE.md` — working rules; **read the constraints block first**
 - `ARCHITECTURE.md` — data source map, honesty rules, what is deliberately not done
 
