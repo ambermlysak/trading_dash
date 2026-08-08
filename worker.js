@@ -1886,6 +1886,980 @@ function premiumRowMeta(row) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   LONG-PREMIUM SCREEN  (/api/long)
+
+   The mirror of the premium screen, and the places it is NOT a mirror are
+   commented individually. Premium asks "where is vol rich enough to sell".
+   This asks "where is vol cheap enough to own, and is the debit structurally
+   payable". Several things invert, and an inverted thing that looks like a copy
+   is how this gets broken later:
+
+     • Premium takes the BID (what a seller can hit). This takes the ASK.
+     • Premium wants IV rank HIGH. This wants it LOW.
+     • Premium reads positive termStructure (backwardation) as the crush setup,
+       a GOOD thing. Here it is the HOSTILE state — front-dated premium is
+       exactly what you are buying, and backwardation means it is the rich end.
+     • Premium's POP is 1 − |Δ| of a short strike. That is N(d1) and it is the
+       WRONG quantity for a long: see probBeyondBreakeven() below.
+
+   Subrequest cost, measured with the INSTR counter (see §"Verification" in the
+   report and rule #1 — the 10,000 cap is one pool and these figures are
+   external fetches only):
+
+     premium-warm  5   base list + 2 Lane A Januaries + 2 Lane B monthlies
+     premium-cold  8-9  + earnings quoteSummary + hv30 chart + back ATM chain
+
+   The reuse of `premium:{TICKER}` is deliberate coupling and is made visible:
+   if the premium row is cold this endpoint is MORE EXPENSIVE, never broken.
+   What is reused is only the slow-moving half (front/back ATM IV, term
+   structure, earnings date, hv30 / IV rank / proxy). Spot and the expiry list
+   are ALWAYS taken live from the base options call, because that call has to
+   happen anyway and a 4-hour-old spot would propagate into every breakeven,
+   leverage figure and N(d2) on a screen where the user is about to pay a debit.
+   The row therefore carries TWO timestamps — `ts` for the live half and
+   `sharedTs`/`sharedFrom` for the reused half — so the card can age them
+   separately instead of implying one as-of for both.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const LONG_SCHEMA      = 1;
+const LONG_FRESH_MS    = 4 * 3600_000;   // freshness horizon — drives the stale badge
+const LONG_ROW_TTL     = 24 * 3600;      // KV retention: outlives freshness so stale can render
+const LONG_MAX_SYMBOLS = 60;
+
+/* Lane A — stock replacement. The two nearest Januaries clearing the LTCG line.
+   §2 selects "nearest 540 DTE" and "nearest January ≥365 DTE"; on most dates
+   those collapse to the same expiry (2026-08-08: both resolve to 2028-01-21),
+   so the second slot is the next January out. Expect the far one to be unlisted
+   or unpriced on all but the largest names — that is a finding about the name,
+   reported as a per-expiry status, never filled in from ATM IV. */
+const LEAPS_MIN_DTE    = 365;
+const LEAPS_TARGET_DTE = 540;
+const LANE_A_TARGETS   = [0.85, 0.70];   // ITM — deep enough to be a share proxy
+const LANE_B_DTES      = [30, 60];       // first monthly at or beyond each
+const LANE_B_TARGETS   = [0.55, 0.40];
+const LANE_C_LONG      = 0.55;
+const LANE_C_SHORT     = 0.25;
+
+/* Gate constants. Shipped to the frontend in `gates` so neither HTML file
+   hardcodes a threshold — the same reason volRegime() lives in the Worker. */
+const IVR_BUY_MAX   = 40;     // IV rank at or below this is "not rich"
+const RATIO_BUY_MAX = 0.95;   // IV/HV30 proxy analogue, used while the rank collects
+const LONG_SPREAD_MAX_NEAR  = 0.15;  // (ask−bid)/mid ceiling, ≤90 DTE
+const LONG_SPREAD_MAX_LEAPS = 0.30;  // ditto, LEAPS — far chains are legitimately wider
+const LONG_MIN_OI   = 10;
+const LONG_BE_EM_MAX = 1.0;   // best-candidate BE/EM must clear this for a row to be undimmed
+const LTCG_DAYS     = 366;    // a hold longer than this can qualify for long-term treatment
+
+/* Row status — EXTENDS the premium vocabulary rather than forking it:
+     ok · no-options · no-iv · error   (identical meaning to premium)
+     no-leaps  — options listed, but no January expiry beyond 365 DTE. A real
+                 finding about the name, not an error: some names simply have no
+                 LEAPS, and that is the answer to "can I replace the stock here".
+     illiquid  — every candidate breached its spread floor. Still fully priced
+                 and still rendered; the row just has to LOOK untradeable.
+   `pending` is never stored; it is what the batch endpoint reports for a ticker
+   that has never been fetched. */
+
+/** Long-premium gate. The inverse of sellableFrom() in direction, and the SAME
+ *  tri-state shape — deliberately, because the null case has already caused one
+ *  incident on the premium tab: treating "no basis to judge" as a fail dimmed
+ *  every row for the whole 60-day collection window. `buyable: null` renders
+ *  NEUTRAL, not dim.
+ *
+ *  Note this is NOT `!sellable`. Both gates can be false at once — an IV rank of
+ *  55 is neither rich enough to sell nor cheap enough to buy, and that is a real
+ *  and common state, not a contradiction. */
+function buyableFrom(ivRank, ivHvRatio, historyDays) {
+  if (ivRank != null) {
+    const pts = ivRank * 100;
+    const ok  = pts <= IVR_BUY_MAX;
+    return {
+      buyable: ok, basis: 'rank',
+      reason: `IVR ${pts.toFixed(0)} — ${ok ? 'at or below' : 'above'} the ${IVR_BUY_MAX} ceiling for `
+            + `buying premium${ok ? '' : '; vol is not cheap here'}`,
+    };
+  }
+  if (ivHvRatio != null) {
+    const ok = ivHvRatio <= RATIO_BUY_MAX;
+    return {
+      buyable: ok, basis: 'proxy',
+      reason: `rank collecting (${historyDays}/${IV_RANK_MIN_DAYS}d), proxy ${ivHvRatio.toFixed(2)}× — `
+            + `${ok ? 'at or below' : 'above'} ${RATIO_BUY_MAX.toFixed(2)}×, i.e. implied vol is pricing `
+            + `${ok ? 'no more' : 'more'} movement than this name has actually realised. A proxy, not a percentile.`,
+    };
+  }
+  return {
+    buyable: null, basis: 'none',
+    reason: 'No IV rank yet and no IV/HV30 proxy either — no basis to judge whether vol is cheap here, '
+          + 'so this row is neither recommended nor dismissed.',
+  };
+}
+
+/** Standard normal PDF — needed for theta and vega, which delta alone does not give. */
+function normPdf(x) {
+  return Number.isFinite(x) ? Math.exp(-x * x / 2) * 0.3989422804014327 : null;
+}
+
+/**
+ * Full Black-Scholes greeks for one contract. `vol`/`rate` are DECIMALS, the
+ * same convention as bsDelta() — anything read off an `atmIv` field is percent
+ * and must be divided by 100 first.
+ *
+ * theta is per YEAR here; callers divide by 365. vega is per 1.00 of sigma, so
+ * "per 1 IV point" is vega/100 per share — which, times the 100-share contract
+ * multiplier, is numerically just `vega`. That coincidence is commented at the
+ * call site because it looks like a missing conversion.
+ */
+function bsGreeks({ spot, strike, tYears, vol, rate = 0, type = 'call' }) {
+  if (![spot, strike, tYears, vol, rate].every(Number.isFinite)) return null;
+  if (spot <= 0 || strike <= 0 || tYears <= 0 || vol <= 0) return null;
+  const sqrtT = Math.sqrt(tYears);
+  const d1 = (Math.log(spot / strike) + (rate + vol * vol / 2) * tYears) / (vol * sqrtT);
+  const d2 = d1 - vol * sqrtT;
+  const nd1 = normCdf(d1), nd2 = normCdf(d2), pdf = normPdf(d1);
+  if (nd1 == null || nd2 == null || pdf == null) return null;
+  const disc = Math.exp(-rate * tYears);
+  const theta = type === 'put'
+    ? -spot * pdf * vol / (2 * sqrtT) + rate * strike * disc * normCdf(-d2)
+    : -spot * pdf * vol / (2 * sqrtT) - rate * strike * disc * nd2;
+  return {
+    delta: type === 'put' ? nd1 - 1 : nd1,
+    d1, d2, theta,
+    vega: spot * pdf * sqrtT,
+  };
+}
+
+/**
+ * P(BE)@exp — the risk-neutral probability of finishing beyond the breakeven.
+ *
+ * THIS IS NOT DELTA, and the difference is the whole reason this function
+ * exists. Delta is N(d1); what is wanted is N(d2) with the BREAKEVEN in the
+ * strike slot, and d1 − d2 = σ√T. At 45 DTE and 40% IV that gap is a couple of
+ * points. On an 18-month LEAPS at 50% IV, σ√T ≈ 0.61 and N(d1) overstates N(d2)
+ * by twenty-plus points — i.e. the shortcut fails worst on exactly the structure
+ * this tab exists for. Reading a probability off the delta ladder here would
+ * produce a confident, plausible, badly optimistic number.
+ *
+ * Returns null rather than a fallback if any input is missing. Callers render
+ * `n/a` with the reason; §4 forbids substituting ATM IV for a missing strike IV.
+ */
+function probBeyondBreakeven({ spot, breakeven, tYears, vol, rate, type }) {
+  if (![spot, breakeven, tYears, vol, rate].every(Number.isFinite)) return null;
+  if (spot <= 0 || breakeven <= 0 || tYears <= 0 || vol <= 0) return null;
+  const d2 = (Math.log(spot / breakeven) + (rate - vol * vol / 2) * tYears) / (vol * Math.sqrt(tYears));
+  const n = normCdf(d2);
+  if (n == null) return null;
+  return type === 'put' ? 1 - n : n;
+}
+
+/** The listed strike nearest a price that actually quotes a usable IV.
+ *  Named on the card, because "which strike's vol did you use" is the first
+ *  question anyone should ask of a P(BE). */
+function ivNearPrice(list, price) {
+  const usable = (list || []).filter(o =>
+    Number.isFinite(o?.strike) && Number.isFinite(o?.impliedVolatility) && o.impliedVolatility > 0);
+  if (!usable.length || !Number.isFinite(price)) return null;
+  const hit = usable.reduce((best, o) =>
+    Math.abs(o.strike - price) < Math.abs(best.strike - price) ? o : best);
+  return { strike: hit.strike, iv: hit.impliedVolatility };
+}
+
+/** Bid/ask/mid/spread for one contract. Debit is the ASK — the mirror of
+ *  premium's credit-is-the-bid. Mid would flatter every number on this screen. */
+function quoteOf(o) {
+  const bid = Number.isFinite(o?.bid) && o.bid > 0 ? o.bid : null;
+  const ask = Number.isFinite(o?.ask) && o.ask > 0 ? o.ask : null;
+  const mid = bid != null && ask != null ? (bid + ask) / 2 : null;
+  const spreadPct = mid != null && mid > 0 ? (ask - bid) / mid : null;
+  return { bid, ask, mid, spreadPct };
+}
+
+/**
+ * One single-leg long candidate (Lanes A and B), fully priced.
+ *
+ * `emPct` is the expected move for THIS candidate's own expiry, not the front
+ * one — BE/EM compares a breakeven against the 1σ the market is pricing over the
+ * same horizon, and using the front expiry's move for a 531-day contract would
+ * make every LEAPS look impossible.
+ */
+function longCandidate(o, ctx, type, laneId) {
+  const { spot, rate, dte, tYears, emPct, chainSide, spreadMax } = ctx;
+  const g = bsGreeks({ spot, strike: o.strike, tYears, vol: o.impliedVolatility, rate, type });
+  if (!g) return null;
+  const q = quoteOf(o);
+  // No ask = nothing to buy. Report it rather than pricing off the bid.
+  if (q.ask == null) {
+    return {
+      lane: laneId, type: type.toUpperCase(), strike: o.strike, status: 'no-quote',
+      reason: 'no ask quoted — nothing to buy at this strike',
+      delta: +g.delta.toFixed(4), iv: +(o.impliedVolatility * 100).toFixed(2),
+      openInterest: o.openInterest ?? null, volume: o.volume ?? null,
+    };
+  }
+
+  const debit     = q.ask;                              // per share
+  const intrinsic = type === 'call' ? Math.max(0, spot - o.strike) : Math.max(0, o.strike - spot);
+  const extrinsic = Math.max(0, debit - intrinsic);
+  const breakeven = type === 'call' ? o.strike + debit : o.strike - debit;
+  const bePct     = Math.abs(breakeven / spot - 1) * 100;
+  const beEm      = Number.isFinite(emPct) && emPct > 0 ? bePct / emPct : null;
+
+  // σ for P(BE) comes from the strike nearest the BREAKEVEN, not this strike and
+  // never ATM. Suppressed with a reason if that strike quotes nothing usable.
+  const beIv = ivNearPrice(chainSide, breakeven);
+  const pBe  = beIv ? probBeyondBreakeven({ spot, breakeven, tYears, vol: beIv.iv, rate, type }) : null;
+
+  const notional = Math.abs(g.delta) * spot;
+  const spreadOk = q.spreadPct == null ? null : q.spreadPct <= spreadMax;
+  const flags = [];
+  if (spreadOk === false) flags.push('wide-spread');
+  if ((o.openInterest ?? 0) < LONG_MIN_OI) flags.push('thin-oi');
+
+  return {
+    lane: laneId,
+    type: type.toUpperCase(),
+    strike: o.strike,
+    status: spreadOk === false ? 'illiquid' : 'ok',
+    delta: +g.delta.toFixed(4),
+    iv: +(o.impliedVolatility * 100).toFixed(2),
+    bid: q.bid, ask: q.ask,
+    mid: q.mid == null ? null : +q.mid.toFixed(2),
+    spreadPct: q.spreadPct == null ? null : +q.spreadPct.toFixed(4),
+    spreadMax,
+    debit: +(debit * 100).toFixed(2),          // per contract, the number you pay
+    debitPerShare: +debit.toFixed(2),
+    intrinsic: +(intrinsic * 100).toFixed(2),
+    extrinsic: +(extrinsic * 100).toFixed(2),
+    extrinsicPct: debit > 0 ? +(extrinsic / debit).toFixed(4) : null,
+    breakeven: +breakeven.toFixed(2),
+    bePct: +bePct.toFixed(2),
+    beEm: beEm == null ? null : +beEm.toFixed(3),
+    // (delta × spot) ÷ debit — how much share exposure a dollar of debit buys.
+    leverage: debit > 0 ? +(notional / debit).toFixed(2) : null,
+    // Annualised cost of carry: the extrinsic paid, per dollar of share exposure
+    // controlled, annualised. Rendered beside the DGS3MO rate so the comparison
+    // is on screen rather than implied.
+    carryAnnual: notional > 0 && dte > 0 ? +(extrinsic / notional * 365 / dte).toFixed(4) : null,
+    thetaDay: +(g.theta / 365 * 100).toFixed(2),                    // $ per contract per day
+    thetaPctDebit: debit > 0 ? +(g.theta / 365 / debit).toFixed(4) : null,
+    // vega is per 1.00 sigma per share; per 1 IV POINT per CONTRACT that is
+    // (vega/100) × 100 = vega. The two conversions cancel — this is not a bug.
+    vegaPerPoint: +g.vega.toFixed(2),
+    vegaLoss5: +(g.vega * 5).toFixed(2),
+    pBe: pBe == null ? null : +pBe.toFixed(4),
+    pBeIvStrike: beIv?.strike ?? null,
+    pBeIvUsed: beIv ? +(beIv.iv * 100).toFixed(2) : null,
+    pBeReason: pBe != null ? null
+      : (!Number.isFinite(rate) ? 'no risk-free rate — P(BE) suppressed rather than computed at r=0'
+                                : 'no listed strike near the breakeven quotes a usable IV; ATM IV is not substituted'),
+    ltcgEligible: dte > LTCG_DAYS,
+    ltcgHeadroomDays: dte - LTCG_DAYS,
+    openInterest: o.openInterest ?? null,
+    volume: o.volume ?? null,
+    flags,
+  };
+}
+
+/* Yahoo quotes an implausible implied vol on deep, untraded strikes, and it
+   corrupts strike SELECTION rather than just one displayed number.
+   Observed 2026-08-08 on AAPL: the 2026-09-18 420 put quoted IV 195.72% against
+   an expiry ATM IV of 24.54% — an 8× outlier on a strike with open interest 0
+   and volume 5. Delta computed from that quote is 0.544, which beat the real
+   near-the-money put for the 0.55 target. The screen would have printed a
+   confident, fully-priced "0.55 delta swing put" struck 34% ABOVE spot, with a
+   272.9% annualised cost of carry, and every downstream number — breakeven,
+   BE/EM, P(BE), leverage — would have been arithmetically correct and
+   completely meaningless.
+
+   So a strike whose IV is an implausible multiple of its own expiry's ATM IV is
+   excluded FROM SELECTION and counted. This is not the same as §7's ban on
+   filling a missing IV from ATM: nothing is substituted here, and the exclusion
+   is reported on the card rather than silently narrowing the chain. */
+const LONG_IV_OUTLIER_MULT = 4;   // real 41-DTE skew rarely exceeds ~2.5× ATM
+
+/** Nearest listed strike to a target |delta|, restricted to one moneyness side. */
+function nearestDelta(list, spot, rate, tYears, type, target, { itm = null, atmIv = null, rejects = null } = {}) {
+  let best = null, bestGap = Infinity;
+  const hi = atmIv ? atmIv * LONG_IV_OUTLIER_MULT : null;
+  const lo = atmIv ? atmIv / LONG_IV_OUTLIER_MULT : null;
+  for (const o of list || []) {
+    if (!Number.isFinite(o?.strike)) continue;
+    if (!Number.isFinite(o?.impliedVolatility) || o.impliedVolatility <= 0) continue;
+    if (hi != null && (o.impliedVolatility > hi || o.impliedVolatility < lo)) {
+      if (rejects) rejects.push({ strike: o.strike, type, iv: +(o.impliedVolatility * 100).toFixed(2) });
+      continue;
+    }
+    if (itm === true  && (type === 'call' ? o.strike >= spot : o.strike <= spot)) continue;
+    if (itm === false && (type === 'call' ? o.strike <= spot : o.strike >= spot)) continue;
+    const d = bsDelta({ spot, strike: o.strike, tYears, vol: o.impliedVolatility, rate, type });
+    if (d == null) continue;
+    const gap = Math.abs(Math.abs(d) - target);
+    if (gap < bestGap) { bestGap = gap; best = o; }
+  }
+  return best;
+}
+
+/**
+ * Lane C — debit vertical. Long the ~0.55Δ strike, short a ~0.25Δ wing.
+ *
+ * Debit is long ASK minus short BID: the two sides of the spread cross in
+ * opposite directions, and using mids here would understate what it costs to
+ * open by roughly the full spread. The ACTUAL deltas of both legs are reported,
+ * not the 0.55/0.25 targets — a sparse chain can land well away from them and a
+ * card printing the target would be describing a contract that does not exist.
+ */
+function verticalCandidate(chainSide, ctx, type) {
+  const { spot, rate, dte, tYears, emPct, spreadMax, atmIv } = ctx;
+  const band = { atmIv: atmIv / 100 };   // same IV-outlier guard as the single-leg lanes
+  const longOpt  = nearestDelta(chainSide, spot, rate, tYears, type, LANE_C_LONG,  band);
+  const shortOpt = nearestDelta(chainSide, spot, rate, tYears, type, LANE_C_SHORT, band);
+  if (!longOpt || !shortOpt || longOpt.strike === shortOpt.strike) return null;
+  // A call vertical is long the lower strike; a put vertical the higher one.
+  if (type === 'call' ? shortOpt.strike <= longOpt.strike : shortOpt.strike >= longOpt.strike) return null;
+
+  const lg = bsGreeks({ spot, strike: longOpt.strike,  tYears, vol: longOpt.impliedVolatility,  rate, type });
+  const sg = bsGreeks({ spot, strike: shortOpt.strike, tYears, vol: shortOpt.impliedVolatility, rate, type });
+  if (!lg || !sg) return null;
+
+  const lq = quoteOf(longOpt), sq = quoteOf(shortOpt);
+  if (lq.ask == null || sq.bid == null) return null;
+  const debit = lq.ask - sq.bid;
+  if (!(debit > 0)) return null;                       // a credit here means the chain is broken
+
+  const width     = Math.abs(shortOpt.strike - longOpt.strike);
+  const breakeven = type === 'call' ? longOpt.strike + debit : longOpt.strike - debit;
+  const bePct     = Math.abs(breakeven / spot - 1) * 100;
+  const beEm      = Number.isFinite(emPct) && emPct > 0 ? bePct / emPct : null;
+  const beIv      = ivNearPrice(chainSide, breakeven);
+  const pBe       = beIv ? probBeyondBreakeven({ spot, breakeven, tYears, vol: beIv.iv, rate, type }) : null;
+
+  const netDelta = lg.delta - sg.delta;
+  const netVega  = lg.vega  - sg.vega;
+  const netTheta = lg.theta - sg.theta;
+  const worstSpread = Math.max(lq.spreadPct ?? 0, sq.spreadPct ?? 0);
+  const flags = [];
+  if (worstSpread > spreadMax) flags.push('wide-spread');
+  if (Math.min(longOpt.openInterest ?? 0, shortOpt.openInterest ?? 0) < LONG_MIN_OI) flags.push('thin-oi');
+
+  return {
+    lane: 'C',
+    type: type.toUpperCase(),
+    status: worstSpread > spreadMax ? 'illiquid' : 'ok',
+    longStrike: longOpt.strike,
+    shortStrike: shortOpt.strike,
+    // The real deltas, not the targets they were selected against.
+    longDelta:  +lg.delta.toFixed(4),
+    shortDelta: +sg.delta.toFixed(4),
+    targetDeltas: [LANE_C_LONG, LANE_C_SHORT],
+    longIv:  +(longOpt.impliedVolatility * 100).toFixed(2),
+    shortIv: +(shortOpt.impliedVolatility * 100).toFixed(2),
+    width: +width.toFixed(2),
+    debit: +(debit * 100).toFixed(2),
+    debitPerShare: +debit.toFixed(2),
+    maxProfit: +((width - debit) * 100).toFixed(2),
+    maxLoss: +(debit * 100).toFixed(2),
+    riskReward: width > debit ? +((width - debit) / debit).toFixed(2) : null,
+    breakeven: +breakeven.toFixed(2),
+    bePct: +bePct.toFixed(2),
+    beEm: beEm == null ? null : +beEm.toFixed(3),
+    netDelta: +netDelta.toFixed(4),
+    thetaDay: +(netTheta / 365 * 100).toFixed(2),
+    vegaPerPoint: +netVega.toFixed(2),
+    vegaLoss5: +(netVega * 5).toFixed(2),
+    // Extrinsic on a vertical is not the Lane A quantity (the short leg refunds
+    // part of it), so cost-of-carry is deliberately absent here rather than
+    // computed from a formula that does not describe the structure.
+    pBe: pBe == null ? null : +pBe.toFixed(4),
+    pBeIvStrike: beIv?.strike ?? null,
+    pBeIvUsed: beIv ? +(beIv.iv * 100).toFixed(2) : null,
+    pBeReason: pBe != null ? null : 'no listed strike near the breakeven quotes a usable IV',
+    ltcgEligible: dte > LTCG_DAYS,
+    ltcgHeadroomDays: dte - LTCG_DAYS,
+    spreadPct: +worstSpread.toFixed(4),
+    spreadMax,
+    openInterest: Math.min(longOpt.openInterest ?? 0, shortOpt.openInterest ?? 0),
+    flags,
+  };
+}
+
+/**
+ * Lane D — calendar / diagonal. DELIBERATELY THIN, and the card says why.
+ *
+ * A calendar has no single-expiry breakeven. Its P/L at the front expiry depends
+ * on what the BACK month's IV is on that future date, which needs a
+ * term-structure model this codebase does not have and cannot obtain free. So
+ * everything that would require one is ABSENT, not blank and not estimated:
+ * no breakeven, no BE/EM, no P(BE), no cost of carry, no payoff diagram.
+ * Deriving any of them from an assumed future IV would produce a plausible
+ * number measuring nothing — the same failure as POP on a debit spread.
+ */
+function calendarCandidate(frontChain, backChain, front, back, ctx, earnIso) {
+  const { spot } = ctx;
+  const atmOf = (chain) => {
+    const c = (chain?.calls || []).filter(o => Number.isFinite(o?.strike));
+    if (!c.length) return null;
+    return c.reduce((b, o) => Math.abs(o.strike - spot) < Math.abs(b.strike - spot) ? o : b);
+  };
+  const f = atmOf(frontChain), b = atmOf(backChain);
+  if (!f || !b) return null;
+  const fq = quoteOf(f), bq = quoteOf(b);
+  if (bq.ask == null || fq.bid == null) return null;
+  const debit = bq.ask - fq.bid;                      // sell the front, buy the back
+  if (!(debit > 0)) return null;
+
+  const fIv = Number.isFinite(f.impliedVolatility) ? f.impliedVolatility * 100 : null;
+  const bIv = Number.isFinite(b.impliedVolatility) ? b.impliedVolatility * 100 : null;
+
+  return {
+    lane: 'D',
+    type: 'CALL',
+    status: 'ok',
+    strike: f.strike === b.strike ? f.strike : null,
+    frontStrike: f.strike, backStrike: b.strike,
+    diagonal: f.strike !== b.strike,
+    frontExpiry: front.expiry, frontDte: front.dte,
+    backExpiry:  back.expiry,  backDte:  back.dte,
+    frontIv: fIv == null ? null : +fIv.toFixed(2),
+    backIv:  bIv == null ? null : +bIv.toFixed(2),
+    ivDiff:  (fIv != null && bIv != null) ? +(fIv - bIv).toFixed(2) : null,
+    debit: +(debit * 100).toFixed(2),
+    debitPerShare: +debit.toFixed(2),
+    // Where the print falls relative to the two legs — the one genuinely
+    // decision-relevant fact a calendar has that a single-expiry structure does not.
+    earningsIso: earnIso,
+    earningsPosition: !earnIso ? 'none'
+      : earnIso <= front.expiry ? 'before-front'
+      : earnIso <= back.expiry  ? 'between-legs'
+      : 'after-back',
+    suppressed: {
+      fields: ['breakeven', 'beEm', 'pBe', 'carryAnnual', 'payoff'],
+      reason: 'A calendar has no single-expiry breakeven: its P/L at the front expiry depends on the '
+            + "back month's IV at that future date, which needs a term-structure model this app does "
+            + 'not have. Deriving these from an assumed future IV would be a plausible number measuring nothing.',
+    },
+    openInterest: Math.min(f.openInterest ?? 0, b.openInterest ?? 0),
+  };
+}
+
+/** Directional read for the alignment tag.
+ *
+ *  Source is `analysis:{TICKER}` — the SAME key the Watchlist tab's
+ *  Recommendation column writes (refreshTickerAnalysis → ANALYSIS_SCHEMA, rating
+ *  is a strict BUY|HOLD|SELL enum). NOT `watchlist:{TICKER}`, which does not
+ *  exist; `watchlist:tickers` is the saved symbol list and a different thing.
+ *
+ *  Two KV reads and ZERO external fetches — and specifically zero Claude calls:
+ *  a missing analysis yields `no read` and must never trigger a generation to
+ *  fill it. Routing this through /api/ai/* would put model spend behind a screen
+ *  the user expects to be free.
+ */
+async function directionalRead(sym, env) {
+  let a = null, entries = [];
+  try { a = await env?.REC_LOG?.get(`analysis:${sym}`, 'json'); } catch (_) {}
+  try { entries = (await env?.REC_LOG?.get(`rec:${sym}`, 'json')) || []; } catch (_) {}
+  const rating = ['BUY', 'HOLD', 'SELL'].includes(a?.rating) ? a.rating : null;
+  const calib  = recCalibration(entries);
+  // The tag ALWAYS renders. It only reorders anything once the model behind it
+  // has a resolved track record — an alignment tag from an unscored model must
+  // not look, or sort, like one from a scored model.
+  const scored = calib.reason == null;
+  return {
+    rating,
+    source: rating ? `analysis:${sym}` : null,
+    asOf: a?.ts ?? null,
+    confidence: Number.isFinite(a?.confidence) ? a.confidence : null,
+    calibration: {
+      n: calib.n, minN: calib.minN, reason: calib.reason,
+      hitRate: scored && rating ? calib.byRating?.[rating]?.hitRate ?? null : null,
+      brier: calib.brier,
+    },
+    affectsSort: scored,
+  };
+}
+
+/** Tag one candidate against the row's directional read. */
+function alignTagFor(rating, optType, lane) {
+  if (lane === 'D') return null;                       // a calendar is not directional
+  if (!rating) return { tag: 'no read', reason: 'no stored analysis for this ticker' };
+  if (lane === 'A') {
+    return {
+      tag: 'out-of-horizon', rating,
+      reason: `Rating is ${rating}, shown for context only. This contract is 365–900 DTE and the `
+            + 'rating\'s track record is measured at 5 and 20 sessions (fwd5/fwd20) — it is not a '
+            + 'signal about where this name sits in a year. Does not affect Lane A sorting.',
+    };
+  }
+  if (rating === 'HOLD') return { tag: 'neutral', rating, reason: 'Rating is HOLD — no directional claim.' };
+  const aligned = (rating === 'BUY') === (optType === 'CALL');
+  return {
+    tag: aligned ? 'aligned' : 'counter', rating,
+    reason: `Rating is ${rating}; this is a long ${optType.toLowerCase()}. `
+          + (aligned ? 'Same direction.' : 'Opposite direction — demoted in sort, never removed.'),
+  };
+}
+
+/** One long-screen row. Never throws — a failed ticker reports why. */
+async function longRow(sym, env, { rate, premium }) {
+  const fail = (status, reason) => ({
+    symbol: sym, ok: false, status, reason, lanes: [], bestBeEm: null,
+    schema: LONG_SCHEMA, ts: Date.now(),
+  });
+
+  let base;
+  try {
+    base = await yahooAuth(`/v7/finance/options/${encodeURIComponent(sym)}`, '', env);
+  } catch (e) { return fail('error', `options chain fetch failed: ${e.message}`); }
+
+  const res  = base?.optionChain?.result?.[0];
+  const spot = res?.quote?.regularMarketPrice;
+  const exps = (res?.expirationDates || []).slice().sort((a, b) => a - b);
+  if (!res || !Number.isFinite(spot) || !exps.length) {
+    return fail('no-options', 'no listed options for this ticker');
+  }
+
+  // Dividend status comes free off the base quote. If Yahoo carries no dividend
+  // field we say UNKNOWN rather than "none" — §4's no-dividend-adjustment
+  // caveat has to be stated against a fact, not against an absence.
+  const divRate  = res.quote?.trailingAnnualDividendRate ?? res.quote?.dividendRate ?? null;
+  const divYield = res.quote?.trailingAnnualDividendYield ?? res.quote?.dividendYield ?? null;
+  const dividend = (divRate == null && divYield == null)
+    ? { known: false, pays: null, note: 'Yahoo quoted no dividend field — dividend status unknown. '
+        + 'The Black-Scholes inputs here carry no dividend adjustment either way.' }
+    : { known: true, pays: (divRate > 0 || divYield > 0), rate: divRate, yield: divYield,
+        note: (divRate > 0 || divYield > 0)
+          ? 'This underlying pays a dividend and the model applies NO dividend adjustment: delta, '
+            + 'P(BE) and cost of carry are all biased for long-dated calls. Stated, not silently ignored.'
+          : 'No dividend on record — the no-dividend assumption holds here.' };
+
+  const loaded = new Map();
+  if (res.options?.[0]?.expirationDate) loaded.set(res.options[0].expirationDate, res.options[0]);
+  let chainFetches = 0;
+  const chainFor = async (exp) => {
+    if (exp == null) return null;
+    if (loaded.has(exp)) return loaded.get(exp);
+    try {
+      chainFetches++;
+      const d = await yahooAuth(`/v7/finance/options/${encodeURIComponent(sym)}`, `?date=${exp}`, env);
+      const c = d?.optionChain?.result?.[0]?.options?.[0] || null;
+      if (c) loaded.set(exp, c);
+      return c;
+    } catch (_) { return null; }
+  };
+
+  /* ── The reuse boundary, and it is deliberately narrow ──────────────────────
+     Reused from a fresh premium row: earnings date, front/back ATM IV, term
+     structure, hv30 / ivRank / ivHvRatio. All slow-moving.
+     NEVER reused: spot and the expiry list, which come off the base call above
+     because that call happens regardless and a stale spot corrupts every
+     breakeven on the screen. The row carries both timestamps so the card can
+     age the two halves separately. */
+  const warm = premium && premium.ok && premium.status === 'ok';
+  let earnIso, frontMeta, backMeta, termStructure, hv30, ivRank, historyDays, rankReason, ivHvRatio;
+
+  if (warm) {
+    earnIso       = premium.earnings?.iso ?? null;
+    frontMeta     = premium.front ?? null;
+    backMeta      = premium.back ?? null;
+    termStructure = premium.termStructure ?? null;
+    hv30          = premium.hv30 ?? null;
+    ivRank        = premium.ivRank ?? null;
+    historyDays   = premium.historyDays ?? 0;
+    rankReason    = premium.rankReason ?? null;
+    ivHvRatio     = premium.ivHvRatio ?? null;
+  } else {
+    try {
+      const qs = await yahooAuth(
+        `/v10/finance/quoteSummary/${encodeURIComponent(sym)}`, '?modules=calendarEvents', env);
+      // Same field as the watchlist column and the premium screen, deliberately:
+      // three tabs quoting different earnings dates for one ticker is a bug.
+      earnIso = nextEarningsIso(qs?.quoteSummary?.result?.[0]);
+    } catch (_) { earnIso = null; }
+
+    const frontExp = exps.find(e => dteOf(e) >= IV_MIN_DTE) ?? exps[exps.length - 1];
+    const backExp  = exps.find(e => e > frontExp && isMonthlyExpiry(e)) ?? null;
+    const fChain = await chainFor(frontExp);
+    const bChain = await chainFor(backExp);
+    const fIv = fChain ? atmIvFor(fChain, spot) : null;
+    const bIv = bChain ? atmIvFor(bChain, spot) : null;
+    if (!fIv) {
+      return fail('no-iv',
+        `options are listed but the front expiry (${expiryIso(frontExp)}, ${dteOf(frontExp)}d) quotes `
+        + 'no usable implied vol — too thin to price');
+    }
+    frontMeta = { expiry: expiryIso(frontExp), dte: dteOf(frontExp), atmIv: fIv.atmIv, strike: fIv.strike };
+    backMeta  = bIv ? { expiry: expiryIso(backExp), dte: dteOf(backExp), atmIv: bIv.atmIv, strike: bIv.strike } : null;
+    termStructure = bIv ? +(fIv.atmIv - bIv.atmIv).toFixed(2) : null;
+
+    try {
+      const closes = await yahoo(`/v8/finance/chart/${encodeURIComponent(sym)}`, '?range=3mo&interval=1d');
+      hv30 = historicalVol(closes?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [], IV_HV_WINDOW);
+    } catch (_) { hv30 = null; }
+
+    const history = await ivHistory(sym, env).catch(() => []);
+    ({ ivRank, historyDays, rankReason } = ivRankFrom(history, fIv.atmIv));
+    ivHvRatio = Number.isFinite(hv30) && hv30 > 0 ? +(fIv.atmIv / hv30).toFixed(3) : null;
+  }
+
+  if (!frontMeta?.atmIv) {
+    return fail('no-iv', 'no usable front-expiry implied vol to anchor the screen');
+  }
+
+  /* ── Expiry selection ─────────────────────────────────────────────────────── */
+  const monthlies = exps.filter(isMonthlyExpiry);
+  const januaries = monthlies.filter(e => new Date(e * 1000).getUTCMonth() === 0 && dteOf(e) >= LEAPS_MIN_DTE);
+  // §2 asks for "nearest 540 DTE" and "nearest January ≥365 DTE". On most dates
+  // those collapse onto one expiry, so Lane A takes the two nearest Januaries
+  // clearing the LTCG line: primary = nearest LEAPS_TARGET_DTE, secondary = the
+  // next January out. The far one is frequently unlisted — that is a fact about
+  // the name and is reported, not hidden.
+  const janPrimary = januaries.length
+    ? januaries.reduce((b, e) => Math.abs(dteOf(e) - LEAPS_TARGET_DTE) < Math.abs(dteOf(b) - LEAPS_TARGET_DTE) ? e : b)
+    : null;
+  const janSecondary = januaries.filter(e => e !== janPrimary)
+    .sort((a, b) => Math.abs(dteOf(a) - dteOf(janPrimary)) - Math.abs(dteOf(b) - dteOf(janPrimary)))[0] ?? null;
+
+  const bExp1 = monthlies.find(e => dteOf(e) >= LANE_B_DTES[0]) ?? null;
+  const bExp2 = monthlies.find(e => dteOf(e) >= LANE_B_DTES[1] && e !== bExp1) ?? null;
+
+  if (!januaries.length && !bExp1 && !bExp2) {
+    return fail('no-leaps', `no January expiry beyond ${LEAPS_MIN_DTE} DTE and no monthly ≥${LANE_B_DTES[0]} DTE is listed`);
+  }
+
+  // Sequential on purpose: chainFor dedupes through `loaded`, which concurrent
+  // calls would defeat, and Yahoo throttles parallel chain requests.
+  const janChain1 = await chainFor(janPrimary);
+  const janChain2 = await chainFor(janSecondary);
+  const bChain1   = await chainFor(bExp1);
+  const bChain2   = await chainFor(bExp2);
+
+  const ctxFor = (exp, chain) => {
+    const dte = dteOf(exp);
+    const atm = chain ? atmIvFor(chain, spot) : null;
+    // Expected move on THIS expiry, not the front one.
+    const emPct = atm ? (atm.atmIv / 100) * Math.sqrt(dte / 365) * 100 : null;
+    return {
+      spot, rate, dte, tYears: dte / 365, emPct,
+      atmIv: atm?.atmIv ?? null,
+      spreadMax: dte > 90 ? LONG_SPREAD_MAX_LEAPS : LONG_SPREAD_MAX_NEAR,
+    };
+  };
+
+  const read = await directionalRead(sym, env);
+  const lanes = [];
+
+  const singleLegLane = (laneId, exp, chain, targets, types, itm) => {
+    if (exp == null) {
+      return { lane: laneId, expiry: null, candidates: [],
+               status: 'not-listed', reason: laneId === 'A'
+                 ? `no January expiry beyond ${LEAPS_MIN_DTE} DTE at this slot`
+                 : `no monthly expiry at this horizon` };
+    }
+    const entry = { lane: laneId, expiry: expiryIso(exp), dte: dteOf(exp), candidates: [] };
+    if (!chain) { entry.status = 'error'; entry.reason = 'expiry chain did not load'; return entry; }
+    const ctx = ctxFor(exp, chain);
+    entry.atmIv = ctx.atmIv;
+    entry.expectedMovePct = ctx.emPct == null ? null : +ctx.emPct.toFixed(2);
+    entry.ltcgEligible = ctx.dte > LTCG_DAYS;
+    if (!Number.isFinite(rate)) { entry.status = 'no-rate'; entry.reason = 'no risk-free rate — greeks suppressed rather than computed at r=0'; return entry; }
+    if (ctx.atmIv == null) {
+      // A far January that is listed but quotes nothing. Real, common, and NOT
+      // patched with ATM IV from a nearer expiry.
+      entry.status = 'no-iv';
+      entry.reason = 'listed but quotes no usable implied vol at any near-the-money strike — '
+                   + 'not filled in from another expiry';
+      return entry;
+    }
+    const rejects = [];
+    for (const type of types) {
+      const side = type === 'call' ? chain.calls : chain.puts;
+      for (const target of targets) {
+        const o = nearestDelta(side, spot, rate, ctx.tYears, type, target,
+                               { itm, atmIv: ctx.atmIv / 100, rejects });
+        if (!o) continue;
+        const c = longCandidate(o, { ...ctx, chainSide: side }, type, laneId);
+        if (!c) continue;
+        if (entry.candidates.some(x => x.type === c.type && x.strike === c.strike)) { c.sparse = true; continue; }
+        c.targetDelta = target;
+        c.align = alignTagFor(read.rating, c.type, laneId);
+        entry.candidates.push(c);
+      }
+    }
+    // Reported, not hidden: an excluded strike is a fact about Yahoo's quote and
+    // the user should be able to see how much of the chain it applied to.
+    const uniq = [...new Map(rejects.map(r => [`${r.type}:${r.strike}`, r])).values()];
+    if (uniq.length) {
+      entry.ivOutliers = uniq.length;
+      entry.ivOutlierNote = `${uniq.length} strike${uniq.length === 1 ? '' : 's'} excluded from selection for `
+        + `quoting an implausible implied vol against this expiry's ATM IV of ${ctx.atmIv.toFixed(1)}% `
+        + `(worst: ${uniq.reduce((a, b) => a.iv > b.iv ? a : b).iv}%). Nothing was substituted for them.`;
+    }
+    entry.status = entry.candidates.length ? 'ok' : 'no-iv';
+    if (!entry.candidates.length) entry.reason = 'no strike on this expiry quotes both a usable IV and an ask';
+    return entry;
+  };
+
+  lanes.push({ ...singleLegLane('A', janPrimary,   janChain1, LANE_A_TARGETS, ['call'], true),  slot: 'primary' });
+  lanes.push({ ...singleLegLane('A', janSecondary, janChain2, LANE_A_TARGETS, ['call'], true),  slot: 'secondary' });
+  lanes.push(singleLegLane('B', bExp1, bChain1, LANE_B_TARGETS, ['call', 'put'], null));
+  lanes.push(singleLegLane('B', bExp2, bChain2, LANE_B_TARGETS, ['call', 'put'], null));
+
+  // Lane C reuses Lane B's already-fetched chains — zero extra subrequests.
+  for (const [exp, chain] of [[bExp1, bChain1], [bExp2, bChain2]]) {
+    if (exp == null || !chain || !Number.isFinite(rate)) continue;
+    const ctx = ctxFor(exp, chain);
+    if (ctx.atmIv == null) continue;
+    const entry = { lane: 'C', expiry: expiryIso(exp), dte: dteOf(exp), atmIv: ctx.atmIv,
+                    expectedMovePct: ctx.emPct == null ? null : +ctx.emPct.toFixed(2), candidates: [] };
+    for (const type of ['call', 'put']) {
+      const v = verticalCandidate(type === 'call' ? chain.calls : chain.puts, ctx, type);
+      if (!v) continue;
+      v.align = alignTagFor(read.rating, v.type, 'C');
+      entry.candidates.push(v);
+    }
+    entry.status = entry.candidates.length ? 'ok' : 'no-iv';
+    if (!entry.candidates.length) entry.reason = 'no pair of strikes on this expiry prices a debit vertical';
+    lanes.push(entry);
+  }
+
+  // Lane D reuses Lane B's chains too.
+  if (bExp1 != null && bExp2 != null && bChain1 && bChain2) {
+    const d = calendarCandidate(bChain1, bChain2, ctxFor(bExp1, bChain1), ctxFor(bExp2, bChain2), { spot }, earnIso);
+    lanes.push(d
+      ? { lane: 'D', expiry: expiryIso(bExp1), dte: dteOf(bExp1), candidates: [
+          { ...d, frontExpiry: expiryIso(bExp1), frontDte: dteOf(bExp1),
+            backExpiry: expiryIso(bExp2), backDte: dteOf(bExp2) }], status: 'ok' }
+      : { lane: 'D', expiry: expiryIso(bExp1), dte: dteOf(bExp1), candidates: [], status: 'no-iv',
+          reason: 'the two monthly legs do not both quote a tradeable ATM contract' });
+  }
+
+  /* ── Row-level gate: TWO parts, and both must pass ─────────────────────────
+     Cheap vol is necessary but not sufficient — a name can have depressed IV and
+     still price every breakeven outside its own expected move, which makes the
+     debit structurally unpayable however cheap the vol is. */
+  const beEms = lanes.flatMap(l => l.candidates || [])
+    .filter(c => c.lane === 'B' || c.lane === 'C')
+    .map(c => c.beEm).filter(Number.isFinite);
+  const bestBeEm = beEms.length ? Math.min(...beEms) : null;
+
+  const gate = buyableFrom(ivRank, ivHvRatio, historyDays);
+  const beOk = bestBeEm == null ? null : bestBeEm <= LONG_BE_EM_MAX;
+  const dim  = gate.buyable === false || beOk === false;
+
+  const frontDte = frontMeta.dte;
+  return {
+    symbol: sym,
+    ok: true,
+    status: 'ok',
+    schema: LONG_SCHEMA,
+    // TWO timestamps: `ts` is this fetch (spot, chains, every candidate).
+    ts: Date.now(),
+    // `sharedTs` is the age of the reused half. Equal to ts when nothing was
+    // reused. The card ages them separately — one as-of for both would imply the
+    // IV rank is as fresh as the spot, which it is not.
+    sharedTs: warm ? (premium.ts ?? null) : Date.now(),
+    sharedFrom: warm ? 'premium-row' : 'live',
+    sharedFields: ['earnings', 'front', 'back', 'termStructure', 'hv30', 'ivRank', 'ivHvRatio'],
+    spot: +spot.toFixed(2),
+    front: frontMeta,
+    back: backMeta,
+    termStructure,
+    /* SIGN INVERSION — the single easiest thing here to get backwards.
+       termStructure = front − back, so POSITIVE is backwardation (front IV
+       richer). On the PREMIUM tab that is the crush setup and reads as GOOD.
+       Here it is HOSTILE: front-dated premium is what a long buyer is paying
+       for, and backwardation means paying the rich end of the curve. Same
+       number, same sign, opposite verdict — hence `hostileTerm`, a separate
+       field from premium's `backwardation`, and a different chip glyph. */
+    backwardation: termStructure != null && termStructure > 0,
+    hostileTerm:   termStructure != null && termStructure > 0,
+    termReading: termStructure == null ? null
+      : termStructure > 0
+        ? `Front IV is ${termStructure.toFixed(1)} pts RICHER than back — backwardation. Hostile for `
+          + 'buying front-dated premium: you are paying the rich end of the curve. (The Premium tab '
+          + 'reads this same sign as favourable, because it is selling it.)'
+        : `Front IV is ${Math.abs(termStructure).toFixed(1)} pts CHEAPER than back — contango. `
+          + 'Favourable for buying front-dated premium.',
+    expectedMove: {
+      pct: +((frontMeta.atmIv / 100) * Math.sqrt(frontDte / 365) * 100).toFixed(2),
+      dollars: +(spot * (frontMeta.atmIv / 100) * Math.sqrt(frontDte / 365)).toFixed(2),
+      dte: frontDte, expiry: frontMeta.expiry,
+    },
+    earnings: earnIso
+      ? { iso: earnIso,
+          daysAway: Math.round((Date.parse(earnIso + 'T00:00:00Z') - Date.parse(etToday() + 'T00:00:00Z')) / 86_400_000),
+          source: 'Yahoo calendarEvents' }
+      : { iso: null, reason: 'no scheduled earnings date from Yahoo' },
+    daysToEarnings: earnIso
+      ? Math.round((Date.parse(earnIso + 'T00:00:00Z') - Date.parse(etToday() + 'T00:00:00Z')) / 86_400_000)
+      : null,
+    hv30, ivHvRatio, ivRank, historyDays, rankReason,
+    rankTargetDays: IV_RANK_TARGET_DAYS,
+    regime: volRegime({ ivRank, ivHvRatio, historyDays, rankTargetDays: IV_RANK_TARGET_DAYS }),
+    buyable: gate.buyable,
+    buyableBasis: gate.basis,
+    buyableReason: gate.reason,
+    beEmOk: beOk,
+    bestBeEm,
+    dim,
+    dimReason: !dim ? null
+      : gate.buyable === false && beOk === false
+        ? `${gate.reason} · and best BE/EM ${bestBeEm.toFixed(2)} is above ${LONG_BE_EM_MAX.toFixed(2)}`
+        : gate.buyable === false ? gate.reason
+        : `vol is not rich, but best BE/EM ${bestBeEm.toFixed(2)} is above ${LONG_BE_EM_MAX.toFixed(2)} — `
+          + 'the breakeven sits outside the move the market is pricing',
+    dividend,
+    directional: read,
+    lanes,
+    leapsListed: januaries.length,
+    janPrimary:   janPrimary   ? { expiry: expiryIso(janPrimary),   dte: dteOf(janPrimary) }   : null,
+    janSecondary: janSecondary ? { expiry: expiryIso(janSecondary), dte: dteOf(janSecondary) } : null,
+    chainFetches,
+  };
+}
+
+const longKey = sym => `long:${sym.toUpperCase()}`;
+
+async function storeLongRow(row, env) {
+  try {
+    await env?.REC_LOG?.put(longKey(row.symbol), JSON.stringify(row), { expirationTtl: LONG_ROW_TTL });
+  } catch (e) { console.warn(`[long] ${row.symbol} KV write failed:`, e.message); }
+}
+
+async function readLongRow(sym, env) {
+  try {
+    const row = await env?.REC_LOG?.get(longKey(sym), 'json');
+    return row && row.schema === LONG_SCHEMA ? row : null;
+  } catch (_) { return null; }
+}
+
+function longRowMeta(row) {
+  const warm = row?.sharedFrom === 'premium-row';
+  return srcMeta('Yahoo options chain', {
+    delayed: true,
+    ok: !!row?.ok,
+    ttlSeconds: LONG_FRESH_MS / 1000,
+    asOf: row?.ts ? new Date(row.ts).toISOString().slice(0, 16).replace('T', ' ') : null,
+    note: row?.ok
+      ? `${(row.lanes || []).filter(l => l.status === 'ok').length} lane slots priced`
+        + (warm && row.sharedTs
+            ? ` · IV/earnings reused from premium row ${Math.round((row.ts - row.sharedTs) / 60000)}min older`
+            : ' · all fields live')
+      : (row?.reason || 'unavailable'),
+  });
+}
+
+/** Refresh one ticker. Measured 5 subrequests premium-warm, 8–9 premium-cold. */
+async function refreshLongTicker(sym, env) {
+  const rate = await riskFreeRate(env);
+  // Reuse a FRESH premium row only. A stale one is not reused: past the
+  // freshness horizon its IV rank and earnings date are no better than refetching.
+  let premium = null;
+  try {
+    const p = await readPremiumRow(sym, env);
+    if (p && p.ts && Date.now() - p.ts < PREMIUM_FRESH_MS) premium = p;
+  } catch (_) {}
+  const row = await longRow(sym, env, { rate: rate.rate, premium });
+  row.rate = { value: rate.rate, asOf: rate.asOf ?? null, stale: !!rate.stale, reason: rate.reason || null };
+  row.gates = {
+    ivrBuyMax: IVR_BUY_MAX, ratioBuyMax: RATIO_BUY_MAX,
+    spreadMaxNear: LONG_SPREAD_MAX_NEAR, spreadMaxLeaps: LONG_SPREAD_MAX_LEAPS,
+    minOi: LONG_MIN_OI, beEmMax: LONG_BE_EM_MAX, ltcgDays: LTCG_DAYS,
+  };
+  await storeLongRow(row, env);
+  return row;
+}
+
+/* ── GET /api/long/batch?symbols= ────────────────────────────────────────────
+   Cache-status read, NOT a data fetch. Zero outbound calls, so the tab paints
+   every watchlist ticker on load without touching Yahoo. (The KV reads do count
+   against the invocation's 10,000-subrequest pool — they are just not fetches.) */
+async function handleLongBatch(params, origin, env) {
+  const symbols = (params.get('symbols') || '')
+    .split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, LONG_MAX_SYMBOLS);
+  if (!symbols.length) return err('symbols required', 400, origin);
+
+  const rows = [], missing = [];
+  await Promise.all(symbols.map(async (sym) => {
+    const row = await readLongRow(sym, env);
+    if (row) rows.push(row);
+    else missing.push({ symbol: sym, status: 'not-loaded',
+                        reason: 'not loaded — expand the row, or use ↻, to fetch this ticker' });
+  }));
+  rows.sort((a, b) => a.symbol.localeCompare(b.symbol));
+
+  const oldest = rows.length ? Math.min(...rows.map(r => r.ts || 0)) : null;
+  return json({
+    rows, missing, symbols,
+    schema: LONG_SCHEMA,
+    ts: Date.now(),
+    freshMs: LONG_FRESH_MS,
+    lanes: {
+      A: { targets: LANE_A_TARGETS, minDte: LEAPS_MIN_DTE, targetDte: LEAPS_TARGET_DTE },
+      B: { targets: LANE_B_TARGETS, dtes: LANE_B_DTES },
+      C: { long: LANE_C_LONG, short: LANE_C_SHORT },
+    },
+    gates: {
+      ivrBuyMax: IVR_BUY_MAX, ratioBuyMax: RATIO_BUY_MAX,
+      spreadMaxNear: LONG_SPREAD_MAX_NEAR, spreadMaxLeaps: LONG_SPREAD_MAX_LEAPS,
+      minOi: LONG_MIN_OI, beEmMax: LONG_BE_EM_MAX, ltcgDays: LTCG_DAYS,
+      ...REGIME_GATES,
+    },
+    rate: rows.find(r => r.rate)?.rate || null,
+    _meta: srcMeta('KV cache (no fetch)', {
+      ttlSeconds: LONG_FRESH_MS / 1000,
+      asOf: oldest ? new Date(oldest).toISOString().slice(0, 16).replace('T', ' ') : null,
+      ok: true,
+      note: `${rows.length}/${symbols.length} cached`
+          + (missing.length ? ` · ${missing.length} not loaded` : '')
+          + ' · rows fetch on expand, one ticker per request',
+    }),
+  }, 200, origin);
+}
+
+/* ── GET /api/long/:ticker ───────────────────────────────────────────────────
+   The only path in this screen that spends subrequests.
+     (no param)   cached row if inside LONG_FRESH_MS, else refetch
+     ?refresh=1   always refetch
+     ?cached=1    never fetch */
+async function handleLongTicker(ticker, params, origin, env) {
+  const sym = String(ticker || '').toUpperCase();
+  if (!sym) return err('ticker required', 400, origin);
+
+  const force      = params.get('refresh') === '1';
+  const cachedOnly = params.get('cached')  === '1';
+  const cached = force ? null : await readLongRow(sym, env);
+  const age    = cached?.ts ? Date.now() - cached.ts : null;
+  const fresh  = age != null && age < LONG_FRESH_MS;
+
+  if (cached && (fresh || cachedOnly)) {
+    return json({ row: cached, cached: true, stale: !fresh, ageMs: age, _meta: longRowMeta(cached) }, 200, origin);
+  }
+  if (cachedOnly) {
+    return json({
+      row: null, cached: true,
+      missing: { symbol: sym, status: 'not-loaded', reason: 'not loaded — no cached row for this ticker' },
+      _meta: srcMeta('KV cache (no fetch)', { ok: false, ttlSeconds: LONG_FRESH_MS / 1000, note: 'nothing cached' }),
+    }, 200, origin);
+  }
+
+  await getYahooCrumb(env).catch(() => {});
+  // Measured, not estimated (rule #1). The bracket covers the crumb, the base
+  // list, every dated chain and — on the premium-cold path — the extra
+  // quoteSummary and hv30 chart. `warm` says which case the number describes,
+  // because the two costs differ by ~4 and a bare number would be ambiguous.
+  // NOTE: external fetches only. The KV reads this handler makes also count
+  // against the 10,000 cap and are invisible to the wrap.
+  const mark = instrMark();
+  const row  = await refreshLongTicker(sym, env);
+  const instr = instrSince(mark, 'complete');
+  return json({
+    row, cached: false, stale: false, ageMs: 0,
+    _instr: { ...instr, premiumWarm: row.sharedFrom === 'premium-row' },
+    _meta: longRowMeta(row),
+  }, 200, origin);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    IMPLIED VOLATILITY  (/api/iv/:ticker)
 
    Implied vol comes from the options chain and nowhere else. The page used to
@@ -6210,6 +7184,12 @@ export default {
           // just not fetches.) A bare ticker refreshes one name, ~5 subrequests.
           if (sub === 'batch') return await handlePremiumBatch(url.searchParams, origin, env);
           return await handlePremiumTicker(sub, url.searchParams, origin, env, ctx);
+        case 'long':
+          // Same shape as premium and for the same reason: `batch` is a KV read
+          // so the tab paints without touching Yahoo, and a bare ticker is the
+          // only spender (~5 warm, ~8-9 cold). Never fan out across the watchlist.
+          if (sub === 'batch') return await handleLongBatch(url.searchParams, origin, env);
+          return await handleLongTicker(sub, url.searchParams, origin, env);
         case 'iv':       return await handleIv(sub, url.searchParams, origin, env, ctx);
         case 'insider':  return await handleInsider(sub, url.searchParams, origin, env, ctx);
         case 'short':    return await handleShortInterest(sub, url.searchParams, origin, env, ctx);

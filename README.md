@@ -145,6 +145,8 @@ the data is past its refresh window.
 - `bs-delta.check.mjs` — Black-Scholes delta check
 - `cron-gate.check.mjs` — cron trading-day gate check (weekends, NYSE holidays, both DST regimes)
 - `cors-check.html` — open in a browser to verify CORS preflight against the Worker
+- `nd2.check.mjs` — the Long tab's `P(BE)@exp` (N(d2)), theta and vega, cross-checked
+  three independent ways; prints computed vs expected
 - `CLAUDE.md` — working rules; **read the constraints block first**
 - `ARCHITECTURE.md` — data source map, honesty rules, what is deliberately not done
 

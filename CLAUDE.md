@@ -569,11 +569,16 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Two checks exist, both of which print computed vs
+There is no build step. Three checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
-gate, over weekends / NYSE holidays / both DST regimes) and
-`node bs-delta.check.mjs`, which prints
-computed vs expected for the Black-Scholes delta rather than asserting.
+gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
+(Black-Scholes delta), and `node nd2.check.mjs` (the Long tab's `P(BE)@exp`,
+theta and vega — N(d2) against a reference series-erf **and** against
+e^{rT}·(−∂C/∂K) by central difference, which is a structurally different
+derivation and so catches "right arithmetic, wrong quantity"; greeks against
+numerical differentiation). All three extract functions from `worker.js` by
+source, not by import, because every named export in `worker.js` must be a
+function or `workerd` refuses to boot.
 
 ## Architecture
 
@@ -588,6 +593,8 @@ GET  /api/chart/:ticker           Yahoo v8 OHLCV (?range=1y&interval=1d)
 GET  /api/options/:ticker         Yahoo v7 options chain
 GET  /api/premium/batch?symbols=  Premium screen, KV only — zero outbound calls
 GET  /api/premium/:ticker         One ticker (?refresh=1 rebuilds it, ~5 subrequests)
+GET  /api/long/batch?symbols=     Long screen, KV only — zero outbound calls
+GET  /api/long/:ticker            One ticker (4 measured warm / 7 cold)
 GET  /api/insider/:ticker         SEC EDGAR Form 4, last 90 days (12h KV)
 GET  /api/short/:ticker           FINRA consolidated short interest, 6 settlements (Yahoo fallback)
 GET  /api/13f/:ticker             Super-investor 13F holdings, from a KV reverse index
@@ -942,6 +949,7 @@ differs from its retention, both are given and the reason is in the notes.
 | `iv:{TICKER}:{DATE}` | **400d** | One daily front-expiry ATM IV sample — the series `ivRank` is built from. `atmIv`/`spot`/`dte` are duplicated into **KV metadata** so `ivHistory()` rebuilds the series from one paged `list()` instead of 400 `get()`s. Metadata caps at 1024 bytes; keep it to those three flat numbers. |
 | `ivsweep:last` | 2d | PT date of the last cron IV sweep, for dedup. **Deliberately outside the `iv:` prefix** so `ivHistory()`'s prefix scan cannot pick it up as a sample. |
 | `premium:{TICKER}` | **24h retention / 4h freshness** | One premium-screen row. The two differ on purpose — see below. |
+| `long:{TICKER}` | **24h retention / 4h freshness** (`LONG_FRESH_MS`) | One long-screen row: four lanes, both timestamps, the buy gate and the directional read. Same freshness/retention split as `premium:` and for the same reason — past 4h the row still renders, badged stale. |
 | `cik:map` | 30d | SEC ticker→CIK map from `company_tickers.json` |
 | `insider:{TICKER}` | 12h | Parsed SEC Form 4 report |
 | `short:{TICKER}` | 6h, or **15min** on the Yahoo fallback | FINRA short interest. The short TTL on the fallback is deliberate: a labelled estimate should be retried soon, not cached like the official figure. |
@@ -1052,7 +1060,7 @@ exactly like a real one.
 
 ### Frontends
 
-`dashboard.html` — macro landing view with **six tabs**. Every tab is deep-linkable
+`dashboard.html` — macro landing view with **seven tabs**. Every tab is deep-linkable
 by hash (`dashboard.html#premium`), and `switchTab()` only lazy-loads a tab whose
 data is still empty — `primeTabs()` has usually painted it already.
 
@@ -1064,6 +1072,7 @@ data is still empty — `primeTabs()` has usually painted it already.
 | **Watchlist** | `#watchlist` | The 14-column table, sortable, with expandable rows and the consolidated Recommendation column. |
 | **Sectors** | `#sectors` | All 11 SPDR sectors, ETF % change plus a Claude-picked opportunity and avoid per sector. |
 | **Premium** | `#premium` | The short-premium screen. **Renamed from "Options"** — the old tab was a V/OI unusual-activity recap on the nearest expiration and was deleted outright, along with `handleOptionsRecap()` and its Claude flow synthesis. |
+| **Long** | `#long` | The long-premium screen — the mirror of Premium. Four lanes (LEAPS / swing / debit verticals / calendars), gated on vol being *cheap* and the debit being structurally payable. See the Long-screen section below for everything that inverts. |
 
 Note the Premium tab is the only one that fetches on interaction rather than on
 load: expanding a row is what spends the subrequests. Sectors and Scanner use
@@ -1215,6 +1224,97 @@ click. Headers sort on any of those (alphabetical by default, annualised ROC des
 useful one); unavailable rows always sink regardless of sort, and nulls sort last in **both**
 directions because a missing value is not a small value. Expanded state persists per ticker in
 `sessionStorage` — it is "where was I", not a durable preference.
+
+### The Long tab — the long-premium screen
+
+The mirror of Premium: Premium asks *where is vol rich enough to sell*, Long asks *where is vol cheap
+enough to own, and is the debit structurally payable*. Same architecture — `/api/long/batch?symbols=`
+is a KV read with zero outbound calls, `/api/long/:ticker` is the only spender, Load all is strictly
+sequential, expanded/sort state in `sessionStorage` under `trading_dash_long_open` /
+`trading_dash_long_sort`. `long:{TICKER}`, `LONG_FRESH_MS` 4h, retention 24h.
+
+**Measured subrequest cost (external fetches, `_instr` on the response, AAPL 2026-08-08):**
+
+| case | measured | breakdown |
+|---|---|---|
+| premium-**warm** | **4** | base list + 3 dated chains (Jan 2028, Sep, Oct) |
+| premium-**cold** | **7** | the above + earnings `quoteSummary` + hv30 chart |
+
+**Everything that inverts, because an inverted thing that looks like a copy is how this gets broken:**
+
+- **Debit is the ASK**, the mirror of Premium's credit-is-the-bid. On a vertical it is long ask − short bid.
+- **Low IV rank is the good state.** `buyableFrom()` mirrors `sellableFrom()` — same tri-state
+  fallthrough, opposite direction: `IVR_BUY_MAX` 40 on rank, `RATIO_BUY_MAX` 0.95 on the IV/HV30 proxy,
+  `buyable: null` when neither exists (renders **neutral, not dim** — the same null-is-not-a-fail rule
+  that greyed the Premium tab for three months). Note `buyable` is **not** `!sellable`: an IV rank of 55
+  is neither rich enough to sell nor cheap enough to buy, which is a real and common state.
+- **The dim gate is two-part**: not-rich vol **AND** best-candidate BE/EM ≤ 1.0. Cheap vol alone is not
+  enough — a name can have depressed IV and still price every breakeven outside its own expected move.
+- **`termStructure = front − back` is unchanged, and its MEANING is opposite.** Positive is
+  backwardation (front IV richer). On Premium that is the crush setup and reads favourable; here it is
+  **hostile**, because front-dated premium is exactly what a buyer is paying for. The row carries
+  `hostileTerm` as a field distinct from `backwardation`, the chip glyph is **▰ / ▱** (never Premium's
+  ◤ / ◢), and the legend states the inversion. Do not reuse the Premium chip renderer.
+- **`P(BE)@exp` is N(d2), not 1 − |Δ|.** Delta is N(d1) and d1 − d2 = σ√T, so the delta shortcut fails
+  worst on exactly the structure Lane A exists for. `node nd2.check.mjs` prints the gap: **5.34 pts at
+  45 DTE / 40% IV, 22.57 pts at 531 DTE / 50% IV, 36.94 pts at 895 DTE / 65% IV.** σ comes from the
+  listed strike nearest the *breakeven* and that strike is named on the card; if it quotes nothing
+  usable the cell is `n/a` with the reason — **never** backfilled from ATM IV.
+
+**Four lanes.** A = stock replacement, the two nearest Januaries ≥365 DTE, 0.85/0.70Δ ITM calls. B =
+directional swing, first monthly ≥30 and ≥60 DTE, 0.55/0.40Δ. C = debit verticals on B's already-fetched
+chains (zero extra subrequests), long ~0.55Δ short ~0.25Δ, **actual leg deltas reported, not the
+targets**. D = calendar/diagonal.
+
+**Lane A's two Januaries usually collapse.** §2's "nearest 540 DTE" and "nearest January ≥365 DTE" pick
+the same expiry on all but ~7 days a year, so the second slot is the *next* January out. Expect it to be
+unlisted on most names — AAPL, NVDA, CRCL, CAVA, QUBT, CRWV, TWLO, MRK and HOOD all listed exactly one
+January beyond 365 DTE on 2026-08-08. That renders as `not-listed` with a reason, never as an error.
+
+**Lane D is deliberately thin and the card says why.** It shows net debit, both IVs, the differential,
+both DTEs and where earnings falls. It shows **no** breakeven, BE/EM, P(BE), cost of carry or payoff
+diagram, because a calendar's P/L at the front expiry depends on the back month's IV *at that future
+date* — a term-structure model this codebase does not have. Deriving any of them from an assumed future
+IV would be a plausible number measuring nothing. Cost of carry is likewise absent on Lane C verticals:
+the short leg refunds part of the extrinsic, so the Lane A formula does not describe the structure.
+
+**Row status extends the Premium vocabulary** rather than forking it: `ok` · `no-options` · `no-iv` ·
+**`no-leaps`** (options listed but no January beyond 365 DTE and no monthly at the swing horizon — a
+finding about the name) · `illiquid` · `error`. `pending` is never stored.
+
+**Liquidity floors** `LONG_SPREAD_MAX_NEAR` (0.15) and `LONG_SPREAD_MAX_LEAPS` (0.30) as spread ÷ mid,
+plus `LONG_MIN_OI` (10). A breach is **flagged and dimmed, never dropped** — a name whose options are
+untradeable has to look untradeable, and dropping it makes that indistinguishable from missing data.
+
+**Directional alignment annotates and demotes, never filters.** The rating comes from
+**`analysis:{TICKER}`** — the same key the Watchlist Recommendation column writes (`ANALYSIS_SCHEMA`,
+strict `BUY|HOLD|SELL`). There is no `watchlist:{TICKER}` key; `watchlist:tickers` is the saved symbol
+list. Two KV reads, **zero external fetches and zero Claude calls — measured: 4 external both with and
+without the key present**. A missing analysis is `no read` and must never trigger a generation. Lanes B/C
+get a live tag; **Lane A is tagged `out-of-horizon`** (a 531-day contract judged by a signal scored at 5
+and 20 sessions) and its sort is unaffected; Lane D gets no tag. `counter` candidates are demoted below
+the rest **only once calibration resolves at n ≥ 10** — an unscored tag must not reorder anything.
+
+### Adding a rule: two failure modes found building the Long tab
+
+**1. Yahoo quotes junk implied vol on deep untraded strikes, and it corrupts strike SELECTION.**
+Observed on AAPL 2026-08-08: the 2026-09-18 **420 put quoted IV 195.72% against an expiry ATM IV of
+24.54%** — an 8× outlier on a strike with open interest 0. Delta from that quote is 0.544, which beat the
+real near-the-money put for the 0.55 target. The screen would have printed a confident, fully-priced
+"0.55Δ swing put" struck **34% above spot** with a 272.9% annualised cost of carry, and every downstream
+number would have been arithmetically correct and completely meaningless. `LONG_IV_OUTLIER_MULT` (4)
+excludes such strikes **from selection** and the lane reports how many and the worst value. This is not
+the banned "fill a missing IV from ATM" — nothing is substituted, and the exclusion is declared on the
+card. **When a metric selects among rows using a vendor-supplied number, validate that number against
+its own peers first; a bad input to a selection is invisible in the output.**
+
+**2. A null rendered through arithmetic becomes a fabricated measurement.** The legend printed
+**"hit rate 0% over n=12"**. Calibration was genuinely resolved (n=12 ≥ 10) but `hitRate` was `null`,
+because a hit rate belongs to a *rating* and that ticker had no stored rating — and
+`(null * 100).toFixed(0)` is `"0"`. A missing number silently became a measured 0% accuracy, which is
+exactly what §6b forbids. **Guard the null before the arithmetic, not after: `x == null` and `x === 0`
+must never render the same way.** The state count was two (resolved / unresolved) and the truth was
+three.
 
 The Scanner tab hosts four presets. Three (Momentum, Pre-Market Gappers, All Movers) hit
 `/api/market/scanner` and share `renderScanner()`; the Golden Cross Setup preset hits

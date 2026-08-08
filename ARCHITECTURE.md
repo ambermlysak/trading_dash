@@ -11,6 +11,8 @@ trading_dash/
 │                        #   Alpaca proxy, Claude calls, KV persistence, cron jobs
 ├── wrangler.toml        # Worker config: KV binding, cron trigger, secret inventory
 ├── bs-delta.check.mjs   # Black-Scholes delta check — prints computed vs expected
+├── nd2.check.mjs        # Long tab P(BE)@exp = N(d2), theta, vega — three
+│                        #   independent cross-checks, prints computed vs expected
 ├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
 │                        #   both DST regimes; prints computed vs expected
 ├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
@@ -29,7 +31,7 @@ moved into the Worker and shipped in the payload (`volRegime`, gate thresholds).
 
 ## The two pages
 
-**`dashboard.html`** — six tabs, all deep-linkable by hash:
+**`dashboard.html`** — seven tabs, all deep-linkable by hash:
 
 | Tab | Contents | Data path |
 |---|---|---|
@@ -39,6 +41,7 @@ moved into the Worker and shipped in the payload (`volRegime`, gate thresholds).
 | Watchlist | 14 columns, sortable, expandable rows, one consolidated Recommendation | `/api/watchlist/batch` |
 | Sectors | 11 SPDR sectors, ETF change + Claude opportunity/avoid per sector | `/api/market/sectors`, 4h KV |
 | **Premium** | Short-premium screen: collapsed rows, expand to fetch | `/api/premium/batch` (KV only) + `/api/premium/:ticker` on expand |
+| **Long** | Long-premium screen: LEAPS / swing / debit verticals / calendars, collapsed rows, expand to fetch | `/api/long/batch` (KV only) + `/api/long/:ticker` on expand |
 
 The Premium tab replaced an "Options" tab that showed a V/OI unusual-activity
 recap of the nearest expiration. That view is deleted, not moved — it answered
@@ -187,6 +190,23 @@ in this codebase and shipped:
    guidance conflicts with a project rule here, the project rule wins. General documentation does
    not know this account is on Workers Paid, does not know which cron hours fall outside
    the trigger window, and does not know which of these numbers have already been wrong on screen.
+21. **A vendor number that drives *selection* must be validated against its peers before it is used.**
+   Yahoo quoted implied vol of 195.72% on AAPL's 2026-09-18 420 put against an expiry ATM IV of 24.54%
+   — an 8× outlier on a strike with zero open interest. The Black-Scholes delta computed from it was
+   0.544, which beat the genuine near-the-money put for the Long tab's 0.55-delta target. Every number
+   downstream — breakeven, BE/EM, P(BE), leverage, a 272.9% annualised carry — was then arithmetically
+   correct and completely meaningless, describing a "0.55 delta swing put" struck 34% *above* spot. A
+   bad input to a *display* shows up as one wrong cell; a bad input to a *selection* is invisible,
+   because the output looks like a normal row. Outlier strikes are now excluded from selection with
+   the count and the worst value declared on the card — which is not the same as the banned practice
+   of filling a missing IV from ATM, since nothing is substituted.
+22. **A null pushed through arithmetic becomes a fabricated measurement.** The Long tab's legend
+   rendered **"hit rate 0% over n=12"**. Calibration really was resolved, but `hitRate` was `null`
+   because a hit rate belongs to a rating and that ticker had no stored rating — and
+   `(null * 100).toFixed(0)` is `"0"`. An absent measurement silently became a measured 0% accuracy,
+   the exact claim the alignment tag is forbidden from implying. The code modelled two states
+   (resolved / unresolved) where there were three. Check `== null` *before* the arithmetic: a missing
+   value and a zero must never render the same way.
 
 ## Section-by-section data source map
 
@@ -229,6 +249,7 @@ Where a paid feed would still add something real, it is named in the notes.
 | 15 | Recommendation history + calibration | Cloudflare KV forward log; `fwd5`/`fwd20` filled by a 2pm PT cron; hit rate and Brier score once n ≥ 10 | **real** | — |
 | 16 | News flow | Alpaca news when keyed, Yahoo `search` otherwise | **real** | Benzinga ($177) |
 | — | Premium screen (dashboard) | Yahoo chain via `/api/premium/:ticker`, one ticker per request: term structure, expected move, 0.30/0.16-delta strikes, credit, ROC, annualised ROC, POP | **real** | ORATS for a historical IV surface |
+| — | Long screen (dashboard) | Yahoo chain via `/api/long/:ticker`, one ticker per request: four lanes, ask-based debit, breakeven, BE/EM, extrinsic %, leverage, annualised carry, theta, vega, `P(BE)@exp` from N(d2). Reuses `premium:{TICKER}`'s slower-moving fields when fresh (4 external fetches) and refetches them when not (7) | **real** — Lane D's breakeven/BE/EM/P(BE)/carry are **suppressed**, not estimated | ORATS for a historical IV surface; a term-structure model would unlock Lane D |
 
 ## If you ever want to pay for data
 
@@ -309,6 +330,8 @@ GET  /api/options/:ticker          ?date=<unix>
 GET  /api/iv/:ticker               ATM IV front/back, term structure, IV rank, HV30, POP ladder
 GET  /api/premium/batch?symbols=   Premium screen — KV read only, zero outbound calls
 GET  /api/premium/:ticker          One ticker (?refresh=1 forces, ?cached=1 never fetches)
+GET  /api/long/batch?symbols=      Long screen — KV read only, zero outbound calls
+GET  /api/long/:ticker             One ticker (?refresh=1 forces, ?cached=1 never fetches)
 GET  /api/insider/:ticker          SEC EDGAR Form 4, last 90 days
 GET  /api/short/:ticker            FINRA consolidated short interest (Yahoo fallback)
 GET  /api/13f/:ticker              Super-investor 13F, from the KV reverse index

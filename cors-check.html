@@ -51,6 +51,8 @@ const CASES = [
   ['GET  /daily',              '/daily',              { method: 'GET' }],
   ['GET  /market/snapshot',    '/market/snapshot',    { method: 'GET' }],
   ['GET  /premium/batch',      '/premium/batch?symbols=AAPL', { method: 'GET' }],
+  ['GET  /long/batch',         '/long/batch?symbols=AAPL',    { method: 'GET' }],
+  ['GET  /long/AAPL',          '/long/AAPL?cached=1',         { method: 'GET' }],
   ['POST /ai/synthesis/AAPL',  '/ai/synthesis/AAPL',  { method: 'POST' }],
   ['POST /log-rec',            '/log-rec',            { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' }],
 ];
