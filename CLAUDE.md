@@ -53,8 +53,9 @@ are free of the cap.
 **Read this before treating 10,000 as permission to fan out.** Every structure in
 this codebase that avoids fan-out stays exactly as it is:
 
-- `/api/premium/batch` and `/api/long/batch` remain **KV reads with zero outbound
-  calls**; `/api/premium/:ticker` and `/api/long/:ticker` remain the only spenders.
+- `/api/premium/batch` and `/api/long/batch` remain **KV reads that make no
+  outbound fetch** (they still cost one KV read per symbol — cheap, not free);
+  `/api/premium/:ticker` and `/api/long/:ticker` remain the only paths that touch Yahoo.
 - **Load all is strictly sequential** on both tabs, one awaited request at a time.
 - The deleted KV queue that once drained the premium sweep across cron firings
   **stays deleted**.
@@ -637,9 +638,9 @@ All data flows through the Worker. CORS is enforced via `ALLOWED_ORIGINS` allowl
 GET  /api/quote/:ticker           Yahoo quoteSummary (multi-module) + Alpaca price overlay
 GET  /api/chart/:ticker           Yahoo v8 OHLCV (?range=1y&interval=1d)
 GET  /api/options/:ticker         Yahoo v7 options chain
-GET  /api/premium/batch?symbols=  Premium screen, KV only — zero outbound calls
+GET  /api/premium/batch?symbols=  Premium screen, KV only — no fetches; 1 KV read/symbol
 GET  /api/premium/:ticker         One ticker (?refresh=1 rebuilds it, ~5 subrequests)
-GET  /api/long/batch?symbols=     Long screen, KV only — zero outbound calls
+GET  /api/long/batch?symbols=     Long screen, KV only — no fetches; 1 KV read/symbol
 GET  /api/long/:ticker            One ticker (4 measured warm / 7 cold)
 GET  /api/insider/:ticker         SEC EDGAR Form 4, last 90 days (12h KV)
 GET  /api/short/:ticker           FINRA consolidated short interest, 6 settlements (Yahoo fallback)
@@ -843,12 +844,47 @@ Note the `TTL` object is a **global**; four handlers used to declare a local `co
 it (now `CRUMB_TTL` / `SCAN_TTL` / `GOLDEN_TTL` / `IPO_TTL`). If you add another, do not call it `TTL`
 — the shadow is silent and turns `TTL.scanner` into `undefined`.
 
-**Stale-while-revalidate: no tab waits on a click.** Sectors, Scanner and Premium accept `?cached=1`,
-which returns the banked KV snapshot at **any** age and never rebuilds; `primeTabs()` paints all three
-on page load, then revalidates through the normal endpoint (which still serves from KV inside its TTL,
-so priming all three costs about what clicking one used to). A failed revalidation leaves the painted
-snapshot alone rather than blanking a view the user is reading, and a loading wall is only drawn when
-there is nothing on screen yet. The manual Refresh buttons pass `?refresh=1` and still force a rebuild.
+**Stale-while-revalidate: no tab waits on a click.** Sectors and Scanner accept `?cached=1`, which
+returns the banked KV snapshot at **any** age and never rebuilds; Premium and Long have no such split
+because their list views *are* KV reads. `primeTabs()` paints all four on page load, then revalidates
+Sectors and Scanner through the normal endpoint (which still serves from KV inside its TTL). A failed
+revalidation leaves the painted snapshot alone rather than blanking a view the user is reading, and a
+loading wall is only drawn when there is nothing on screen yet. The manual Refresh buttons pass
+`?refresh=1` and still force a rebuild.
+
+**What `primeTabs()` actually costs, measured (`_instr`, 22-ticker watchlist, 2026-08-08).** It used
+to be described as costing "about what clicking one tab used to", which was a comparison rather than a
+number. One full dashboard page load fires **12 requests — 10 GET plus 2 CORS preflights — and totals
+capCost ≈ 133–140** across all of them:
+
+| request | capCost |
+|---|---|
+| `/market/sectors` (revalidate, cold cache) | **~47** |
+| `/premium/batch` (22 symbols) | 22 |
+| `/long/batch` (22 symbols) | 22 |
+| `/market/snapshot` | 12 |
+| `/market/movers` | 8 |
+| `/daily` | 4 |
+| `/market/ipos`, `/market/sectors?cached=1`, `/market/scanner` ×2 | 2 each |
+| CORS preflight ×2 | 0 (returns before any binding call) |
+
+Three things follow, and only the third is a change:
+
+1. **The cap is unaffected and this is not close.** The 10,000 meters **per invocation**, and each of
+   these is its own invocation. The largest single one is the cold sectors rebuild at ~47, then the
+   batch reads at 22 — roughly 0.5% and 0.2% of the ceiling. Adding Long to `primeTabs()` did not
+   change the per-invocation figure at all; it added one more 22-cost invocation alongside Premium's.
+2. **The batch reads are not the expensive part.** They are ~32% of the page load between them, and
+   one cold sectors revalidation costs more than both together. If page-load cost ever needs reducing,
+   that is the line to look at, not the batch reads.
+3. **Stop saying these reads are free.** "Zero outbound calls" is true of *fetches* and false of
+   *subrequests*: one KV read per symbol, so 44 for the two batch tabs on every page load. Both
+   endpoints now report `_instr` so the figure is readable rather than asserted.
+
+Caveat on the ~47: measured against a **cold** local sectors cache with no `ANTHROPIC_API_KEY`, so it
+attempted a rebuild and 500ed. In production inside the 4h TTL that call is a KV read (~2), which puts
+a steady-state page load nearer **~90**. The number that was actually measured is stated; the
+production figure is an inference and is labelled as one.
 
 **Model confidence renders as an ordinal, never a percentage.** `confLabel()` maps to Low / Moderate
 / High in all three places it surfaced (synthesis hero + ring, watchlist recommendation, options-recap
@@ -1189,9 +1225,10 @@ There was briefly a KV queue drained across cron firings to work around that. It
 is used one or two names at a time when deciding what to sell, so fetching all 22 daily was solving a
 problem nobody had at the cost of a queue, a cursor, a seed step and a share of every cron firing.
 
-- `GET /api/premium/batch?symbols=` is a **cache-status read, not a data fetch**: it reads KV and
-  makes zero outbound calls, so the tab paints every watchlist ticker on load for free. Tickers with
-  nothing cached come back in `missing[]` as `not-loaded`.
+- `GET /api/premium/batch?symbols=` is a **cache-status read, not a data fetch**: no outbound fetches,
+  so the tab paints every watchlist ticker on load without touching Yahoo. It is **not free** — one KV
+  read per symbol, measured `capCost 22` for a 22-name watchlist, and KV counts against the same pool.
+  Cheap, not free. Tickers with nothing cached come back in `missing[]` as `not-loaded`.
 - `GET /api/premium/:ticker` is the only path that spends subrequests, and spends ~5. Bare = serve
   cache if inside `PREMIUM_FRESH_MS`, else refetch. `?refresh=1` always refetches (the ↻ control).
   `?cached=1` never fetches.
@@ -1286,7 +1323,8 @@ directions because a missing value is not a small value. Expanded state persists
 
 The mirror of Premium: Premium asks *where is vol rich enough to sell*, Long asks *where is vol cheap
 enough to own, and is the debit structurally payable*. Same architecture — `/api/long/batch?symbols=`
-is a KV read with zero outbound calls, `/api/long/:ticker` is the only spender, Load all is strictly
+is a KV read making no outbound fetch (1 KV read/symbol), `/api/long/:ticker` is the only path that
+touches Yahoo, Load all is strictly
 sequential, expanded/sort state in `sessionStorage` under `trading_dash_long_open` /
 `trading_dash_long_sort`. `long:{TICKER}`, `LONG_FRESH_MS` 4h, retention 24h.
 

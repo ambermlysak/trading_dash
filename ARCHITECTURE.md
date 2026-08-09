@@ -4,8 +4,8 @@
 
 ```
 trading_dash/
-├── dashboard.html       # Macro landing view — 6 tabs (market, midday, scanner,
-│                        #   watchlist, sectors, premium)
+├── dashboard.html       # Macro landing view — 7 tabs (market, midday, scanner,
+│                        #   watchlist, sectors, premium, long)
 ├── index.html           # Per-ticker research page — hero + 14 numbered cards
 ├── worker.js            # Cloudflare Worker: Yahoo / SEC EDGAR / FINRA / FRED /
 │                        #   Alpaca proxy, Claude calls, KV persistence, cron jobs
@@ -17,8 +17,6 @@ trading_dash/
 │                        #   gate branch, Lane A with two Januaries, the IV guard
 ├── instr-bindings.check.mjs # The binding counter: shape detection, automatic
 │                        #   pickup of a new binding, and its failure paths
-├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
-│                        #   both DST regimes; prints computed vs expected
 ├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
 │                        #   both DST regimes; prints computed vs expected
 ├── cors-check.html      # Open in a BROWSER to verify CORS preflight; curl cannot
@@ -50,9 +48,17 @@ moved into the Worker and shipped in the payload (`volRegime`, gate thresholds).
 The Premium tab replaced an "Options" tab that showed a V/OI unusual-activity
 recap of the nearest expiration. That view is deleted, not moved — it answered
 "what traded today", and at the nearest expiration the answer is mostly 0DTE churn.
-It is the only tab that fetches on interaction rather than on load; Sectors and
-Scanner paint a KV snapshot immediately and revalidate behind it, so no tab
-requires a click to show data.
+Premium and Long are the only tabs that fetch upstream on interaction rather than
+on load; Sectors and Scanner paint a KV snapshot immediately and revalidate behind
+it, so no tab requires a click to show data.
+
+**Painting is cheap, not free.** `primeTabs()` fires both batch reads on every page
+load, and each costs one KV read per symbol — 22 apiece on a 22-name watchlist,
+which counts against the same 10,000 pool as an outbound fetch. A full dashboard
+page load measures **capCost ≈ 133–140** across the 12 requests it triggers (≈90 in
+steady state, once the sectors cache is warm). The cap meters per *invocation*, so
+the figure that matters against 10,000 is the largest single request — ~47 for a
+cold sectors rebuild, 22 for a batch read — not the page-load total.
 
 **`index.html`** — per-ticker deep dive. Hero strip (price, change, market cap,
 P/E, sector, exchange, AI verdict + confidence ring) over numbered cards:
@@ -357,9 +363,9 @@ GET  /api/quote/:ticker            Yahoo quoteSummary (multi-module) + Alpaca ov
 GET  /api/chart/:ticker            ?range=1y&interval=1d
 GET  /api/options/:ticker          ?date=<unix>
 GET  /api/iv/:ticker               ATM IV front/back, term structure, IV rank, HV30, POP ladder
-GET  /api/premium/batch?symbols=   Premium screen — KV read only, zero outbound calls
+GET  /api/premium/batch?symbols=   Premium screen — no fetches; 1 KV read/symbol (22 = capCost 22)
 GET  /api/premium/:ticker          One ticker (?refresh=1 forces, ?cached=1 never fetches)
-GET  /api/long/batch?symbols=      Long screen — KV read only, zero outbound calls
+GET  /api/long/batch?symbols=      Long screen — no fetches; 1 KV read/symbol (22 = capCost 22)
 GET  /api/long/:ticker             One ticker (?refresh=1 forces, ?cached=1 never fetches)
 GET  /api/insider/:ticker          SEC EDGAR Form 4, last 90 days
 GET  /api/short/:ticker            FINRA consolidated short interest (Yahoo fallback)
