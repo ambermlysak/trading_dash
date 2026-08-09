@@ -150,6 +150,9 @@ the data is past its refresh window.
 - `long-fixtures.check.mjs` — the Long-screen paths live data cannot reach yet:
   the IV-rank gate branch, Lane A with two listed Januaries, and the shared
   IV-outlier guard at its boundaries
+- `instr-bindings.check.mjs` — the binding counter that makes `capCost` complete:
+  shape detection, automatic pickup of a newly added binding, and the failure
+  paths that must still hand back a working `env`
 - `CLAUDE.md` — working rules; **read the constraints block first**
 - `ARCHITECTURE.md` — data source map, honesty rules, what is deliberately not done
 
@@ -157,7 +160,9 @@ the data is past its refresh window.
 
 - **The Worker is on Cloudflare Workers Paid: 10,000 subrequests per invocation**
   (settable via `limits.subrequests`). It is **one pool** — external `fetch()` and
-  KV/R2/D1 binding calls all count against it. See rule #1 in `CLAUDE.md`.
+  KV/R2/D1 binding calls all count against it, and both are measured: every
+  instrumented response carries `_instr.capCost`. Quote that, not `extFetches`.
+  See rule #1 in `CLAUDE.md`.
 - **The cap is not what limits fan-out; Yahoo's crumb rate-limiting is.** The
   on-demand premium/long screens, the KV-only batch endpoints and the sequential
   Load-all all exist for that reason and do not change with the plan tier. Budget

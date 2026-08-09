@@ -91,13 +91,54 @@ shape* is what matters, and the shape is untouched by the ceiling moving:
 **`ctx.waitUntil` does not get its own budget.** It shares the invocation's, so
 two jobs dispatched on the same cron firing share one ceiling.
 
-**Measure, do not estimate.** `worker.js` does this permanently: `INSTR` wraps
-`globalThis.fetch` at module load. **It counts external calls only, so it is now a
-LOWER BOUND on what the cap meters** — KV binding calls do not travel over
-`globalThis.fetch` and cannot be seen by it, but they do count. That is a known
-gap, not a claim of completeness: budget external fetches with `extFetches` and
-add KV operations by hand. `instrMark()` / `instrSince()` bracket a job, and the
-result rides along as `_instr` on `daily:snapshot`, `daily:midday` and
+**Measure, do not estimate.** `worker.js` counts **both** halves of the pool:
+`INSTR` wraps `globalThis.fetch` at module load, and `instrWrapBindings(env)` runs
+at the top of `fetch()` and `scheduled()` to wrap every binding. `instrMark()` /
+`instrSince()` bracket a job and the result rides along as `_instr`:
+
+| field | what it is |
+|---|---|
+| `extFetches` | external `fetch()` calls |
+| `bindingOps` | KV / R2 / D1 / DO calls |
+| **`capCost`** | **extFetches + bindingOps — the figure the 10,000 meters** |
+| `bindingsWrapped` / `bindingsSkipped` | the counter's own coverage |
+| `cacheApiCounted` | always `false` — see the gap below |
+
+**Quote `capCost`, never `extFetches`.** `extFetches` alone was reported as the
+cost of a long-screen ticker and understated it by **125–143%**: measured on AAPL
+2026-08-08, premium-warm is 4 external + 5 binding = **9**, and premium-cold is
+7 external + 6 binding = **13** (17 when the Yahoo crumb is also cold, which adds
+2 fetches and 2 KV ops). The `/api/long/batch` and `/api/premium/batch` endpoints
+were documented as "zero outbound calls"; that is true of *fetches* and false of
+*subrequests* — they cost **exactly one KV read per symbol**, so a 22-name
+watchlist paints for **22** against the cap, not 0. Both now report `_instr`.
+
+**Coverage is declared, not assumed.** `instrWrapBindings` does not name
+`REC_LOG` — it walks `env` and wraps everything binding-*shaped* (an object or
+function carrying at least one callable member; a secret is a string, a `[vars]`
+JSON entry has no methods). So a binding added later is counted the day it
+appears. What it wrapped and what it could not ride along in every payload,
+because a total that silently omits a source is the `build13FIndex` failure in
+different clothing. It sits in front of every KV call in the Worker, so it fails
+safe in the strongest sense: any fault returns the **original, unwrapped `env`**
+and degrades the report to `bindingsWrapped: []`.
+
+**KNOWN GAP — the Cache API.** `caches.default.match/put` and `caches.open()`
+count against the cap and travel over neither `globalThis.fetch` nor `env`, so
+**neither counter can see them**. Nothing in the Worker uses the Cache API today
+(verified by grep, not assumed), and `cacheApiCounted: false` says so in every
+payload.
+
+> **Rule: any new binding, or the first use of the Cache API, must be checked
+> against the instrumentation's coverage in the same commit.** For a binding that
+> means confirming it appears in `bindingsWrapped` at runtime — shape detection
+> should handle it, but "should" is what this codebase keeps getting caught by.
+> For the Cache API it means extending `INSTR` to count it and flipping
+> `cacheApiCounted`, because a gap that lives only in a JSON payload is invisible
+> to the person adding the call. `node instr-bindings.check.mjs` covers the
+> detection and the failure paths.
+
+The same `_instr` block is stamped on `daily:snapshot`, `daily:midday` and
 `daily:eod`:
 
 ```json
@@ -105,12 +146,11 @@ result rides along as `_instr` on `daily:snapshot`, `daily:midday` and
             "scope": "scheduled", "measured": true, "phase": "complete" }
 ```
 
-- `extFetches` — this job's external calls. A lower bound on its cap cost: KV
-  operations count against the same pool and are invisible here.
+- `extFetches` — this job's external calls. Budget against `capCost`, not this.
 - `settledRejected` — promises its `Promise.allSettled` blocks swallowed. See
   rule #7; `errors: 0` in Cloudflare's telemetry is not evidence of success.
-- `invocationFetches` — whole-invocation external total. Larger than `extFetches`
-  when two jobs share a firing; still excludes binding calls.
+- `invocationFetches` / `invocationCapCost` — whole-invocation totals. Larger
+  than the per-job figures when two jobs share a firing.
 - `measured` — whether the `globalThis.fetch` wrap installed. **A zero count with
   `measured: false` means "not instrumented", not "made no calls."**
 - `phase` — `briefing` or `complete`. `daily:snapshot` is written before the
@@ -569,10 +609,13 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Four checks exist, all of which print computed vs
+There is no build step. Five checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
-(Black-Scholes delta), `node long-fixtures.check.mjs` (the three Long-screen paths
+(Black-Scholes delta), `node instr-bindings.check.mjs` (the binding counter:
+shape detection across bindings/secrets/vars, automatic pickup of a second
+binding, `this`-binding through the proxy, and the failure paths that must return
+a working `env`), `node long-fixtures.check.mjs` (the three Long-screen paths
 live data cannot reach: `buyableFrom()`'s `rank` branch, which stays unreachable
 until 60 days of IV history exist; Lane A with **two** listed Januaries; and the
 shared `ivPlausible()` guard at its boundaries), and `node nd2.check.mjs` (the Long tab's `P(BE)@exp`,
@@ -1247,12 +1290,19 @@ is a KV read with zero outbound calls, `/api/long/:ticker` is the only spender, 
 sequential, expanded/sort state in `sessionStorage` under `trading_dash_long_open` /
 `trading_dash_long_sort`. `long:{TICKER}`, `LONG_FRESH_MS` 4h, retention 24h.
 
-**Measured subrequest cost (external fetches, `_instr` on the response, AAPL 2026-08-08):**
+**Measured subrequest cost (`_instr` on the response, AAPL 2026-08-08).**
+`capCost` is the number the 10,000 meters — external fetches *and* KV together:
 
-| case | measured | breakdown |
-|---|---|---|
-| premium-**warm** | **4** | base list + 3 dated chains (Jan 2028, Sep, Oct) |
-| premium-**cold** | **7** | the above + earnings `quoteSummary` + hv30 chart |
+| case | extFetches | bindingOps | **capCost** | breakdown |
+|---|---|---|---|---|
+| premium-**warm** | 4 | 5 | **9** | base list + 3 dated chains (Jan 2028, Sep, Oct) |
+| premium-**cold** | 7 | 6 | **13** | the above + earnings `quoteSummary` + hv30 chart |
+| premium-cold, **crumb also cold** | 9 | 8 | **17** | + 2 crumb fetches and 2 crumb KV ops |
+| cache hit (`?cached=1` or fresh) | 0 | 1 | **1** | one KV read |
+| `/api/long/batch`, 22 symbols | 0 | 22 | **22** | one KV read per symbol |
+
+The earlier figures of 4 and 7 were `extFetches` only and understated the real
+cost by 125–143%. Do not quote them.
 
 **Everything that inverts, because an inverted thing that looks like a copy is how this gets broken:**
 

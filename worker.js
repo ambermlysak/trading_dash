@@ -38,11 +38,29 @@
    Cloudflare services like R2, KV, or D1" (verified 2026-08-08). The Free plan's
    50-external / 1,000-service split does not apply here.
 
-   The counter below wraps `globalThis.fetch` ONLY, because binding calls do not
-   travel over it and cannot be intercepted this way. So `fetches` is a LOWER
-   BOUND on the invocation's cap cost, not the whole of it — a KV read never moves
-   it but does spend the budget. Budget external fan-out with this number and add
-   KV operations by hand.
+   BOTH are counted, separately, and the total is named `capCost`:
+
+     • `extFetches`  — the `globalThis.fetch` wrap below
+     • `bindingOps`  — the per-request binding proxy (`instrWrapBindings`)
+     • `capCost`     — extFetches + bindingOps, the figure the 10,000 meters
+
+   `extFetches` alone used to be reported as the cost, which understated it by
+   the whole of KV — for one long-screen ticker that is roughly a third of the
+   real number. Never quote extFetches as a budget again.
+
+   COVERAGE IS DECLARED, NOT ASSUMED. `instrWrapBindings` does not name
+   `REC_LOG`; it walks `env` and wraps everything binding-SHAPED, so a binding
+   added later is counted the day it appears rather than the day someone
+   remembers this file. What it wrapped and what it could not rides along as
+   `bindingsWrapped` / `bindingsSkipped`, because a total that silently omits a
+   source is the `build13FIndex` failure wearing different clothes.
+
+   KNOWN GAP, stated rather than papered over: the **Cache API**
+   (`caches.default.match/put`, `caches.open`) also counts against the cap and
+   does NOT travel over `globalThis.fetch` or `env`, so neither counter can see
+   it. Nothing in this file uses it today (`cacheApiUsed: false` is asserted by
+   grep, not by hope). If you add one, you must extend this block in the same
+   commit — see the rule in CLAUDE.md.
 
    In practice the cap is not the binding constraint anyway: Yahoo crumb
    rate-limiting is, and it is untouched by the plan tier. Nothing that avoids
@@ -57,7 +75,12 @@
    An isolate can also serve requests, so a page load landing mid-cron inflates
    `invocationFetches`. The per-job `extFetches` delta is the number to trust,
    and `scope` records which reset it was measured against. */
-const INSTR = { fetches: 0, rejected: 0, scope: 'none', wrapped: false };
+const INSTR = {
+  fetches: 0, rejected: 0, scope: 'none', wrapped: false,
+  bindingOps: 0,
+  bindingsWrapped: [],   // names actually counted this invocation
+  bindingsSkipped: [],   // {name, reason} — present on env, NOT counted
+};
 
 try {
   const _nativeFetch = globalThis.fetch.bind(globalThis);
@@ -67,6 +90,96 @@ try {
   // Never let instrumentation take the Worker down. `wrapped:false` rides along
   // in every payload so a zero count can't be misread as "made no calls".
   console.error('[instr] could not wrap globalThis.fetch:', e.message);
+}
+
+/* ── Binding counter ─────────────────────────────────────────────────────────
+   Binding calls (KV/R2/D1/DO/service) count against the same 10,000 as external
+   fetches, and they do not go through `globalThis.fetch`, so they need their own
+   interception. This one is deliberately NOT written as "wrap env.REC_LOG":
+   naming the binding means a second binding added later is silently uncounted
+   while the total still looks authoritative — the same shape as a per-item catch
+   reporting 16 of 20 managers as complete.
+
+   So it detects by SHAPE. A binding is an object (or function) carrying at least
+   one callable member; a `[vars]` entry that happens to be JSON is an object with
+   none, and a secret is a string. Anything binding-shaped gets a counting proxy;
+   anything that cannot be wrapped is recorded in `bindingsSkipped` with a reason
+   and reported, never quietly dropped.
+
+   This sits in front of EVERY KV call in the Worker, which is a far more
+   dangerous place than the fetch wrap. It therefore fails safe in the strongest
+   sense available: any failure returns the ORIGINAL, unwrapped `env` so the
+   request proceeds normally, and degrades the report to `bindingsWrapped: []`. */
+
+/** An object/function carrying at least one callable member. */
+function looksLikeBinding(v) {
+  if (v == null) return false;
+  const t = typeof v;
+  if (t !== 'object' && t !== 'function') return false;   // strings = secrets
+  const seen = new Set();
+  for (let o = v; o && o !== Object.prototype && o !== Function.prototype; o = Object.getPrototypeOf(o)) {
+    for (const k of Object.getOwnPropertyNames(o)) {
+      if (k === 'constructor' || seen.has(k)) continue;
+      seen.add(k);
+      try { if (typeof v[k] === 'function') return true; } catch (_) { /* getter threw; keep looking */ }
+    }
+  }
+  return false;
+}
+
+/** Counting proxy over one binding. Method wrappers are memoised so a hot loop
+ *  (ivHistory's paged list()) does not allocate a closure per property access. */
+function countingBinding(target) {
+  const cache = new Map();
+  return new Proxy(target, {
+    get(t, prop) {
+      // Receiver is the raw target on purpose: a proxy receiver breaks internal
+      // slots / private fields on some runtime classes.
+      const val = Reflect.get(t, prop, t);
+      if (typeof val !== 'function') return val;
+      let wrapped = cache.get(prop);
+      if (!wrapped) {
+        wrapped = (...args) => {
+          try { INSTR.bindingOps++; } catch (_) { /* counting must never break the call */ }
+          return val.apply(t, args);
+        };
+        cache.set(prop, wrapped);
+      }
+      return wrapped;
+    },
+  });
+}
+
+/**
+ * Wrap every binding-shaped member of `env` in a counting proxy.
+ * Returns the env to actually use. On ANY failure returns the original env
+ * untouched — a broken counter must never become a broken KV read.
+ */
+function instrWrapBindings(env) {
+  try {
+    if (!env || typeof env !== 'object') return env;
+    const wrapped = [], skipped = [];
+    const out = {};
+    for (const name of Object.keys(env)) {
+      const val = env[name];
+      if (!looksLikeBinding(val)) { out[name] = val; continue; }   // secret or plain var
+      try {
+        out[name] = countingBinding(val);
+        wrapped.push(name);
+      } catch (e) {
+        out[name] = val;                                          // uncounted but WORKING
+        skipped.push({ name, reason: e.message || 'proxy failed' });
+      }
+    }
+    INSTR.bindingsWrapped = wrapped;
+    INSTR.bindingsSkipped = skipped;
+    if (skipped.length) console.warn('[instr] bindings not counted:', JSON.stringify(skipped));
+    return out;
+  } catch (e) {
+    console.error('[instr] binding wrap failed, counts will read 0:', e.message);
+    try { INSTR.bindingsWrapped = []; INSTR.bindingsSkipped = [{ name: '*', reason: e.message }]; } catch (_) {}
+    return env;
+  }
 }
 
 /* ── EVERY function below swallows its own failures ──────────────────────────
@@ -81,28 +194,43 @@ try {
    would not. */
 
 function instrReset(scope) {
-  try { INSTR.fetches = 0; INSTR.rejected = 0; INSTR.scope = scope; }
+  try { INSTR.fetches = 0; INSTR.rejected = 0; INSTR.bindingOps = 0; INSTR.scope = scope; }
   catch (e) { console.warn('[instr] reset failed:', e.message); }
 }
 
 /** Baseline, so one job's cost separates from the whole invocation's. */
 function instrMark() {
-  try { return { f: INSTR.fetches, r: INSTR.rejected }; }
+  try { return { f: INSTR.fetches, r: INSTR.rejected, b: INSTR.bindingOps }; }
   catch (e) { console.warn('[instr] mark failed:', e.message); return null; }
 }
 
 /** Cost of the work done since `mark`. `phase` says how far the job actually got.
  *  Returns a `measured:false` stub rather than throwing — this call sits inside
- *  the JSON.stringify of a KV put, so a throw here would lose the payload. */
+ *  the JSON.stringify of a KV put, so a throw here would lose the payload.
+ *
+ *  `capCost` is the number the 10,000 actually meters. `extFetches` on its own is
+ *  a LOWER BOUND and must not be quoted as a budget — that mistake is why this
+ *  block exists. `bindingsWrapped` / `bindingsSkipped` / `cacheApiCounted` state
+ *  the counter's own coverage, so a total can be read as complete or not. */
 function instrSince(mark, phase) {
   try {
     if (!mark) return { measured: false, phase, note: 'no baseline captured' };
+    const extFetches = INSTR.fetches - mark.f;
+    const bindingOps = INSTR.bindingOps - (mark.b || 0);
     return {
-      extFetches:        INSTR.fetches - mark.f,
+      extFetches,
+      bindingOps,
+      capCost: extFetches + bindingOps,
       settledRejected:   INSTR.rejected - mark.r,
       invocationFetches: INSTR.fetches,
+      invocationCapCost: INSTR.fetches + INSTR.bindingOps,
       scope:             INSTR.scope,
       measured:          INSTR.wrapped,
+      bindingsWrapped:   [...(INSTR.bindingsWrapped || [])],
+      bindingsSkipped:   [...(INSTR.bindingsSkipped || [])],
+      // The Cache API counts against the cap and is invisible to both counters.
+      // Nothing uses it today; this field exists so that stops being silent.
+      cacheApiCounted:   false,
       phase,
     };
   } catch (e) {
@@ -1867,11 +1995,15 @@ async function refreshPremiumTicker(sym, env, shared = null) {
 }
 
 /* ── GET /api/premium/batch?symbols= ─────────────────────────────────────────
-   Cache-status read, NOT a data fetch. Reads KV and makes ZERO outbound calls,
-   so the tab can paint every watchlist ticker on load without spending a single
-   subrequest. Tickers with nothing cached come back in `missing` so the row can
-   say "not loaded" rather than being silently absent. */
+   Cache-status read, NOT a data fetch: reads KV and makes ZERO outbound FETCHES,
+   so the tab can paint every watchlist ticker on load without touching Yahoo.
+
+   It does NOT cost zero subrequests, which is what this comment used to imply:
+   one KV read per symbol, and KV counts against the same 10,000 pool. The number
+   ships in `_instr`. Tickers with nothing cached come back in `missing` so the
+   row can say "not loaded" rather than being silently absent. */
 async function handlePremiumBatch(params, origin, env) {
+  const mark = instrMark();
   const symbols = (params.get('symbols') || '')
     .split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, PREM_MAX_SYMBOLS);
   if (!symbols.length) return err('symbols required', 400, origin);
@@ -1901,6 +2033,7 @@ async function handlePremiumBatch(params, origin, env) {
     freshMs: PREMIUM_FRESH_MS,
     gates: { ...REGIME_GATES, ratioSellMin: RATIO_SELL_MIN },
     rate,
+    _instr: instrSince(mark, 'batch'),
     _meta: srcMeta('KV cache (no fetch)', {
       ttlSeconds: PREMIUM_FRESH_MS / 1000,
       // The as-of that matters is the OLDEST row on screen, not this read.
@@ -2863,10 +2996,16 @@ async function refreshLongTicker(sym, env) {
 }
 
 /* ── GET /api/long/batch?symbols= ────────────────────────────────────────────
-   Cache-status read, NOT a data fetch. Zero outbound calls, so the tab paints
-   every watchlist ticker on load without touching Yahoo. (The KV reads do count
-   against the invocation's 10,000-subrequest pool — they are just not fetches.) */
+   Cache-status read, NOT a data fetch: zero outbound FETCHES, so the tab paints
+   every watchlist ticker on load without touching Yahoo.
+
+   "Zero outbound calls" was the old wording and it is not the same claim. This
+   endpoint costs ONE KV READ PER SYMBOL, and KV reads count against the same
+   10,000 pool — a 22-name watchlist is ~22 against the cap, not 0. It is still
+   the cheap path (no upstream, no rate-limit exposure, ~11ms), but the figure
+   now rides along in `_instr` rather than being described as nothing. */
 async function handleLongBatch(params, origin, env) {
+  const mark = instrMark();
   const symbols = (params.get('symbols') || '')
     .split(',').map(s => s.trim().toUpperCase()).filter(Boolean).slice(0, LONG_MAX_SYMBOLS);
   if (!symbols.length) return err('symbols required', 400, origin);
@@ -2898,6 +3037,7 @@ async function handleLongBatch(params, origin, env) {
       ...REGIME_GATES,
     },
     rate: rows.find(r => r.rate)?.rate || null,
+    _instr: instrSince(mark, 'batch'),
     _meta: srcMeta('KV cache (no fetch)', {
       ttlSeconds: LONG_FRESH_MS / 1000,
       asOf: oldest ? new Date(oldest).toISOString().slice(0, 16).replace('T', ' ') : null,
@@ -2918,6 +3058,14 @@ async function handleLongTicker(ticker, params, origin, env) {
   const sym = String(ticker || '').toUpperCase();
   if (!sym) return err('ticker required', 400, origin);
 
+  /* Baseline at the TOP of the handler, not just before the refetch.
+     It used to sit after the cache read and the crumb call, which quietly
+     excluded their cost from a number labelled "this request" — a smaller
+     version of the same understatement that made extFetches look like a budget.
+     Every return path below reports, so a cache hit states its cost too. */
+  const mark = instrMark();
+  const stamp = (phase, extra = {}) => ({ ...instrSince(mark, phase), ...extra });
+
   const force      = params.get('refresh') === '1';
   const cachedOnly = params.get('cached')  === '1';
   const cached = force ? null : await readLongRow(sym, env);
@@ -2925,29 +3073,29 @@ async function handleLongTicker(ticker, params, origin, env) {
   const fresh  = age != null && age < LONG_FRESH_MS;
 
   if (cached && (fresh || cachedOnly)) {
-    return json({ row: cached, cached: true, stale: !fresh, ageMs: age, _meta: longRowMeta(cached) }, 200, origin);
+    return json({ row: cached, cached: true, stale: !fresh, ageMs: age,
+                  _instr: stamp('cache-hit'), _meta: longRowMeta(cached) }, 200, origin);
   }
   if (cachedOnly) {
     return json({
       row: null, cached: true,
       missing: { symbol: sym, status: 'not-loaded', reason: 'not loaded — no cached row for this ticker' },
+      _instr: stamp('cache-miss'),
       _meta: srcMeta('KV cache (no fetch)', { ok: false, ttlSeconds: LONG_FRESH_MS / 1000, note: 'nothing cached' }),
     }, 200, origin);
   }
 
   await getYahooCrumb(env).catch(() => {});
-  // Measured, not estimated (rule #1). The bracket covers the crumb, the base
-  // list, every dated chain and — on the premium-cold path — the extra
-  // quoteSummary and hv30 chart. `warm` says which case the number describes,
-  // because the two costs differ by ~4 and a bare number would be ambiguous.
-  // NOTE: external fetches only. The KV reads this handler makes also count
-  // against the 10,000 cap and are invisible to the wrap.
-  const mark = instrMark();
-  const row  = await refreshLongTicker(sym, env);
-  const instr = instrSince(mark, 'complete');
+  // Measured, not estimated (rule #1). The bracket covers the cache probe, the
+  // crumb, the base list, every dated chain, the KV traffic behind the IV
+  // history and the directional read, and — on the premium-cold path — the
+  // extra quoteSummary and hv30 chart. `capCost` is the figure the 10,000
+  // meters; `premiumWarm` says which of the two cases the number describes,
+  // because they differ by roughly a third and a bare number would be ambiguous.
+  const row = await refreshLongTicker(sym, env);
   return json({
     row, cached: false, stale: false, ageMs: 0,
-    _instr: { ...instr, premiumWarm: row.sharedFrom === 'premium-row' },
+    _instr: stamp('complete', { premiumWarm: row.sharedFrom === 'premium-row' }),
     _meta: longRowMeta(row),
   }, 200, origin);
 }
@@ -7258,6 +7406,11 @@ Include all 11 sectors in order: Technology, Financials, Energy, Health Care, Co
 /* ── Main fetch handler ── */
 export default {
   async fetch(request, env, ctx) {
+    // Count binding calls for the rest of this request. Substituted for `env`
+    // wholesale so every handler downstream is measured without touching any of
+    // them. Returns the original env on failure, so a counter fault can never
+    // become a KV fault.
+    env = instrWrapBindings(env);
     const origin = request.headers.get('Origin') || '';
 
     /* Preflight is answered FIRST, before the origin 403 and before any gate.
@@ -7436,6 +7589,10 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
+    // Same substitution as fetch(): cron jobs spend the same pool, and the
+    // morning briefing's KV traffic was previously invisible in its own _instr.
+    env = instrWrapBindings(env);
+
     // ── The cron expression is a COARSE WAKEUP AND NOTHING ELSE ──────────────
     // Every 15 min, UTC hours 13-22, ALL days. Every date and time decision is
     // made here, in code, against Pacific wall-clock. The expression carries no

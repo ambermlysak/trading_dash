@@ -15,6 +15,8 @@ trading_dash/
 │                        #   independent cross-checks, prints computed vs expected
 ├── long-fixtures.check.mjs # Long-screen paths live data cannot reach: the IV-rank
 │                        #   gate branch, Lane A with two Januaries, the IV guard
+├── instr-bindings.check.mjs # The binding counter: shape detection, automatic
+│                        #   pickup of a new binding, and its failure paths
 ├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
 │                        #   both DST regimes; prints computed vs expected
 ├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
