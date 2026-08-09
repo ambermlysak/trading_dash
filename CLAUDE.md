@@ -1473,13 +1473,22 @@ Three properties worth knowing before touching it:
   the positive P/L can never require every episode. Three separated moves report
   **2, not 3**. Do not write a test expecting 3; it is unachievable.
 
-**No threshold is set.** `EPISODE_CONCENTRATION_WARN` is `null` by design, ships as
-`gates.episodeConcentrationWarn`, and nothing flags, dims or reorders on the metric.
-The old `0.40` did **not** carry over — it applied to a share and this is a count
-with inverted polarity. Measured distribution (real candidates, realistic 0.95–1.10×
-moneyness, 2026-08-09): on the **3y** window `episodesTo50` is 1 for 27%, median 2,
-p90 8, max 25; on **1y** it is 1 for 51%, median 1. A cutoff must be chosen against
-the window expectancy actually used, and the fire rate differs sharply between them.
+**`EPISODE_CONCENTRATION_WARN = 1`**, chosen from the observed distribution rather
+than intuition (real candidates at the 0.95–1.10× moneyness the screen selects,
+2026-08-09): on the **3y** window `episodesTo50` is 1 for **27%**, median 2, p90 8,
+max 25; on **1y** it is 1 for **51%**, median 1. 1 is the only value making an
+unambiguous claim — half the expected value from a single market episode. 2 would
+fire on the median 3y candidate (53%), and a warning that fires on the median is
+decoration. The old `0.40` did **not** carry over; it applied to a share, and this
+is a count with inverted polarity.
+
+**The flag must name its window inline, and `concentrationLabel` is its only
+renderable form.** Calibration is on 3y, but expectancy falls back to the 1y array
+when 3y is unsupported — and a 252-session series holds fewer distinct episodes, so
+the same candidate can flag on one window and not the other. That is correct and it
+looks like a bug, which is why the rendered string is *"half the expected value from
+ONE 3y episode"* and never a bare ⚑. **Never draw a warning glyph from
+`concentrationFlag` alone.** Nothing dims, hides or reorders on the flag.
 
 **Row status extends the Premium vocabulary** rather than forking it: `ok` · `no-options` · `no-iv` ·
 **`no-expiries`** (options listed but nothing screenable — no monthly at the swing horizon and no

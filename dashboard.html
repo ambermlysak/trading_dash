@@ -568,6 +568,9 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .cd-v { color: var(--ink-1); margin-right: 12px; }
 .cd-v.up { color: var(--bull); } .cd-v.dn { color: var(--bear); }
 .cd-note { color: var(--amber); cursor: help; }
+/* The concentration flag. Always rendered WITH its label — see candDetail(). */
+.cd-flag { color: var(--amber); background: rgba(244,183,64,0.12); padding: 1px 6px;
+  border-radius: 3px; margin-right: 12px; cursor: help; white-space: nowrap; }
 .prem-cands th.csort, .long-lane-sub .csort { cursor: pointer; user-select: none; }
 .prem-cands th.csort:hover, .long-lane-sub .csort:hover { color: var(--cyan); }
 .prem-cands th.csort.sorted, .long-lane-sub .csort.sorted { color: var(--cyan); }
@@ -2781,7 +2784,15 @@ function candDetail(c) {
       title="Mean ${c.coverageHorizon}-session return over each window. This is the DRIFT CONFOUND in the gap beside it: coverage contains it, p(be) does not. On a trending name it is most of the gap.">${
       p2(c.drift1y)} 1y · ${p2(c.drift3y)} 3y</span>
     <span class="cd-k">episodes to 50%</span> <span class="cd-v" title="${esc(c.concentrationNote || '')}">${
-      ep == null ? '—' : ep + ' of ' + c.expectancyEpisodes}</span>
+      ep == null ? '—' : ep + ' of ' + c.expectancyEpisodes}</span>${
+      /* THE FLAG ALWAYS CARRIES ITS WINDOW. `concentrationLabel` is built in the
+         Worker and already reads "half the expected value from ONE 3y episode".
+         Never substitute a bare ⚑ here: the same candidate legitimately flags on
+         3y and not on 1y, and an unlabelled glyph would read as a bug at exactly
+         the moment the number is working. */
+      c.concentrationFlag && c.concentrationLabel
+        ? `<span class="cd-flag" title="${esc(c.concentrationNote || '')}">⚑ ${esc(c.concentrationLabel)}</span>`
+        : ''}
     <span class="cd-k">median</span> <span class="cd-v">${c.expectancyMedian == null ? '—' : (c.expectancyMedian * 100).toFixed(0) + '%'}</span>
     <span class="cd-k">Sharpe</span> <span class="cd-v">${c.expectancySharpe == null ? '—' : c.expectancySharpe.toFixed(2)}</span>
     <span class="cd-k">¼-Kelly</span> <span class="cd-v" title="Sizing reference only. Never sorts anything.">${
@@ -3213,9 +3224,14 @@ function renderLong(data) {
     overlap, so the three largest were usually one market move counted three times. Every window is now
     assigned to exactly one <b>episode</b> — a cluster of windows starting within N sessions of each other —
     and the figure is how many separate episodes it takes to reach half the positive P/L. <b>LOW is the
-    warning</b>, the opposite polarity to the share it replaced: 1 or 2 means the expectancy rests on one or
-    two market moves rather than on a property of the trade; 8 is unremarkable. <b>No threshold is set</b>, so
-    nothing is flagged, dimmed or reordered on this number yet — it is displayed for reading.<br>
+    warning</b>, the opposite polarity to the share it replaced: 1 means the expectancy rests on a single
+    market move rather than on a property of the trade; 8 is unremarkable. Flagged at
+    <b>${g.episodeConcentrationWarn ?? 1} or below</b>, calibrated on the 3y distribution (1 occurs on ~27% of
+    3y candidates, versus ~51% on 1y). <b>The flag always names its window</b> — "half the expected value from
+    ONE 3y episode" — because a 252-session series holds fewer distinct episodes, so the same candidate can
+    flag on one window and not the other. That is correct, not a defect, and an unlabelled warning icon would
+    read as a bug at exactly the moment the number is working. Nothing is dimmed, hidden or reordered on
+    it.<br>
     <b>Expectancy assumes the position is held to expiry.</b> No assignment, no early close and no IV path
     between now and then is modelled — so it understates any structure that would realistically be closed
     early, which is most of them. It is a relative ranking, not a P&L forecast. Lane A is held out of the

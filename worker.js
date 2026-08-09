@@ -2385,17 +2385,29 @@ const SESSIONS_PER_YEAR = 252;            // calendar DTE → trading sessions
    keeps its native cost-of-carry sort rather than joining the cross-lane one. */
 const COVERAGE_MIN_INDEPENDENT = 4;
 
-/* Threshold for `expectancyEpisodesTo50` — DELIBERATELY NULL, meaning no flag.
-   The previous constant was 0.40 against the old top-3 SHARE. It does not carry
-   over and was not reused: this is a COUNT with the opposite polarity — LOW is
-   the alarming reading, high is healthy — so 0.40 would be meaningless here.
-   Carrying it forward as a number would have been worse than deleting it,
-   because a stale threshold shipped in `gates` reads as a live one.
+/* Flag `expectancyEpisodesTo50` at or below this. LOW IS THE WARNING — the
+   opposite polarity to the old top-3 SHARE this replaced, which is why that
+   constant (0.40) was deleted rather than carried over: a stale threshold shipped
+   in `gates` reads as a live one.
 
-   Null until the observed distribution across the watchlist has been read and a
-   cutoff chosen from it. `attachCoverage()` sets `concentrationFlag: false`
-   unconditionally while this is null; nothing dims, hides or reorders on it. */
-const EPISODE_CONCENTRATION_WARN = null;
+   1 is chosen from the OBSERVED distribution, not from intuition. Measured over
+   real candidates at the moneyness the screen actually selects (0.95–1.10× spot),
+   2026-08-09:
+
+     3y window (n=198):  ==1 on 27%,  median 2,  p90 8,  max 25
+     1y window (n=155):  ==1 on 51%,  median 1,  p90 4,  max 9
+
+   1 is the only value that makes an unambiguous claim — half the expected value
+   from a SINGLE market episode. 2 would fire on the median candidate at 3y (53%)
+   and on three-quarters at 1y, and a warning that fires on the median is
+   decoration.
+
+   CALIBRATED ON 3y, AND THE SAME CANDIDATE FLAGS DIFFERENTLY BY WINDOW. That is
+   correct — a 252-session window simply contains fewer distinct episodes, so the
+   fire rate roughly doubles — but on screen it looks like a bug. The flag
+   therefore NAMES ITS WINDOW INLINE (`concentrationLabel`), and no bare warning
+   glyph may render without that text attached. */
+const EPISODE_CONCENTRATION_WARN = 1;
 
 const movesKey = sym => `moves:${sym.toUpperCase()}`;
 
@@ -2738,6 +2750,13 @@ function expectancyFrom(sorted, st, spot, breakeven = null, horizon = null) {
      caveat to avoid misleading is the wrong metric — so this measures the claimed
      thing instead, and `top3Share` is REMOVED rather than kept alongside.
 
+     Measured over 323 real candidates: the old flag fired on 60 and MISSED 126
+     that rest on a single episode; inside the `episodesTo50 == 1` bucket the old
+     share ranged 2.1%–100%, i.e. near-uncorrelated with the property it was named
+     for. Full write-up and the general rule for anything computed over
+     overlapping windows: see "Design note: overlapping windows and the
+     proxy-vs-thing failure" in ARCHITECTURE.md.
+
      Every window is assigned to exactly one episode, greedily:
        1. among unassigned windows take the one with the highest pl_i
        2. claim it and every unassigned window starting within N sessions of it
@@ -2882,7 +2901,9 @@ function attachCoverage(cand, st, { moves, spot, dte, pBe }) {
     // collision would have been invisible.
     expectancyWindows: null, maxGain: null, expectancyRiskReward: null, kellyQuarter: null,
     upsideTruncated: null, upsideTruncatedReason: null,
-    concentrationFlag: false, concentrationNote: null,
+    // `concentrationLabel` is the flag's ONLY renderable form and always names its
+    // window. A UI must never draw a warning glyph from `concentrationFlag` alone.
+    concentrationFlag: false, concentrationLabel: null, concentrationNote: null,
     expectancyReason: null,
   };
 
@@ -2976,20 +2997,26 @@ function attachCoverage(cand, st, { moves, spot, dte, pBe }) {
   out.upsideTruncatedReason = e.upsideTruncatedReason;
   out.expectancyWindow    = arrLabel;
 
-  /* CONCENTRATION FLAG — DELIBERATELY DISABLED THIS RELEASE.
-     `CONCENTRATION_WARN` (0.40) belonged to the old top-3 SHARE and does not
-     carry over: this is a COUNT, with the opposite polarity — low is alarming,
-     high is healthy. Picking a cutoff from intuition would be inventing a
-     threshold, so the metric ships displayed and unflagged until the observed
-     distribution across the watchlist has been read. `concentrationFlag` stays
-     false and nothing dims or reorders on it. */
-  if (e.expectancyEpisodesTo50 != null) {
-    out.concentrationNote = `Half the positive P/L comes from ${e.expectancyEpisodesTo50} `
-      + `separate market episode${e.expectancyEpisodesTo50 === 1 ? '' : 's'} out of `
-      + `${e.expectancyEpisodes} in ${e.expectancyWindows} overlapping windows. LOW IS THE WARNING: `
-      + `1 or 2 means this expectancy rests on one or two moves rather than a property of the trade. `
-      + `Read it against the median (${(e.expectancyMedian * 100).toFixed(0)}%). No threshold is set yet, `
-      + `so nothing is flagged on this number.`;
+  /* CONCENTRATION FLAG. Fires at or below EPISODE_CONCENTRATION_WARN (1).
+     `concentrationLabel` is the ONLY thing a UI may render as the flag, and it
+     always carries the window. The same candidate legitimately flags on 3y and
+     not on 1y — a shorter series holds fewer distinct episodes — so a bare glyph
+     would read as a bug at exactly the moment the number is doing its job. */
+  const ep = e.expectancyEpisodesTo50;
+  if (ep != null) {
+    const win = arrLabel;
+    out.concentrationFlag = EPISODE_CONCENTRATION_WARN != null && ep <= EPISODE_CONCENTRATION_WARN;
+    out.concentrationLabel = out.concentrationFlag
+      ? `half the expected value from ${ep === 1 ? 'ONE' : ep} ${win} episode${ep === 1 ? '' : 's'}`
+      : null;
+    out.concentrationNote = `Half the positive P/L comes from ${ep} separate market `
+      + `episode${ep === 1 ? '' : 's'} out of ${e.expectancyEpisodes}, over the ${win} series `
+      + `(${e.expectancyWindows} overlapping windows). LOW IS THE WARNING: 1 means this expectancy `
+      + `rests on a single market move rather than a property of the trade. `
+      + `Read it against the median (${(e.expectancyMedian * 100).toFixed(0)}%). `
+      + `Flagged at ${EPISODE_CONCENTRATION_WARN} or below, calibrated on the 3y distribution — `
+      + `the 1y series holds fewer episodes, so the same candidate can flag on one window and not `
+      + `the other, and that is correct rather than a defect.`;
   } else if (e.expectancyEpisodesReason) {
     out.concentrationNote = e.expectancyEpisodesReason;
   }

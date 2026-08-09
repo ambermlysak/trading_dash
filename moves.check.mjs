@@ -35,8 +35,10 @@
  *      appears in up to N consecutive windows, so the old top-3-window share
  *      counted a single episode three times and called it three. Episode
  *      assignment collapses those. Tested BOTH ways — one move must report 1 AND
- *      three separated moves must report 3, because a test that only proves
- *      collapsing would pass on code that always answers 1.
+ *      separated moves must report MORE, because a test that only proves
+ *      collapsing would pass on code that always answers 1. Note the metric is
+ *      bounded by ceil(k/2) for k equal episodes: reaching HALF the positive P/L
+ *      can never need every episode, so three separated moves report 2, not 3.
  */
 import fs from 'fs';
 
@@ -384,7 +386,7 @@ for (const [dte, wantSessions, wantHorizon] of [
 }
 
 console.log('\n══ 8. MEAN vs MEDIAN, and episode concentration on synthetic series ══');
-console.log(`   EPISODE_CONCENTRATION_WARN = ${M.EPISODE_CONCENTRATION_WARN} — NO FLAG IS SET.`);
+console.log(`   EPISODE_CONCENTRATION_WARN = ${M.EPISODE_CONCENTRATION_WARN} — flags at or below this.`);
 console.log('   A mean far above its median is the signature of a number built on few');
 console.log('   episodes; the episode count is what quantifies "few". Section 10 tests it.\n');
 {

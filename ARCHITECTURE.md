@@ -271,6 +271,62 @@ in this codebase and shipped:
    a missing measurement. Caught only by auditing the whole class after the first instance; a
    `.toFixed` sweep alone would have missed it.
 
+## Design note: overlapping windows and the proxy-vs-thing failure
+
+The Long tab's first concentration metric was `expectancyTop3Share` — the share of
+total positive P/L carried by the three largest historical windows. It was replaced
+by `expectancyEpisodesTo50`, and the reason is worth keeping because the failure
+generalises well beyond this one metric.
+
+**The windows overlap by construction.** Coverage uses overlapping N-session
+windows deliberately — disjoint windows would leave about five samples a year at
+N=45, and the number would be worthless. But that means a single market move
+appears in up to N consecutive windows. The "three largest windows" were therefore,
+almost always, **three overlapping views of one episode**. The metric counted one
+move three times and reported three.
+
+Nothing about it was miscalculated. It computed exactly what it said, and what it
+said was not what anyone would read it as. That is the distinguishing mark of a
+**proxy standing in for the thing**, rather than a wrong number: no arithmetic
+check can find it, because the arithmetic is right.
+
+**The tell was the caveat.** The first fix was to reword the tooltip — to explain
+that the three windows were probably one move, so the reader would not be misled.
+That was honest and still wrong: it left a metric on screen whose plain reading was
+false and relied on a paragraph of prose to undo it. **A metric that needs a
+paragraph of caveat to avoid misleading is the wrong metric.** Measure the claimed
+thing instead. Every window is now assigned to exactly one episode by start-index
+proximity, and the metric counts how many episodes carry half the positive P/L.
+
+**How far apart the two actually were**, measured over 323 real candidates
+(8 tickers × 5 horizons × 7 strikes × 2 windows, 2026-08-09):
+
+| | |
+|---|---|
+| Old flag fired (`top3Share > 0.40`) | 60 candidates |
+| Candidates resting on a **single** episode (`episodesTo50 == 1`) | 180 |
+| Overlap between the two | **54** |
+| Single-episode candidates the old flag **missed** | **126** |
+| Range of `top3Share` *within* the `episodesTo50 == 1` bucket | **2.1% – 100%** |
+
+That last row is the finding. Inside the group the metric most needed to identify,
+the old number spanned nearly its entire domain — it was close to uncorrelated with
+the property it was named for. It was not a weaker version of concentration; it was
+a different quantity that happened to share a plausible name.
+
+**The general rule: anything computed over overlapping windows should be checked
+for the same defect.** Ask whether the statistic counts *observations* or *events*.
+Counts, extremes, "top N", tail frequencies and any variance estimate over
+overlapping windows all inherit this — the independent-window estimate
+(`(sessions − N) / N`) is the honest denominator, not the window count. Coverage
+itself is safe because a frequency over overlapping windows is still an unbiased
+estimate of the marginal probability; the counts built *on top of* it were not.
+
+Constants: `EPISODE_CONCENTRATION_WARN` and the episode assignment in
+`expectancyFrom()` (`worker.js`), tested in `moves.check.mjs` §10 — which asserts
+in **both** directions, because a test that only proves de-clustering collapses
+things passes on code that always answers 1.
+
 ## Section-by-section data source map
 
 **Everything on both pages runs on real data.** There are no mock generators left
@@ -511,8 +567,10 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    fetch and no request-path race. **That baseline is itself drift-contaminated**
    (honesty rule 26) and whatever spec it gets must say so.
 
-7. **A threshold for `expectancyEpisodesTo50`.** `EPISODE_CONCENTRATION_WARN` is
-   null and nothing flags on the metric. Observed distribution is in `CLAUDE.md`.
+7. **Recalibrate `EPISODE_CONCENTRATION_WARN` once a full watchlist sweep exists.**
+   It is set to 1, from a distribution measured by computing coverage on the fly
+   over 8 tickers. The first stored-`moves:` sweep is the point to re-derive it
+   across all 22 names and confirm the storage round-trip has not shifted it.
 
 8. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
    Lightweight Charts supports custom drawings; recognition would be rules-based
