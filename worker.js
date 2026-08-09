@@ -1276,7 +1276,7 @@ function smaCrossState(closes, fast = 50, slow = 200) {
 /* Yahoo v7 spark: close-only series for many symbols per request (max 20).
  * Far cheaper than one v8 chart call per symbol. Returns Map<symbol, closes[]>.
  * Unknown/delisted symbols are simply absent from the response. */
-async function yahooSparkCloses(symbols, range = '3y', concurrency = 4) {
+async function yahooSparkCloses(symbols, range = '3y', concurrency = 4, { withTimestamps = false } = {}) {
   const out = new Map();
   const chunks = [];
   for (let i = 0; i < symbols.length; i += 20) chunks.push(symbols.slice(i, i + 20));
@@ -1290,8 +1290,27 @@ async function yahooSparkCloses(symbols, range = '3y', concurrency = 4) {
       const d = await r.json();
       for (const item of (d?.spark?.result || [])) {
         const closes = item?.response?.[0]?.indicators?.quote?.[0]?.close;
+        if (!Array.isArray(closes)) continue;
         // Keep only the numbers — the raw response is dropped on the next tick.
-        if (Array.isArray(closes)) out.set(item.symbol, closes.filter(v => v != null));
+        const clean = closes.filter(v => v != null);
+        if (!withTimestamps) { out.set(item.symbol, clean); continue; }
+
+        /* OPT-IN ONLY. The default return shape stays a bare close array because
+           two existing callers (the golden-cross sweep and the watchlist batch)
+           index it directly. The move-series sweep needs dates: it stores
+           `asOfClose` and skips a symbol whose stored series already ends on the
+           latest close, and neither is expressible from closes alone.
+           Timestamps are filtered on the SAME predicate as the closes so the two
+           arrays stay aligned; if they cannot be aligned, null rather than a
+           silently mismatched pairing. */
+        const ts = item?.response?.[0]?.timestamp;
+        let stamps = null;
+        if (Array.isArray(ts) && ts.length === closes.length) {
+          stamps = [];
+          for (let k = 0; k < closes.length; k++) if (closes[k] != null) stamps.push(ts[k]);
+          if (stamps.length !== clean.length) stamps = null;
+        }
+        out.set(item.symbol, { closes: clean, timestamps: stamps });
       }
     }));
   }
@@ -2132,7 +2151,13 @@ function premiumRowMeta(row) {
    separately instead of implying one as-of for both.
    ══════════════════════════════════════════════════════════════════════════ */
 
-const LONG_SCHEMA      = 1;
+/* SCHEMA 2 — the CANDIDATE shape changed: `drift1y` / `drift3y` and
+   `expectancyEpisodesTo50` in, `expectancyTop3Share` out. Bumped so cached
+   schema-1 rows RETIRE instead of rendering every coverage cell blank with a
+   generic hover — a stale row whose fields are simply absent reads on screen as
+   "no measurement available", which misattributes our own cache to the ticker
+   (honesty rule 17). Same rule the golden-cross payload follows. */
+const LONG_SCHEMA      = 2;
 const LONG_FRESH_MS    = 4 * 3600_000;   // freshness horizon — drives the stale badge
 const LONG_ROW_TTL     = 24 * 3600;      // KV retention: outlives freshness so stale can render
 const LONG_MAX_SYMBOLS = 60;
@@ -2291,6 +2316,686 @@ function quoteOf(o) {
   return { bid, ask, mid, spreadPct };
 }
 
+/* ══════════════════════════════════════════════════════════════════════════════
+   MOVE COVERAGE — the measured half of the Long screen
+   ══════════════════════════════════════════════════════════════════════════════
+
+   `beEm` and `pBe` are both derived from the implied-vol surface: `emPct` from
+   ATM IV, `pBe` from the IV of the strike nearest the breakeven. They say whether
+   a contract is priced consistently with its own chain. NEITHER is a measurement
+   of what the underlying has actually done.
+
+   `moveCoverage` is that measurement: the fraction of historical N-session
+   windows in which the underlying actually moved past a given breakeven. Rendered
+   next to `pBe`, the difference between the two is the finding.
+
+   FIVE things here have already been reasoned about and must not be "simplified":
+
+   1. WINDOWS OVERLAP, DELIBERATELY. Disjoint windows leave ~5 samples/year at
+      N=45 and the number would be worthless. The consequence — these are not
+      independent observations — is carried in `independent` and stated on screen,
+      not buried. `COVERAGE_MIN_INDEPENDENT` nulls a horizon the history cannot
+      support rather than returning a confident-looking percentage.
+
+   2. COVERAGE IS COMPUTED FROM THE RAW RETURN ARRAY, never from binned data. Any
+      histogram a frontend draws is for the picture. If you find yourself deriving
+      coverage from bin counts, that is the bug.
+
+   3. 1y AND 3y ARE REPORTED SEPARATELY AND NEVER AVERAGED. They disagree on names
+      that have re-rated, and that disagreement IS the regime-dependence warning.
+      A blended figure would hide exactly what this exists to expose.
+
+   4. `pBe` IS A RISK-NEUTRAL PROBABILITY; COVERAGE IS A REAL-WORLD FREQUENCY.
+      They are not the same measure, and ZERO IS NOT FAIR VALUE. A persistent
+      modest negative gap is the variance risk premium — what compensates option
+      sellers — not a defect. No copy anywhere may imply otherwise.
+
+   5. NEVER FALL BACK TO A SHORTER HORIZON AND LABEL IT AS THE REQUESTED ONE.
+      Same failure class as substituting a percentile of HV for IV rank. The
+      horizon actually used and the candidate's own DTE are reported side by side.
+
+   Expectancy (below) is the ranking derived from the same array. It is sorted on
+   because a descending PROBABILITY sort is a descending moneyness sort wearing a
+   probability label — it ignores payoff and systematically selects against
+   convexity, the property this screen exists to buy. */
+
+/* SCHEMA 2 — the stored return arrays are `[return, startIdx]` PAIRS, not bare
+   numbers. Schema 1 stored bare numbers and a reader that coerced one shape into
+   the other would produce coverage figures that look entirely normal and are
+   wrong. `readMoveSeries()` guards with STRICT EQUALITY, so any schema that is
+   not exactly this one reads as ABSENT and the next sweep recomputes it. Never
+   relax that to `<` or `>=`. */
+const MOVES_SCHEMA   = 2;
+const MOVES_TTL      = 7 * 24 * 3600;     // 7d retention; the sweep rewrites daily
+const MOVES_RANGE    = '3y';              // see the note on COVERAGE_MIN_INDEPENDENT
+const MOVES_HORIZONS = [5, 10, 20, 45, 90, 180, 365];   // trading sessions
+const MOVES_1Y_SESSIONS = 252;            // the trailing-1y slice of the same series
+const SESSIONS_PER_YEAR = 252;            // calendar DTE → trading sessions
+
+/* A horizon whose history supports fewer than this many INDEPENDENT windows
+   returns null with a reason instead of a percentage.
+   At a 3y range (~756 sessions) this nulls N=180 (3.2) and N=365 (1.07); on the
+   1y slice (~252) it nulls everything from N=90 up. That is the correct outcome,
+   not a bug to engineer around.
+
+   DO NOT RAISE `MOVES_RANGE` TO BUY BACK THOSE HORIZONS. 5y still yields only
+   2.45 independent windows at N=365, and 10y of a name like NVDA spans a
+   different company — it makes the stationarity problem worse, not better. The
+   consequence is that Lane A (365+ DTE) has no expectancy, which is why Lane A
+   keeps its native cost-of-carry sort rather than joining the cross-lane one. */
+const COVERAGE_MIN_INDEPENDENT = 4;
+
+/* Threshold for `expectancyEpisodesTo50` — DELIBERATELY NULL, meaning no flag.
+   The previous constant was 0.40 against the old top-3 SHARE. It does not carry
+   over and was not reused: this is a COUNT with the opposite polarity — LOW is
+   the alarming reading, high is healthy — so 0.40 would be meaningless here.
+   Carrying it forward as a number would have been worse than deleting it,
+   because a stale threshold shipped in `gates` reads as a live one.
+
+   Null until the observed distribution across the watchlist has been read and a
+   cutoff chosen from it. `attachCoverage()` sets `concentrationFlag: false`
+   unconditionally while this is null; nothing dims, hides or reorders on it. */
+const EPISODE_CONCENTRATION_WARN = null;
+
+const movesKey = sym => `moves:${sym.toUpperCase()}`;
+
+/** One KV read. Returns null on a schema mismatch so a stored series from an
+ *  older shape retires rather than rendering as blanks. */
+async function readMoveSeries(sym, env) {
+  try {
+    const m = await env?.REC_LOG?.get(movesKey(sym), 'json');
+    return m && m.schema === MOVES_SCHEMA ? m : null;
+  } catch (_) { return null; }
+}
+
+/**
+ * Overlapping N-session forward returns as `[return, startIdx]` PAIRS.
+ * `c[i+N]/c[i] − 1` for every i that fits; length is `closes.length − n`.
+ * Unbinned, and it stays that way.
+ *
+ * THE START INDEX IS LOAD-BEARING, not bookkeeping. Overlapping windows mean one
+ * market move appears in up to N consecutive windows, so any concentration
+ * measure computed without knowing WHICH windows are neighbours counts a single
+ * episode many times over. `startIdx` is what lets the episode assignment in
+ * `expectancyFrom()` collapse those back into one.
+ */
+function moveWindows(closes, n) {
+  const out = [];
+  if (!Array.isArray(closes) || !Number.isFinite(n) || n < 1) return out;
+  for (let i = 0; i + n < closes.length; i++) {
+    const a = closes[i], b = closes[i + n];
+    if (!(a > 0) || !Number.isFinite(b)) continue;
+    out.push([b / a - 1, i]);
+  }
+  return out;
+}
+
+/* Binary search on an array of pairs sorted ascending BY ELEMENT 0 (the return).
+   Split out rather than inlined because coverage in both directions has to agree
+   on tie handling: a return exactly equal to the required move counts as covered
+   on BOTH sides, so `>=` uses the lower bound and `<=` uses the upper. */
+function lowerBound(sorted, x) {           // first index with sorted[i][0] >= x
+  let lo = 0, hi = sorted.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (sorted[mid][0] < x) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+function upperBound(sorted, x) {           // first index with sorted[i][0] > x
+  let lo = 0, hi = sorted.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (sorted[mid][0] <= x) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+
+/**
+ * Empirical coverage against a required signed move.
+ *
+ *   dir 'up'   → P(r ≥ threshold)   (a long call's breakeven sits above spot)
+ *   dir 'down' → P(r ≤ threshold)   (a long put's sits below, so threshold < 0)
+ *
+ * Returns 0 — NOT null — when the breakeven falls outside every observed window.
+ * Zero coverage is a valid, informative answer: the underlying has never once
+ * made that move over this horizon. `null` is reserved for "we cannot tell", and
+ * the two must never render the same way (honesty rule 22).
+ */
+function coverageAt(sorted, threshold, dir) {
+  if (!Array.isArray(sorted) || !sorted.length || !Number.isFinite(threshold)) return null;
+  const n = sorted.length;
+  return dir === 'down'
+    ? upperBound(sorted, threshold) / n
+    : (n - lowerBound(sorted, threshold)) / n;
+}
+
+/** Calendar DTE → trading sessions, snapped to the nearest precomputed horizon.
+ *  Returns BOTH so the card can print "scored at 45 sessions, contract is 41". */
+function snapHorizon(dte) {
+  if (!Number.isFinite(dte) || dte <= 0) return null;
+  const sessions = Math.round(dte * SESSIONS_PER_YEAR / 365);
+  let horizon = MOVES_HORIZONS[0];
+  for (const h of MOVES_HORIZONS) {
+    if (Math.abs(h - sessions) < Math.abs(horizon - sessions)) horizon = h;
+  }
+  return { sessions, horizon };
+}
+
+/**
+ * Build the stored move series for one ticker from a daily close array.
+ *
+ * The sorted return arrays are stored rather than fitted parameters, deliberately:
+ * coverage against an arbitrary breakeven is a lookup into the EMPIRICAL
+ * distribution, and fitting a distribution to it would reintroduce the exact
+ * model assumption this measurement exists to check. Expectancy needs the raw
+ * returns too, not just quantiles.
+ *
+ * `reason1y` / `reason3y` are separate fields rather than the single `reason` the
+ * spec sketched, because the two windows resolve independently: at N=90 the 3y
+ * window supports 7.4 independent windows and the 1y window supports 1.8, so one
+ * horizon genuinely has two different verdicts and one field cannot carry both.
+ */
+function buildMoveSeries(symbol, closes, asOfClose) {
+  const c3y = (closes || []).filter(v => Number.isFinite(v) && v > 0);
+  const c1y = c3y.slice(-Math.min(c3y.length, MOVES_1Y_SESSIONS));
+
+  const horizons = {};
+  for (const n of MOVES_HORIZONS) {
+    const entry = {};
+    for (const [label, series] of [['1y', c1y], ['3y', c3y]]) {
+      const independent = series.length > n ? (series.length - n) / n : 0;
+      // The reason names the ACTUAL numbers. A generic "insufficient history"
+      // string cannot be checked against anything.
+      if (series.length <= n) {
+        entry[`n${label}`]           = null;
+        entry[`independent${label}`] = +independent.toFixed(2);
+        entry[`sorted${label}`]      = null;
+        entry[`drift${label}`]       = null;
+        entry[`reason${label}`] =
+          `only ${series.length} sessions of ${label} history — a ${n}-session window needs at least ${n + 1}`;
+        continue;
+      }
+      if (independent < COVERAGE_MIN_INDEPENDENT) {
+        entry[`n${label}`]           = series.length - n;
+        entry[`independent${label}`] = +independent.toFixed(2);
+        entry[`sorted${label}`]      = null;
+        entry[`drift${label}`]       = null;
+        entry[`reason${label}`] =
+          `${series.length} sessions of ${label} history support only ${independent.toFixed(2)} independent `
+          + `${n}-session windows (${series.length - n} overlapping); the floor is ${COVERAGE_MIN_INDEPENDENT}`;
+        continue;
+      }
+      const raw = moveWindows(series, n);
+      const w = raw.slice().sort((a, b) => a[0] - b[0]).map(([r, i]) => [+r.toFixed(4), i]);
+      entry[`n${label}`]           = w.length;
+      entry[`independent${label}`] = +independent.toFixed(2);
+      entry[`sorted${label}`]      = w;
+      /* REALIZED DRIFT over this window, precomputed because every candidate at
+         this horizon needs it and it does not depend on the structure.
+
+         This is the confound in `gap`. Coverage is a real-world frequency and
+         therefore INCLUDES whatever drift the stock actually had; `pBe` is
+         risk-neutral and driftless by construction. So a positive gap can mean
+         "the tails were fatter than the chain priced" OR simply "the stock went
+         up", and on a strongly trending name the second term dominates. Carrying
+         drift beside the gap is what stops a reader inferring "vol is cheap
+         here" from what is really a directional observation. */
+      entry[`drift${label}`]       = +(raw.reduce((a, [r]) => a + r, 0) / raw.length).toFixed(5);
+      entry[`reason${label}`]      = null;
+    }
+    horizons[String(n)] = entry;
+  }
+
+  return {
+    symbol: String(symbol).toUpperCase(),
+    schema: MOVES_SCHEMA,
+    ts: Date.now(),
+    range: MOVES_RANGE,
+    sessions:   c3y.length,
+    sessions1y: c1y.length,
+    asOfClose:  asOfClose || null,
+    minIndependent: COVERAGE_MIN_INDEPENDENT,
+    horizonList: MOVES_HORIZONS,
+    horizons,
+  };
+}
+
+/* ── Payoff at expiry, per structure ──────────────────────────────────────────
+   GET THESE EXACTLY RIGHT: an error here INVERTS the ranking rather than
+   degrading it.
+
+   UNITS: `debit` and `credit` are PER CONTRACT, in dollars (i.e. per-share × 100).
+   `strike` and `width` are per share. Every terminal value below is per contract.
+   This codebase carries BOTH conventions on the same object — `longCandidate`
+   returns `debit` (per contract) alongside `debitPerShare` — so feeding a
+   per-share figure into one of these produces an expectancy 100× too SMALL, which
+   sorts to the bottom and looks like a bad trade rather than a bug. The invariant
+   check in `expectancyFrom()` is what catches that; the ≤1.0 credit-spread
+   ceiling alone does not.
+
+   Credit spreads have NO CALLER on this screen — Lanes A/B are long single legs,
+   Lane C is a debit vertical, Lane D is null. They are implemented anyway and
+   exercised in `moves.check.mjs`, following the `long-fixtures.check.mjs`
+   precedent for paths live data cannot reach. Do not wire them to a candidate
+   without deciding to add a credit lane. */
+
+const clampTo = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
+const CREDIT_KINDS = new Set(['credit-call-spread', 'credit-put-spread']);
+
+/** Terminal value at expiry given a terminal underlying price `S`, per contract.
+ *  For DEBIT structures this is the value of what you hold; P/L subtracts the
+ *  debit. For CREDIT structures this column already IS the P/L. */
+function terminalValue(st, S) {
+  if (!st || !Number.isFinite(S)) return null;
+  switch (st.kind) {
+    case 'long-call':
+      return Math.max(0, S - st.strike) * 100;
+    case 'long-put':
+      return Math.max(0, st.strike - S) * 100;
+    // A call vertical is long the LOWER strike, a put vertical the HIGHER one, so
+    // the clamp bounds swap. Both are written lo-then-hi.
+    case 'debit-call-vertical':
+      return (clampTo(S, st.longStrike, st.shortStrike) - st.longStrike) * 100;
+    case 'debit-put-vertical':
+      return (st.longStrike - clampTo(S, st.shortStrike, st.longStrike)) * 100;
+    case 'straddle':
+      return (Math.max(0, S - st.strike) + Math.max(0, st.strike - S)) * 100;
+    case 'strangle':
+      return (Math.max(0, S - st.callStrike) + Math.max(0, st.putStrike - S)) * 100;
+    // Short the near strike, long the far wing. Loss grows from the short strike
+    // and stops at the long one.
+    case 'credit-call-spread':
+      return st.credit - (clampTo(S, st.shortStrike, st.longStrike) - st.shortStrike) * 100;
+    case 'credit-put-spread':
+      return st.credit - (st.shortStrike - clampTo(S, st.longStrike, st.shortStrike)) * 100;
+    default:
+      return null;
+  }
+}
+
+/** P/L at expiry, per contract, in dollars. */
+function payoffAt(st, S) {
+  const tv = terminalValue(st, S);
+  if (tv == null) return null;
+  return CREDIT_KINDS.has(st.kind) ? tv : tv - st.debit;
+}
+
+/** Capital risked = MAX LOSS.
+ *  For a credit spread that is `width × 100 − credit`, NOT the credit received.
+ *  Using the credit would post expectancies in the hundreds of percent and pin
+ *  every credit candidate to the top of the screen. */
+function capitalOf(st) {
+  if (!st) return null;
+  if (CREDIT_KINDS.has(st.kind)) {
+    const cap = st.width * 100 - st.credit;
+    return Number.isFinite(cap) && cap > 0 ? cap : null;
+  }
+  return Number.isFinite(st.debit) && st.debit > 0 ? st.debit : null;
+}
+
+/** Maximum gain, or null where it is genuinely unbounded (long call, straddle,
+ *  strangle). A long PUT is bounded — its maximum is at S = 0 — so it is not
+ *  flagged as truncated. */
+function maxGainOf(st) {
+  if (!st) return null;
+  switch (st.kind) {
+    case 'long-call': case 'straddle': case 'strangle':
+      return null;
+    case 'long-put':
+      return st.strike * 100 - st.debit;
+    case 'debit-call-vertical': case 'debit-put-vertical':
+      return Math.abs(st.shortStrike - st.longStrike) * 100 - st.debit;
+    case 'credit-call-spread': case 'credit-put-spread':
+      return st.credit;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Expectancy over the stored historical windows.
+ *
+ *   expectancy = mean(pl_i) / capital        (0.34 = +34% expected return on capital)
+ *
+ * ASSIGNMENT IS NOT MODELLED, and neither is early close or any IV path between
+ * now and expiry. This is expectancy for a position held to expiration, so it
+ * UNDERSTATES any structure that would realistically be closed early — which is
+ * most of them. It is a relative ranking, not a P&L forecast.
+ *
+ * TWO GUARDS, AND THEY CATCH DIFFERENT THINGS. Both are required.
+ *
+ *   1. THE BREAKEVEN CROSS-CHECK is the primary one. The candidate already
+ *      derived a breakeven by a completely separate route (`strike + debit` on
+ *      the option price); this payoff table derives one implicitly. Evaluating
+ *      the payoff AT the candidate's claimed breakeven must give ~0. Two
+ *      derivations of the same quantity, so a disagreement is structural.
+ *
+ *      This is what catches a per-share/per-contract unit mixup — and the bound
+ *      check below CANNOT, which is the whole reason this exists. For any debit
+ *      structure `min(pl) = −debit = −capital` holds BY CONSTRUCTION whatever
+ *      units `debit` is in, so the bound is trivially satisfied however wrong the
+ *      units are. Measured in `moves.check.mjs`: a long call given a per-share
+ *      debit of 5 instead of 500 passes the bound check cleanly and reports an
+ *      expectancy of **169.80 against a true 0.708** — 240× out, and the bound
+ *      never notices. The breakeven anchor rejects it deterministically.
+ *
+ *   2. THE BOUND CHECK, `min(pl) ≥ −capital` and `max(pl) ≤ maxGain` for capped
+ *      structures. It catches what the breakeven cannot: a wrong clamp bound, a
+ *      flipped sign, a credit spread denominated on its credit.
+ *
+ * The cheaper "no credit-spread expectancy above 1.0" ceiling is a third check,
+ * in `moves.check.mjs`.
+ */
+function expectancyFrom(sorted, st, spot, breakeven = null, horizon = null) {
+  if (!Array.isArray(sorted) || !sorted.length) return null;
+  if (!Number.isFinite(spot) || spot <= 0) return null;
+  const capital = capitalOf(st);
+  if (capital == null) return null;
+
+  /* Guard 1 — the payoff must cross zero at the breakeven the candidate computed
+     independently. Tolerance is 1% of capital or $1, whichever is larger: the
+     stored breakeven is rounded to 2dp, which is worth up to $0.50 of payoff, and
+     a unit error is off by orders of magnitude rather than dollars. */
+  if (Number.isFinite(breakeven)) {
+    const atBe = payoffAt(st, breakeven);
+    const beTol = Math.max(1, 0.01 * capital);
+    if (!Number.isFinite(atBe) || Math.abs(atBe) > beTol) {
+      return { ok: false, reason: `payoff does not cross zero at the candidate's own breakeven `
+        + `${breakeven}: P/L there is ${Number.isFinite(atBe) ? atBe.toFixed(2) : 'not finite'}, expected ~0 `
+        + `(±${beTol.toFixed(2)}). The payoff table and the option pricing disagree — most likely a `
+        + `per-share figure passed where a per-contract one belongs.` };
+    }
+  }
+
+  const pl = [], startIdx = [];
+  for (const [r, i] of sorted) {
+    const v = payoffAt(st, spot * (1 + r));
+    if (!Number.isFinite(v)) return null;
+    pl.push(v);
+    startIdx.push(i);
+  }
+
+  // Guard 2 — the bounds.
+  const maxGain = maxGainOf(st);
+  const minPl = Math.min(...pl), maxPl = Math.max(...pl);
+  const tol = 1e-6 * Math.max(1, capital);
+  if (minPl < -capital - tol) {
+    return { ok: false, reason: `payoff breached max loss: min P/L ${minPl.toFixed(2)} below −${capital.toFixed(2)} `
+                              + `capital — the payoff and the capital denominator disagree` };
+  }
+  if (maxGain != null && maxPl > maxGain + tol) {
+    return { ok: false, reason: `payoff breached max gain: max P/L ${maxPl.toFixed(2)} above ${maxGain.toFixed(2)}` };
+  }
+
+  const n    = pl.length;
+  const mean = pl.reduce((a, b) => a + b, 0) / n;
+  const ord  = [...pl].sort((a, b) => a - b);
+  const median = n % 2 ? ord[(n - 1) / 2] : (ord[n / 2 - 1] + ord[n / 2]) / 2;
+
+  const variance = pl.reduce((a, v) => a + (v - mean) ** 2, 0) / n;
+  const stdev    = Math.sqrt(variance);
+
+  /* ── CONCENTRATION, DE-CLUSTERED ────────────────────────────────────────────
+     The old `top3Share` measured the wrong thing. Windows OVERLAP, so one market
+     move appears in up to N consecutive windows: the "three largest windows" are
+     usually three overlapping views of a SINGLE episode, and the metric counted
+     it three times while calling it three. A metric that needs a paragraph of
+     caveat to avoid misleading is the wrong metric — so this measures the claimed
+     thing instead, and `top3Share` is REMOVED rather than kept alongside.
+
+     Every window is assigned to exactly one episode, greedily:
+       1. among unassigned windows take the one with the highest pl_i
+       2. claim it and every unassigned window starting within N sessions of it
+       3. repeat until nothing is unassigned
+
+     Ranking on pl_i and NOT on return is deliberate: for a straddle the payoff is
+     not monotonic in S — both tails pay — so ranking by return would build the
+     episode around the wrong extreme. */
+  const totalPos = pl.reduce((a, v) => a + (v > 0 ? v : 0), 0);
+
+  let episodesTo50 = null, episodeCount = null, episodesReason = null;
+  if (!(totalPos > 0)) {
+    // 0/0 must never render as a measured concentration (honesty rule 22).
+    episodesReason = 'no winning windows — there is no positive P/L to concentrate';
+  } else {
+    // `span`, not `n` — `n` is already pl.length in this scope and shadowing it
+    // here would be silent and wrong-by-a-factor-of-thirty.
+    const span = Number.isFinite(horizon) && horizon > 0 ? horizon : 1;
+    const order = pl.map((_, i) => i).sort((a, b) => pl[b] - pl[a]);   // by pl desc
+    const taken = new Uint8Array(pl.length);
+    const episodes = [];
+    for (const seed of order) {
+      if (taken[seed]) continue;
+      const at = startIdx[seed];
+      let posSum = 0;
+      for (let k = 0; k < pl.length; k++) {
+        if (taken[k]) continue;
+        if (Math.abs(startIdx[k] - at) < span) {
+          taken[k] = 1;
+          if (pl[k] > 0) posSum += pl[k];
+        }
+      }
+      episodes.push(posSum);
+    }
+    episodeCount = episodes.length;
+
+    /* An episode is scored by the POSITIVE P/L it contributes, not its net.
+       The spec's termination argument — "every window is assigned, so the sum
+       over episodes equals the total" — holds for the positive total but NOT for
+       the net: net episode sums add up to mean x n, which on a losing structure
+       is far below 50% of the positive total, and the accumulation would never
+       terminate. Scoring by positive contribution makes the episode sums add to
+       exactly `totalPos`, so the count always terminates by construction. */
+    episodes.sort((a, b) => b - a);
+    let acc = 0;
+    for (let i = 0; i < episodes.length; i++) {
+      acc += episodes[i];
+      if (acc >= 0.5 * totalPos) { episodesTo50 = i + 1; break; }
+    }
+    // Unreachable given the invariant above; kept so a future change to the
+    // scoring cannot silently produce a null that reads as "not measured".
+    if (episodesTo50 == null) {
+      episodesReason = `episode sums (${acc.toFixed(2)}) did not reach 50% of positive P/L `
+                     + `(${totalPos.toFixed(2)}) — episode scoring invariant broken`;
+      console.warn(`[moves] ${episodesReason}`);
+    }
+  }
+
+  // Quarter-Kelly under a Gaussian approximation (f* ≈ mean/variance in units of
+  // capital). DISPLAY ONLY and NEVER a sort key: Kelly is highly sensitive to the
+  // variance estimate, and that estimate rests on ~5 independent windows a year
+  // at N=45. Clamped at 0 so a negative-expectancy structure never suggests a size.
+  const rMean = mean / capital;
+  const rVar  = variance / (capital * capital);
+  const kellyQuarter = rVar > 0 ? clampTo(rMean / rVar / 4, 0, 1) : null;
+
+  const largestWindow = sorted[sorted.length - 1][0];
+
+  return {
+    ok: true,
+    expectancyMean:      +(mean / capital).toFixed(4),
+    expectancyMedian:    +(median / capital).toFixed(4),
+    /* How many SEPARATE market episodes carry half the positive P/L. LOW is the
+       alarming reading: 1 or 2 means the expectancy rests on one or two moves.
+       Replaces `expectancyTop3Share`, which counted one episode three times. */
+    expectancyEpisodesTo50: episodesTo50,
+    expectancyEpisodes:     episodeCount,
+    expectancyEpisodesReason: episodesReason,
+    expectancyWinRate:   +(pl.filter(v => v > 0).length / n).toFixed(4),
+    expectedDollars:     +mean.toFixed(2),
+    expectancySharpe:    stdev > 0 ? +(mean / stdev).toFixed(4) : null,
+    expectancyWindows:   n,
+    capital:             +capital.toFixed(2),
+    maxGain:             maxGain == null ? null : +maxGain.toFixed(2),
+    riskReward:          maxGain == null ? null : +(maxGain / capital).toFixed(3),
+    kellyQuarter:        kellyQuarter == null ? null : +kellyQuarter.toFixed(4),
+    // An uncapped structure can only be scored at the largest move that actually
+    // happened and no further, while a vertical's cap is real and binding. The
+    // metric therefore STRUCTURALLY UNDERSTATES uncapped structures relative to
+    // capped ones. Not fixable without assuming a distribution — which is exactly
+    // what this measurement exists to avoid. Flagged, and the number left alone.
+    upsideTruncated: maxGain == null,
+    upsideTruncatedReason: maxGain == null
+      ? `unbounded upside scored only as far as the largest observed ${n}-window move `
+        + `(${(largestWindow * 100).toFixed(1)}%); capped structures are not truncated this way, `
+        + 'so this figure understates it relative to a vertical'
+      : null,
+  };
+}
+
+/**
+ * Attach the measured half to one candidate.
+ *
+ * `st` is the payoff descriptor; `bePct`/`breakeven` come from the candidate.
+ * Direction is taken from the SIGNED required move (`breakeven/spot − 1`) rather
+ * than the candidate's `bePct`, which is an absolute value and would point a put
+ * the wrong way.
+ *
+ * WHEN `pBe` IS NULL, `gap` IS NULL — it is a difference of two numbers and one
+ * is missing. Coverage alone never renders in the gap cell.
+ * WHEN COVERAGE IS NULL, EXPECTANCY IS NULL — both come from the same array.
+ */
+function attachCoverage(cand, st, { moves, spot, dte, pBe }) {
+  const out = {
+    coverage1y: null, coverage3y: null,
+    coverageHorizon: null, coverageSessions: null, coverageDte: dte ?? null,
+    coverageN1y: null, coverageN3y: null,
+    coverageIndependent1y: null, coverageIndependent3y: null,
+    gap1y: null, gap3y: null,
+    // Ships null for this release, on purpose. A median over the 2–6 candidates a
+    // row scores at one horizon is not a baseline — and those candidates are the
+    // same population being measured against it, which is close to circular. A
+    // thin median rendered in the style of a real one is the stand-in this
+    // codebase forbids. Raw gaps across the watchlist come first.
+    gapBaseline: null,
+    gapBaselineReason: 'gap is uncalibrated this release: no per-ticker, per-horizon baseline is '
+      + 'computed yet, so a gap cannot be read as large or small for this name. NOTE a modest '
+      + 'negative gap is EXPECTED — it is the variance risk premium, not a defect.',
+    /* REALIZED DRIFT at this horizon — the confound in `gap`, carried beside it.
+       Coverage includes whatever the stock actually did; pBe is driftless. So a
+       positive gap is NOT a pure "vol is cheap here" signal, and on a trending
+       name the drift term dominates it entirely. */
+    drift1y: null, drift3y: null,
+    coverageReason: null,
+    expectancyMean: null, expectancyMedian: null,
+    expectancyEpisodesTo50: null, expectancyEpisodes: null, expectancyEpisodesReason: null,
+    expectancyWinRate: null, expectedDollars: null, expectancySharpe: null,
+    // `expectancyRiskReward`, not `riskReward`: verticalCandidate ALREADY returns a
+    // `riskReward` the card renders, and spreading this block over it would have
+    // silently replaced a displayed field with a differently-rounded one. The two
+    // are algebraically identical for a debit vertical — which is exactly why the
+    // collision would have been invisible.
+    expectancyWindows: null, maxGain: null, expectancyRiskReward: null, kellyQuarter: null,
+    upsideTruncated: null, upsideTruncatedReason: null,
+    concentrationFlag: false, concentrationNote: null,
+    expectancyReason: null,
+  };
+
+  if (!moves || moves.schema !== MOVES_SCHEMA) {
+    out.coverageReason = 'no move series collected for this ticker yet — the 2:00pm PT sweep banks one daily';
+    out.expectancyReason = out.coverageReason;
+    return out;
+  }
+  const snap = snapHorizon(dte);
+  if (!snap) {
+    out.coverageReason = 'no usable DTE on this candidate';
+    out.expectancyReason = out.coverageReason;
+    return out;
+  }
+  out.coverageHorizon  = snap.horizon;
+  out.coverageSessions = snap.sessions;
+
+  const h = moves.horizons?.[String(snap.horizon)];
+  if (!h) {
+    out.coverageReason = `horizon ${snap.horizon} is not in the stored series (schema ${moves.schema})`;
+    out.expectancyReason = out.coverageReason;
+    return out;
+  }
+  out.coverageN1y = h.n1y; out.coverageN3y = h.n3y;
+  out.coverageIndependent1y = h.independent1y ?? null;
+  out.coverageIndependent3y = h.independent3y ?? null;
+  out.drift1y = h.drift1y ?? null;
+  out.drift3y = h.drift3y ?? null;
+
+  const reqMove = Number.isFinite(cand.breakeven) && spot > 0 ? cand.breakeven / spot - 1 : null;
+  const dir = cand.type === 'PUT' ? 'down' : 'up';
+  if (reqMove == null) {
+    out.coverageReason = 'no breakeven to measure against';
+    out.expectancyReason = out.coverageReason;
+    return out;
+  }
+
+  out.coverage1y = coverageAt(h.sorted1y, reqMove, dir);
+  out.coverage3y = coverageAt(h.sorted3y, reqMove, dir);
+  if (out.coverage1y == null && out.coverage3y == null) {
+    out.coverageReason = h.reason3y || h.reason1y || 'no window at this horizon is supported by the stored history';
+  } else if (out.coverage1y == null) {
+    out.coverageReason = h.reason1y;
+  } else if (out.coverage3y == null) {
+    out.coverageReason = h.reason3y;
+  }
+
+  // GAP IS IN POINTS, and its sign convention is stated in the legend: POSITIVE
+  // means the underlying has historically cleared this breakeven MORE often than
+  // the chain prices it to.
+  if (pBe != null) {
+    if (out.coverage1y != null) out.gap1y = +((out.coverage1y - pBe) * 100).toFixed(1);
+    if (out.coverage3y != null) out.gap3y = +((out.coverage3y - pBe) * 100).toFixed(1);
+  }
+
+  // Expectancy runs on the 3y array when it exists, falling back to 1y — and the
+  // window used is NAMED rather than left implicit.
+  const arr = h.sorted3y || h.sorted1y;
+  const arrLabel = h.sorted3y ? '3y' : '1y';
+  if (!arr) {
+    out.expectancyReason = out.coverageReason;
+    return out;
+  }
+  // The candidate's own breakeven is handed across as an independent anchor —
+  // see guard 1 in expectancyFrom(). The horizon is passed too: it is the
+  // session span that defines when two windows belong to the same episode.
+  const e = expectancyFrom(arr, st, spot, cand.breakeven, snap.horizon);
+  if (!e) {
+    out.expectancyReason = 'structure could not be priced across the historical windows';
+    return out;
+  }
+  if (e.ok === false) {
+    console.warn(`[moves] expectancy invariant failed for ${st.kind}: ${e.reason}`);
+    out.expectancyReason = e.reason;
+    return out;
+  }
+
+  out.expectancyMean      = e.expectancyMean;
+  out.expectancyMedian    = e.expectancyMedian;
+  out.expectancyEpisodesTo50   = e.expectancyEpisodesTo50;
+  out.expectancyEpisodes       = e.expectancyEpisodes;
+  out.expectancyEpisodesReason = e.expectancyEpisodesReason;
+  out.expectancyWinRate   = e.expectancyWinRate;
+  out.expectedDollars     = e.expectedDollars;
+  out.expectancySharpe    = e.expectancySharpe;
+  out.expectancyWindows   = e.expectancyWindows;
+  out.maxGain             = e.maxGain;
+  out.expectancyRiskReward = e.riskReward;
+  out.kellyQuarter        = e.kellyQuarter;
+  out.upsideTruncated     = e.upsideTruncated;
+  out.upsideTruncatedReason = e.upsideTruncatedReason;
+  out.expectancyWindow    = arrLabel;
+
+  /* CONCENTRATION FLAG — DELIBERATELY DISABLED THIS RELEASE.
+     `CONCENTRATION_WARN` (0.40) belonged to the old top-3 SHARE and does not
+     carry over: this is a COUNT, with the opposite polarity — low is alarming,
+     high is healthy. Picking a cutoff from intuition would be inventing a
+     threshold, so the metric ships displayed and unflagged until the observed
+     distribution across the watchlist has been read. `concentrationFlag` stays
+     false and nothing dims or reorders on it. */
+  if (e.expectancyEpisodesTo50 != null) {
+    out.concentrationNote = `Half the positive P/L comes from ${e.expectancyEpisodesTo50} `
+      + `separate market episode${e.expectancyEpisodesTo50 === 1 ? '' : 's'} out of `
+      + `${e.expectancyEpisodes} in ${e.expectancyWindows} overlapping windows. LOW IS THE WARNING: `
+      + `1 or 2 means this expectancy rests on one or two moves rather than a property of the trade. `
+      + `Read it against the median (${(e.expectancyMedian * 100).toFixed(0)}%). No threshold is set yet, `
+      + `so nothing is flagged on this number.`;
+  } else if (e.expectancyEpisodesReason) {
+    out.concentrationNote = e.expectancyEpisodesReason;
+  }
+  return out;
+}
+
 /**
  * One single-leg long candidate (Lanes A and B), fully priced.
  *
@@ -2300,7 +3005,7 @@ function quoteOf(o) {
  * make every LEAPS look impossible.
  */
 function longCandidate(o, ctx, type, laneId) {
-  const { spot, rate, dte, tYears, emPct, chainSide, spreadMax } = ctx;
+  const { spot, rate, dte, tYears, emPct, chainSide, spreadMax, moves } = ctx;
   const g = bsGreeks({ spot, strike: o.strike, tYears, vol: o.impliedVolatility, rate, type });
   if (!g) return null;
   const q = quoteOf(o);
@@ -2331,6 +3036,15 @@ function longCandidate(o, ctx, type, laneId) {
   const flags = [];
   if (spreadOk === false) flags.push('wide-spread');
   if ((o.openInterest ?? 0) < LONG_MIN_OI) flags.push('thin-oi');
+
+  /* The measured half. `debit` here is PER CONTRACT — the same figure the row
+     reports below — because every payoff in the coverage block is per contract.
+     Passing `debit` (per share) instead would make expectancy 100× too small. */
+  const cov = attachCoverage(
+    { type: type.toUpperCase(), breakeven },
+    { kind: type === 'call' ? 'long-call' : 'long-put', strike: o.strike, debit: +(debit * 100).toFixed(2) },
+    { moves, spot, dte, pBe },
+  );
 
   return {
     lane: laneId,
@@ -2374,6 +3088,7 @@ function longCandidate(o, ctx, type, laneId) {
     openInterest: o.openInterest ?? null,
     volume: o.volume ?? null,
     flags,
+    ...cov,
   };
 }
 
@@ -2410,7 +3125,7 @@ function nearestDelta(list, spot, rate, tYears, type, target, { itm = null, atmI
  * card printing the target would be describing a contract that does not exist.
  */
 function verticalCandidate(chainSide, ctx, type) {
-  const { spot, rate, dte, tYears, emPct, spreadMax, atmIv } = ctx;
+  const { spot, rate, dte, tYears, emPct, spreadMax, atmIv, moves } = ctx;
   const band = { atmIv: atmIv / 100 };   // same IV-outlier guard as the single-leg lanes
   const longOpt  = nearestDelta(chainSide, spot, rate, tYears, type, LANE_C_LONG,  band);
   const shortOpt = nearestDelta(chainSide, spot, rate, tYears, type, LANE_C_SHORT, band);
@@ -2437,6 +3152,18 @@ function verticalCandidate(chainSide, ctx, type) {
   const netDelta = lg.delta - sg.delta;
   const netVega  = lg.vega  - sg.vega;
   const netTheta = lg.theta - sg.theta;
+
+  /* Capital risked on a DEBIT vertical is the debit — which is already this
+     row's `maxLoss`. Computed once here and used for both, so the number the
+     card prints as max loss and the number expectancy divides by cannot drift. */
+  const maxLoss = +(debit * 100).toFixed(2);
+  const cov = attachCoverage(
+    { type: type.toUpperCase(), breakeven },
+    { kind: type === 'call' ? 'debit-call-vertical' : 'debit-put-vertical',
+      longStrike: longOpt.strike, shortStrike: shortOpt.strike, debit: maxLoss },
+    { moves, spot, dte, pBe },
+  );
+
   const worstSpread = Math.max(lq.spreadPct ?? 0, sq.spreadPct ?? 0);
   const flags = [];
   if (worstSpread > spreadMax) flags.push('wide-spread');
@@ -2458,7 +3185,7 @@ function verticalCandidate(chainSide, ctx, type) {
     debit: +(debit * 100).toFixed(2),
     debitPerShare: +debit.toFixed(2),
     maxProfit: +((width - debit) * 100).toFixed(2),
-    maxLoss: +(debit * 100).toFixed(2),
+    maxLoss,
     riskReward: width > debit ? +((width - debit) / debit).toFixed(2) : null,
     breakeven: +breakeven.toFixed(2),
     bePct: +bePct.toFixed(2),
@@ -2480,6 +3207,7 @@ function verticalCandidate(chainSide, ctx, type) {
     spreadMax,
     openInterest: Math.min(longOpt.openInterest ?? 0, shortOpt.openInterest ?? 0),
     flags,
+    ...cov,
   };
 }
 
@@ -2717,6 +3445,22 @@ async function longRow(sym, env, { rate, premium }) {
     backMeta  = bIv ? { expiry: expiryIso(backExp), dte: dteOf(backExp), atmIv: bIv.atmIv, strike: bIv.strike } : null;
     termStructure = bIv ? +(fIv.atmIv - bIv.atmIv).toFixed(2) : null;
 
+    /* Bank the IV sample from the LIVE branch, unconditionally, and BEFORE the
+       ivHistory() read below — the same ordering handleIv() uses, so today's
+       reading sits inside its own ranking window.
+
+       This path exists because `/api/iv` is not the only place a ticker's IV gets
+       read any more. Card 06 will stop calling it, and when it does, every
+       off-watchlist name would silently stop collecting the history `ivRank`
+       needs — the 1:15pm cron only sweeps the watchlist. Costs one KV write
+       against data already fetched: zero additional subrequests to Yahoo.
+       The call in handleIv() STAYS for now, deliberately: two paths writing the
+       same key for one release is harmless and lets this one be verified against
+       the old one. */
+    try {
+      await recordIvSample(sym, { spot, front: frontMeta }, env, { src: 'long-live' });
+    } catch (e) { console.warn(`[long] ${sym} iv sample write failed:`, e.message); }
+
     try {
       const closes = await yahoo(`/v8/finance/chart/${encodeURIComponent(sym)}`, '?range=3mo&interval=1d');
       hv30 = historicalVol(closes?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [], IV_HV_WINDOW);
@@ -2729,6 +3473,19 @@ async function longRow(sym, env, { rate, premium }) {
 
   if (!frontMeta?.atmIv) {
     return fail('no-iv', 'no usable front-expiry implied vol to anchor the screen');
+  }
+
+  /* The warm counterpart. `frontMeta` here came from `premium:{TICKER}` and may
+     be up to 4h old, so this write DEFERS to any sample already banked today
+     rather than overwriting a fresher one — see the precedence note in
+     recordIvSample(). `spot` is the live figure off the base call above (the
+     premium row's would be equally stale, and the sample's purpose is the IV
+     series); `src: 'long-warm'` declares that the two halves differ in age. */
+  if (warm) {
+    try {
+      await recordIvSample(sym, { spot, front: frontMeta }, env,
+                           { src: 'long-warm', skipIfPresent: true });
+    } catch (e) { console.warn(`[long] ${sym} warm iv sample write failed:`, e.message); }
   }
 
   /* ── Expiry selection ─────────────────────────────────────────────────────── */
@@ -2771,10 +3528,15 @@ async function longRow(sym, env, { rate, premium }) {
       spot, rate, dte, tYears: dte / 365, emPct,
       atmIv: atm?.atmIv ?? null,
       spreadMax: dte > 90 ? LONG_SPREAD_MAX_LEAPS : LONG_SPREAD_MAX_NEAR,
+      moves,
     };
   };
 
   const read = await directionalRead(sym, env);
+  // One KV read. Banked daily by the 2:00pm PT sweep, so this path never fetches
+  // for it — a per-ticker chart fetch here would put 22 invocations against Yahoo
+  // the moment anyone hit "Load all".
+  const moves = await readMoveSeries(sym, env);
   const lanes = [];
 
   const singleLegLane = (laneId, exp, chain, targets, types, itm) => {
@@ -2990,6 +3752,13 @@ async function refreshLongTicker(sym, env) {
     ivrBuyMax: IVR_BUY_MAX, ratioBuyMax: RATIO_BUY_MAX,
     spreadMaxNear: LONG_SPREAD_MAX_NEAR, spreadMaxLeaps: LONG_SPREAD_MAX_LEAPS,
     minOi: LONG_MIN_OI, beEmMax: LONG_BE_EM_MAX, ltcgDays: LTCG_DAYS,
+    // Move-coverage thresholds ship too, for the same reason every other gate
+    // does: neither frontend may hardcode a threshold the Worker owns.
+    coverageMinIndependent: COVERAGE_MIN_INDEPENDENT,
+    // null = no flag is set on episode concentration yet. The frontend must render
+    // the metric unflagged while this is null rather than inventing a cutoff.
+    episodeConcentrationWarn: EPISODE_CONCENTRATION_WARN,
+    coverageHorizons: MOVES_HORIZONS, coverageRange: MOVES_RANGE,
   };
   await storeLongRow(row, env);
   return row;
@@ -3034,6 +3803,13 @@ async function handleLongBatch(params, origin, env) {
       ivrBuyMax: IVR_BUY_MAX, ratioBuyMax: RATIO_BUY_MAX,
       spreadMaxNear: LONG_SPREAD_MAX_NEAR, spreadMaxLeaps: LONG_SPREAD_MAX_LEAPS,
       minOi: LONG_MIN_OI, beEmMax: LONG_BE_EM_MAX, ltcgDays: LTCG_DAYS,
+    // Move-coverage thresholds ship too, for the same reason every other gate
+    // does: neither frontend may hardcode a threshold the Worker owns.
+    coverageMinIndependent: COVERAGE_MIN_INDEPENDENT,
+    // null = no flag is set on episode concentration yet. The frontend must render
+    // the metric unflagged while this is null rather than inventing a cutoff.
+    episodeConcentrationWarn: EPISODE_CONCENTRATION_WARN,
+    coverageHorizons: MOVES_HORIZONS, coverageRange: MOVES_RANGE,
       ...REGIME_GATES,
     },
     rate: rows.find(r => r.rate)?.rate || null,
@@ -3246,23 +4022,46 @@ async function ivSnapshot(ticker, env, { withLadder = false, rate = null } = {})
  * rather than one `get()` per stored day. Metadata is capped at 1024 bytes per
  * key, so it stays three flat numbers — the full sample lives in the value.
  */
-async function recordIvSample(ticker, snap, env) {
-  if (!env?.REC_LOG || !snap?.front?.atmIv) return;
+async function recordIvSample(ticker, snap, env, { src = null, skipIfPresent = false } = {}) {
+  if (!env?.REC_LOG || !snap?.front?.atmIv) return null;
+  const key = `iv:${ticker.toUpperCase()}:${ptDate()}`;
+
+  /* PRECEDENCE. The key is one sample per ticker per PT day, last write wins, so
+     a second caller does not double-count — but it can DOWNGRADE. `longRow`'s
+     warm branch reuses `premium:{TICKER}`, which may be up to 4h old, and an
+     11am reading overwriting the 1:15pm cron's live post-close one is a silent
+     quality regression in the series `ivRank` is built from.
+
+     So the warm path passes `skipIfPresent` and the cron does not:
+       · watchlist names — the 1:15pm cron always wins, whatever the page does
+       · off-watchlist names — the cron never touches them, so no sample exists
+         and the warm write lands, which is the whole point of the new path
+     One extra binding op, only on the branch that can regress the value. */
+  if (skipIfPresent) {
+    const existing = await env.REC_LOG.get(key);
+    if (existing != null) return 'skipped';
+  }
+
   const sample = {
     atmIv:  snap.front.atmIv,
     expiry: snap.front.expiry,
     dte:    snap.front.dte,
     spot:   snap.spot,
     ts:     new Date().toISOString(),
+    // Provenance rides in the BODY. It must never go into the metadata, which is
+    // capped at 1024 bytes and holds the three flat numbers `ivHistory()` rebuilds
+    // the whole series from in one list() pass.
+    ...(src ? { src } : {}),
   };
   await env.REC_LOG.put(
-    `iv:${ticker.toUpperCase()}:${ptDate()}`,
+    key,
     JSON.stringify(sample),
     {
       expirationTtl: IV_HISTORY_TTL,
       metadata: { atmIv: sample.atmIv, spot: sample.spot, dte: sample.dte },
     },
   );
+  return 'written';
 }
 
 /** Every stored daily ATM IV for a ticker, read from key metadata in one list pass.
@@ -4992,6 +5791,85 @@ async function fillForwardReturns(env) {
 
   try { await env.REC_LOG.put('recfwd:last', ptDate(), { expirationTtl: 172800 }); } catch (_) {}
   console.log(`[cron] forward fill: ${filled} value(s) across ${tickers} ticker(s)`);
+}
+
+/* ── Cron: bank the historical move distribution per watchlist ticker ─────────
+   Runs on the 2:00pm PT `forward-returns` branch, NOT the 1:15pm EOD one, and
+   the reason is bar settlement rather than load: the NYSE closes at 1:00pm PT,
+   so at 1:15pm the day's daily bar may still be forming. Banking a forming bar
+   into the series every coverage figure is measured against would never surface
+   as an error — it would just quietly shift the most recent window. By 2:00pm
+   the bar is settled. (`fillForwardReturns` guards the same hazard from the
+   other side with `bars[idx].iso < today`.)
+
+   ONE `yahooSparkCloses` CALL FOR THE WHOLE WATCHLIST. Spark takes 20 symbols
+   per request and needs no crumb, so 22 names cost 2 external fetches. Do not
+   replace this with a per-ticker chart fetch: 22 concurrent invocations against
+   Yahoo is the crumb-rate-limit failure, which the subrequest ceiling has
+   nothing to do with. */
+const MOVES_SWEEP_KEY = 'movesweep:last';
+
+/** ISO date of the last session in a spark timestamp array. Yahoo stamps a daily
+ *  bar at the exchange open, which is mid-afternoon UTC for US names, so the UTC
+ *  calendar date is the session date. */
+function lastSessionIso(timestamps) {
+  if (!Array.isArray(timestamps) || !timestamps.length) return null;
+  const t = timestamps[timestamps.length - 1];
+  if (!Number.isFinite(t)) return null;
+  return new Date(t * 1000).toISOString().slice(0, 10);
+}
+
+async function collectMoveSeries(env) {
+  if (!env?.REC_LOG) return;
+  const mark = instrMark();
+
+  try {
+    const last = await env.REC_LOG.get(MOVES_SWEEP_KEY);
+    if (last === ptDate()) { console.log('[cron] move-series sweep already ran today, skipping'); return; }
+  } catch (_) {}
+
+  let tickers = [...DEFAULT_WATCHLIST];
+  try {
+    const saved = await env.REC_LOG.get('watchlist:tickers', 'json');
+    if (Array.isArray(saved) && saved.length) {
+      tickers = [...new Set([...saved, ...DEFAULT_WATCHLIST].map(t => String(t).toUpperCase()))];
+    }
+  } catch (_) {}
+  tickers = tickers.slice(0, LONG_MAX_SYMBOLS);
+
+  let series;
+  try {
+    series = await yahooSparkCloses(tickers, MOVES_RANGE, 4, { withTimestamps: true });
+  } catch (e) {
+    console.warn('[cron] move-series sweep: spark failed —', e.message);
+    return;
+  }
+
+  let written = 0, skipped = 0, absent = 0, thin = 0;
+  await allSettledCounted(tickers.map(async (sym) => {
+    const s = series.get(sym);
+    // Spark drops unknown/delisted symbols silently and keys off `item.symbol`,
+    // so an absent entry is a fact worth counting rather than a loop that ends early.
+    if (!s?.closes?.length) { absent++; return; }
+
+    const asOfClose = lastSessionIso(s.timestamps);
+    const prev = await readMoveSeries(sym, env);
+    if (prev && asOfClose && prev.asOfClose === asOfClose) { skipped++; return; }
+
+    const payload = buildMoveSeries(sym, s.closes, asOfClose);
+    // A name with too little history still gets stored: every horizon carries its
+    // own reason, and "3 months since IPO" is a finding the card should state
+    // rather than an absence that reads as a collection failure.
+    if (payload.sessions < MOVES_HORIZONS[0] + 1) thin++;
+    await env.REC_LOG.put(movesKey(sym), JSON.stringify(payload), { expirationTtl: MOVES_TTL });
+    written++;
+  }), 'move-series sweep');
+
+  try { await env.REC_LOG.put(MOVES_SWEEP_KEY, ptDate(), { expirationTtl: 172800 }); } catch (_) {}
+  console.log(
+    `[cron] move-series sweep: ${written} written, ${skipped} already current, ${absent} not returned by spark, `
+    + `${thin} with thin history · ${JSON.stringify(instrSince(mark, 'complete'))}`,
+  );
 }
 
 /* ── New route handlers ── */
@@ -7665,8 +8543,13 @@ export default {
       ctx.waitUntil(generateEODSummary(env));          // 1:15pm PT EOD summary
       ctx.waitUntil(recordWatchlistIv(env));           // 1:15pm PT bank one IV sample per watchlist name
     } else if (h === 14 && m < 30) {
-      branch = 'forward-returns';
+      branch = 'forward-returns+moves';
       ctx.waitUntil(fillForwardReturns(env));          // 2:00pm PT resolve 5/20-session forward returns
+      // 2:00pm PT bank the historical move distribution. Placed on THIS branch and
+      // not the 1:15pm EOD one because the daily bar is settled by now — see the
+      // note on collectMoveSeries(). Both jobs share this invocation's subrequest
+      // budget: ctx.waitUntil does not get its own.
+      ctx.waitUntil(collectMoveSeries(env));
     } else if (h === 10) {
       // Fires on all four firings of the hour: a slice is only 4 managers, so
       // four slices a day completes a 20-manager pass in ~1.3 days. 13F-HR lands

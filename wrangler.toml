@@ -61,6 +61,14 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   fund:{TICKER}       — per-ticker Yahoo fundamentals cache (6h TTL)
 #   premium:{TICKER}    — premium-screen row, cached on demand (4h fresh, 24h retained)
 #   long:{TICKER}       — long-screen row, cached on demand (4h fresh, 24h retained)
+#   moves:{TICKER}      — historical N-session return distribution behind the Long
+#                         tab's measured `cov` column and its expectancy ranking.
+#                         Banked by the 2:00pm PT sweep, 7d TTL, ~60 KB/ticker.
+#                         Sorted [return, startIdx] PAIRS — schema 2; the reader
+#                         treats any other schema as ABSENT and recomputes.
+#   movesweep:last      — PT date of the last move-series sweep (dedup). Outside
+#                         the `moves:` prefix so nothing scanning that prefix
+#                         picks it up as a ticker.
 #   13f:cursor          — which manager the 13F pass is up to (outside 13f:index)
 #   econ:dgs3mo         — FRED 3-month T-bill, risk-free rate for Black-Scholes
 #                         (12h fresh, 90d kept — the long retention is the outage

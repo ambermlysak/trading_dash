@@ -15,6 +15,9 @@ trading_dash/
 │                        #   independent cross-checks, prints computed vs expected
 ├── long-fixtures.check.mjs # Long-screen paths live data cannot reach: the IV-rank
 │                        #   gate branch, Lane A with two Januaries, the IV guard
+├── moves.check.mjs      # Move coverage + expectancy — coverage vs brute force,
+│                        #   all 8 payoff structures, the two expectancy guards,
+│                        #   the independent-window floor, episode de-clustering
 ├── instr-bindings.check.mjs # The binding counter: shape detection, automatic
 │                        #   pickup of a new binding, and its failure paths
 ├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
@@ -232,6 +235,31 @@ in this codebase and shipped:
    Retention is now 90 days and the stored print is served flagged `stale` with its age rendered
    ("FRED DGS3MO · 9d old"). **Match the failure response to the failure: "no value has ever existed"
    and "the refresh is late" are different states and must not degrade the same way.**
+25. **A metric that needs a paragraph of caveat to avoid misleading is the wrong
+   metric — measure the claimed thing instead.** The Long tab's first concentration
+   figure was `top3Share`: the share of total positive P/L carried by the three
+   largest windows. But the windows OVERLAP by design, so one market move appears in
+   up to N consecutive windows and the "three largest" were routinely three
+   overlapping views of a *single* episode. The number was arithmetically correct and
+   described something nobody wanted to know. Rewording the tooltip to admit that was
+   honest and still wrong: it left a metric on screen whose plain reading was false.
+   It is now `expectancyEpisodesTo50` — every window assigned to exactly one episode
+   by start-index proximity, and a count of how many episodes carry half the positive
+   P/L. Measured on 323 real candidates, the old flag fired on 60 and **missed 126
+   candidates whose expectancy rested on a single episode**; within the
+   `episodesTo50 == 1` group the old share ranged from 2.1% to 100%, i.e. the two
+   were near-uncorrelated where it mattered.
+26. **A real-world frequency and a risk-neutral probability differ by drift, and
+   subtracting them silently attributes that drift to volatility.** The Long tab's
+   `gap` is `coverage − pBe`. Coverage is measured from what the stock actually did
+   and therefore contains its realized drift; `pBe` is driftless by construction. On
+   a trending name the drift term dominates the difference, so a reader seeing a
+   large positive gap concludes "vol is cheap here" when the true statement is "this
+   stock went up." Nothing was miscalculated — the defect was presenting a
+   two-component quantity as though it had one component. `drift1y`/`drift3y` are now
+   rendered directly adjacent to the gap, and the legend states the confound outright.
+   **When a metric is a difference of two things measured under different assumptions,
+   name the assumption that differs and put it next to the number.**
 22. **A null pushed through arithmetic becomes a fabricated measurement.** The Long tab's legend
    rendered **"hit rate 0% over n=12"**. Calibration really was resolved, but `hitRate` was `null`
    because a hit rate belongs to a rating and that ticker had no stored rating — and
@@ -285,6 +313,7 @@ Where a paid feed would still add something real, it is named in the notes.
 | 16 | News flow | Alpaca news when keyed, Yahoo `search` otherwise | **real** | Benzinga ($177) |
 | — | Premium screen (dashboard) | Yahoo chain via `/api/premium/:ticker`, one ticker per request: term structure, expected move, 0.30/0.16-delta strikes, credit, ROC, annualised ROC, POP | **real** | ORATS for a historical IV surface |
 | — | Long screen (dashboard) | Yahoo chain via `/api/long/:ticker`, one ticker per request: four lanes, ask-based debit, breakeven, BE/EM, extrinsic %, leverage, annualised carry, theta, vega, `P(BE)@exp` from N(d2). Reuses `premium:{TICKER}`'s slower-moving fields when fresh (4 external fetches) and refetches them when not (7) | **real** — Lane D's breakeven/BE/EM/P(BE)/carry are **suppressed**, not estimated | ORATS for a historical IV surface; a term-structure model would unlock Lane D |
+| — | Long screen · `cov` / `gap` / `E[R]` / `E[$]` | **Measured** from `moves:{TICKER}` — 3y of Yahoo daily closes banked by the 2pm PT sweep (2 external fetches for the whole watchlist), then overlapping N-session windows. `cov` is an empirical frequency, `p(be)` beside it is modelled; `E[R]` is mean P/L over those windows ÷ capital risked | **real** — 1y/3y never averaged; horizons the history cannot support return null naming the numbers; `gapBaseline` null this release | ORATS for a historical IV surface would let `pBe` be checked against a *measured* IV rather than only against realized moves |
 
 ## If you ever want to pay for data
 
@@ -465,22 +494,37 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    SEC's ticker file carries no CUSIPs and no share-class detail, which is the
    binding constraint.
 
-5. **`Hist Win` backtest.** The stat stays blank pending a real backtest of each
-   structure on the underlying. It sits beside POP so the difference between a
-   formula and a measurement stays visible. Needs historical option chains (ORATS /
-   IVolatility) — no free source carries them.
+5. **`Hist Win` backtest on `index.html`.** The stat stays blank on the research
+   page's strategy card, pending a real backtest of each structure on the
+   underlying. It sits beside POP so the difference between a formula and a
+   measurement stays visible. **The Long tab now has the measured counterpart**
+   (`cov`, from `moves:{TICKER}`), but wiring it into `renderStrategies()` was
+   deliberately deferred: that card's structures are mostly credit strategies with
+   no Long-tab equivalent, and it would need coverage delivered over `/api/iv`.
 
-6. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
+6. **A structural baseline for `gap`.** Currently `gapBaseline` is null with a
+   reason, because a median over the handful of candidates a row scores is
+   circular. The intended replacement is computed at collection time: compare the
+   empirical distribution to the lognormal implied by that day's ATM IV at fixed
+   reference points (±0.5σ, ±1σ, ±1.5σ), stored in `moves:{TICKER}`, reading
+   `iv:{TICKER}:{date}` written 45 minutes earlier by the 1:15pm cron — no extra
+   fetch and no request-path race. **That baseline is itself drift-contaminated**
+   (honesty rule 26) and whatever spec it gets must say so.
+
+7. **A threshold for `expectancyEpisodesTo50`.** `EPISODE_CONCENTRATION_WARN` is
+   null and nothing flags on the metric. Observed distribution is in `CLAUDE.md`.
+
+8. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
    Lightweight Charts supports custom drawings; recognition would be rules-based
    code or a Claude vision call against a chart screenshot.
 
-7. **Backfill of recommendation history.** The forward log only grows from first
+9. **Backfill of recommendation history.** The forward log only grows from first
    use. RSI/MACD/Bollinger/analyst inputs are all reproducible from Yahoo history,
    so a replay script could synthesise "what would the model have said on date X".
    Roughly 100 lines of Node, and it would make the calibration card useful
    immediately rather than after 10 resolved entries.
 
-8. **Two `setBadge()` implementations.** `index.html` and `dashboard.html` each
+10. **Two `setBadge()` implementations.** `index.html` and `dashboard.html` each
    carry one, byte-for-byte equivalent. No build step and no module system, so the
    alternatives were duplication or a third HTTP request. If a bundler ever
    arrives, unify these first — they are the most drift-prone duplication left.

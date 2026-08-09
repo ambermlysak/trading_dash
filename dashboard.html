@@ -555,6 +555,23 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .long-tag.noread  { background: var(--bg-3); color: var(--ink-3); opacity: 0.7; }
 .long-tag.horizon { background: rgba(180,161,173,0.16); color: var(--violet); }
 .long-tag.unscored { opacity: 0.65; font-style: italic; }
+/* Move coverage / expectancy. `.cov-alt` is the second window (3y) rendered
+   subordinate to the first — subordinate in weight only: the two are never
+   averaged and the 3y figure is not a footnote to the 1y one. */
+.cov-alt { color: var(--ink-3); opacity: 0.75; font-size: 0.9em; }
+/* Per-candidate expanded detail: drift sits beside gap so the confound is read
+   at the same moment as the number it confounds. */
+.cand-detail > td { padding: 3px 8px 7px 14px !important; border-top: none !important;
+  font-family: var(--mono); font-size: 9px; color: var(--ink-3); }
+.cd-k { color: var(--ink-3); opacity: 0.65; margin-right: 4px; }
+.cd-k::before { content: '· '; }
+.cd-v { color: var(--ink-1); margin-right: 12px; }
+.cd-v.up { color: var(--bull); } .cd-v.dn { color: var(--bear); }
+.cd-note { color: var(--amber); cursor: help; }
+.prem-cands th.csort, .long-lane-sub .csort { cursor: pointer; user-select: none; }
+.prem-cands th.csort:hover, .long-lane-sub .csort:hover { color: var(--cyan); }
+.prem-cands th.csort.sorted, .long-lane-sub .csort.sorted { color: var(--cyan); }
+.prem-cands td.muted { color: var(--ink-3); opacity: 0.6; }
 .prem-cands tr.demoted { opacity: 0.62; }
 .prem-cands tr.illiquid td { color: var(--ink-3); }
 .prem-col.beem.good { color: var(--bull); }
@@ -2357,9 +2374,13 @@ premSortLoad();
 let longData = null;
 let longLoading = false;
 let longSort = { col: 'symbol', dir: 1 };
+/* Candidate sort WITHIN a lane. Separate state from `longSort`, which orders the
+   ticker rows. Default is expectancy descending — see the note on sortLongCands. */
+let longCandSort = { col: 'exp', dir: -1 };
 
 const LONG_OPEN_KEY = 'trading_dash_long_open';
 const LONG_SORT_KEY = 'trading_dash_long_sort';
+const LONG_CAND_SORT_KEY = 'trading_dash_long_cand_sort';
 
 function longOpenSet() {
   try { return new Set(JSON.parse(sessionStorage.getItem(LONG_OPEN_KEY)) || []); }
@@ -2376,6 +2397,15 @@ function longSortLoad() {
 }
 function longSortSave() {
   try { sessionStorage.setItem(LONG_SORT_KEY, JSON.stringify(longSort)); } catch (_) {}
+}
+function longCandSortLoad() {
+  try {
+    const s = JSON.parse(sessionStorage.getItem(LONG_CAND_SORT_KEY));
+    if (s && typeof s.col === 'string' && (s.dir === 1 || s.dir === -1)) longCandSort = s;
+  } catch (_) {}
+}
+function longCandSortSave() {
+  try { sessionStorage.setItem(LONG_CAND_SORT_KEY, JSON.stringify(longCandSort)); } catch (_) {}
 }
 
 async function loadLong() {
@@ -2537,27 +2567,105 @@ function alignChip(align, scored) {
   }">${esc(align.tag)}</span>`;
 }
 
-/** Sort candidates within a lane. Lane A by annualised cost of carry ascending,
- *  B and C by BE/EM ascending. NO cross-lane composite score anywhere — ordering
- *  an 18-month LEAPS against a 45-day call would invent a preference between two
- *  different questions and hide its inputs behind a number.
+/* ── Candidate sort ───────────────────────────────────────────────────────────
+   THIS REVERSES A DOCUMENTED DECISION, and a silent reversal would be worse than
+   the decision either way.
+
+   `long-tab-prompt.md` §8 deliberately REFUSED a cross-lane composite score, on
+   the grounds that ordering an 18-month LEAPS against a 45 DTE call invents a
+   preference between two different questions and hides its inputs behind a
+   number. That refusal was right about a COMPOSITE.
+
+   Expectancy is a narrower claim: ONE quantity — mean P/L over the historical
+   windows, divided by capital risked — measured the same way for every structure,
+   with its assumptions stated on the card. It blends nothing. So it is allowed to
+   order across lanes where the composite was not. It is still a cross-lane
+   ordering and is on the record as such.
+
+   Sorting on expectancy rather than probability is the point. Coverage rises as
+   the breakeven moves toward spot, and the breakeven moves toward spot as more
+   intrinsic is paid — so a descending probability sort is a descending MONEYNESS
+   sort wearing a probability label. It also ignores payoff: 76% paying 0.23:1 and
+   39% paying 4:1 are not comparable on probability, and ranking on probability
+   systematically selects against convexity, which is the property this screen
+   exists to buy.
+
+   LANE A DOES NOT PARTICIPATE. Its candidates are 365+ DTE, which snaps to the
+   365-session horizon, which a 3y range cannot support (1.07 independent windows
+   against a floor of 4) — so every Lane A expectancy is null. Under nulls-last
+   that would sink the whole lane. Lane A therefore keeps its native cost-of-carry
+   sort and says so in its header. */
+const LONG_CAND_SORTS = {
+  exp:  { label: 'E[R]',   get: c => c.expectancyMean,   dirDefault: -1 },
+  cov:  { label: 'cov 1y', get: c => c.coverage1y,       dirDefault: -1 },
+  gap:  { label: 'gap',    get: c => c.gap1y,            dirDefault: -1 },
+  shrp: { label: 'Sharpe', get: c => c.expectancySharpe, dirDefault: -1 },
+  beem: { label: 'BE/EM',  get: c => c.beEm,             dirDefault:  1 },
+  carry:{ label: 'Carry',  get: c => c.carryAnnual,      dirDefault:  1 },
+};
+
+/** Does this lane have any scorable expectancy at all? Lane A never will at a 3y
+ *  range; a swing lane will unless the move series has not been collected yet. */
+function laneHasExpectancy(cands) {
+  return (cands || []).some(c => c.expectancyMean != null);
+}
+
+/** The sort actually in effect for a lane, and why — rendered in the lane header
+ *  so a fallback is never silent. */
+function laneSortInEffect(lane, cands) {
+  if (lane === 'A') {
+    return { col: 'carry', dir: 1, native: true,
+      why: 'Lane A is sorted by annualised cost of carry, ascending — its native order. '
+         + 'It is held out of the expectancy ordering because a 365+ DTE contract snaps to the '
+         + '365-session horizon, which 3 years of closes cannot support (see the legend).' };
+  }
+  if (longCandSort.col !== 'carry' && !laneHasExpectancy(cands) && longCandSort.col === 'exp') {
+    return { col: 'beem', dir: 1, native: true,
+      why: 'No expectancy is available on this expiry, so the lane has fallen back to its native '
+         + 'BE/EM ascending order rather than presenting an all-null column as a ranking.' };
+  }
+  return { col: longCandSort.col, dir: longCandSort.dir, native: false, why: null };
+}
+
+/** Sort candidates within a lane.
  *  `counter` candidates are demoted below the rest, but only once the rating has
  *  a resolved track record, and never in Lane A (out-of-horizon by definition). */
 function sortLongCands(cands, lane, scored) {
   const demote = lane !== 'A' && scored;
-  const metric = c => lane === 'A' ? c.carryAnnual : c.beEm;
+  const eff = laneSortInEffect(lane, cands);
+  const spec = LONG_CAND_SORTS[eff.col] || LONG_CAND_SORTS.beem;
   return [...cands].sort((a, b) => {
     if (demote) {
       const ra = a.align?.tag === 'counter' ? 1 : 0;
       const rb = b.align?.tag === 'counter' ? 1 : 0;
       if (ra !== rb) return ra - rb;
     }
-    const av = metric(a), bv = metric(b);
+    const av = spec.get(a), bv = spec.get(b);
+    // Nulls last in BOTH directions: a missing expectancy is not a low
+    // expectancy, and a candidate we could not score must not read as one we
+    // scored badly.
     if (av == null && bv == null) return 0;
-    if (av == null) return 1;            // nulls last, both directions
+    if (av == null) return 1;
     if (bv == null) return -1;
-    return av - bv;
+    return (av - bv) * eff.dir;
   });
+}
+
+function setLongCandSort(col) {
+  const spec = LONG_CAND_SORTS[col];
+  if (!spec) return;
+  longCandSort = longCandSort.col === col
+    ? { col, dir: -longCandSort.dir }
+    : { col, dir: spec.dirDefault };
+  longCandSortSave();
+  renderLong(longData);
+}
+
+/** A sortable candidate-table header cell. */
+function candTh(col, label, title) {
+  const on = longCandSort.col === col;
+  return `<th class="csort ${on ? 'sorted' : ''}" data-long-cand-sort="${col}" title="${esc(title)}">${
+    esc(label)}${on ? (longCandSort.dir === 1 ? ' ▲' : ' ▼') : ''}</th>`;
 }
 
 function pbeCell(c) {
@@ -2568,6 +2676,129 @@ function pbeCell(c) {
 
 function flagStr(c) {
   return (c.flags || []).length ? `<span class="long-flag" title="wide-spread: bid/ask exceeds the floor for this horizon. thin-oi: open interest below 10.">${c.flags.join(' ')}</span>` : '';
+}
+
+/* ── The measured cells ───────────────────────────────────────────────────────
+   `cov` is MEASURED — the share of historical N-session windows in which the
+   underlying actually moved past this breakeven. `p(be)` next to it is MODELLED.
+   Neither is called POP on this screen: the index.html strategy card already uses
+   POP for the delta-derived figure, and three names for two things across two
+   pages is how they get conflated. */
+
+/** Coverage. Both windows in one cell — 1y is the sort key, 3y sits beside it,
+ *  and they are NEVER averaged. Disagreement between them IS the finding. */
+function covCell(c) {
+  if (c.coverage1y == null && c.coverage3y == null) {
+    return `<td class="muted" title="${esc(c.coverageReason || 'no measurement available')}">—</td>`;
+  }
+  const p = v => v == null ? '—' : (v * 100).toFixed(0) + '%';
+  // A horizon mismatch is stated, not implied: a 531-day contract scored at the
+  // 365-session bucket must not present as if scored at its own horizon.
+  const horizon = c.coverageHorizon == null ? '' :
+    `Scored at the ${c.coverageHorizon}-session horizon; this contract is ${c.coverageDte}d `
+    + `(≈${c.coverageSessions} sessions). `;
+  const counts = `Windows: ${c.coverageN1y == null ? '—' : c.coverageN1y} over 1y, ${
+    c.coverageN3y == null ? '—' : c.coverageN3y} over 3y — but they OVERLAP, so the honest sample `
+    + `size is ~${c.coverageIndependent1y ?? '—'} and ~${c.coverageIndependent3y ?? '—'} independent windows. `;
+  const why = c.coverageReason ? `\n\n${c.coverageReason}` : '';
+  return `<td title="${esc('MEASURED frequency, not a model. ' + horizon + counts
+    + '1y and 3y are shown separately and never averaged: they disagree on names that have re-rated, '
+    + 'and that disagreement is the regime-dependence warning.' + why)}">${p(c.coverage1y)} <span class="cov-alt">/ ${p(c.coverage3y)}</span></td>`;
+}
+
+/** Gap = coverage − p(be), in POINTS.
+ *  NULL WHEN p(be) IS NULL — it is a difference of two numbers and one is
+ *  missing. Coverage alone must never render in this cell. */
+function gapCell(c) {
+  if (c.gap1y == null && c.gap3y == null) {
+    const why = c.pBe == null
+      ? 'p(be) is unavailable, so the gap cannot be formed — it is a difference of two numbers. '
+        + (c.pBeReason || '')
+      : (c.coverageReason || 'no measurement available');
+    return `<td class="muted" title="${esc(why)}">—</td>`;
+  }
+  const s = v => v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(0);
+  const cls = c.gap1y == null ? '' : c.gap1y > 0 ? 'up' : 'dn';
+  return `<td class="${cls}" title="${esc(
+    'coverage − p(be), in points. POSITIVE means the underlying has historically cleared this '
+    + 'breakeven MORE often than the chain prices it to.\n\n'
+    + 'ZERO IS NOT FAIR VALUE. p(be) is a risk-neutral probability and coverage is a real-world '
+    + 'frequency — they are different measures, and a persistent modest NEGATIVE gap is EXPECTED. '
+    + 'That is the variance risk premium, which is what compensates option sellers. It is not a defect.\n\n'
+    + (c.gapBaselineReason || ''))}">${s(c.gap1y)} <span class="cov-alt">/ ${s(c.gap3y)}</span></td>`;
+}
+
+/** Expectancy — the sort key. Median rides in the hover ALWAYS, per the
+ *  concentration rule: a mean far above its median with a high top-3 share is the
+ *  signature of a number built on a handful of windows, and both halves of that
+ *  signature have to be readable. */
+function expCell(c) {
+  if (c.expectancyMean == null) {
+    return `<td class="muted" title="${esc(c.expectancyReason || c.coverageReason || 'not scored')}">—</td>`;
+  }
+  const pct = v => v == null ? '—' : (v * 100).toFixed(0) + '%';
+  const ep = c.expectancyEpisodesTo50;
+  const detail = [
+    `median ${pct(c.expectancyMedian)} — read the mean against this`,
+    `win rate ${pct(c.expectancyWinRate)} of ${c.expectancyWindows} windows (${c.expectancyWindow} series)`,
+    // De-clustered concentration. LOW is the warning, which is the opposite
+    // polarity to the top-3 share this replaced.
+    `episodes to 50% of positive P/L: ${ep == null ? 'n/a — ' + (c.expectancyEpisodesReason || 'not measured')
+      : ep + ' of ' + c.expectancyEpisodes + ' (LOW is the warning: 1–2 means one or two market moves carry it)'}`,
+    `Sharpe ${c.expectancySharpe == null ? '—' : c.expectancySharpe.toFixed(2)} — clickable sort, not a visible column`,
+    `max gain ${c.maxGain == null ? 'uncapped' : '$' + c.maxGain.toFixed(0)}`,
+    `reward:risk ${c.expectancyRiskReward == null ? 'n/a (uncapped)' : c.expectancyRiskReward.toFixed(2) + ':1'}`,
+    `quarter-Kelly ${c.kellyQuarter == null ? '—' : pct(c.kellyQuarter)} — a sizing REFERENCE only, never a sort key; `
+      + `Kelly is very sensitive to the variance estimate and that estimate rests on ~5 independent windows a year`,
+  ].join('\n');
+  const caveat = '\n\nHELD TO EXPIRY. No assignment, no early close, no IV path is modelled — so this '
+    + 'UNDERSTATES any structure that would realistically be closed early, which is most of them. '
+    + 'A relative ranking, not a P&L forecast.';
+  const trunc = c.upsideTruncated ? '\n\n' + (c.upsideTruncatedReason || '') : '';
+  return `<td class="${c.expectancyMean > 0 ? 'up' : 'dn'}" title="${esc(
+    'Mean P/L across the historical windows ÷ capital risked.\n' + detail + caveat + trunc)}">${
+    pct(c.expectancyMean)}${c.upsideTruncated ? '<span class="cov-alt">↑</span>' : ''}</td>`;
+}
+
+/* ── Per-candidate expanded detail ────────────────────────────────────────────
+   DRIFT SITS DIRECTLY BESIDE GAP, and that adjacency is the point.
+
+   `coverage` is a real-world frequency and therefore includes whatever direction
+   the stock actually went. `p(be)` is risk-neutral and driftless by
+   construction. So `gap` conflates two different things — how fat the tails were,
+   and which way the stock ran — and on a strongly trending name the second term
+   dominates. Reading a positive gap as "vol is cheap here" does not follow, and
+   putting drift anywhere other than next to the gap invites exactly that
+   inference. Not a table column: the table stays cov · gap · E[R] · E[$]. */
+function candDetail(c) {
+  const p2 = v => v == null ? '—' : ((v > 0 ? '+' : '') + (v * 100).toFixed(1) + '%');
+  const g  = v => v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(0);
+  const ep = c.expectancyEpisodesTo50;
+  if (c.coverage1y == null && c.coverage3y == null && c.expectancyMean == null) return '';
+  return `<tr class="cand-detail"><td colspan="99">
+    <span class="cd-k">gap</span> <span class="cd-v">${g(c.gap1y)} 1y · ${g(c.gap3y)} 3y</span>
+    <span class="cd-k">realized drift</span> <span class="cd-v ${c.drift1y > 0 ? 'up' : c.drift1y < 0 ? 'dn' : ''}"
+      title="Mean ${c.coverageHorizon}-session return over each window. This is the DRIFT CONFOUND in the gap beside it: coverage contains it, p(be) does not. On a trending name it is most of the gap.">${
+      p2(c.drift1y)} 1y · ${p2(c.drift3y)} 3y</span>
+    <span class="cd-k">episodes to 50%</span> <span class="cd-v" title="${esc(c.concentrationNote || '')}">${
+      ep == null ? '—' : ep + ' of ' + c.expectancyEpisodes}</span>
+    <span class="cd-k">median</span> <span class="cd-v">${c.expectancyMedian == null ? '—' : (c.expectancyMedian * 100).toFixed(0) + '%'}</span>
+    <span class="cd-k">Sharpe</span> <span class="cd-v">${c.expectancySharpe == null ? '—' : c.expectancySharpe.toFixed(2)}</span>
+    <span class="cd-k">¼-Kelly</span> <span class="cd-v" title="Sizing reference only. Never sorts anything.">${
+      c.kellyQuarter == null ? '—' : (c.kellyQuarter * 100).toFixed(0) + '%'}</span>
+    ${c.upsideTruncated ? `<span class="cd-note" title="${esc(c.upsideTruncatedReason || '')}">↑ upside truncated</span>` : ''}
+  </td></tr>`;
+}
+
+/** Expected dollars per contract. Disagrees with E[R] on purpose — $100 on $500
+ *  risked beats $1,000 on $10,000 risked. Sort on E[R], display both. */
+function edollarCell(c) {
+  if (c.expectedDollars == null) return `<td class="muted">—</td>`;
+  return `<td class="${c.expectedDollars > 0 ? 'up' : 'dn'}" title="${esc(
+    'Mean P/L in dollars, per contract, over the same windows. E[R] ranks per dollar of capital; '
+    + 'this answers "what does one contract actually pay". They disagree, and both readings are wanted.'
+    + `\n\nCapital risked here: $${(c.expectancyMean ? (c.expectedDollars / c.expectancyMean) : 0).toFixed(0)}.`)}">${
+    c.expectedDollars > 0 ? '+' : ''}$${Math.abs(c.expectedDollars).toFixed(0)}</td>`;
 }
 
 /** Lanes A and B — single-leg longs. */
@@ -2589,16 +2820,28 @@ function longSingleTable(entry, scored) {
       <td>${nOrDash(c.thetaDay, 2)}</td>
       <td title="Dollar change per 1 IV point, per contract. At −5 IV points: ${money(c.vegaLoss5)}.">${nOrDash(c.vegaPerPoint, 2)}</td>
       ${pbeCell(c)}
+      ${covCell(c)}
+      ${gapCell(c)}
+      ${expCell(c)}
+      ${edollarCell(c)}
       <td title="Ceiling for this horizon is ${(c.spreadMax * 100).toFixed(0)}% of mid.">${pOrDash(c.spreadPct, 1)}${flagStr(c)}</td>
       <td>${c.openInterest == null ? '—' : fmtVol(c.openInterest)}</td>
       <td title="${c.ltcgEligible ? `Expiry is ${c.ltcgHeadroomDays}d past the 366-day long-term line, so holding to expiry could qualify.` : `Expiry is ${Math.abs(c.ltcgHeadroomDays)}d short of the 366-day line — a hold to expiry cannot qualify.`} A fact about the contract only: this app has no position data.">${c.ltcgEligible ? '✓' : '—'}</td>
       <td>${alignChip(c.align, scored)}</td>
-    </tr>`).join('');
+    </tr>${candDetail(c)}`).join('');
 
   return `<table class="prem-cands">
     <thead><tr>
-      <th>Contract</th><th>Δ</th><th>Debit</th><th>Breakeven</th><th>% move</th><th>BE/EM</th>
-      <th>Extr %</th><th>Lev</th><th>Carry ann.</th><th>θ/day</th><th>Vega/pt</th><th>P(BE)@exp</th>
+      <th>Contract</th><th>Δ</th><th>Debit</th><th>Breakeven</th><th>% move</th>
+      ${candTh('beem', 'BE/EM', '% move to breakeven ÷ the expected move for THIS expiry. Below 1.00 means the market\'s own 1σ covers the breakeven.')}
+      <th>Extr %</th><th>Lev</th>
+      ${candTh('carry', 'Carry ann.', 'Extrinsic ÷ (Δ × spot), annualised. Lane A\'s native sort.')}
+      <th>θ/day</th><th>Vega/pt</th>
+      <th title="MODELLED: N(d2) at the breakeven, risk-neutral and lognormal. Renamed from POP on this screen — the index.html strategy card uses POP for the delta-derived figure and they are different quantities.">p(be)</th>
+      ${candTh('cov', 'cov 1y/3y', 'MEASURED: share of historical N-session windows that actually cleared this breakeven. 1y and 3y separately, never averaged.')}
+      ${candTh('gap', 'gap', 'cov − p(be), in points. A modest negative gap is the variance risk premium, not a defect.')}
+      ${candTh('exp', 'E[R]', 'Expectancy: mean P/L over the historical windows ÷ capital risked. The default sort.')}
+      <th title="Expected dollars per contract. Sort on E[R], read both.">E[$]</th>
       <th>Spread</th><th>OI</th><th>LTCG</th><th>Read</th>
     </tr></thead><tbody>${rows}</tbody></table>`;
 }
@@ -2623,16 +2866,27 @@ function longVerticalTable(entry, scored) {
       <td>${nOrDash(c.thetaDay, 2)}</td>
       <td>${nOrDash(c.vegaPerPoint, 2)}</td>
       ${pbeCell(c)}
+      ${covCell(c)}
+      ${gapCell(c)}
+      ${expCell(c)}
+      ${edollarCell(c)}
       <td>${pOrDash(c.spreadPct, 1)}${flagStr(c)}</td>
       <td>${c.openInterest == null ? '—' : fmtVol(c.openInterest)}</td>
       <td>${alignChip(c.align, scored)}</td>
-    </tr>`).join('');
+    </tr>${candDetail(c)}`).join('');
 
   return `<table class="prem-cands">
     <thead><tr>
       <th>Structure</th><th>Δ long/short</th><th>Width</th><th>Debit</th><th>Max P</th><th>R:R</th>
-      <th>Breakeven</th><th>% move</th><th>BE/EM</th><th>Net Δ</th><th>θ/day</th><th>Vega/pt</th>
-      <th>P(BE)@exp</th><th>Spread</th><th>OI</th><th>Read</th>
+      <th>Breakeven</th><th>% move</th>
+      ${candTh('beem', 'BE/EM', '% move to breakeven ÷ the expected move for THIS expiry.')}
+      <th>Net Δ</th><th>θ/day</th><th>Vega/pt</th>
+      <th title="MODELLED: N(d2) at the breakeven. Not POP — that name belongs to the delta-derived figure on the research page.">p(be)</th>
+      ${candTh('cov', 'cov 1y/3y', 'MEASURED: share of historical N-session windows that actually cleared this breakeven.')}
+      ${candTh('gap', 'gap', 'cov − p(be), in points. A modest negative gap is the variance risk premium, not a defect.')}
+      ${candTh('exp', 'E[R]', 'Expectancy: mean P/L over the historical windows ÷ capital risked (max loss = the debit).')}
+      <th title="Expected dollars per contract.">E[$]</th>
+      <th>Spread</th><th>OI</th><th>Read</th>
     </tr></thead><tbody>${rows}</tbody></table>
     <div class="prem-note">Cost of carry is absent on a vertical by design: the short leg refunds part of the
     extrinsic, so the Lane A formula would not describe this structure.</div>`;
@@ -2667,12 +2921,29 @@ function longCalendarTable(entry) {
     lane, and that is deliberate.</b> ${esc(c.suppressed.reason)}</div>`;
 }
 
+/* Lane headers no longer hardcode their sort — it is now selectable and can fall
+   back, and a header claiming an order the table is not in would be worse than no
+   header at all. `laneSortLine()` states the order actually in effect. */
 const LANE_META = {
-  A: ['Lane A · Stock replacement (LEAPS)', 'calls only · nearest 0.85 and 0.70 delta, ITM · sorted by annualised cost of carry, ascending'],
-  B: ['Lane B · Directional swing',          'calls and puts · nearest 0.55 and 0.40 delta · sorted by BE/EM, ascending'],
-  C: ['Lane C · Debit verticals',            'long ~0.55Δ, short ~0.25Δ · debit is long ask − short bid · sorted by BE/EM, ascending'],
+  A: ['Lane A · Stock replacement (LEAPS)', 'calls only · nearest 0.85 and 0.70 delta, ITM'],
+  B: ['Lane B · Directional swing',          'calls and puts · nearest 0.55 and 0.40 delta'],
+  C: ['Lane C · Debit verticals',            'long ~0.55Δ, short ~0.25Δ · debit is long ask − short bid'],
   D: ['Lane D · Calendar / diagonal',        'sell the front monthly, buy the back · intentionally thin — see the note'],
 };
+
+/** What this lane is actually sorted by, plus the Sharpe control — which has no
+ *  visible column and would otherwise be an invisible feature. */
+function laneSortLine(lane, cands) {
+  if (lane === 'D') return '';
+  const eff = laneSortInEffect(lane, cands);
+  const spec = LONG_CAND_SORTS[eff.col] || LONG_CAND_SORTS.beem;
+  const arrow = eff.dir === 1 ? 'ascending' : 'descending';
+  const shrpOn = longCandSort.col === 'shrp';
+  const shrp = lane === 'A' ? '' :
+    ` · <span class="csort ${shrpOn ? 'sorted' : ''}" data-long-cand-sort="shrp" title="Sharpe = mean(pl) ÷ stdev(pl). Two candidates can share an expectancy while one clusters near its mean and the other is 95% total losses and a few enormous wins. This is that read, one click away.">sort by Sharpe${shrpOn ? (longCandSort.dir === 1 ? ' ▲' : ' ▼') : ''}</span>`;
+  return `<div class="long-lane-sub">sorted by <b>${esc(spec.label)}</b>, ${arrow}${
+    eff.native ? ' <span class="long-tag noread" title="' + esc(eff.why) + '">native order</span>' : ''}${shrp}</div>`;
+}
 
 function longSummary(r, open) {
   const st = !r.ok ? (LONG_STATUS[r.status] || LONG_STATUS.error) : null;
@@ -2731,6 +3002,7 @@ function longDetail(r) {
     const entries = (r.lanes || []).filter(l => l.lane === lane);
     if (!entries.length) return '';
     const [title, sub] = LANE_META[lane];
+    const laneCands = entries.flatMap(e => e.candidates || []);
     const body = entries.map((entry) => {
       const head = `<div class="long-lane-head">
         <span class="prem-chip ${entry.status === 'ok' ? 'cyan' : entry.status === 'not-listed' ? 'muted' : 'amber'}">${
@@ -2752,6 +3024,7 @@ function longDetail(r) {
     }).join('');
     return `<div class="long-lane">
       <div class="long-lane-head"><span class="long-lane-title">${esc(title)}</span><span class="long-lane-sub">${esc(sub)}</span></div>
+      ${laneSortLine(lane, laneCands)}
       ${body}
     </div>`;
   }).join('');
@@ -2903,7 +3176,52 @@ function renderLong(data) {
     <b>P(BE)@exp is N(d2) at the breakeven</b>, using the implied vol of the listed strike nearest that breakeven —
     never ATM IV and never the delta ladder. It is <b>risk-neutral</b> (no drift; not "my odds of making money"),
     <b>lognormal</b> (real tails are fatter, so it flatters the wings) and <b>at expiry</b> (most longs are closed
-    early, so it understates the chance of ever being profitable). Hist Win stays blank pending a real backtest.<br>
+    early, so it understates the chance of ever being profitable).<br>
+    <b>cov is MEASURED where p(be) is MODELLED</b>, and that difference is the whole point of putting them
+    side by side. cov is the share of historical N-session windows in which this underlying actually moved past
+    this breakeven; p(be) is what the option chain prices. <b>1y and 3y are shown separately and never
+    averaged</b> — they disagree on names that have re-rated, and that disagreement is the regime warning.
+    <b>The windows overlap</b>, deliberately (disjoint windows would leave ~5 samples a year at 45 sessions), so
+    the window count is not the sample size: hover a cov cell for the <b>independent</b> count, which is the
+    honest one. A horizon whose history cannot support at least ${g.coverageMinIndependent ?? 4} independent
+    windows returns <b>—</b> with the numbers named, never a shorter horizon relabelled as the requested one.<br>
+    <b>gap = cov − p(be), in points, and zero is NOT fair value.</b> p(be) is a risk-neutral probability and cov
+    is a real-world frequency; they are different measures. A persistent modest <b>negative</b> gap is
+    <b>expected</b> — it is the variance risk premium, which is what compensates option sellers — and is not by
+    itself a mark against a contract. There is <b>no baseline this release</b>: until raw gaps have been read
+    across the whole watchlist, nothing says what is normal for a given name at a given horizon, and a thin
+    stand-in median would be indistinguishable on screen from a real one.<br>
+    <b>GAP IS NOT A PURE VOLATILITY SIGNAL — do not read a positive gap as "vol is cheap here".</b> cov is a
+    real-world frequency and so contains whatever direction the stock actually went; p(be) is driftless by
+    construction. gap therefore reflects <b>both</b> how fat the tails were <b>and</b> which way the stock ran,
+    and <b>on a strongly trending name the drift term dominates it</b> — a name that rose 40% over the window
+    will show large positive gaps on every call and large negative ones on every put, with the option chain
+    having priced volatility perfectly well. The <b>realized drift</b> for each window is printed directly
+    beside the gap in each candidate's expanded detail line, so the two are read together. When drift is large
+    relative to the gap, the gap is telling you about direction, not about vol.<br>
+    <b>E[R] is expectancy — mean P/L across those same windows ÷ capital risked — and it is the default sort.</b>
+    Probability is not, on purpose: coverage rises as the breakeven moves toward spot, so ranking on it is
+    ranking on moneyness, and it ignores payoff entirely (76% paying 0.23:1 against 39% paying 4:1), which
+    selects against exactly the convexity this screen exists to buy. <b>E[$]</b> is the same mean in dollars per
+    contract; the two disagree ($100 on $500 risked beats $1,000 on $10,000) and both readings are wanted.
+    <b>Sharpe has no column but is a clickable sort</b> — the control sits in each lane header, next to the sort
+    line. Each candidate's expanded detail line carries median, realized drift, episode concentration, Sharpe
+    and a quarter-Kelly sizing reference. <b>↑</b> marks a candidate whose upside is uncapped and therefore
+    <b>structurally understated</b>, since a historical window can only score moves that actually happened
+    while a vertical's cap is real and binding.<br>
+    <b>Episodes to 50%</b> replaces the old top-3-window share, which measured the wrong thing: the windows
+    overlap, so the three largest were usually one market move counted three times. Every window is now
+    assigned to exactly one <b>episode</b> — a cluster of windows starting within N sessions of each other —
+    and the figure is how many separate episodes it takes to reach half the positive P/L. <b>LOW is the
+    warning</b>, the opposite polarity to the share it replaced: 1 or 2 means the expectancy rests on one or
+    two market moves rather than on a property of the trade; 8 is unremarkable. <b>No threshold is set</b>, so
+    nothing is flagged, dimmed or reordered on this number yet — it is displayed for reading.<br>
+    <b>Expectancy assumes the position is held to expiry.</b> No assignment, no early close and no IV path
+    between now and then is modelled — so it understates any structure that would realistically be closed
+    early, which is most of them. It is a relative ranking, not a P&L forecast. Lane A is held out of the
+    expectancy ordering entirely and keeps its cost-of-carry sort: a 365+ DTE contract scores at the
+    365-session horizon, which three years of closes cannot support. Lane D gets no expectancy at all, for the
+    same reason it shows no breakeven.<br>
     ${okRows ? `${dimRows} of ${okRows} priced rows are dimmed${dimRows ? ` — ${dimVol} on vol (IV rank above
     ${g.ivrBuyMax ?? 40}, or the IV/HV30 proxy above ${Number(g.ratioBuyMax ?? 0.95).toFixed(2)}× while the rank
     collects) and ${dimBe} on breakeven (best BE/EM above ${Number(g.beEmMax ?? 1).toFixed(2)}×)` : ''}.
@@ -2950,6 +3268,11 @@ document.getElementById('long-content').addEventListener('click', (e) => {
   const sortBtn = e.target.closest('[data-long-sort]');
   if (sortBtn) { setLongSort(sortBtn.dataset.longSort); return; }
 
+  // Candidate-level sort. Checked BEFORE the row handler below, because these
+  // live inside an expanded row and would otherwise collapse it on click.
+  const candSort = e.target.closest('[data-long-cand-sort]');
+  if (candSort) { e.stopPropagation(); setLongCandSort(candSort.dataset.longCandSort); return; }
+
   if (e.target.closest('#long-loadall')) { loadAllLong(); return; }
   if (e.target.closest('#long-stopall')) { longLoadAllAbort = true; return; }
   if (e.target.closest('#long-expand-all')) {
@@ -2971,6 +3294,7 @@ document.getElementById('long-content').addEventListener('click', (e) => {
 
 document.getElementById('long-refresh-btn').addEventListener('click', () => loadLong());
 longSortLoad();
+longCandSortLoad();
 
 /* ─── Sectors ─── */
 let sectorsLoading = false;

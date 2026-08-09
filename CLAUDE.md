@@ -610,10 +610,16 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Five checks exist, all of which print computed vs
+There is no build step. Six checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
-(Black-Scholes delta), `node instr-bindings.check.mjs` (the binding counter:
+(Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
+measured half: coverage against a brute-force reference, all eight payoff
+structures at five prices each, the two expectancy guards, the independent-window
+floor, and de-clustered episode concentration tested in **both** directions —
+one move must report 1 *and* separated moves must report more, since a test that
+only proves collapsing passes on code that always answers 1),
+`node instr-bindings.check.mjs` (the binding counter:
 shape detection across bindings/secrets/vars, automatic pickup of a second
 binding, `this`-binding through the proxy, and the failure paths that must return
 a working `env`), `node long-fixtures.check.mjs` (the three Long-screen paths
@@ -1030,6 +1036,8 @@ differs from its retention, both are given and the reason is in the notes.
 | `analysis:{TICKER}` | 2d | Per-ticker Claude recommendation for the watchlist column |
 | `iv:{TICKER}:{DATE}` | **400d** | One daily front-expiry ATM IV sample — the series `ivRank` is built from. `atmIv`/`spot`/`dte` are duplicated into **KV metadata** so `ivHistory()` rebuilds the series from one paged `list()` instead of 400 `get()`s. Metadata caps at 1024 bytes; keep it to those three flat numbers. |
 | `ivsweep:last` | 2d | PT date of the last cron IV sweep, for dedup. **Deliberately outside the `iv:` prefix** so `ivHistory()`'s prefix scan cannot pick it up as a sample. |
+| `moves:{TICKER}` | **7d** | The historical N-session return distribution behind the Long tab's measured `cov` column, its `gap`, and the expectancy ranking. Banked by the 2:00pm PT sweep. **~60 KB/ticker measured** (largest QUBT 61,496 bytes, 2026-08-09); KV's ceiling is 25 MB. Stores sorted **`[return, startIdx]` pairs**, not bare numbers — see below. |
+| `movesweep:last` | 2d | PT date of the last move-series sweep, for dedup. **Outside the `moves:` prefix** so nothing scanning that prefix can read it as a ticker — the same rule as `ivsweep:last`. |
 | `premium:{TICKER}` | **24h retention / 4h freshness** | One premium-screen row. The two differ on purpose — see below. |
 | `long:{TICKER}` | **24h retention / 4h freshness** (`LONG_FRESH_MS`) | One long-screen row: four lanes, both timestamps, the buy gate and the directional read. Same freshness/retention split as `premium:` and for the same reason — past 4h the row still renders, badged stale. |
 | `cik:map` | 30d | SEC ticker→CIK map from `company_tickers.json` |
@@ -1057,6 +1065,21 @@ A literal 4h KV TTL would evict the row at the exact moment it becomes stale,
 leaving nothing to render *as* stale. A 5-hour-old chain badged "stale" is more
 useful than a blank row, so `PREMIUM_FRESH_MS` (4h) drives the badge and
 revalidation while `PREMIUM_ROW_TTL` (24h) keeps the row alive to be badged.
+
+**`moves:{TICKER}` — schema 2, and the schema check must stay strict equality.**
+The stored return arrays are `[return, startIdx]` **pairs**. Schema 1 stored bare
+numbers, and a reader that coerced one shape into the other would produce coverage
+figures that look entirely normal and are wrong — the worst available outcome.
+`readMoveSeries()` guards with `m.schema === MOVES_SCHEMA`: **any** other value
+reads as *absent*, `attachCoverage()` returns its stated reason, and the next 2pm
+sweep recomputes the key from scratch. Never relax that to `<` or `>=`, and never
+bump the schema without changing the shape in the same commit — stamping a new
+version onto old-shaped data is the same bug inverted.
+
+The start index is **load-bearing, not bookkeeping**: overlapping windows mean one
+market move appears in up to N consecutive windows, and without knowing which
+windows are neighbours any concentration measure counts a single episode many
+times. See the episode note in the Long-screen section.
 
 **`econ:dgs3mo` — 12h freshness, 90d retention, and the gap is the whole point.**
 The FRED integration originally resolved *release dates* only; `fetchFredReleaseDates()`
@@ -1088,7 +1111,18 @@ their own `const TTL = <number>`, which shadowed it silently and turned
 the badge. They are now **`CRUMB_TTL`, `SCAN_TTL`, `GOLDEN_TTL`, `IPO_TTL`**. Any
 new local cache window needs its own name.
 
-**Cron trigger:** a single `*/15 13-22 * * *` UTC cron — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), EOD summary + IV sample sweep (1:15pm PT), the forward-return fill (2pm PT), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
+**Cron trigger:** a single `*/15 13-22 * * *` UTC cron — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), EOD summary + IV sample sweep (1:15pm PT), the **`forward-returns+moves`** branch (2pm PT — the forward-return fill *and* the move-series sweep), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
+
+**`collectMoveSeries` runs at 2:00pm PT, not on the 1:15pm EOD branch, and the
+reason is bar settlement rather than load balance.** The NYSE closes at 1:00pm PT,
+so at 1:15pm the day's daily bar may still be forming. Banking a forming bar into
+the series every coverage figure is measured against would never surface as an
+error — it would quietly shift the most recent window. By 2:00pm the bar is
+settled. (`fillForwardReturns` guards the same hazard from the other side with
+`bars[idx].iso < today`.) Both jobs share that invocation's subrequest budget:
+`ctx.waitUntil` does not get its own. **Measured cost of the sweep: `extFetches` 2,
+`bindingOps` 47, `capCost` 49** for a 22-name watchlist — one `yahooSparkCloses`
+call at 20 symbols per request, then one KV read and one write per symbol.
 
 **Check the UTC hour in both DST regimes before scheduling anything.** The 13F job used to run at 3pm PT, which is 22:00 UTC under PDT but **23:00 under PST** — outside this window — so it silently never ran for the winter half of the year. It moved to 10am PT (17:00/18:00 UTC), inside the window in both. Every other job was already safe; this one was not.
 
@@ -1379,6 +1413,73 @@ diagram, because a calendar's P/L at the front expiry depends on the back month'
 date* — a term-structure model this codebase does not have. Deriving any of them from an assumed future
 IV would be a plausible number measuring nothing. Cost of carry is likewise absent on Lane C verticals:
 the short leg refunds part of the extrinsic, so the Lane A formula does not describe the structure.
+
+### Move coverage, drift and expectancy — the measured half
+
+`beEm` and `pBe` both come off the implied-vol surface: they say whether a contract
+is priced consistently with its own chain. **Neither measures what the underlying
+has actually done.** `coverage` does — the fraction of historical N-session windows
+in which the stock really moved past a given breakeven, from `moves:{TICKER}`.
+Rendered beside `pBe`, the difference between the two is the finding.
+
+Five things here are already-decided and must not be "simplified":
+
+1. **Windows overlap, deliberately.** Disjoint windows leave ~5 samples/year at
+   N=45. The consequence is carried in `independent = (sessions − N) / N` and
+   stated on screen. Below `COVERAGE_MIN_INDEPENDENT` (4) a horizon returns `null`
+   **naming the actual numbers**, never a shorter horizon relabelled as the
+   requested one.
+2. **Coverage is computed from the raw return array, never from binned data.**
+3. **1y and 3y are reported separately and never averaged.** They disagree on names
+   that have re-rated, and that disagreement *is* the regime warning. Measured
+   2026-08-09: NVDA's 45 DTE calls read cov3y 40–56% against cov1y 17–35%.
+4. **`gap = coverage − pBe` in POINTS, and zero is not fair value.** `pBe` is
+   risk-neutral, coverage is a real-world frequency. A persistent modest *negative*
+   gap is **expected** — it is the variance risk premium. No copy may imply otherwise.
+5. **`gapBaseline` is null this release, with a reason.** A median over the 2–6
+   candidates a row scores at one horizon is not a baseline, and those candidates
+   are the same population being measured against it.
+
+**GAP IS NOT A PURE VOLATILITY SIGNAL — this is the easiest wrong inference on the
+screen.** Coverage contains whatever direction the stock actually went; `pBe` is
+driftless by construction. So `gap` conflates *how fat the tails were* with *which
+way the stock ran*, and **on a trending name the drift term dominates**. A name
+that rose 40% shows large positive gaps on every call and large negative ones on
+every put with the chain having priced vol perfectly well. `drift1y` / `drift3y`
+(mean N-session return) are therefore rendered **directly adjacent to the gap** in
+each candidate's expanded detail — not as a table column, and not somewhere else on
+the card. Reading them together is the whole point of the adjacency.
+
+**`expectancyEpisodesTo50` replaced `expectancyTop3Share`, which measured the wrong
+thing.** Because windows overlap, the "three largest windows" were usually one
+market move counted three times. Every window is now assigned to exactly one
+**episode** — greedily: take the highest `pl_i`, claim every unassigned window
+starting within N sessions of it, repeat — and the metric is how many episodes it
+takes to reach half the total positive P/L. Ranking is on **`pl_i`, not on return**:
+a straddle's payoff is not monotonic in S, so ranking by return builds the episode
+around the wrong extreme.
+
+Three properties worth knowing before touching it:
+
+- **Low is the warning**, the opposite polarity to the share it replaced. 1 or 2
+  means the expectancy rests on one or two market moves; 8 is unremarkable.
+- **Episodes are scored on their POSITIVE P/L contribution, not their net.** The
+  obvious formulation — rank by net episode P/L — *does not terminate*: net sums
+  total `mean × n`, which on a losing structure sits far below half the positive
+  total. Scored on positive contribution the episode sums equal `totalPos` exactly,
+  so the count always terminates. Verified in `moves.check.mjs` §10 against a
+  structure with +150,000 positive and −190,000 net.
+- **The metric is bounded by `ceil(k/2)` for k equal episodes** — reaching *half*
+  the positive P/L can never require every episode. Three separated moves report
+  **2, not 3**. Do not write a test expecting 3; it is unachievable.
+
+**No threshold is set.** `EPISODE_CONCENTRATION_WARN` is `null` by design, ships as
+`gates.episodeConcentrationWarn`, and nothing flags, dims or reorders on the metric.
+The old `0.40` did **not** carry over — it applied to a share and this is a count
+with inverted polarity. Measured distribution (real candidates, realistic 0.95–1.10×
+moneyness, 2026-08-09): on the **3y** window `episodesTo50` is 1 for 27%, median 2,
+p90 8, max 25; on **1y** it is 1 for 51%, median 1. A cutoff must be chosen against
+the window expectancy actually used, and the fire rate differs sharply between them.
 
 **Row status extends the Premium vocabulary** rather than forking it: `ok` · `no-options` · `no-iv` ·
 **`no-expiries`** (options listed but nothing screenable — no monthly at the swing horizon and no
