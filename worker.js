@@ -2959,25 +2959,47 @@ function attachCoverage(cand, st, { moves, spot, dte, pBe }) {
     if (out.coverage3y != null) out.gap3y = +((out.coverage3y - pBe) * 100).toFixed(1);
   }
 
-  /* Expectancy runs on the 3y array, and the window used is NAMED rather than
-     left implicit.
+  /* EXPECTANCY RUNS ON THE 3y ARRAY, AND ONLY ON IT. There is deliberately no
+     `|| h.sorted1y` fallback: it could never fire, and a branch that cannot fire
+     is a false statement about the code — it advertises a fallback that does not
+     exist, and a comment cannot repair that because the next reader would have to
+     re-derive the argument to know whether the comment still held.
 
-     THE `|| h.sorted1y` FALLBACK IS UNREACHABLE, and that is structural rather
-     than a fact about today's data. `c1y` is a SUFFIX of `c3y`, so either the two
-     arrays are identical (≤252 sessions) or `len(3y) > len(1y)`; `independent =
-     (len − N)/N` is increasing in `len`, so `independent3y >= independent1y`
-     always. Hence `sorted3y === null` implies `sorted1y === null`. Verified over
-     154 ticker × horizon pairs: 0 counterexamples, 0 of 172 resolved candidates
-     scored on 1y.
+     Why it cannot fire, in one line: the 1y series is a SUFFIX of the 3y one, so
+     `len(3y) >= len(1y)`, and `independent = (len − N)/N` increases in `len` —
+     therefore `sorted3y === null` implies `sorted1y === null`. Full argument in
+     ARCHITECTURE.md, "expectancy always resolves on 3y".
 
-     It stays as a defensive no-op, but do NOT read it as a live branch — it
-     protects nothing. Any change to MOVES_1Y_SESSIONS, the slicing, or the
-     independence rule must re-derive that argument. NOTE this says nothing about
-     `coverage1y`, which reads `h.sorted1y` DIRECTLY and is very much alive. */
-  const arr = h.sorted3y || h.sorted1y;
-  const arrLabel = h.sorted3y ? '3y' : '1y';
+     THIS SAYS NOTHING ABOUT `coverage1y`, which reads `h.sorted1y` DIRECTLY a few
+     lines above and is fully live. Only the expectancy fallback was dead. The two
+     are easy to conflate. */
+  const arr = h.sorted3y;
+  const arrLabel = '3y';
   if (!arr) {
-    out.expectancyReason = out.coverageReason;
+    /* AN ASSERTION, NOT A FALLBACK — and the difference is why this survives
+       while the `|| h.sorted1y` above it was deleted for being unreachable.
+
+       Both branches are unreachable today. But a FALLBACK that cannot fire is a
+       false claim about behaviour: it says "expectancy can run on 1y", which is
+       untrue, and a reader has to re-derive the suffix argument to find that out.
+       An ASSERTION that cannot fire is the opposite — it claims nothing about
+       normal operation, it says "this must never happen, and if it does you will
+       hear about it rather than getting a silent null". Assertions are supposed
+       to be unreachable; that is what makes them assertions.
+
+       So do NOT delete this by applying the same rule that removed the fallback.
+       If the horizon set or the window definitions ever diverge enough to make a
+       resolved 1y outlive an unresolved 3y, this is the only thing that will say
+       so at runtime. `moves.check.mjs` §11 covers the same invariant statically,
+       across 13 series lengths × every shipped horizon. */
+    if (h.sorted1y) {
+      out.expectancyReason = `1y resolves at horizon ${snap.horizon} but 3y does not — the window `
+        + `definitions have diverged and expectancy has no array to run on. This is structurally `
+        + `impossible while the 1y series is a suffix of the 3y one; see ARCHITECTURE.md.`;
+      console.warn(`[moves] ${out.expectancyReason}`);
+    } else {
+      out.expectancyReason = out.coverageReason;
+    }
     return out;
   }
   // The candidate's own breakeven is handed across as an independent anchor —

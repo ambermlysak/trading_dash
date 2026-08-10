@@ -327,11 +327,22 @@ Constants: `EPISODE_CONCENTRATION_WARN` and the episode assignment in
 in **both** directions, because a test that only proves de-clustering collapses
 things passes on code that always answers 1.
 
-## Design note: expectancy always resolves on 3y — the 1y fallback is unreachable
+## Design note: expectancy always resolves on 3y — and why the 1y fallback was deleted
 
-`attachCoverage()` picks the array expectancy runs on with
-`const arr = h.sorted3y || h.sorted1y`. **That fallback can never be taken**, and
-this is a structural property, not an observation about current data.
+`attachCoverage()` runs expectancy on `h.sorted3y` and **nothing else**. It briefly
+had a `|| h.sorted1y` fallback. That branch could never be taken, and this is a
+structural property rather than an observation about current data.
+
+**The branch was removed rather than commented, because a branch that provably
+cannot fire is a false statement about the code.** It advertised a fallback that
+did not exist, and a comment could not repair that: the next reader would have had
+to re-derive the argument below to know whether the comment was still true. Worse,
+if the horizon set or the window definitions ever changed, the dead branch would
+have quietly become live with nothing covering it. What stands in its place is an
+explicit invariant check in `attachCoverage()` — which *reports* the divergence
+instead of silently scoring nothing — plus `moves.check.mjs` §11, which sweeps 13
+series lengths across every shipped horizon and fails if a resolved 1y ever
+outlives an unresolved 3y.
 
 The 1y series is built as `c3y.slice(-min(len, 252))` — a *suffix* of the 3y one.
 So:
@@ -348,21 +359,25 @@ Confirmed exhaustively: 154 ticker × horizon pairs across the full 22-name
 watchlist, **0 cases** where 3y is null and 1y is not; 242 scored candidates, 172
 on 3y, **0 on 1y**, 70 unresolved.
 
-Two consequences worth keeping straight, because they are easy to conflate:
+**`coverage1y` AND THE 1y EXPECTANCY PATH ARE DIFFERENT THINGS, AND THEY WILL BE
+CONFLATED.** Keep them apart:
 
-- **The `cov 1y` column is alive.** `coverage1y` reads `h.sorted1y` directly, not
-  through the expectancy fallback, and renders a number on 88 of the horizons the
-  watchlist reaches. The 1y/3y comparison the screen exists to show is unaffected.
-- **Only the 1y *expectancy* path is dead**, and with it the "51% of 1y candidates
-  flag" figure from the concentration calibration — that describes a population
-  that never reaches the expectancy code. `EPISODE_CONCENTRATION_WARN = 1` is
-  calibrated on the 3y distribution (27%), which is the only one that renders, so
-  the threshold is right for a stronger reason than originally stated.
+- **The `cov 1y` column is fully alive.** `coverage1y` calls
+  `coverageAt(h.sorted1y, …)` **directly**, several lines before the expectancy
+  block and nowhere near the deleted fallback. It renders a number on **88** of the
+  horizons the watchlist reaches. The 1y-versus-3y comparison the screen exists to
+  show is completely unaffected — nothing about it was removed or weakened.
+- **Only the 1y *expectancy* path was dead**, and only that was deleted.
 
-The `|| h.sorted1y` is left in place as a defensive no-op, but **it must not be
-read as a live branch**: any change to `MOVES_1Y_SESSIONS`, the slicing, or the
-independence rule should re-derive the argument above rather than assume the
-fallback protects anything.
+The one real consequence is for calibration: the "51% of 1y candidates flag" figure
+from the concentration work describes a population that **never reaches the
+expectancy code at all**. `EPISODE_CONCENTRATION_WARN = 1` is calibrated on the 3y
+distribution (27%), which is the only one that ever renders — so the threshold is
+correct for a stronger reason than was originally given.
+
+Any change to `MOVES_1Y_SESSIONS`, the slicing, `MOVES_HORIZONS`, or the
+independence rule must re-derive the suffix argument above. The check in §11 will
+catch a divergence, but it will report it as a failure, not fix it.
 
 ## Section-by-section data source map
 

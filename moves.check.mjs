@@ -6,7 +6,7 @@
  * function or workerd refuses to boot). Nothing asserts silently: every number is
  * printed against its expected value with the deviation.
  *
- * TEN sections. The thing being verified is not just "is the arithmetic right"
+ * ELEVEN sections. The thing being verified is not just "is the arithmetic right"
  * but "is this the right quantity, in the right units, measuring what it claims":
  *
  *   1. Coverage vs BRUTE FORCE over the raw closes. The shipped path sorts the
@@ -39,6 +39,11 @@
  *      collapsing would pass on code that always answers 1. Note the metric is
  *      bounded by ceil(k/2) for k equal episodes: reaching HALF the positive P/L
  *      can never need every episode, so three separated moves report 2, not 3.
+ *   11. THE 1y/3y INVARIANT. Expectancy runs on sorted3y with no 1y fallback,
+ *      because the 1y series is a suffix of the 3y one and so sorted3y === null
+ *      implies sorted1y === null. The branch was removed as a false statement
+ *      about the code; this section is what covers the invariant if the horizon
+ *      set or window definitions ever diverge.
  */
 import fs from 'fs';
 
@@ -541,6 +546,62 @@ console.log('   2, not 3. Scaling is shown by the 6- and 8-move cases.\n');
   const contiguous = idxs.every((v, i) => v === i);
   if (!contiguous) fails++;
   console.log(`     ${contiguous ? 'ok  ' : 'FAIL'} every startIdx 0..${idxs.length - 1} present exactly once after sorting by return`);
+}
+
+console.log('\n══ 11. THE 1y/3y INVARIANT — what stands where the fallback used to ══');
+console.log('   `attachCoverage` runs expectancy on h.sorted3y with NO 1y fallback, because');
+console.log('   the 1y series is a SUFFIX of the 3y one: len(3y) >= len(1y), and');
+console.log('   independent = (len - N)/N increases in len, so sorted3y === null implies');
+console.log('   sorted1y === null. Removing the branch removed a false statement about the');
+console.log('   code; THIS is what covers the invariant if the definitions ever diverge.\n');
+{
+  // Sweep series lengths across every boundary that matters: below the 1y cap,
+  // exactly at it, just past it, and far past it — at every shipped horizon.
+  const lengths = [30, 60, 100, 200, 251, 252, 253, 300, 400, 500, 756, 1000, 2600];
+  let pairs = 0, violations = 0, bothNull = 0, bothOk = 0, only3y = 0;
+  for (const len of lengths) {
+    const closes = synthCloses(len);
+    const built = M.buildMoveSeries('SWEEP', closes, '2026-08-07');
+    for (const n of M.MOVES_HORIZONS) {
+      const h = built.horizons[String(n)];
+      pairs++;
+      const has3 = !!h.sorted3y, has1 = !!h.sorted1y;
+      if (!has3 && has1) { violations++; console.log(`  FAIL  len=${len} N=${n}: 3y null but 1y resolved`); }
+      else if (has3 && has1) bothOk++;
+      else if (has3 && !has1) only3y++;
+      else bothNull++;
+    }
+  }
+  if (violations) fails++;
+  console.log(`  ${violations === 0 ? 'ok  ' : 'FAIL'}  ${pairs} (series length x horizon) pairs checked across `
+    + `${lengths.length} lengths and ${M.MOVES_HORIZONS.length} horizons`);
+  console.log(`         both resolve      ${String(bothOk).padStart(3)}`);
+  console.log(`         only 3y resolves  ${String(only3y).padStart(3)}   <- expected: 3y outlives 1y`);
+  console.log(`         neither resolves  ${String(bothNull).padStart(3)}`);
+  console.log(`         ONLY 1y resolves  ${String(violations).padStart(3)}   <- must be 0, or the fallback was needed`);
+
+  console.log('\n   The boundary that would break it first, made explicit:');
+  console.log('   at len == MOVES_1Y_SESSIONS the two series are IDENTICAL, so they must agree exactly.');
+  {
+    const built = M.buildMoveSeries('EQ', synthCloses(M.MOVES_1Y_SESSIONS), '2026-08-07');
+    let agree = true;
+    for (const n of M.MOVES_HORIZONS) {
+      const h = built.horizons[String(n)];
+      if (!!h.sorted3y !== !!h.sorted1y) agree = false;
+      if (h.sorted3y && h.sorted1y && h.sorted3y.length !== h.sorted1y.length) agree = false;
+    }
+    if (!agree) fails++;
+    rowStr(`     len == ${M.MOVES_1Y_SESSIONS}: 1y and 3y agree at every horizon`, agree, true);
+  }
+
+  console.log('\n   And that coverage1y is NOT affected — it reads h.sorted1y directly:');
+  const built = M.buildMoveSeries('COV', synthCloses(756), '2026-08-07');
+  let cov1yLive = 0;
+  for (const n of M.MOVES_HORIZONS) if (built.horizons[String(n)].sorted1y) cov1yLive++;
+  const covOk = cov1yLive > 0;
+  if (!covOk) fails++;
+  console.log(`     ${covOk ? 'ok  ' : 'FAIL'} coverage1y resolves at ${cov1yLive} of ${M.MOVES_HORIZONS.length} horizons `
+    + `on a 756-session series — the 1y COLUMN is live, only the 1y EXPECTANCY path was dead.`);
 }
 
 console.log(`\n${fails === 0 ? 'ALL CHECKS PASSED' : fails + ' CHECK(S) FAILED'}\n`);
