@@ -493,3 +493,62 @@ than a fault in the magnitude field. It self-heals on the next firing. Do not
 Related and structural, not a race: the sweep writes only the **22** watchlist
 names while `listsByTicker` covers **63** `rec:` keys, so `ratesByTicker.size ≤ 22`
 and `benchmarkedN < n` always. That is what §5's 75-of-112 already reflects.
+
+### 7.4 Live preconditions, captured 11:50 PT — these expire when the crons run
+
+Taken against production KV before either firing. **None of this is recoverable
+after the fact**, which is the only reason it is here.
+
+**Confirmed absent** (`moves:` list returned `[]`; the other three 404 on `get`,
+and the successful list on the same namespace proves that is absence and not an
+auth failure):
+
+```
+moves:*          0 keys      ← 4(a)'s "first sweep" premise, verified not assumed
+movesweep:last   absent
+calib:pooled     absent      ← 4(d) is a first write, not an overwrite
+recfwd:last      absent      (2d TTL, last written Fri 08-07 — expired over the weekend)
+ivsweep:last     absent      (same)
+```
+
+**4(c) is now a precise prediction rather than a wait-and-see.** 65 `iv:` keys
+total, and **12 already carry today's date**, written by page views before the
+cron:
+
+| dte 7 (08-17 weekly) | atmIv / spot | dte 11 (08-21 monthly) | atmIv / spot |
+|---|---|---|---|
+| AAPL | 22.41 / 306.805 | CRCL | 77.73 / 64.95 |
+| AMD | 54.09 / 475.79 | CRWV | 115.09 / 90.69 |
+| AMZN | 28.71 / 279.26 | DELL | 82.07 / 469.055 |
+| MSFT | 27.06 / 509.7 | HOOD | 60.45 / 93.36 |
+| MU | 62.6 / 876 | MDB | 59.38 / 414.46 |
+| | | SHOP | 49.75 / 153.84 |
+| | | TWLO | 57.75 / 248.55 |
+
+Of these, **8 are watchlist names** — AAPL, AMD, AMZN, CRCL, CRWV, HOOD, MU,
+TWLO. DELL, MDB, MSFT and SHOP are not on the watchlist, so the sweep never
+reaches them; they are here to explain why the key count exceeds the skip count.
+
+> **Prediction for 4(c): `recordWatchlistIv` at 13:15 should SKIP exactly those 8
+> and write the other 14.** A skip count of 8 is the pass. 0 skips means
+> skip-if-exists still is not firing; 22 skips means it is matching something it
+> should not.
+
+Two documented invariants verified live in passing: KV metadata is exactly the
+three flat numbers `{"atmIv","spot","dte"}`, and the front-expiry split is
+coherent — names with weeklies resolve to 08-17 at dte 7, names without to the
+08-21 monthly at dte 11. AAPL reads 22.41 @ 306.805 today against §6.4's 23.28 @
+313.33 yesterday: same expiry, one day less, spot down ~2%.
+
+### 7.5 The `*/5 * * * *` probe is scheduled for removal TODAY
+
+Not drift — `wrangler.toml` (the `crons` block) and `worker.js` (`PROBE_CRON`)
+both document it at length, and both carry `TODO(2026-08-10)`, which is today. It
+logs `branch=none (probe · dispatch suppressed)` and returns before dispatch, so
+it does **not** interfere with item 4; it only triples the line count in a tail.
+
+It exists to prove this morning's 6:00am run was clean after the day-of-week fix,
+which it has now done. Removing it is a two-file change **plus a deploy**, so it
+waits until after item 4 rather than landing mid-measurement. CLAUDE.md rule #2
+still says "a single cron" and should be reconciled in the same commit that
+removes it.
