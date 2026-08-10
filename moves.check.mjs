@@ -51,6 +51,7 @@
  *      unaffected by whether a bar exists.
  */
 import fs from 'fs';
+import { tally, record, reportVerdict, populated } from './check-harness.mjs';
 
 const src = fs.readFileSync('worker.js', 'utf8');
 function grab(name) {
@@ -88,18 +89,24 @@ const M = new Function(
   + ' REC_CALIB_MIN_N, REC_RATING_MIN_N };',
 )();
 
+/* `T` counts what was actually compared. `fails` is kept as the running failure
+   count the sections already increment directly. See check-harness.mjs for why a
+   comparison COUNT has to sit beside the verdict. */
+const T = tally();
 let fails = 0;
 const F = (x, d = 6) => (x == null ? String(x) : Number(x).toFixed(d));
 function row(label, got, want, tol = 1e-9) {
   const bad = got == null || want == null
     ? got !== want
     : Math.abs(got - want) > tol;
+  record(T, !bad);
   if (bad) fails++;
   const dev = (got == null || want == null) ? '—' : F(Math.abs(got - want), 10);
   console.log(`  ${bad ? 'FAIL' : 'ok  '}  ${label.padEnd(52)} got ${String(F(got)).padStart(14)}   want ${String(F(want)).padStart(14)}   dev ${dev}`);
 }
 function rowStr(label, got, want) {
   const bad = got !== want;
+  record(T, !bad);
   if (bad) fails++;
   console.log(`  ${bad ? 'FAIL' : 'ok  '}  ${label.padEnd(52)} got ${String(got).padStart(14)}   want ${String(want).padStart(14)}`);
 }
@@ -697,5 +704,9 @@ console.log('   magnitude hit rate to 0% or 100% while looking entirely plausibl
   console.log(`   ${hasReason ? 'ok  ' : 'FAIL'} and it carries a reason: ${noBar.magnitudeReason}`);
 }
 
-console.log(`\n${fails === 0 ? 'ALL CHECKS PASSED' : fails + ' CHECK(S) FAILED'}\n`);
-process.exit(fails === 0 ? 0 : 1);
+/* minComparisons is a real expected count, not 1. This suite has twelve sections
+   and hundreds of rows; if a refactor left it comparing a handful, "passed" would
+   be as misleading as passing on zero. */
+process.exit(reportVerdict({
+  label: 'moves.check', comparisons: T.comparisons, failures: fails, minComparisons: 138,
+}));

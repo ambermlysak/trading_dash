@@ -122,27 +122,22 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #                      window, so the job never ran for half the year.
 # Each job deduplicates via KV timestamp check (2-hour window).
 #
-# ── TEMPORARY DIAGNOSTIC PROBE — REMOVE MONDAY 2026-08-10 ────────────────────
-# TODO(2026-08-10): delete the second entry below AND the matching `PROBE_CRON`
-# constant in worker.js. They are a pair; removing one without the other is
-# exactly the drift this file keeps getting caught by.
+# ONE EXPRESSION. A temporary every-5-minutes diagnostic probe sat here from
+# 2026-08-08 to 2026-08-10 as a second `crons` entry, paired with a `PROBE_CRON`
+# constant in worker.js that suppressed its dispatch. It existed because three
+# post-deploy boundaries produced no [cron] line while observability logs were
+# off, which made that silence uninterpretable rather than informative. It did
+# its job — invocations confirmed, the weekend gate observed firing, and the
+# Monday 2026-08-10 6:00am run it was watching came through clean — and both
+# halves were removed together on 2026-08-10.
 #
-# Why it exists: three consecutive post-deploy boundaries (13:00/13:15/13:30 PT)
-# produced no [cron] line — but observability logs were off at the time, so that
-# silence is uninterpretable, not evidence. The probe fires every 5 minutes with
-# no hour restriction so evidence accumulates across the weekend rather than
-# waiting for Monday 6am, and it exercises the weekend gate path (Sat/Sun must
-# log "not a trading day (weekend) · branch=none", no dispatch, no KV writes).
-# Both triggers are separable in the log: scheduled() prints controller.cron.
-#
-# IT DOES NOT DISPATCH. scheduled() matches PROBE_CRON right after the
-# trading-day gate and returns, so the probe only ever proves that invocations
-# happen. Left dispatching, it would triple the firings inside every dispatch
-# window on a trading day; dedup absorbs that on a successful run, but a failed
-# morning briefing retries by design and the probe would turn 2 attempts into 6
-# (~150 Claude calls instead of ~50) — on the exact Monday 6:00am run that is
-# the first real observation of the day-of-week fix.
-crons = ["*/15 13-22 * * *", "*/5 * * * *"]
+# If a probe is ever needed again: add the trigger AND the suppression constant
+# in the SAME commit, and remove them the same way. A trigger without its
+# suppression dispatches every real job three times inside each window, which
+# dedup absorbs on a successful run but not on a failed morning briefing — that
+# retries by design, and the probe would turn 2 attempts into 6 (~150 Claude
+# calls instead of ~50).
+crons = ["*/15 13-22 * * *"]
 
 # Required secrets (set via: npx wrangler secret put <NAME>):
 #   AI_GATE_SECRET     — REQUIRED. Shared secret gating every AI-spend and KV-write

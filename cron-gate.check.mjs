@@ -12,6 +12,7 @@
    wrangler.toml — that is precisely the layer that failed last time, and only a
    deployed heartbeat can confirm it. */
 
+import { reportVerdict, populated } from './check-harness.mjs';
 import {
   ptParts, tradingDayStatus, cronGateCalendar,
   allSettledCounted, instrPeek, instrMark, instrSince,
@@ -109,6 +110,11 @@ for (const [utc, tz, label, expIso, expDow, expOpen, expReason, expBranch] of CA
 console.log('-'.repeat(210));
 console.log(`\n${pass} matched, ${fail} mismatched, ${CASES.length} cases\n`);
 
+/* The gate table is the substance of this script, so its population is asserted
+   here rather than only at the end: a CASES array that emptied would otherwise
+   print "0 matched, 0 mismatched" and exit 0. */
+if (!populated('cron gate table', pass + fail)) process.exitCode = 1;
+
 /* The regression in one line: under the old `1-5` cron the Friday rows above
    never reached this dispatcher at all, and the Sunday rows did. */
 /* ── Instrumentation: does the rejection counter actually count? ─────────────
@@ -185,4 +191,8 @@ console.log('Runway check :', NYSE_HOLIDAYS_THROUGH < soon
   ? `WARN — table ends within 120 days (${NYSE_HOLIDAYS_THROUGH}); extend it`
   : `ok — ${NYSE_HOLIDAYS_THROUGH} is more than 120 days out`);
 
-process.exitCode = fail ? 1 : 0;
+/* `|| process.exitCode` preserves a failure already recorded by the forced-fault
+   instrumentation section below the table, which sets it directly. */
+process.exitCode = reportVerdict({
+  label: 'cron-gate.check', comparisons: pass + fail, failures: fail, minComparisons: 28,
+}) || process.exitCode || 0;

@@ -138,6 +138,43 @@ async-context tracking the runtime does not offer — but an unlabelled per-job
 figure from a shared firing is a measurement that is quietly wrong, which is the
 failure this whole section exists to prevent.
 
+#### Provenance audit — every per-job figure in these docs, 2026-08-10
+
+Rule #1 covers this going forward, but the figures already written down were
+measured the same way and had to be re-classified rather than left implicit.
+
+**The criterion is that contamination is strictly ADDITIVE.** A concurrent job can
+only add ops to another's bracket, never remove them. So a figure that equals its
+structural derivation *exactly* provably contains nothing foreign, whatever branch
+it came from. Only figures that **exceed** their derivation need explaining.
+
+Two things are isolated by construction and need no argument: every **request-path**
+figure (one HTTP request is one invocation running one job), and every cron branch
+that dispatches **one** `waitUntil` — `morning-briefing`, `midday-pulse` and
+`13f-slice`. Only `eod+iv-sweep` and `forward-returns+moves` dispatch two.
+
+| figure | branch | derivation | verdict |
+|---|---|---|---|
+| move sweep N=22 — `2 / 47 / 49` | shared (2pm) | `ceil(22/20)=2`, `2·22+3=47` | **SURVIVES** — exact, so uncontaminated even on a shared branch |
+| move sweep N=35 — `5 / 76 / 81` | shared (2pm) | `2 / 73 / 75` | **CONTAMINATED** — exceeds by +3/+3; labelled at the call site |
+| one EOD summary — `12` fetches | shared (1:15pm) | 11 index charts + 1 news search = 12 | **SURVIVES** — exact; the IV sweep had already deduped |
+| one 13F manager — `3` | isolated (10am) | submissions + filing index + info table | **SURVIVES** |
+| long tiers `9 / 13 / 17`, `16 / 17 / ~20` | request path | — | **SURVIVES** — isolated by construction |
+| `/api/long/batch` 22, cache hit 1 | request path | 1 KV read/symbol | **SURVIVES** |
+| `primeTabs()` page load ~133–140 | request path | per-request table | **SURVIVES** |
+
+**So exactly one documented figure fails the audit, and it is the newest one.**
+That is the reassuring outcome, but it is reassuring *because of the additivity
+argument*, not because the measurements were careful — before that argument every
+cron figure was equally suspect.
+
+**Separately, the AAPL 2026-08-08 table below is STALE, not contaminated** — a
+different fault that this audit surfaced. Its `5` and `6` binding figures predate
+move coverage and pooled calibration. Measured live 2026-08-10: premium-warm
+`4 / 8 / 12`, premium-cold `8 / 10 / 18`. The `+3` matches this file's own
+`6 → 8 → 9` history exactly, so the table is superseded rather than wrong for its
+date, and it is marked as such where it appears.
+
 **Coverage is declared, not assumed.** `instrWrapBindings` does not name
 `REC_LOG` — it walks `env` and wraps everything binding-*shaped* (an object or
 function carrying at least one callable member; a secret is a string, a `[vars]`
@@ -208,6 +245,18 @@ The trigger is `*/15 13-22 * * *`: every 15 minutes, UTC hours 13–22, **every
 day**. It decides *how often we wake up* and nothing else. Which day, which date,
 which job — all of that is decided in `scheduled()`, in code, against Pacific
 wall-clock time.
+
+**There is exactly one expression again as of 2026-08-10.** A temporary
+every-5-minutes diagnostic probe ran as a second `crons` entry from 2026-08-08,
+paired with a `PROBE_CRON` constant that suppressed its dispatch. It existed
+because three post-deploy boundaries produced no `[cron]` line while observability
+logs were off — silence that was uninterpretable rather than informative. It did
+its job (invocations confirmed, weekend gate observed firing, the Monday 6:00am
+run clean) and **both halves were removed together**. If a probe is ever needed
+again, add the trigger *and* its suppression in the same commit and remove them
+the same way: a trigger without suppression triples the firings inside every
+dispatch window, which dedup absorbs on a successful run but not on a failed
+morning briefing — that retries by design, turning 2 attempts into 6.
 
 **Do not put a day-of-week, day-of-month or month back into the expression.**
 
@@ -1007,6 +1056,15 @@ blanks, and use `?refresh=1` to force a rebuild.
 instead of 250. Results key off `item.symbol` — the response order does not match the request
 order, and unknown/delisted symbols are silently absent.
 
+**Fetches are `ceil(N/20)`, and every "2" in these docs is an artifact of N ≤ 40.**
+The move-series sweep is documented at `extFetches 2`. That is not a property of
+the sweep — it is what `ceil(N/20)` happens to equal for the current **35**-name
+watchlist. **At 41 names it becomes 3** and every figure here that says 2 silently
+stops matching, with nothing failing to announce it. The watchlist has already
+grown from 22 to 35 during this work, so 41 is not a hypothetical. When quoting a
+spark-backed cost, quote the formula and the N it was evaluated at, never the bare
+number.
+
 **Yahoo crumb auth:** Yahoo v10 requires a session crumb. `getYahooCrumb()` tries two strategies (direct user-agent endpoint, then HTML stream scan), caches in memory + KV (`yahoo:crumb`, 50-min TTL), and deduplicates concurrent fetches via `_crumbInflight` promise. On 401/403 it invalidates and retries once.
 
 **Alpaca integration:** Optional — if `ALPACA_KEY`/`ALPACA_SECRET` are set, Alpaca overlays real-time prices on quote results and provides the news feed. Yahoo is always the fallback.
@@ -1425,15 +1483,28 @@ sequential, expanded/sort state in `sessionStorage` under `trading_dash_long_ope
 `trading_dash_long_sort`. `long:{TICKER}`, `LONG_FRESH_MS` 4h, retention 24h.
 
 **Measured subrequest cost (`_instr` on the response, AAPL 2026-08-08).**
-`capCost` is the number the 10,000 meters — external fetches *and* KV together:
+`capCost` is the number the 10,000 meters — external fetches *and* KV together.
+
+> **SUPERSEDED — the binding column below predates move coverage and pooled
+> calibration.** Correct for 2026-08-08 and no longer the live figure. Measured
+> live 2026-08-10 on AAPL: premium-**warm** `4 / 8 / 12`, premium-**cold**
+> `8 / 10 / 18`. The `+3` is `readMoveSeries` + `recordIvSample` + `calib:pooled`,
+> matching the `6 → 8 → 9` history recorded above. All of these are request-path
+> figures and so are isolated by construction — this is staleness, not the `_instr`
+> concurrency contamination. Kept because the *breakdown* column still explains
+> where the external fetches go.
 
 | case | extFetches | bindingOps | **capCost** | breakdown |
 |---|---|---|---|---|
-| premium-**warm** | 4 | 5 | **9** | base list + 3 dated chains (Jan 2028, Sep, Oct) |
-| premium-**cold** | 7 | 6 | **13** | the above + earnings `quoteSummary` + hv30 chart |
-| premium-cold, **crumb also cold** | 9 | 8 | **17** | + 2 crumb fetches and 2 crumb KV ops |
+| premium-**warm** | 4 | ~~5~~ → **8** | ~~9~~ → **12** | base list + 3 dated chains (Jan 2028, Sep, Oct) |
+| premium-**cold** | 7–8 | ~~6~~ → **10** | ~~13~~ → **18** | the above + earnings `quoteSummary` + hv30 chart |
+| premium-cold, **crumb also cold** | 9 | 8 → **11** | 17 → **~20** | + 2 crumb fetches and 2 crumb KV ops |
 | cache hit (`?cached=1` or fresh) | 0 | 1 | **1** | one KV read |
 | `/api/long/batch`, 22 symbols | 0 | 22 | **22** | one KV read per symbol |
+
+**Warm is 8 and cold is 10 because `ivHistory()` runs only on the cold path** —
+warm reuses `ivRank` / `historyDays` / `rankReason` from `premium:{TICKER}`, so the
+`list()` never happens. The 9-op breakdown further down is the **cold** figure.
 
 **Re-measured 2026-08-09 after move coverage was added, and the crumb is why the
 figure looks unstable.** Three consecutive `?refresh=1` calls on one local isolate:
@@ -1850,6 +1921,45 @@ So: **treat the first post-deploy probe as advisory only.** Confirm a suspected 
 deploy on a second probe at least a minute later before changing anything. This
 applies to KV-shape checks especially, since a stale isolate reads and writes the
 same namespace as the new one.
+
+## An empty comparison is not a pass
+
+**No comparison may report agreement without first asserting a non-zero population
+on both sides, and the population count goes in the output beside the verdict.**
+
+A harness that measures nothing reports success. That is not a hypothetical:
+verifying the first live move-series sweep, a script printed
+
+```
+VERDICT (i) vs (ii): IDENTICAL — the storage round-trip loses nothing.
+```
+
+having scored **zero** candidates on both sides — two wrong field names
+(`winners` / `episodesTo50` instead of `expectancyWinRate` /
+`expectancyEpisodesTo50`). Two empty sets compare equal, so the most reassuring
+possible output appeared at the exact moment the test was measuring nothing.
+
+**The failure was already latent in the committed suite, in two places.**
+`bs-delta.check.mjs` and `nd2.check.mjs` both judged on `worst < 7.5e-8` with
+`worst` initialised to `0` — so a run whose cases never executed printed "within
+spec" and exited 0. Neither had any notion of how many comparisons it had made.
+
+All six check scripts now share `check-harness.mjs`:
+
+- `tally()` / `record(t, ok)` — the counter, incremented **where the comparison
+  happens**, inside the row helper. Counting declared cases instead would restore
+  the same blind spot one level up: a loop that skips every case still declared them.
+- `reportVerdict({ label, comparisons, failures, minComparisons })` — prints
+  `ALL CHECKS PASSED across N comparisons` and **refuses a verdict** below the
+  floor, exiting non-zero.
+- `populated(label, ...sides)` — guards an aggregate comparison *before* it is made.
+
+`minComparisons` is each script's **observed** population, not a guess: 138 / 31 /
+28 / 35 / 13 / 30 for moves / long-fixtures / cron-gate / instr-bindings /
+bs-delta / nd2. Set at the exact count on purpose — a change in population is
+something a human should have to notice and update deliberately, not something
+that slides. (The first draft guessed 25 for bs-delta, whose real count is 13, and
+the guard correctly refused the verdict; that refusal is also the proof it fires.)
 
 ## Verification standard
 

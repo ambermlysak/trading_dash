@@ -17,6 +17,7 @@
  * Prints computed vs expected. Nothing asserts silently.
  */
 import fs from 'fs';
+import { tally, record, reportVerdict } from './check-harness.mjs';
 
 const src = fs.readFileSync('worker.js', 'utf8');
 function grab(name) {
@@ -45,9 +46,11 @@ const M = new Function(
 )();
 
 const pad = (s, n) => String(s).padEnd(n);
+const T = tally();
 let fails = 0;
 const check = (label, got, want) => {
   const ok = JSON.stringify(got) === JSON.stringify(want);
+  record(T, ok);
   if (!ok) fails++;
   console.log(`  ${pad(label, 46)} got ${pad(JSON.stringify(got), 26)} want ${pad(JSON.stringify(want), 26)} ${ok ? 'OK' : '<<< MISMATCH'}`);
 };
@@ -133,5 +136,6 @@ check('iv 0                 -> reject', M.ivPlausible(0, atm), false);
 check('atmIv null -> guard DISABLED (no reference, no verdict)', M.ivPlausible(1.9572, null), true);
 check('atmIv 0    -> guard disabled', M.ivPlausible(1.9572, 0), true);
 
-console.log(`\n${fails === 0 ? 'All checks matched.' : fails + ' MISMATCH(ES) — see above.'}`);
-process.exitCode = fails === 0 ? 0 : 1;
+process.exitCode = reportVerdict({
+  label: 'long-fixtures.check', comparisons: T.comparisons, failures: fails, minComparisons: 31,
+});

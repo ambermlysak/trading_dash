@@ -170,10 +170,21 @@ History of the binding figure: **6** before move coverage → **8** after it
 (`readMoveSeries` + `recordIvSample`) → **9** after pooled calibration
 (`calib:pooled`).
 
+**PROVENANCE (added 2026-08-10).** Every figure in this section is **request-path
+and therefore isolated by construction** — one HTTP request is one invocation
+running one job — except the move sweep below, which runs on the two-job 2:00pm
+branch. See the audit in CLAUDE.md rule #1. Note also that the tier figures here
+are `?refresh=1` on a **premium-cold** path; premium-warm is one op lower because
+`ivHistory()` is skipped.
+
 Other measured costs:
 
 - **move-series sweep, 22 symbols:** `extFetches 2`, `bindingOps 47`,
   `capCost 49`. The 2 is the whole point — spark takes 20 symbols per request.
+  **SURVIVES the provenance audit despite the shared branch**: contamination is
+  strictly additive, and `2 = ceil(22/20)` and `47 = 2·22 + 3` are the exact
+  structural derivations, so nothing foreign is in them. The N=35 re-measurement
+  (`5 / 76 / 81` against a derived `2 / 73 / 75`) is the contaminated one.
 - `/api/long/batch`, 22 symbols: capCost 22 (one KV read per symbol)
 - warm cache hit on `/api/long/:ticker`: capCost 1
 - pooled scan **if it had been on the request path**: `list('rec:')` + 63 gets =

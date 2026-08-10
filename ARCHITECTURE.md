@@ -63,6 +63,13 @@ steady state, once the sectors cache is warm). The cap meters per *invocation*, 
 the figure that matters against 10,000 is the largest single request — ~47 for a
 cold sectors rebuild, 22 for a batch read — not the page-load total.
 
+**Provenance: all request-path, therefore isolated.** Every figure in this
+paragraph comes from an HTTP request, and one request is one invocation running
+one job, so none of it is exposed to the `_instr` concurrency contamination that
+affects two-job cron branches (CLAUDE.md rule #1). The per-symbol figures scale
+with the watchlist and **the saved list is now 35, not 22** — a batch read costs
+35, and the page-load total rises with it.
+
 **`index.html`** — per-ticker deep dive. Hero strip (price, change, market cap,
 P/E, sector, exchange, AI verdict + confidence ring) over numbered cards:
 

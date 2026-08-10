@@ -13,6 +13,7 @@
  * functions or workerd refuses to boot). Prints computed vs expected.
  */
 import fs from 'fs';
+import { tally, record, reportVerdict } from './check-harness.mjs';
 
 const src = fs.readFileSync('worker.js', 'utf8');
 function grab(name) {
@@ -33,10 +34,12 @@ const M = new Function(
   '\nreturn { INSTR, looksLikeBinding, countingBinding, instrWrapBindings, instrReset, instrMark, instrSince };',
 )();
 
+const T = tally();
 let fails = 0;
 const pad = (s, n) => String(s).padEnd(n);
 const check = (label, got, want) => {
   const ok = JSON.stringify(got) === JSON.stringify(want);
+  record(T, ok);
   if (!ok) fails++;
   console.log(`  ${pad(label, 52)} got ${pad(JSON.stringify(got), 30)} want ${pad(JSON.stringify(want), 24)} ${ok ? 'OK' : '<<< MISMATCH'}`);
 };
@@ -160,5 +163,6 @@ console.log('\n══ 6. instrSince with no baseline still reports honestly ═�
 check('null mark -> measured:false', M.instrSince(null, 'x').measured, false);
 check('null mark -> no fabricated capCost', M.instrSince(null, 'x').capCost, undefined);
 
-console.log(`\n${fails === 0 ? 'All checks matched.' : fails + ' MISMATCH(ES) — see above.'}`);
-process.exitCode = fails === 0 ? 0 : 1;
+process.exitCode = reportVerdict({
+  label: 'instr-bindings.check', comparisons: T.comparisons, failures: fails, minComparisons: 35,
+});

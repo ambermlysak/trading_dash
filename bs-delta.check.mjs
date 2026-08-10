@@ -8,6 +8,7 @@
  * ~1e-15) so this is not A&S being checked against itself.
  */
 import fs from 'fs';
+import { tally, record, reportVerdict } from './check-harness.mjs';
 
 const src = fs.readFileSync('worker.js', 'utf8');
 function grab(name) {
@@ -59,10 +60,14 @@ function deltaRef({ spot, strike, tYears, vol, rate, type }) {
 }
 
 const pad = (s, n) => String(s).padStart(n);
+const T = tally();
 let worst = 0;
 const row = (label, got, want, note = '', count = true) => {
   const diff = Math.abs(got - want);
-  if (count) worst = Math.max(worst, diff);
+  /* Only tolerance-bearing rows are counted. The verdict is a statement about
+     `worst`, so the population beside it must be the rows that can move `worst`
+     — counting the display-only z-table rows would overstate the evidence. */
+  if (count) { worst = Math.max(worst, diff); record(T, true); }
   console.log(`  ${label.padEnd(34)} computed ${pad(got.toFixed(8), 12)}   expected ${pad(want.toFixed(8), 12)}   Δ ${diff.toExponential(2)}  ${note}`);
 };
 
@@ -131,4 +136,13 @@ for (const [label, args] of [
 
 console.log(`\nworst absolute deviation across every case above: ${worst.toExponential(3)}`);
 console.log(`A&S 26.2.17 claims |error| < 7.5e-8 -- ${worst < 7.5e-8 ? 'within spec' : 'OUT OF SPEC'}`);
-console.log('(case 2 excluded from the worst-case: Hull is printed to 3 significant figures)\n');
+console.log('(case 2 excluded from the worst-case: Hull is printed to 3 significant figures)');
+
+/* `worst` starts at 0, so `worst < 7.5e-8` was TRUE for a run that compared
+   nothing — this script would have reported "within spec" with every case
+   skipped. That latent false pass is why the comparison count is now printed
+   beside the verdict and a zero-population run cannot pass. */
+process.exitCode = reportVerdict({
+  label: 'bs-delta.check', comparisons: T.comparisons,
+  failures: worst < 7.5e-8 ? 0 : 1, minComparisons: 13,
+});

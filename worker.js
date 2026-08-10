@@ -465,22 +465,17 @@ export const cronGateCalendar = () => ({
 });
 export const instrPeek = () => ({ ...INSTR });
 
-// TODO(2026-08-10): remove this constant together with the second entry in
-// `crons` in wrangler.toml. The two are a pair; deleting one without the other
-// is the drift this codebase keeps getting caught by.
+// The every-5-minutes diagnostic probe and its PROBE_CRON suppression were removed
+// 2026-08-10, together with the second `crons` entry in wrangler.toml. It existed
+// because three post-deploy boundaries produced no [cron] line while observability
+// logs were off, which made that silence uninterpretable. It proved what it was
+// for — invocations happen, the weekend gate fires — and the Monday 6:00am run it
+// was watching for came through clean. `scheduled()` now sees exactly one
+// expression again.
 //
-// The temporary diagnostic trigger, matched EXACTLY as wrangler.toml spells it.
-// scheduled() suppresses dispatch for firings carrying this expression: the
-// probe exists to prove invocations happen and to exercise the weekend gate,
-// and neither needs it to run a job.
-//
-// Matched by allowlisting the PROBE rather than by "anything that is not the
-// primary cron" on purpose. If Cloudflare ever reports a normalized expression
-// string, an allowlist-the-probe test fails toward the probe dispatching —
-// bounded, and exactly the behaviour before this guard existed. The inverted
-// test would fail toward the REAL cron being suppressed and nothing running at
-// all, which is the far more expensive direction to be wrong in.
-const PROBE_CRON = '*/5 * * * *';
+// (Written as line comments deliberately: the probe's own expression contains the
+// character pair that closes a block comment, which turned the first draft of this
+// note into a syntax error that would have failed the Worker at startup.)
 
 /** Is this a NYSE trading day? Weekend or full-day holiday means no dispatch. */
 function tradingDayStatus(isoDate, dow) {
@@ -6139,6 +6134,12 @@ function buildPooledCalibration(listsByTicker, ratesByTicker) {
   };
 }
 
+/** The shape a Yahoo-resolvable symbol has. Mirrors the guard on
+ *  `/api/ai/:type/:ticker`. Anything in the `rec:` log failing this can never
+ *  resolve a forward return, because the chart fetch behind it 404s by
+ *  construction. */
+const REC_SYMBOL_RE = /^[A-Z][A-Z.\-]{0,9}$/;
+
 async function fillForwardReturns(env) {
   if (!env?.REC_LOG) return;
   try {
@@ -6174,6 +6175,24 @@ async function fillForwardReturns(env) {
     const pending = list.filter(e =>
       Number.isFinite(e.price) && REC_FWD_HORIZONS.some(h => e[h.ret] == null));
     if (!pending.length) continue;
+
+    /* A key whose name cannot be a Yahoo symbol 404s on every run, forever —
+       `rec:/BTC` has produced a daily `chart failed — Yahoo 404` warn since it
+       was logged. Skipping the fetch is NON-DESTRUCTIVE: the key is untouched
+       and its entries still reach the pooled calibration below. The outcome is
+       identical to today (those forward returns never resolved either), minus
+       one doomed request and minus a warn line that reads like a fault.
+
+       Deliberately NOT deleting the key. A KV delete is irreversible, and a
+       malformed symbol is not worth that. Logged at `log`, not `warn`, and the
+       line says it is expected — a recurring red herring in the log costs more
+       reader-time than the fetch costs budget. */
+    if (!REC_SYMBOL_RE.test(ticker.toUpperCase())) {
+      console.log(`[cron] forward fill: skipped rec:${ticker} — name is not a valid symbol `
+        + `shape, so its chart fetch would 404. EXPECTED, not an error; its forward returns `
+        + `can never resolve and the key is left in place.`);
+      continue;
+    }
 
     let bars;
     try {
@@ -8972,25 +8991,6 @@ export default {
        run for weeks without anyone being able to see it. */
     if (!day.open) {
       console.log(`[cron] ${at} · ${via} · not a trading day (${day.reason}) · branch=none`);
-      return;
-    }
-
-    // TODO(2026-08-10): remove with PROBE_CRON and the second `crons` entry.
-    //
-    // Diagnostic probe: log and return WITHOUT dispatching. It fires every 5
-    // minutes with no hour restriction, so on a trading day it lands inside the
-    // dispatch windows three times as often as the real trigger. Each generator's
-    // KV dedup absorbs that on a successful run — but a failed morning briefing
-    // deliberately leaves its cache incomplete so it retries, and the probe would
-    // turn a 2-attempt retry into 6 (~150 Claude calls instead of ~50). Monday
-    // 6:00am PT is the first real observation of the day-of-week fix, and that
-    // run has to be clean.
-    //
-    // Placed AFTER the trading-day gate so weekend and holiday firings still take
-    // the branch=none path above and keep proving the gate works — which is half
-    // of what the probe is for.
-    if (event.cron === PROBE_CRON) {
-      console.log(`[cron] ${at} · ${via} · trading day · branch=none (probe · dispatch suppressed)`);
       return;
     }
 

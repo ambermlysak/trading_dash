@@ -23,6 +23,7 @@
  * overstates the answer by twenty-plus points.
  */
 import fs from 'fs';
+import { tally, record, reportVerdict } from './check-harness.mjs';
 
 const src = fs.readFileSync('worker.js', 'utf8');
 function grab(name) {
@@ -73,8 +74,16 @@ function bsPriceRef(S, K, T, sig, r, type) {
 
 const f = (v, n = 8) => (v == null ? String(v).padStart(12) : v.toFixed(n).padStart(12));
 const dev = (a, b) => (a == null || b == null) ? '        n/a' : Math.abs(a - b).toExponential(3).padStart(11);
+const T = tally();
 let worst = 0;
-const track = (a, b) => { if (a != null && b != null) worst = Math.max(worst, Math.abs(a - b)); };
+/* Counts only pairs that actually compared. A null on either side is not a
+   comparison, and counting it would let a run where every value came back null
+   report a population it never had. */
+const track = (a, b) => {
+  if (a == null || b == null) return;
+  worst = Math.max(worst, Math.abs(a - b));
+  record(T, true);
+};
 
 /* Cases: S, K/breakeven, T years, sigma, r, label. The last two are the ones
    this whole function exists for — long-dated and high-IV. */
@@ -168,4 +177,12 @@ for (const [label, args] of bad) {
 
 console.log(`\nworst absolute deviation across the probability checks: ${worst.toExponential(3)}`);
 console.log('A&S 26.2.17 claims |error| < 7.5e-8 — the reference-erf and ∂C/∂K routes');
-console.log('are both bounded by that plus the finite-difference step.\n');
+console.log('are both bounded by that plus the finite-difference step.');
+
+/* Same latent false pass as bs-delta: `worst` initialised to 0 means a run that
+   compared nothing satisfied every tolerance. The finite-difference tolerance is
+   looser than A&S because the central difference carries its own step error. */
+process.exitCode = reportVerdict({
+  label: 'nd2.check', comparisons: T.comparisons,
+  failures: worst < 1e-5 ? 0 : 1, minComparisons: 30,
+});
