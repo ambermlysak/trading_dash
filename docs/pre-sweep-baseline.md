@@ -413,7 +413,83 @@ must keep an `async ` prefix or an async function becomes a sync one whose
   value size, one ticker's horizon nulls with the independent numbers
 - (b) `episodesTo50` from **stored pairs via `readMoveSeries`**, side by side with
   §1's REALISTIC 3y table (n=198). A shift implicates `startIdx` precision or sort
-  ordering
+  ordering — **but read §7.1 first: as originally specified this test cannot
+  isolate that.**
 - (c) `skip-if-exists` firing, and the resulting `iv:{TICKER}:{DATE}` sample + `src`
 - (d) `fillForwardReturns` actually wrote `calib:pooled`, and the magnitude field
   resolving against real `moves:` data rather than the seeded fixture
+
+---
+
+## 7. Gaps found on re-reading this file cold, 2026-08-10 ~12:55 PT
+
+Added after compaction, before the sweep. Everything above is frozen measurement;
+this section is correction to the *method* of item 4, not to any number.
+
+### 7.1 4(b) as specified cannot isolate what it claims to
+
+Two independent problems.
+
+**The populations differ.** §1 was built at `asOf 2026-08-07`; the sweep stores
+`asOfClose 2026-08-10`. That adds a session at the tail **and** rolls sessions off
+the head of a 3y spark window. §1's structure is spot-relative — `strike = spot ×
+km`, `debit = spot × 0.03 × 100`, `breakeven = strike + spot × 0.03` — so a new
+spot moves every strike and every breakeven, and the candidate set is not the same
+set. **A shift against the n=198 table is EXPECTED and does not implicate
+`startIdx`.**
+
+**The stated hypothesis cannot fire.** `buildMoveSeries` stores
+`+r.toFixed(4)` and an integer `startIdx`, and §1's arrays came from
+`buildMoveSeries` too — so both sides are already rounded identically and a JSON
+round-trip of a 4dp number and a small integer is exact. "Precision loss" is not a
+reachable failure here. The reachable ones are **sort ordering**, the strict
+`m.schema === MOVES_SCHEMA` guard silently reading as absent, and truncation.
+
+So run **three** columns, not two:
+
+| column | source | what a difference means |
+|---|---|---|
+| (i) stored | `readMoveSeries(t, env)` | — |
+| (ii) rebuilt | fresh spark, `buildMoveSeries(t, closes, <stored asOfClose>)` | **(i) vs (ii) = the round-trip.** Any difference is a real bug: ordering, schema guard, truncation |
+| (iii) frozen | §1 REALISTIC 3y, n=198 | **(ii) vs (iii) = data drift.** Expected to move; not evidence of anything |
+
+For (ii), confirm spark's last session equals the stored `asOfClose` before
+comparing; if spark has moved on, say so rather than treating (ii) as faithful.
+Take `spot` the same way §1 did — the last close of the series.
+
+### 7.2 The sweep's `extFetches` is LOG-ONLY — start a tail before 2:00pm PT
+
+`collectMoveSeries` emits its `_instr` through `console.log` (the line ending
+`· ${JSON.stringify(instrSince(mark, 'complete'))}`). **Nothing writes it to KV** —
+`movesweep:last` holds a bare PT date and nothing else. So 4(a)'s "expect
+`extFetches` 2" is retrievable only from Workers Logs.
+
+`wrangler tail` **streams live and retains nothing**, so it must be running before
+the firing. Dashboard log search is the fallback (observability is on in
+`wrangler.toml`). Note both jobs share the invocation, so `invocationFetches` will
+exceed the sweep's own `extFetches`; the figure to quote is the sweep's.
+
+The same log line carries `written / already current / not returned by spark /
+thin history`. **First-sweep prediction: `skipped` = 0** — the sweep's own
+skip-if-exists compares `prev.asOfClose === asOfClose` and `prev` is null
+everywhere today, so expect ~22 written.
+
+> Two distinct `skip-if-exists` mechanisms are now in play and must not be
+> conflated: the **sweep's** (`prev.asOfClose`, expected NOT to fire today) and the
+> **IV sample's** (§6.4, item 4(c), expected TO fire today for the first time).
+
+### 7.3 4(d) has a first-day race — a low `magnitudeN` is not a defect
+
+Both jobs are dispatched on the same firing under `ctx.waitUntil`, and they run
+concurrently: `fillForwardReturns` first, `collectMoveSeries` second. Fill builds
+`ratesByTicker` by calling `readMoveSeries` per ticker — but only at the **end** of
+its walk, after the per-ticker chart fetches, so the short sweep will most likely
+have written first. **It is not ordered**, and `moves:` starts empty today.
+
+So on the first day `magnitudeN` may be **0 or partial**, and that is a race rather
+than a fault in the magnitude field. It self-heals on the next firing. Do not
+"fix" it on one observation; re-check tomorrow.
+
+Related and structural, not a race: the sweep writes only the **22** watchlist
+names while `listsByTicker` covers **63** `rec:` keys, so `ratesByTicker.size ≤ 22`
+and `benchmarkedN < n` always. That is what §5's 75-of-112 already reflects.
