@@ -3344,25 +3344,70 @@ function calendarCandidate(frontChain, backChain, front, back, ctx, earnIso) {
  *  fill it. Routing this through /api/ai/* would put model spend behind a screen
  *  the user expects to be free.
  */
-async function directionalRead(sym, env) {
-  let a = null, entries = [];
+/** `moves` is passed in by the caller rather than read here, because `longRow()`
+ *  already holds it for the coverage block — so the per-ticker magnitude bar
+ *  costs ZERO additional binding ops. Without it the ticker basis would be the
+ *  only one with no magnitude figure, which would read as a defect rather than as
+ *  the deliberate absence it is not. */
+async function directionalRead(sym, env, moves = null) {
+  let a = null, entries = [], pooled = null;
   try { a = await env?.REC_LOG?.get(`analysis:${sym}`, 'json'); } catch (_) {}
   try { entries = (await env?.REC_LOG?.get(`rec:${sym}`, 'json')) || []; } catch (_) {}
+  // ONE read, not a scan. The pooled record is precomputed by the 2:00pm cron
+  // from a list it was already performing — see buildPooledCalibration().
+  try {
+    const p = await env?.REC_LOG?.get(POOLED_CALIB_KEY, 'json');
+    if (p && p.schema === POOLED_CALIB_SCHEMA) pooled = p;
+  } catch (_) {}
+
   const rating = ['BUY', 'HOLD', 'SELL'].includes(a?.rating) ? a.rating : null;
-  const calib  = recCalibration(entries);
-  // The tag ALWAYS renders. It only reorders anything once the model behind it
-  // has a resolved track record — an alignment tag from an unscored model must
-  // not look, or sort, like one from a scored model.
-  const scored = calib.reason == null;
+  // Same magnitude bar the pooled record uses, from the series already in hand.
+  const own    = recCalibration(entries, { absThresholdPct: medianAbsMovePct(moves, 20) });
+
+  /* TRI-STATE BASIS, the same shape as sellableFrom(): 'ticker' | 'pooled' |
+     'none'. This ticker's own record wins when it clears the floor; the pooled
+     record stands in while it does not; neither resolving is 'none'.
+
+     THE BASIS TRAVELS WITH THE NUMBERS AND MUST BE RENDERED. A pooled hit rate
+     shown as though it were this ticker's own is the same class of error as
+     substituting an HV percentile for IV rank — plausible, indistinguishable on
+     screen, and wrong about which question it answers. */
+  const useOwn    = own.reason == null;
+  const usePooled = !useOwn && pooled && pooled.reason == null;
+  const basis  = useOwn ? 'ticker' : usePooled ? 'pooled' : 'none';
+  const source = useOwn ? own : usePooled ? pooled : null;
+  const scored = basis !== 'none';
+
+  const basisReason = basis === 'ticker'
+    ? `${own.n} resolved outcomes for ${sym} — this ticker's own record`
+    : basis === 'pooled'
+      ? `${sym} has ${own.n} of ${own.minN} resolved outcomes, so this is the POOLED record across `
+        + `${pooled.tickersContributing} tickers (n=${pooled.n}). It describes the model's average `
+        + `behaviour, NOT this ticker's.`
+      : `${own.n} of ${own.minN} resolved for ${sym}, and no pooled record has resolved either`;
+
   return {
     rating,
     source: rating ? `analysis:${sym}` : null,
     asOf: a?.ts ?? null,
     confidence: Number.isFinite(a?.confidence) ? a.confidence : null,
     calibration: {
-      n: calib.n, minN: calib.minN, reason: calib.reason,
-      hitRate: scored && rating ? calib.byRating?.[rating]?.hitRate ?? null : null,
-      brier: calib.brier,
+      basis, basisReason,
+      n:     source ? source.n : own.n,
+      tickerN: own.n,
+      pooledN: pooled?.n ?? null,
+      minN:  own.minN,
+      reason: scored ? null : basisReason,
+      hitRate: scored && rating ? source.byRating?.[rating]?.hitRate ?? null : null,
+      brier:   source ? source.brier : null,
+      // The magnitude-scored outcome, reported ALONGSIDE the sign-scored hit rate
+      // above. Null with a reason until a move series exists to derive a bar from.
+      magnitudeHitRate: scored && rating
+        ? source.byRatingMagnitude?.[rating]?.hitRate ?? null : null,
+      magnitudeBarPct:  scored && rating
+        ? source.byRatingMagnitude?.[rating]?.barPct ?? null : null,
+      magnitudeReason:  source ? source.magnitudeReason : null,
+      pooledAsOf: pooled?.d ?? null,
     },
     affectsSort: scored,
   };
@@ -3594,11 +3639,12 @@ async function longRow(sym, env, { rate, premium }) {
     };
   };
 
-  const read = await directionalRead(sym, env);
   // One KV read. Banked daily by the 2:00pm PT sweep, so this path never fetches
   // for it — a per-ticker chart fetch here would put 22 invocations against Yahoo
   // the moment anyone hit "Load all".
+  // Read BEFORE the directional read, which reuses it for the magnitude bar.
   const moves = await readMoveSeries(sym, env);
+  const read = await directionalRead(sym, env, moves);
   const lanes = [];
 
   const singleLegLane = (laneId, exp, chain, targets, types, itm) => {
@@ -5708,25 +5754,72 @@ async function handleLogRec(request, env, origin) {
   return json({ ok: true, count: list.length, replaced, tradingDate: entry.d }, 200, origin);
 }
 
+/* ── The magnitude bar ────────────────────────────────────────────────────────
+   `fwd20 > 0` scores "did it go up at all". A long option needs "did it move far
+   enough to pay", which is a different question and the only one relevant to how
+   this screen is used. The bar is the MEDIAN 20-session ABSOLUTE move for that
+   underlying, taken from `moves:{TICKER}` — a typical move for that name, so the
+   threshold is per-ticker and measured rather than assumed.
+
+   NO FIXED PERCENTAGE STAND-IN. Without a stored series the magnitude figures are
+   null with a reason, exactly as `ivRank` is null before 60 days of samples.
+
+   UNITS: `moves` returns are FRACTIONS (0.0523) and `fwd20` is PERCENT (5.23).
+   This returns percent so it can be compared with `fwd20` directly, and that
+   conversion is the single most likely place for this to go silently wrong. */
+function medianAbsMovePct(moves, horizon = 20) {
+  const arr = moves?.horizons?.[String(horizon)]?.sorted3y;
+  if (!Array.isArray(arr) || !arr.length) return null;
+  const abs = arr.map(([r]) => Math.abs(r)).sort((a, b) => a - b);
+  const m = abs.length % 2
+    ? abs[(abs.length - 1) / 2]
+    : (abs[abs.length / 2 - 1] + abs[abs.length / 2]) / 2;
+  return Number.isFinite(m) ? +(m * 100).toFixed(3) : null;   // fraction -> percent
+}
+
 /**
- * Calibration over the resolved slice of a ticker's log.
+ * Calibration over the resolved slice of a log.
  *
  * "Resolved" means fwd20 is filled — an entry logged nine sessions ago has no
  * outcome yet and cannot count. Below REC_CALIB_MIN_N the figures are returned
  * as nulls with a reason: a hit rate over four entries is noise wearing a
  * percentage sign, and it would read on screen exactly like a real one.
+ *
+ * `absThresholdPct` enables the SECOND, magnitude-scored outcome. It is reported
+ * ALONGSIDE the sign-scored one and never replaces it — the gap between "went the
+ * right way" and "went far enough to pay" is the point, and collapsing them into
+ * one number would hide it.
+ *
+ * Per-entry thresholds are supported via `thresholdFor(entry)` so the pooled
+ * calibration can use each ticker's OWN median move rather than one blended bar
+ * across names with wildly different vol.
  */
-function recCalibration(list) {
+function recCalibration(list, { absThresholdPct = null, thresholdFor = null } = {}) {
   const resolved = list.filter(e => Number.isFinite(e.fwd20));
   const n = resolved.length;
 
   if (n < REC_CALIB_MIN_N) {
     return {
       n, minN: REC_CALIB_MIN_N, brier: null, brierN: 0, byRating: null,
+      byRatingMagnitude: null,
+      magnitudeReason: `${n} of ${REC_CALIB_MIN_N} resolved — magnitude scoring needs the same floor`,
       reason: `${n} of ${REC_CALIB_MIN_N} recommendations have a 20-session outcome. `
             + `Each entry needs 20 trading days to elapse before it resolves.`,
     };
   }
+
+  /* MAGNITUDE-SCORED OUTCOME. Same directional claim, higher bar: a BUY hits only
+     if the move was UP *and* at least a typical 20-session move for that name.
+     Direction is retained deliberately — a pure |fwd20| test would score a BUY
+     that collapsed 20% as a hit, which is not what "far enough to pay" means. */
+  const barFor = e => (thresholdFor ? thresholdFor(e) : absThresholdPct);
+  const withBar = resolved.filter(e => Number.isFinite(barFor(e)));
+  const magnitudeReason = withBar.length === 0
+    ? 'no stored move series to derive a magnitude bar from — the 2:00pm PT sweep banks one daily. '
+      + 'No fixed percentage is substituted.'
+    : withBar.length < REC_CALIB_MIN_N
+      ? `${withBar.length} of ${REC_CALIB_MIN_N} resolved entries have a move series behind them`
+      : null;
 
   const mean = arr => arr.length
     ? +(arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2)
@@ -5760,7 +5853,32 @@ function recCalibration(list) {
       }, 0) / scored.length).toFixed(4)
     : null;
 
-  return { n, minN: REC_CALIB_MIN_N, reason: null, brier, brierN: scored.length, byRating };
+  /* The magnitude table, built over the same rows but only those with a bar.
+     `barPct` is reported per rating so the number the hit was scored against is
+     visible rather than implied. */
+  let byRatingMagnitude = null;
+  if (!magnitudeReason) {
+    byRatingMagnitude = {};
+    for (const r of ['BUY', 'HOLD', 'SELL']) {
+      const rows = withBar.filter(e => e.rating === r);
+      const hits = (r === 'HOLD' || !rows.length) ? null
+        : rows.filter(e => r === 'BUY' ? e.fwd20 >= barFor(e) : e.fwd20 <= -barFor(e)).length;
+      const bars = rows.map(e => barFor(e)).filter(Number.isFinite).sort((a, b) => a - b);
+      byRatingMagnitude[r] = {
+        n:       rows.length,
+        hitRate: hits == null ? null : +(hits / rows.length).toFixed(4),
+        // Median of the per-entry bars actually applied — one number cannot
+        // describe a pooled set spanning several tickers, so this is explicitly
+        // the median bar, not "the" bar.
+        barPct:  bars.length ? +bars[Math.floor(bars.length / 2)].toFixed(2) : null,
+      };
+    }
+  }
+
+  return {
+    n, minN: REC_CALIB_MIN_N, reason: null, brier, brierN: scored.length, byRating,
+    byRatingMagnitude, magnitudeReason, magnitudeN: withBar.length,
+  };
 }
 
 async function handleTrack(ticker, env, origin) {
@@ -5781,6 +5899,64 @@ async function handleTrack(ticker, env, origin) {
 /* ── Cron: fill forward returns on logged recommendations (2:00pm PT) ──
    Walks every rec:{TICKER} list and resolves entries that have come of age.
    One chart fetch per ticker covers all of its pending entries. */
+/* ── Pooled calibration ───────────────────────────────────────────────────────
+   Requiring 10 RESOLVED entries per ticker splits the evidence 63 ways, so
+   `affectsSort` is false almost everywhere and the alignment tag reorders nothing
+   on any ticker. Pooled across the log the same evidence clears the floor
+   immediately.
+
+   WHERE THIS RUNS, AND WHY IT IS NOT ON THE REQUEST PATH. A pooled scan is
+   `list('rec:')` plus one `get` per key — measured at 64 binding ops against 63
+   keys in production, and the key count GROWS with every ticker ever browsed.
+   `directionalRead()` runs on every `/api/long/:ticker`, where the whole binding
+   budget is currently 8, so that would be a 9× increase per request. A TTL cache
+   would not fix it either: a cache still pays the full scan on every miss, and
+   the miss lands on whichever user's request happens to be first.
+
+   `fillForwardReturns()` ALREADY performs exactly this scan — it lists `rec:` and
+   reads every key to fill forward returns. So the pooled figures are computed
+   there, from data already in hand, for **zero additional list or get ops**. The
+   only new cost is one KV write of the result and one read on the request path.
+
+   `calib:pooled` has no TTL: it is rewritten every trading day by this job, and a
+   stale pooled figure is strictly better than none — but `ptDate` and `ts` ride
+   along so the reader can age it. */
+const POOLED_CALIB_KEY    = 'calib:pooled';
+const POOLED_CALIB_SCHEMA = 1;
+
+/**
+ * Build the pooled record from the per-ticker lists the caller already holds.
+ * `barByTicker` maps TICKER -> median 20-session absolute move in PERCENT.
+ */
+function buildPooledCalibration(listsByTicker, barByTicker) {
+  const all = [];
+  let contributing = 0;
+  for (const [tkr, list] of listsByTicker) {
+    if (!Array.isArray(list) || !list.length) continue;
+    let used = 0;
+    for (const e of list) {
+      if (!Number.isFinite(e.fwd20)) continue;
+      // Tag each entry with its own ticker so the magnitude bar stays per-name.
+      all.push({ ...e, ticker: e.ticker || tkr });
+      used++;
+    }
+    if (used) contributing++;
+  }
+
+  const calib = recCalibration(all, {
+    thresholdFor: e => barByTicker.get(String(e.ticker || '').toUpperCase()) ?? null,
+  });
+
+  return {
+    schema: POOLED_CALIB_SCHEMA,
+    ts: Date.now(),
+    d: ptDate(),
+    tickersContributing: contributing,
+    tickersWithBar: [...barByTicker.keys()].length,
+    ...calib,
+  };
+}
+
 async function fillForwardReturns(env) {
   if (!env?.REC_LOG) return;
   try {
@@ -5799,11 +5975,19 @@ async function fillForwardReturns(env) {
   const today = etToday();
   let tickers = 0, filled = 0;
 
+  /* Every list this walk reads is retained for the pooled calibration below.
+     The scan is the expensive part and it is already being paid for here — see
+     the note above buildPooledCalibration(). Accumulate BEFORE the `continue`s,
+     or tickers with nothing pending (which is most of them, most days) would be
+     silently excluded from the pool. */
+  const listsByTicker = new Map();
+
   for (const key of keys) {
     const ticker = key.slice(4);
     let list;
     try { list = await env.REC_LOG.get(key, 'json'); } catch (_) { continue; }
     if (!Array.isArray(list) || !list.length) continue;
+    listsByTicker.set(ticker.toUpperCase(), list);
 
     const pending = list.filter(e =>
       Number.isFinite(e.price) && REC_FWD_HORIZONS.some(h => e[h.ret] == null));
@@ -5853,6 +6037,41 @@ async function fillForwardReturns(env) {
 
   try { await env.REC_LOG.put('recfwd:last', ptDate(), { expirationTtl: 172800 }); } catch (_) {}
   console.log(`[cron] forward fill: ${filled} value(s) across ${tickers} ticker(s)`);
+
+  /* ── Pooled calibration, from the lists just read ──────────────────────────
+     Wrapped end to end: this is bookkeeping bolted onto a job that has already
+     done its real work and written its results. A failure here must not make the
+     forward fill look failed, and must never throw past the `recfwd:last` write
+     above — otherwise a bookkeeping slip re-runs the whole fill tomorrow. */
+  try {
+    /* The magnitude bar per ticker. One `moves:` read per ticker that has at
+       least one resolved entry — tickers with nothing resolved cannot contribute
+       to calibration, so reading their series would be pure cost.
+
+       DAY-ONE RACE, STATED: `collectMoveSeries` runs on this same 2:00pm branch
+       under a separate ctx.waitUntil, so on the very first day the `moves:` keys
+       may not exist yet when this runs. The magnitude fields then null with their
+       reason and resolve on the next firing. They are deliberately NOT sequenced:
+       chaining them would mean a hang in the sweep also blocks the forward fill,
+       trading a one-day delay for a permanent robustness regression. */
+    const barByTicker = new Map();
+    for (const [tkr, list] of listsByTicker) {
+      if (!list.some(e => Number.isFinite(e.fwd20))) continue;
+      const m = await readMoveSeries(tkr, env);
+      const bar = medianAbsMovePct(m, 20);
+      if (Number.isFinite(bar)) barByTicker.set(tkr, bar);
+    }
+
+    const pooled = buildPooledCalibration(listsByTicker, barByTicker);
+    await env.REC_LOG.put(POOLED_CALIB_KEY, JSON.stringify(pooled));
+    console.log(
+      `[cron] pooled calibration: n=${pooled.n} across ${pooled.tickersContributing} ticker(s), `
+      + `magnitude n=${pooled.magnitudeN} over ${barByTicker.size} with a bar`
+      + `${pooled.reason ? ` · sign-scored unresolved: ${pooled.reason}` : ''}`
+      + `${pooled.magnitudeReason ? ` · magnitude unresolved: ${pooled.magnitudeReason}` : ''}`);
+  } catch (e) {
+    console.warn('[cron] pooled calibration failed:', e.message);
+  }
 }
 
 /* ── Cron: bank the historical move distribution per watchlist ticker ─────────

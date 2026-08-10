@@ -1036,6 +1036,7 @@ differs from its retention, both are given and the reason is in the notes.
 | `analysis:{TICKER}` | 2d | Per-ticker Claude recommendation for the watchlist column |
 | `iv:{TICKER}:{DATE}` | **400d** | One daily front-expiry ATM IV sample — the series `ivRank` is built from. `atmIv`/`spot`/`dte` are duplicated into **KV metadata** so `ivHistory()` rebuilds the series from one paged `list()` instead of 400 `get()`s. Metadata caps at 1024 bytes; keep it to those three flat numbers. |
 | `ivsweep:last` | 2d | PT date of the last cron IV sweep, for dedup. **Deliberately outside the `iv:` prefix** so `ivHistory()`'s prefix scan cannot pick it up as a sample. |
+| `calib:pooled` | **none** | Pooled recommendation calibration across every `rec:` key — the basis used when a ticker has fewer than `REC_CALIB_MIN_N` resolved outcomes of its own. Written once a trading day by `fillForwardReturns()`; **no TTL on purpose**, since a stale pooled figure beats none and `d`/`ts` ride along so the reader can age it. |
 | `moves:{TICKER}` | **7d** | The historical N-session return distribution behind the Long tab's measured `cov` column, its `gap`, and the expectancy ranking. Banked by the 2:00pm PT sweep. **~60 KB/ticker measured** (largest QUBT 61,496 bytes, 2026-08-09); KV's ceiling is 25 MB. Stores sorted **`[return, startIdx]` pairs**, not bare numbers — see below. |
 | `movesweep:last` | 2d | PT date of the last move-series sweep, for dedup. **Outside the `moves:` prefix** so nothing scanning that prefix can read it as a ticker — the same rule as `ivsweep:last`. |
 | `premium:{TICKER}` | **24h retention / 4h freshness** | One premium-screen row. The two differ on purpose — see below. |
@@ -1065,6 +1066,26 @@ A literal 4h KV TTL would evict the row at the exact moment it becomes stale,
 leaving nothing to render *as* stale. A 5-hour-old chain badged "stale" is more
 useful than a blank row, so `PREMIUM_FRESH_MS` (4h) drives the badge and
 revalidation while `PREMIUM_ROW_TTL` (24h) keeps the row alive to be badged.
+
+**`calib:pooled` — why the scan lives in the cron and must never move.**
+Requiring `REC_CALIB_MIN_N` (10) *resolved* outcomes **per ticker** splits the
+evidence across every ticker ever browsed. Measured 2026-08-10: **62 tickers, 289
+resolved entries, and only 7 clear the floor on their own** — so `affectsSort` was
+false on 55 of 62 and the alignment tag reordered nothing almost everywhere. Pooled,
+the same 289 entries clear it immediately.
+
+A pooled scan is `list('rec:')` + one `get` per key = **64 binding ops measured**,
+and the key count grows with every ticker ever opened. `directionalRead()` runs on
+every `/api/long/:ticker`, whose entire binding budget is 9 — so that scan on the
+request path would be a ~8× increase. **A TTL cache does not fix this**: a cache
+still pays the full scan on each miss, and the miss lands on whatever user request
+happens to be first.
+
+`fillForwardReturns()` (2:00pm PT) **already performs exactly this scan** to fill
+forward returns. The pooled figures are therefore computed there from lists already
+in hand — **zero additional list or get ops** — and the request path pays one KV
+read. Accumulate into `listsByTicker` *before* the `continue`s in that walk, or
+every ticker with nothing pending (most of them, most days) drops out of the pool.
 
 **`moves:{TICKER}` — schema 2, and the schema check must stay strict equality.**
 The stored return arrays are `[return, startIdx]` **pairs**. Schema 1 stored bare
@@ -1376,26 +1397,32 @@ sequential, expanded/sort state in `sessionStorage` under `trading_dash_long_ope
 **Re-measured 2026-08-09 after move coverage was added, and the crumb is why the
 figure looks unstable.** Three consecutive `?refresh=1` calls on one local isolate:
 
-| call | extFetches | bindingOps | capCost | what differs |
+| tier | extFetches | bindingOps | capCost | what differs |
 |---|---|---|---|---|
-| 1st (cold isolate) | 9 | 10 | **19** | crumb fetched *and* written to KV |
-| 2nd, 3rd | 7 | 8 | **15** | crumb served from in-memory cache |
+| crumb in isolate memory | 7 | 9 | **16** | the steady state on a warm isolate |
+| crumb in KV, not memory | 7 | 10 | **17** | one extra KV read, no fetch — the common production case |
+| crumb fully cold | 9 | 11 | **~20** | + 2 crumb fetches and 2 crumb KV ops |
 
-In production the intermediate case is the common one — **16–17**, where the crumb
-is in KV but not in that isolate's memory, costing one KV read and no fetch. Full
-binding accounting for the crumb-in-memory path, which sums to exactly the observed
-8 with nothing unattributed:
+Full binding accounting for the crumb-in-memory path. It sums to exactly the
+observed 9 with nothing unattributed, and **it must keep closing** — an
+unexplained op here is how a per-request cost compounds silently as more reads get
+threaded through `longRow()`:
 
 ```
 riskFreeRate (econ:dgs3mo)   1     directionalRead (analysis:, rec:)   2
-readPremiumRow               1     readMoveSeries                      1   ← added
-recordIvSample (long-live)   1 ←   storeLongRow                        1
-ivHistory (list)             1                                    total 8
+readPremiumRow               1     calib:pooled                        1   ← step 2
+recordIvSample (long-live)   1     readMoveSeries                      1
+ivHistory (list)             1     storeLongRow                        1
+                                                                 total 9
 ```
 
-The pre-change figure of 6 was measured on a request whose crumb was already in
-memory; the +2 is this feature and the rest is the crumb tier. **Quote the tier,
-not a bare number** — a single measurement of this path is ambiguous by ±4.
+History of that figure: **6** before move coverage (measured with the crumb already
+in memory), **8** after it (`readMoveSeries` + `recordIvSample`), **9** after pooled
+calibration (`calib:pooled`). Each step is one read, and the pooled read replaced
+what would otherwise have been a 64-op scan — see the KV-key note below.
+
+**Quote the tier, not a bare number** — a single measurement of this path is
+ambiguous by ±4 on crumb state alone.
 
 The earlier figures of 4 and 7 were `extFetches` only and understated the real
 cost by 125–143%. Do not quote them.

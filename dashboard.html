@@ -571,6 +571,9 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 /* The concentration flag. Always rendered WITH its label — see candDetail(). */
 .cd-flag { color: var(--amber); background: rgba(244,183,64,0.12); padding: 1px 6px;
   border-radius: 3px; margin-right: 12px; cursor: help; white-space: nowrap; }
+/* Marks a tag whose hit rate came from the POOLED record, not this ticker's own.
+   The basis is never allowed to be invisible where the number is shown. */
+.pooled-mark { color: var(--violet); font-size: 0.85em; margin-left: 1px; cursor: help; }
 .prem-cands th.csort, .long-lane-sub .csort { cursor: pointer; user-select: none; }
 .prem-cands th.csort:hover, .long-lane-sub .csort:hover { color: var(--cyan); }
 .prem-cands th.csort.sorted, .long-lane-sub .csort.sorted { color: var(--cyan); }
@@ -2560,14 +2563,20 @@ const money    = v => v == null ? '—' : '$' + v.toFixed(2);
 
 /** The alignment tag. Renders ALWAYS; reorders only when the rating behind it
  *  has a resolved track record. An unscored tag must not look like a scored one. */
-function alignChip(align, scored) {
+function alignChip(align, scored, basis) {
   if (!align) return '';
   const cls = { aligned: 'aligned', counter: 'counter', neutral: 'neutral',
                 'no read': 'noread', 'out-of-horizon': 'horizon' }[align.tag] || 'noread';
   const unscored = (align.tag === 'aligned' || align.tag === 'counter') && !scored ? ' unscored' : '';
-  return `<span class="long-tag ${cls}${unscored}" title="${esc(align.reason || '')}${
+  /* `basis` rides into the hover so the chip itself cannot imply this ticker has
+     its own track record when the number behind it is pooled. */
+  const basisNote = !basis ? ''
+    : basis === 'pooled' ? ' — scored against the POOLED record across every logged ticker, not this one\'s own'
+    : basis === 'ticker' ? ' — scored against this ticker\'s own resolved calls'
+    : '';
+  return `<span class="long-tag ${cls}${unscored}" title="${esc(align.reason || '')}${esc(basisNote)}${
     unscored ? ' — the rating behind this tag has no resolved track record yet, so it does not reorder anything.' : ''
-  }">${esc(align.tag)}</span>`;
+  }">${esc(align.tag)}${basis === 'pooled' && (align.tag === 'aligned' || align.tag === 'counter') ? '<sup class="pooled-mark" title="pooled basis">ᵖ</sup>' : ''}</span>`;
 }
 
 /* ── Candidate sort ───────────────────────────────────────────────────────────
@@ -2813,7 +2822,7 @@ function edollarCell(c) {
 }
 
 /** Lanes A and B — single-leg longs. */
-function longSingleTable(entry, scored) {
+function longSingleTable(entry, scored, basis) {
   if (!entry.candidates.length) {
     return `<div class="prem-note">${esc(entry.reason || 'no candidates priced on this expiry')}.</div>`;
   }
@@ -2838,7 +2847,7 @@ function longSingleTable(entry, scored) {
       <td title="Ceiling for this horizon is ${(c.spreadMax * 100).toFixed(0)}% of mid.">${pOrDash(c.spreadPct, 1)}${flagStr(c)}</td>
       <td>${c.openInterest == null ? '—' : fmtVol(c.openInterest)}</td>
       <td title="${c.ltcgEligible ? `Expiry is ${c.ltcgHeadroomDays}d past the 366-day long-term line, so holding to expiry could qualify.` : `Expiry is ${Math.abs(c.ltcgHeadroomDays)}d short of the 366-day line — a hold to expiry cannot qualify.`} A fact about the contract only: this app has no position data.">${c.ltcgEligible ? '✓' : '—'}</td>
-      <td>${alignChip(c.align, scored)}</td>
+      <td>${alignChip(c.align, scored, basis)}</td>
     </tr>${candDetail(c)}`).join('');
 
   return `<table class="prem-cands">
@@ -2858,7 +2867,7 @@ function longSingleTable(entry, scored) {
 }
 
 /** Lane C — debit verticals. Two legs, so a different column set. */
-function longVerticalTable(entry, scored) {
+function longVerticalTable(entry, scored, basis) {
   if (!entry.candidates.length) {
     return `<div class="prem-note">${esc(entry.reason || 'no pair of strikes prices a debit vertical here')}.</div>`;
   }
@@ -2883,7 +2892,7 @@ function longVerticalTable(entry, scored) {
       ${edollarCell(c)}
       <td>${pOrDash(c.spreadPct, 1)}${flagStr(c)}</td>
       <td>${c.openInterest == null ? '—' : fmtVol(c.openInterest)}</td>
-      <td>${alignChip(c.align, scored)}</td>
+      <td>${alignChip(c.align, scored, basis)}</td>
     </tr>${candDetail(c)}`).join('');
 
   return `<table class="prem-cands">
@@ -3006,6 +3015,8 @@ function longSummary(r, open) {
 function longDetail(r) {
   const em = r.expectedMove;
   const scored = !!r.directional?.affectsSort;
+  // The calibration basis travels with `scored` everywhere the tag renders.
+  const basis  = r.directional?.calibration?.basis || null;
 
   // Lane sections in order, each labelled with what it is and how it is sorted.
   const laneOrder = ['A', 'B', 'C', 'D'];
@@ -3029,9 +3040,9 @@ function longDetail(r) {
       // the exclusion is a fact about Yahoo's quote, not about the ticker.
       const outliers = entry.ivOutlierNote
         ? `<div class="prem-note">${esc(entry.ivOutlierNote)}</div>` : '';
-      return head + (lane === 'C' ? longVerticalTable(entry, scored)
+      return head + (lane === 'C' ? longVerticalTable(entry, scored, basis)
                    : lane === 'D' ? longCalendarTable(entry)
-                   : longSingleTable(entry, scored)) + outliers;
+                   : longSingleTable(entry, scored, basis)) + outliers;
     }).join('');
     return `<div class="long-lane">
       <div class="long-lane-head"><span class="long-lane-title">${esc(title)}</span><span class="long-lane-sub">${esc(sub)}</span></div>
@@ -3158,19 +3169,48 @@ function renderLong(data) {
    * exactly the unearned number this section exists to prevent. Never render a
    * hit rate without checking it is a number. */
   const cal = rows.map(r => r.directional?.calibration).find(c => c && c.n != null);
+
+  /* THE BASIS MUST BE RENDERED WHEREVER THE NUMBERS ARE. A pooled hit rate shown
+     as if it were this ticker's own is the same class of error as substituting an
+     HV percentile for IV rank: plausible, indistinguishable on screen, and wrong
+     about which question it answers. Never print a hit rate from this block
+     without the basis phrase attached. */
+  const basisPhrase = !cal ? '' : cal.basis === 'pooled'
+    ? `<b>POOLED across ${cal.pooledN} resolved calls on every logged ticker</b> — this ticker has only
+       ${cal.tickerN} of ${cal.minN} of its own, so what follows describes the model's <i>average</i>
+       behaviour, not this ticker's`
+    : cal.basis === 'ticker'
+      ? `<b>this ticker's own record</b>, ${cal.tickerN} resolved calls`
+      : '';
+
+  /* The magnitude-scored outcome sits BESIDE the sign-scored one, never instead
+     of it. "Went the right way" and "went far enough to pay a long option" are
+     different questions, and the gap between them is the reason both are shown. */
+  const magLine = !cal ? ''
+    : cal.magnitudeHitRate != null && cal.magnitudeBarPct != null
+      ? ` Scored on <b>magnitude</b> instead — did it move at least ${cal.magnitudeBarPct.toFixed(1)}%,
+          the median 20-session move for the name — that same rating hits
+          <b>${(cal.magnitudeHitRate * 100).toFixed(0)}%</b>. A long option needs the second number, not the
+          first: "went up at all" does not pay a debit.`
+      : cal.magnitudeReason
+        ? ` Magnitude scoring — did it move far enough to pay, not merely the right way — is unresolved:
+            ${esc(cal.magnitudeReason)}`
+        : '';
+
   const calLine = !cal ? ''
     : cal.reason
-      ? `<b>Directional tags are shown but do not reorder anything.</b> The watchlist rating behind them has
-         ${cal.n} of ${cal.minN} recommendations with a resolved 20-session outcome, so its hit rate is
-         unresolved — there is no measured accuracy to attach to the tag, and none is implied.`
+      ? `<b>Directional tags are shown but do not reorder anything.</b> ${esc(cal.basisReason || '')}
+         There is no measured accuracy to attach to the tag, and none is implied.`
       : cal.hitRate == null
-        ? `Directional tags are shown for the tickers that have a stored watchlist rating. ${cal.n} recommendations
-           have a resolved 20-session outcome${cal.brier != null ? `, Brier ${cal.brier.toFixed(3)}` : ''}, but no
-           per-rating hit rate applies to the row this was read from — so none is shown rather than a placeholder.`
-        : `Directional tags come from the same watchlist rating scored in the Recommendation History card:
-           hit rate ${(cal.hitRate * 100).toFixed(0)}% over n=${cal.n} resolved calls${
-             cal.brier != null ? `, Brier ${cal.brier.toFixed(3)}` : ''}. <b>counter</b> candidates are demoted below
-           the rest within a lane — never removed, still fully priced.`;
+        ? `Directional tags are shown for the tickers that have a stored watchlist rating — ${basisPhrase}${
+             cal.brier != null ? `, Brier ${cal.brier.toFixed(3)}` : ''}. No per-rating hit rate applies to the
+           row this was read from, so none is shown rather than a placeholder.`
+        : `Directional tags come from the same watchlist rating scored in the Recommendation History card,
+           measured against ${basisPhrase}: hit rate <b>${(cal.hitRate * 100).toFixed(0)}%</b> on the
+           sign-scored test (did fwd20 go the right way)${
+             cal.brier != null ? `, Brier ${cal.brier.toFixed(3)}` : ''}.${magLine}
+           <b>counter</b> candidates are demoted below the rest within a lane — never removed, still fully
+           priced.${cal.basis === 'pooled' && cal.pooledAsOf ? ` Pooled record as of ${esc(cal.pooledAsOf)}.` : ''}`;
 
   const legend = `<div class="prem-legend">
     <b>Rows load on demand — expand one to fetch it.</b> One ticker per request (~5 chain fetches when this

@@ -66,6 +66,11 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #                         Banked by the 2:00pm PT sweep, 7d TTL, ~60 KB/ticker.
 #                         Sorted [return, startIdx] PAIRS — schema 2; the reader
 #                         treats any other schema as ABSENT and recomputes.
+#   calib:pooled        — pooled recommendation calibration across every rec: key.
+#                         The basis used when a ticker has fewer than
+#                         REC_CALIB_MIN_N resolved outcomes of its own. No TTL;
+#                         rewritten daily by fillForwardReturns(), which already
+#                         performs the rec: scan it needs.
 #   movesweep:last      — PT date of the last move-series sweep (dedup). Outside
 #                         the `moves:` prefix so nothing scanning that prefix
 #                         picks it up as a ticker.

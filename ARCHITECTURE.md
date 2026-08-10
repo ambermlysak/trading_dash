@@ -624,17 +624,29 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    over 8 tickers. The first stored-`moves:` sweep is the point to re-derive it
    across all 22 names and confirm the storage round-trip has not shifted it.
 
-8. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
+8. **Per-rating sample floor on calibration — a live defect, found not fixed.**
+   `recCalibration()` gates on the TOTAL resolved count (`REC_CALIB_MIN_N` = 10),
+   but `hitRate` is computed **per rating**. A ticker can clear the floor overall
+   while a rating cell rests on one observation. Real example, 2026-08-10: PLTR has
+   32 resolved entries so calibration reports as resolved, but **31 are HOLD** —
+   which is excluded from hit rate by design — leaving **BUY n = 1**, and the card
+   renders a confident **100% hit rate from a single call**. This is honesty rule 22
+   in a new place: two states are modelled (resolved / unresolved) where there are
+   three, and the third renders identically to a real measurement. The fix is a
+   per-rating minimum with its own reason string, not a change to
+   `REC_CALIB_MIN_N`. Pooled basis is unaffected (BUY n = 112).
+
+9. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
    Lightweight Charts supports custom drawings; recognition would be rules-based
    code or a Claude vision call against a chart screenshot.
 
-9. **Backfill of recommendation history.** The forward log only grows from first
+10. **Backfill of recommendation history.** The forward log only grows from first
    use. RSI/MACD/Bollinger/analyst inputs are all reproducible from Yahoo history,
    so a replay script could synthesise "what would the model have said on date X".
    Roughly 100 lines of Node, and it would make the calibration card useful
    immediately rather than after 10 resolved entries.
 
-10. **Two `setBadge()` implementations.** `index.html` and `dashboard.html` each
+11. **Two `setBadge()` implementations.** `index.html` and `dashboard.html` each
    carry one, byte-for-byte equivalent. No build step and no module system, so the
    alternatives were duplication or a third HTTP request. If a bundler ever
    arrives, unify these first — they are the most drift-prone duplication left.

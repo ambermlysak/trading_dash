@@ -6,7 +6,7 @@
  * function or workerd refuses to boot). Nothing asserts silently: every number is
  * printed against its expected value with the deviation.
  *
- * ELEVEN sections. The thing being verified is not just "is the arithmetic right"
+ * TWELVE sections. The thing being verified is not just "is the arithmetic right"
  * but "is this the right quantity, in the right units, measuring what it claims":
  *
  *   1. Coverage vs BRUTE FORCE over the raw closes. The shipped path sorts the
@@ -44,6 +44,11 @@
  *      implies sorted1y === null. The branch was removed as a false statement
  *      about the code; this section is what covers the invariant if the horizon
  *      set or window definitions ever diverge.
+ *   12. THE MAGNITUDE BAR behind the recommendation calibration's second,
+ *      magnitude-scored outcome: the fraction->percent conversion (fwd20 is
+ *      PERCENT, move returns are FRACTIONS), that direction is retained so a BUY
+ *      that collapsed is not scored as a hit, and that the sign-scored figure is
+ *      unaffected by whether a bar exists.
  */
 import fs from 'fs';
 
@@ -73,10 +78,12 @@ const M = new Function(
     grab('moveWindows'), grab('lowerBound'), grab('upperBound'), grab('coverageAt'),
     grab('snapHorizon'), grab('buildMoveSeries'), grab('terminalValue'), grab('payoffAt'),
     grab('capitalOf'), grab('maxGainOf'), grab('expectancyFrom'),
+    grabConst('REC_CALIB_MIN_N'), grab('medianAbsMovePct'), grab('recCalibration'),
   ].join('\n') +
   '\nreturn { moveWindows, coverageAt, snapHorizon, buildMoveSeries, terminalValue, payoffAt,'
   + ' capitalOf, maxGainOf, expectancyFrom, MOVES_HORIZONS, COVERAGE_MIN_INDEPENDENT,'
-  + ' EPISODE_CONCENTRATION_WARN, SESSIONS_PER_YEAR, MOVES_1Y_SESSIONS };',
+  + ' EPISODE_CONCENTRATION_WARN, SESSIONS_PER_YEAR, MOVES_1Y_SESSIONS,'
+  + ' medianAbsMovePct, recCalibration, REC_CALIB_MIN_N };',
 )();
 
 let fails = 0;
@@ -602,6 +609,69 @@ console.log('   code; THIS is what covers the invariant if the definitions ever 
   if (!covOk) fails++;
   console.log(`     ${covOk ? 'ok  ' : 'FAIL'} coverage1y resolves at ${cov1yLive} of ${M.MOVES_HORIZONS.length} horizons `
     + `on a 756-session series — the 1y COLUMN is live, only the 1y EXPECTANCY path was dead.`);
+}
+
+console.log('\n══ 12. THE MAGNITUDE BAR — units, direction, and the null path ══');
+console.log('   `fwd20` is PERCENT (5.23). `moves` returns are FRACTIONS (0.0523).');
+console.log('   medianAbsMovePct converts, and that conversion is the single most likely');
+console.log('   place for this to go silently wrong — a 100x error here would move every');
+console.log('   magnitude hit rate to 0% or 100% while looking entirely plausible.\n');
+{
+  // A series whose 20-session absolute moves have a known median.
+  const closes = synthCloses(760);
+  const built = M.buildMoveSeries('BAR', closes, '2026-08-07');
+  const bar = M.medianAbsMovePct(built, 20);
+
+  // Independent reference: recompute from the raw closes, no shared code.
+  const absMoves = [];
+  for (let i = 0; i + 20 < closes.length; i++) absMoves.push(Math.abs(closes[i + 20] / closes[i] - 1));
+  absMoves.sort((a, b) => a - b);
+  const refFrac = absMoves.length % 2
+    ? absMoves[(absMoves.length - 1) / 2]
+    : (absMoves[absMoves.length / 2 - 1] + absMoves[absMoves.length / 2]) / 2;
+  row('median |20-session move|, PERCENT', bar, +(refFrac * 100).toFixed(3), 0.05);
+  console.log(`         reference fraction ${refFrac.toFixed(5)} -> percent ${(refFrac * 100).toFixed(3)}`);
+  const sane = bar > 0.5 && bar < 60;
+  if (!sane) fails++;
+  console.log(`  ${sane ? 'ok  ' : 'FAIL'}  magnitude sanity: ${bar}% is in the plausible 0.5–60% band `
+    + `(a fraction/percent slip lands at ${(bar / 100).toFixed(4)} or ${(bar * 100).toFixed(0)})`);
+
+  rowStr('  no series -> null, no fixed-percent stand-in', M.medianAbsMovePct(null, 20), null);
+  rowStr('  unsupported horizon -> null', M.medianAbsMovePct(built, 365), null);
+
+  console.log('\n   DIRECTION IS RETAINED. A BUY that collapsed is NOT a magnitude hit —');
+  console.log('   a pure |fwd20| test would score it as one, which is not "far enough to pay".');
+  const entries = [
+    { rating: 'BUY', fwd20:  20, confidence: 70 },   // up and far      -> hit
+    { rating: 'BUY', fwd20: -20, confidence: 70 },   // far but DOWN    -> miss
+    { rating: 'BUY', fwd20:   2, confidence: 70 },   // up but small    -> miss (sign-scored hit)
+    { rating: 'BUY', fwd20:  15, confidence: 70 },   // up and far      -> hit
+    { rating: 'SELL', fwd20: -20, confidence: 70 },  // down and far    -> hit
+    { rating: 'SELL', fwd20:  20, confidence: 70 },  // far but UP      -> miss
+    { rating: 'HOLD', fwd20:  30, confidence: 50 },
+    { rating: 'HOLD', fwd20: -30, confidence: 50 },
+    { rating: 'BUY', fwd20:   1, confidence: 70 },
+    { rating: 'BUY', fwd20:   3, confidence: 70 },
+  ];
+  const c = M.recCalibration(entries, { absThresholdPct: 10 });
+  console.log(`   bar = 10%, BUY rows = ${c.byRating.BUY.n}`);
+  // 6 BUY rows: +20, -20, +2, +15, +1, +3.
+  //   sign-scored  (fwd20 > 0)   -> +20, +2, +15, +1, +3        = 5/6
+  //   magnitude    (fwd20 >= 10) -> +20, +15                    = 2/6
+  row('   BUY sign-scored  (fwd20 > 0)', c.byRating.BUY.hitRate, +(5 / 6).toFixed(4), 1e-4);
+  row('   BUY magnitude    (fwd20 >= +10)', c.byRatingMagnitude.BUY.hitRate, +(2 / 6).toFixed(4), 1e-4);
+  row('   SELL magnitude   (fwd20 <= -10)', c.byRatingMagnitude.SELL.hitRate, 1 / 2, 1e-9);
+  rowStr('   HOLD magnitude stays null (no directional claim)', c.byRatingMagnitude.HOLD.hitRate, null);
+  console.log('   -> the BUY that fell 20% is excluded from BOTH, as it must be.');
+
+  console.log('\n   SIGN-SCORED IS UNAFFECTED BY THE BAR — the two are reported side by side,');
+  console.log('   never one instead of the other.');
+  const noBar = M.recCalibration(entries);
+  row('   BUY sign-scored without a bar', noBar.byRating.BUY.hitRate, c.byRating.BUY.hitRate, 1e-9);
+  rowStr('   magnitude table null without a bar', noBar.byRatingMagnitude, null);
+  const hasReason = typeof noBar.magnitudeReason === 'string' && noBar.magnitudeReason.length > 0;
+  if (!hasReason) fails++;
+  console.log(`   ${hasReason ? 'ok  ' : 'FAIL'} and it carries a reason: ${noBar.magnitudeReason}`);
 }
 
 console.log(`\n${fails === 0 ? 'ALL CHECKS PASSED' : fails + ' CHECK(S) FAILED'}\n`);
