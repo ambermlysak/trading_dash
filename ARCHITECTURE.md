@@ -379,6 +379,50 @@ Any change to `MOVES_1Y_SESSIONS`, the slicing, `MOVES_HORIZONS`, or the
 independence rule must re-derive the suffix argument above. The check in §11 will
 catch a divergence, but it will report it as a failure, not fix it.
 
+## Decision: the alignment tag does not reorder, and why
+
+The Long tab's directional alignment tag renders and has **no sort influence**.
+`affectsSort` is false everywhere. This is a **data-driven disable, not dead code**
+— the machinery is intact and lights up again if the measurement changes.
+
+Measured 2026-08-10 across the whole recommendation log (63 `rec:` keys, 290
+resolved outcomes), against the base rate for the same population and window:
+
+| outcome | rate | base rate | edge | n |
+|---|---|---|---|---|
+| sign-scored BUY (`fwd20 > 0`) | 53.3% | 61.4% | **−8.1 pts** | 75 |
+| magnitude-scored BUY (`fwd20 ≥ median abs move`) | 17.3% | 34.3% | **−16.9 pts** | 75 |
+
+53.3% reads as a coin flip. It is a **negative edge**: these names drifted up, so
+`P(fwd20 > 0)` over the same 20-session windows is 61.4%, and the rating
+underperformed simply being long. The magnitude test — the one that actually
+matters for buying options, since "went up at all" does not pay a debit — is worse.
+
+**Both outcomes score below their benchmark, so any sort influence would reorder
+candidates on a measured non-edge.** That is worse than reordering on nothing: the
+ordering carries an implicit claim the data contradicts. The re-enable condition is
+`edgePts > 0` on the cell in use — a rate that *beats* its base rate on a population
+clearing both floors — not a rate that merely exists.
+
+**The caveats matter as much as the figures**, and are recorded verbatim:
+
+> n=76 is small; the base rate is computed over a 3y window overlapping the period
+> the recommendations were made, so it isn't clean out-of-sample; the watchlist is
+> survivor-biased upward, which inflates base rates and makes the signal look
+> worse; and 173 of 290 entries are HOLD, which is excluded — so the measured
+> signal is thin.
+
+(The n in those caveats was 76 at the time of the analysis; the shipped
+same-population computation puts it at 75. Nothing else changes.)
+
+Two floors guard the figures behind this. `REC_CALIB_MIN_N` (10) gates the total
+resolved count; **`REC_RATING_MIN_N` (10) gates each rating's own cell**, because a
+ticker can clear the total while a rating rests on one observation — PLTR had 32
+resolved entries of which 31 were HOLD, leaving BUY n=1 and a card rendering a
+confident **100%**. AAPL (n=2), AMD (n=1) and CAVA (n=1) did the same, and the
+pooled record added a SELL cell at n=4. All are now null with a reason naming the
+count.
+
 ## Section-by-section data source map
 
 **Everything on both pages runs on real data.** There are no mock generators left
@@ -624,17 +668,12 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    over 8 tickers. The first stored-`moves:` sweep is the point to re-derive it
    across all 22 names and confirm the storage round-trip has not shifted it.
 
-8. **Per-rating sample floor on calibration — a live defect, found not fixed.**
-   `recCalibration()` gates on the TOTAL resolved count (`REC_CALIB_MIN_N` = 10),
-   but `hitRate` is computed **per rating**. A ticker can clear the floor overall
-   while a rating cell rests on one observation. Real example, 2026-08-10: PLTR has
-   32 resolved entries so calibration reports as resolved, but **31 are HOLD** —
-   which is excluded from hit rate by design — leaving **BUY n = 1**, and the card
-   renders a confident **100% hit rate from a single call**. This is honesty rule 22
-   in a new place: two states are modelled (resolved / unresolved) where there are
-   three, and the third renders identically to a real measurement. The fix is a
-   per-rating minimum with its own reason string, not a change to
-   `REC_CALIB_MIN_N`. Pooled basis is unaffected (BUY n = 112).
+8. **Base rates on `index.html`'s Recommendation History card.** The rule is that
+   no rate renders without its base rate, and it applies retroactively.
+   `/api/track/:ticker` now returns `baseRate` and `edgePts` on every cell, and the
+   per-rating floor already reaches that card — so the n=1 100% is fixed there. But
+   the card still renders only the raw rate. Surfacing the benchmark means touching
+   `index.html`, which is a separate commit.
 
 9. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
    Lightweight Charts supports custom drawings; recognition would be rules-based

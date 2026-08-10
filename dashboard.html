@@ -568,6 +568,9 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .cd-v { color: var(--ink-1); margin-right: 12px; }
 .cd-v.up { color: var(--bull); } .cd-v.dn { color: var(--bear); }
 .cd-note { color: var(--amber); cursor: help; }
+/* A rate rendered with no benchmark beside it. Should be rare — the rule is that
+   it does not go on screen at all — so it is marked rather than styled quietly. */
+.rate-nobase { color: var(--amber); font-style: italic; cursor: help; }
 /* The concentration flag. Always rendered WITH its label — see candDetail(). */
 .cd-flag { color: var(--amber); background: rgba(244,183,64,0.12); padding: 1px 6px;
   border-radius: 3px; margin-right: 12px; cursor: help; white-space: nowrap; }
@@ -2567,6 +2570,10 @@ function alignChip(align, scored, basis) {
   if (!align) return '';
   const cls = { aligned: 'aligned', counter: 'counter', neutral: 'neutral',
                 'no read': 'noread', 'out-of-horizon': 'horizon' }[align.tag] || 'noread';
+  /* `scored` is false everywhere right now — a data-driven disable, not a bug.
+     Neither the sign-scored nor the magnitude-scored hit rate beats its base
+     rate, so the tag renders and does not reorder. The `unscored` styling is the
+     honest signal for that; see the sort-disable note in the legend. */
   const unscored = (align.tag === 'aligned' || align.tag === 'counter') && !scored ? ' unscored' : '';
   /* `basis` rides into the hover so the chip itself cannot imply this ticker has
      its own track record when the number behind it is pooled. */
@@ -2575,7 +2582,7 @@ function alignChip(align, scored, basis) {
     : basis === 'ticker' ? ' — scored against this ticker\'s own resolved calls'
     : '';
   return `<span class="long-tag ${cls}${unscored}" title="${esc(align.reason || '')}${esc(basisNote)}${
-    unscored ? ' — the rating behind this tag has no resolved track record yet, so it does not reorder anything.' : ''
+    unscored ? ' — this tag does not reorder anything: the rating behind it does not beat the base rate for the same population, so it is shown but not ranked on.' : ''
   }">${esc(align.tag)}${basis === 'pooled' && (align.tag === 'aligned' || align.tag === 'counter') ? '<sup class="pooled-mark" title="pooled basis">ᵖ</sup>' : ''}</span>`;
 }
 
@@ -3186,16 +3193,50 @@ function renderLong(data) {
   /* The magnitude-scored outcome sits BESIDE the sign-scored one, never instead
      of it. "Went the right way" and "went far enough to pay a long option" are
      different questions, and the gap between them is the reason both are shown. */
+  /* NO RATE RENDERS WITHOUT ITS BASE RATE. A hit rate alone is unreadable: 53.9%
+     looks like a coin flip and is a negative edge against a 61.5% benchmark. Both
+     numbers and the signed edge go on screen together, or neither does. */
+  const rate = (r, base, edge) => {
+    if (r == null) return null;
+    const pct = v => (v * 100).toFixed(0) + '%';
+    if (!Number.isFinite(base)) {
+      return `<b>${pct(r)}</b> <span class="rate-nobase" title="No base rate could be computed for this
+        population, so this figure has no benchmark to be read against and must not be treated as an
+        edge.">(no base rate available — not readable as an edge)</span>`;
+    }
+    const sign = edge > 0 ? '+' : '';
+    return `<b>${pct(r)}</b> against a base rate of <b>${pct(base)}</b> —
+      <b class="${edge > 0 ? 'up' : 'dn'}">${sign}${edge.toFixed(1)} pts</b>`;
+  };
+
+  const signPhrase = !cal ? null : rate(cal.hitRate, cal.baseRate, cal.edgePts);
+  const magPhrase  = !cal ? null : rate(cal.magnitudeHitRate, cal.magnitudeBaseRate, cal.magnitudeEdgePts);
+
   const magLine = !cal ? ''
-    : cal.magnitudeHitRate != null && cal.magnitudeBarPct != null
-      ? ` Scored on <b>magnitude</b> instead — did it move at least ${cal.magnitudeBarPct.toFixed(1)}%,
-          the median 20-session move for the name — that same rating hits
-          <b>${(cal.magnitudeHitRate * 100).toFixed(0)}%</b>. A long option needs the second number, not the
-          first: "went up at all" does not pay a debit.`
-      : cal.magnitudeReason
-        ? ` Magnitude scoring — did it move far enough to pay, not merely the right way — is unresolved:
-            ${esc(cal.magnitudeReason)}`
-        : '';
+    : magPhrase
+      ? ` Scored on <b>magnitude</b> instead — did it move at least ${(cal.magnitudeBarPct ?? 0).toFixed(1)}%,
+          the median 20-session move for the name — that same rating hits ${magPhrase} over
+          n=${cal.magnitudeN}. A long option needs the second number, not the first: "went up at all" does
+          not pay a debit.`
+      : cal.magnitudeHitRateReason
+        ? ` Magnitude scoring is not published for this rating: ${esc(cal.magnitudeHitRateReason)}`
+        : cal.magnitudeReason
+          ? ` Magnitude scoring — did it move far enough to pay, not merely the right way — is unresolved:
+              ${esc(cal.magnitudeReason)}`
+          : '';
+
+  /* THE SORT DISABLE IS STATED IN VISIBLE TEXT, NOT A LEGEND, WITH BOTH NUMBERS.
+     A tag that silently stopped reordering would look like a bug; a tag that
+     reorders on a negative edge is worse. */
+  const sortLine = !cal ? ''
+    : ` <b>These tags do not reorder anything, and that is a measured decision rather than a missing
+        feature.</b> ${signPhrase
+          ? `The rating's hit rate does not beat the base rate for the same population and window —
+             ${signPhrase}${magPhrase ? `, and on the magnitude test ${magPhrase}` : ''} — so the tag is
+             shown and is not used for ranking.`
+          : `No hit rate clears the ${cal.ratingMinN ?? 10}-outcome floor for this rating, so there is no
+             measured accuracy to rank on.`}
+        It will rank again if a rate ever beats its benchmark.`;
 
   const calLine = !cal ? ''
     : cal.reason
@@ -3203,14 +3244,12 @@ function renderLong(data) {
          There is no measured accuracy to attach to the tag, and none is implied.`
       : cal.hitRate == null
         ? `Directional tags are shown for the tickers that have a stored watchlist rating — ${basisPhrase}${
-             cal.brier != null ? `, Brier ${cal.brier.toFixed(3)}` : ''}. No per-rating hit rate applies to the
-           row this was read from, so none is shown rather than a placeholder.`
+             cal.brier != null ? `, Brier ${cal.brier.toFixed(3)}` : ''}.${
+             cal.hitRateReason ? ` No hit rate is published for this rating: ${esc(cal.hitRateReason)}` : ''}${magLine}${sortLine}`
         : `Directional tags come from the same watchlist rating scored in the Recommendation History card,
-           measured against ${basisPhrase}: hit rate <b>${(cal.hitRate * 100).toFixed(0)}%</b> on the
-           sign-scored test (did fwd20 go the right way)${
-             cal.brier != null ? `, Brier ${cal.brier.toFixed(3)}` : ''}.${magLine}
-           <b>counter</b> candidates are demoted below the rest within a lane — never removed, still fully
-           priced.${cal.basis === 'pooled' && cal.pooledAsOf ? ` Pooled record as of ${esc(cal.pooledAsOf)}.` : ''}`;
+           measured against ${basisPhrase}. On the sign-scored test (did fwd20 go the right way) it hits
+           ${signPhrase} over n=${cal.hitRateN}${
+             cal.brier != null ? `, Brier ${cal.brier.toFixed(3)}` : ''}.${magLine}${sortLine}`;
 
   const legend = `<div class="prem-legend">
     <b>Rows load on demand — expand one to fetch it.</b> One ticker per request (~5 chain fetches when this

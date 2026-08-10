@@ -1724,6 +1724,53 @@ Kill background processes when a task completes. Don't leave wrangler dev, wrang
 
 Add a "Verification standard" section to CLAUDE.md:
 
+## No hit rate goes on screen without its base rate
+
+**Any hit rate, win rate or accuracy figure must be reported against the base rate
+for the same population and the same window, or it does not render at all.** Not in
+a tooltip, not in a legend — beside the number, with the signed difference.
+
+A rate on its own is unreadable, and it is worse than unreadable when it looks
+fine. Measured 2026-08-10 on the recommendation log:
+
+| outcome | rate | base rate | edge |
+|---|---|---|---|
+| sign-scored BUY (`fwd20 > 0`) | 53.3% | **61.4%** | **−8.1 pts** |
+| magnitude-scored BUY | 17.3% | **34.3%** | **−16.9 pts** |
+
+Both over the same 75 benchmarked BUY outcomes. 53.3% reads as a coin flip — an unremarkable, believable number. It is in fact a
+**negative edge**: these names drifted up, so `P(fwd20 > 0)` over the same 20-session
+windows is 61.5%, and the rating *underperformed simply being long*. Nothing about
+the figure 53.9% reveals that. The benchmark is not context for the number; without
+it there is no number.
+
+The base rate must be **direction-matched and population-matched**: a BUY is scored
+on upside so its benchmark is `P(r ≥ threshold)` on the same underlying and horizon,
+a SELL on downside. For a pooled figure it is entry-weighted across the contributing
+tickers, because each entry carries its own name's benchmark.
+
+**Population-matched is not a formality, and it was got wrong on the first pass.**
+Not every logged entry has a stored move series — the sweep covers the watchlist,
+the log covers every ticker ever browsed. The first version took the rate over all
+**112** BUY outcomes and the benchmark over the **75** with a series, printing
+**48.2% against 61.4%** as though the two described the same thing. On the matched
+population the rate is **53.3%** — a 5-point difference produced entirely by the
+mismatch, in the direction that exaggerates the deficit. `cell()` now restricts
+BOTH to the benchmarked rows and reports `n` and `benchmarkedN` separately, so the
+shrinkage is visible rather than silent. `baseRatesFrom()` and
+the `cell()` helper in `recCalibration()` do this; every rate cell ships `baseRate`
+and `edgePts` alongside `hitRate`.
+
+**This applies retroactively.** Anything already rendering a rate is in scope. Known
+outstanding: `index.html`'s Recommendation History card renders raw hit rates —
+`/api/track/:ticker` now returns `baseRate`/`edgePts`, but surfacing them there is
+still to do.
+
+**A rate below its base rate must never drive ranking, sizing or selection.** It is
+not a weak signal, it is a signal pointing the wrong way, and ordering on it makes a
+claim the data contradicts. The Long tab's alignment tag is disabled on exactly this
+basis — see `directionalRead()`.
+
 ## A single negative probe right after a deploy is UNCONFIRMED, not a failure
 
 **Re-probe after ~60 seconds before acting on it.** For roughly a minute after

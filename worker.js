@@ -3361,8 +3361,12 @@ async function directionalRead(sym, env, moves = null) {
   } catch (_) {}
 
   const rating = ['BUY', 'HOLD', 'SELL'].includes(a?.rating) ? a.rating : null;
-  // Same magnitude bar the pooled record uses, from the series already in hand.
-  const own    = recCalibration(entries, { absThresholdPct: medianAbsMovePct(moves, 20) });
+  // Same bar and base rates the pooled record uses, from the series already in hand.
+  const ownRates = baseRatesFrom(moves, 20);
+  const ownMap   = ownRates ? new Map([[sym.toUpperCase(), ownRates]]) : new Map();
+  const own      = recCalibration(entries, {
+    statsFor: e => statsForEntry({ ...e, ticker: e.ticker || sym }, ownMap),
+  });
 
   /* TRI-STATE BASIS, the same shape as sellableFrom(): 'ticker' | 'pooled' |
      'none'. This ticker's own record wins when it clears the floor; the pooled
@@ -3376,7 +3380,34 @@ async function directionalRead(sym, env, moves = null) {
   const usePooled = !useOwn && pooled && pooled.reason == null;
   const basis  = useOwn ? 'ticker' : usePooled ? 'pooled' : 'none';
   const source = useOwn ? own : usePooled ? pooled : null;
-  const scored = basis !== 'none';
+  const resolvedBasis = basis !== 'none';
+
+  /* ── SORT INFLUENCE IS DISABLED, AND THIS IS A DATA-DRIVEN DISABLE ──────────
+     NOT DEAD CODE. Do not delete this block by applying the rule that removed the
+     unreachable 1y fallback — that branch could never fire; this one is switched
+     off by a measurement and is meant to light up again if the measurement
+     changes. Everything below it still computes.
+
+     Measured 2026-08-10 over the whole recommendation log, against the BASE RATE
+     for the same population and window:
+
+       sign-scored BUY       53.3%   base 61.4%   edge  −8.1 pts
+       magnitude-scored BUY  17.3%   base 34.3%   edge −16.9 pts
+       (both over the same 75 benchmarked outcomes)
+
+     53.3% reads as a coin flip and is in fact a NEGATIVE edge: these names drifted
+     up, so being long unconditionally beat the rating. Both outcomes score below
+     their benchmark, so any sort influence would be reordering candidates on a
+     measured non-edge — which is worse than reordering on nothing, because the
+     ordering carries an implicit claim the data contradicts.
+
+     The tag still renders. It just does not reorder. To re-enable, the condition
+     is a rate that BEATS its base rate on a population that clears both floors —
+     `edgePts > 0` on the cell in use — not a rate that merely exists. */
+  const cellFor = r => (source && r ? source.byRating?.[r] ?? null : null);
+  const liveCell = cellFor(rating);
+  const hasEdge  = Number.isFinite(liveCell?.edgePts) && liveCell.edgePts > 0;
+  const scored   = false;   // ← the disable. See above before changing.
 
   const basisReason = basis === 'ticker'
     ? `${own.n} resolved outcomes for ${sym} — this ticker's own record`
@@ -3393,21 +3424,44 @@ async function directionalRead(sym, env, moves = null) {
     confidence: Number.isFinite(a?.confidence) ? a.confidence : null,
     calibration: {
       basis, basisReason,
-      n:     source ? source.n : own.n,
+      n:       source ? source.n : own.n,
       tickerN: own.n,
       pooledN: pooled?.n ?? null,
-      minN:  own.minN,
-      reason: scored ? null : basisReason,
-      hitRate: scored && rating ? source.byRating?.[rating]?.hitRate ?? null : null,
-      brier:   source ? source.brier : null,
-      // The magnitude-scored outcome, reported ALONGSIDE the sign-scored hit rate
-      // above. Null with a reason until a move series exists to derive a bar from.
-      magnitudeHitRate: scored && rating
-        ? source.byRatingMagnitude?.[rating]?.hitRate ?? null : null,
-      magnitudeBarPct:  scored && rating
-        ? source.byRatingMagnitude?.[rating]?.barPct ?? null : null,
-      magnitudeReason:  source ? source.magnitudeReason : null,
+      minN:       own.minN,
+      ratingMinN: own.ratingMinN,
+      reason: resolvedBasis ? null : basisReason,
+      /* EVERY RATE SHIPS WITH ITS BASE RATE AND EDGE. Nothing renders a hit rate
+         without them — a rate alone is unreadable, which is the whole finding
+         behind the sort disable above. `hitRateReason` says why a rate is null:
+         HOLD makes no claim, or the per-rating floor was not met. */
+      hitRate:       liveCell?.hitRate ?? null,
+      hitRateReason: liveCell?.hitRateReason ?? null,
+      // The count the rate was actually computed over — the BENCHMARKED rows, not
+      // all rows. Rendering `n` beside a rate computed on a subset would reprint
+      // the population mismatch the cell() fix removed. `hitRateNAll` carries the
+      // wider count so the shrinkage stays visible.
+      hitRateN:      liveCell?.benchmarkedN ?? null,
+      hitRateNAll:   liveCell?.n ?? null,
+      baseRate:      liveCell?.baseRate ?? null,
+      edgePts:       liveCell?.edgePts ?? null,
+      brier:         source ? source.brier : null,
+      // The magnitude-scored outcome, ALONGSIDE the sign-scored one above — never
+      // instead of it. Null with a reason until a move series exists for the bar.
+      magnitudeHitRate:   rating ? source?.byRatingMagnitude?.[rating]?.hitRate ?? null : null,
+      magnitudeHitRateReason: rating ? source?.byRatingMagnitude?.[rating]?.hitRateReason ?? null : null,
+      // Benchmarked count again, for the same reason as `hitRateN` above.
+      magnitudeN:         rating ? source?.byRatingMagnitude?.[rating]?.benchmarkedN ?? null : null,
+      magnitudeNAll:      rating ? source?.byRatingMagnitude?.[rating]?.n ?? null : null,
+      magnitudeBarPct:    rating ? source?.byRatingMagnitude?.[rating]?.barPct ?? null : null,
+      magnitudeBaseRate:  rating ? source?.byRatingMagnitude?.[rating]?.baseRate ?? null : null,
+      magnitudeEdgePts:   rating ? source?.byRatingMagnitude?.[rating]?.edgePts ?? null : null,
+      magnitudeReason:    source ? source.magnitudeReason : null,
       pooledAsOf: pooled?.d ?? null,
+      // Why the tag does not reorder. Carried as data so the card can name both
+      // numbers inline rather than deferring to a legend.
+      sortDisabled: true,
+      sortDisabledEdge: liveCell?.edgePts ?? null,
+      sortWouldQualify: hasEdge,
     },
     affectsSort: scored,
   };
@@ -5714,6 +5768,24 @@ const REC_FWD_HORIZONS = [
 ];
 const REC_CALIB_MIN_N = 10;
 
+/* PER-RATING floor, deliberately a SEPARATE constant from REC_CALIB_MIN_N even
+   though it currently holds the same value. `REC_CALIB_MIN_N` gates the TOTAL
+   resolved count; `hitRate` is computed per RATING, and a ticker can clear the
+   total while a rating cell rests on one observation.
+
+   That is not hypothetical. Measured 2026-08-10 across the whole log: PLTR had 32
+   resolved entries so calibration reported as resolved — but 31 were HOLD, which
+   is excluded from hit rate by design, leaving BUY n=1 and a card rendering a
+   confident 100%. AAPL (n=2), AMD (n=1) and CAVA (n=1) did the same. The pooled
+   record introduced a fourth instance at SELL n=4.
+
+   A confident 100% from one call is the most trustworthy-LOOKING number on the
+   card and the least trustworthy — strictly worse than a null, because a null
+   invites a second look and a percentage does not. Below this floor the rating's
+   hit rate is null with a reason naming the actual count. Same floor, same
+   treatment, for the magnitude-scored rate. */
+const REC_RATING_MIN_N = 10;
+
 async function handleLogRec(request, env, origin) {
   if (!env.REC_LOG) return err('REC_LOG KV not bound', 500, origin);
   const body = await request.json();
@@ -5778,6 +5850,45 @@ function medianAbsMovePct(moves, horizon = 20) {
 }
 
 /**
+ * BASE RATES — the benchmark without which a hit rate is unreadable.
+ *
+ * Over the same underlying and the same 20-session window set, how often does the
+ * outcome happen ANYWAY, with no signal involved? A signal with no edge scores its
+ * base rate; above is edge, below is worse than no signal at all.
+ *
+ * This is not decoration. Measured 2026-08-10, the BUY rating's sign-scored hit
+ * rate of 53.3% reads as a coin flip and is in fact a **negative** edge against a
+ * base rate of 61.4% — these names drifted up, so being long unconditionally beat
+ * the rating. No amount of staring at "53.9%" reveals that.
+ *
+ * Direction-matched to the rating: a BUY is scored on upside, a SELL on downside,
+ * so the benchmark has to be too. HOLD makes no directional claim and gets none.
+ */
+function baseRatesFrom(moves, horizon = 20) {
+  const arr = moves?.horizons?.[String(horizon)]?.sorted3y;
+  if (!Array.isArray(arr) || !arr.length) return null;
+  const barPct = medianAbsMovePct(moves, horizon);
+  if (!Number.isFinite(barPct)) return null;
+  const f = barPct / 100;
+  return {
+    barPct,
+    BUY:  { sign: coverageAt(arr, 0, 'up'),   magnitude: coverageAt(arr,  f, 'up')   },
+    SELL: { sign: coverageAt(arr, 0, 'down'), magnitude: coverageAt(arr, -f, 'down') },
+    HOLD: { sign: null, magnitude: null },
+  };
+}
+
+/** Per-entry stats for `recCalibration`, direction-matched to that entry's rating.
+ *  `ratesByTicker` lets the pooled record use each ticker's OWN bar and base rate
+ *  rather than one blended figure across names with wildly different vol. */
+function statsForEntry(e, ratesByTicker) {
+  const rates = ratesByTicker.get(String(e.ticker || '').toUpperCase());
+  if (!rates) return null;
+  const side = rates[e.rating] || { sign: null, magnitude: null };
+  return { barPct: rates.barPct, signBase: side.sign, magBase: side.magnitude };
+}
+
+/**
  * Calibration over the resolved slice of a log.
  *
  * "Resolved" means fwd20 is filled — an entry logged nine sessions ago has no
@@ -5785,34 +5896,42 @@ function medianAbsMovePct(moves, horizon = 20) {
  * as nulls with a reason: a hit rate over four entries is noise wearing a
  * percentage sign, and it would read on screen exactly like a real one.
  *
- * `absThresholdPct` enables the SECOND, magnitude-scored outcome. It is reported
- * ALONGSIDE the sign-scored one and never replaces it — the gap between "went the
- * right way" and "went far enough to pay" is the point, and collapsing them into
- * one number would hide it.
+ * TWO FLOORS, and they gate different things. REC_CALIB_MIN_N gates the TOTAL
+ * resolved count. REC_RATING_MIN_N gates each RATING's own cell — a ticker can
+ * clear the total while a rating rests on one observation, which is how a
+ * confident 100% from n=1 shipped.
  *
- * Per-entry thresholds are supported via `thresholdFor(entry)` so the pooled
- * calibration can use each ticker's OWN median move rather than one blended bar
- * across names with wildly different vol.
+ * TWO OUTCOMES, reported side by side and never one instead of the other:
+ *   sign-scored      did fwd20 go the right way
+ *   magnitude-scored did it move at least a typical 20-session move for the name
+ * The gap between them is the point.
+ *
+ * EVERY RATE CARRIES ITS BASE RATE. A hit rate without the benchmark for the same
+ * population and window is unreadable — 53.9% looks like a coin flip and is a
+ * negative edge against 61.4%. `baseRate` and `edgePts` ride on every cell, and
+ * nothing renders a rate without them.
+ *
+ * `statsFor(entry)` supplies the per-entry bar and base rates, so the pooled
+ * record can use each ticker's OWN figures rather than one blended set across
+ * names with wildly different vol.
  */
-function recCalibration(list, { absThresholdPct = null, thresholdFor = null } = {}) {
+function recCalibration(list, { statsFor = null } = {}) {
   const resolved = list.filter(e => Number.isFinite(e.fwd20));
   const n = resolved.length;
 
   if (n < REC_CALIB_MIN_N) {
     return {
-      n, minN: REC_CALIB_MIN_N, brier: null, brierN: 0, byRating: null,
-      byRatingMagnitude: null,
+      n, minN: REC_CALIB_MIN_N, ratingMinN: REC_RATING_MIN_N,
+      brier: null, brierN: 0, byRating: null, byRatingMagnitude: null,
       magnitudeReason: `${n} of ${REC_CALIB_MIN_N} resolved — magnitude scoring needs the same floor`,
+      magnitudeN: 0,
       reason: `${n} of ${REC_CALIB_MIN_N} recommendations have a 20-session outcome. `
             + `Each entry needs 20 trading days to elapse before it resolves.`,
     };
   }
 
-  /* MAGNITUDE-SCORED OUTCOME. Same directional claim, higher bar: a BUY hits only
-     if the move was UP *and* at least a typical 20-session move for that name.
-     Direction is retained deliberately — a pure |fwd20| test would score a BUY
-     that collapsed 20% as a hit, which is not what "far enough to pay" means. */
-  const barFor = e => (thresholdFor ? thresholdFor(e) : absThresholdPct);
+  const st      = e => (statsFor ? statsFor(e) : null);
+  const barFor  = e => st(e)?.barPct ?? null;
   const withBar = resolved.filter(e => Number.isFinite(barFor(e)));
   const magnitudeReason = withBar.length === 0
     ? 'no stored move series to derive a magnitude bar from — the 2:00pm PT sweep banks one daily. '
@@ -5824,20 +5943,68 @@ function recCalibration(list, { absThresholdPct = null, thresholdFor = null } = 
   const mean = arr => arr.length
     ? +(arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(2)
     : null;
+  // Entry-weighted, because each entry carries its own ticker's benchmark.
+  const meanRate = vals => {
+    const v = vals.filter(Number.isFinite);
+    return v.length ? +(v.reduce((a, b) => a + b, 0) / v.length).toFixed(4) : null;
+  };
+
+  /* One cell.
+   *
+   * THE RATE AND ITS BASE RATE ARE COMPUTED OVER THE SAME ROWS. Not every entry
+   * has a stored move series behind it — the sweep covers the watchlist, the
+   * recommendation log covers every ticker ever browsed — so a rate taken over
+   * all rows and a benchmark taken over the subset with a series would be two
+   * different populations printed side by side as if comparable. That is the
+   * precise failure the base-rate rule exists to stop, so the cell restricts BOTH
+   * to the benchmarked rows and reports `n` (all) and `benchmarkedN` separately,
+   * making the shrinkage visible instead of silent.
+   *
+   * Three distinct null states, which must not collapse into one another:
+   *   HOLD          makes no directional claim, so no outcome counts as right
+   *   no rows       nothing resolved for this rating at all
+   *   below floor   too few to publish, and the reason names the count
+   */
+  const cell = (rating, rows, hitFn, baseOf, extra = {}) => {
+    const benched = rows.filter(e => Number.isFinite(baseOf(e)));
+    const isHold  = rating === 'HOLD';
+    const short   = benched.length < REC_RATING_MIN_N;
+    const hits    = (isHold || !benched.length) ? null : benched.filter(hitFn).length;
+    const rate    = (hits == null || short) ? null : +(hits / benched.length).toFixed(4);
+    const baseRate = benched.length ? meanRate(benched.map(baseOf)) : null;
+    return {
+      n: rows.length,
+      benchmarkedN: benched.length,
+      hitRate: rate,
+      hitRateReason: isHold
+        ? 'HOLD makes no directional claim, so no outcome counts as right'
+        : rows.length === 0
+          ? 'no resolved outcomes for this rating'
+          : benched.length === 0
+            ? `${rows.length} resolved outcome${rows.length === 1 ? '' : 's'}, but none has a stored move `
+              + `series to benchmark against — a rate with no base rate is not published`
+            : short
+              ? `${benched.length} of ${REC_RATING_MIN_N} benchmarked outcomes for this rating — too few to `
+                + `publish a rate. A hit rate over ${benched.length} call${benched.length === 1 ? '' : 's'} `
+                + `is noise wearing a percentage sign.`
+              : null,
+      // The benchmark travels with the rate, always, over the same rows.
+      baseRate,
+      edgePts: (rate != null && Number.isFinite(baseRate))
+        ? +((rate - baseRate) * 100).toFixed(1) : null,
+      ...extra,
+    };
+  };
 
   const byRating = {};
   for (const r of ['BUY', 'HOLD', 'SELL']) {
     const rows = resolved.filter(e => e.rating === r);
-    // HOLD is excluded from hit rate by design: it makes no directional claim,
-    // so there is no outcome that would count as right.
-    const hits = (r === 'HOLD' || !rows.length) ? null
-      : rows.filter(e => r === 'BUY' ? e.fwd20 > 0 : e.fwd20 < 0).length;
-    byRating[r] = {
-      n:         rows.length,
-      hitRate:   hits == null ? null : +(hits / rows.length).toFixed(4),
-      meanFwd5:  mean(rows.filter(e => Number.isFinite(e.fwd5)).map(e => e.fwd5)),
-      meanFwd20: mean(rows.map(e => e.fwd20)),
-    };
+    byRating[r] = cell(r, rows,
+      e => (r === 'BUY' ? e.fwd20 > 0 : e.fwd20 < 0),
+      e => st(e)?.signBase ?? null, {
+        meanFwd5:  mean(rows.filter(e => Number.isFinite(e.fwd5)).map(e => e.fwd5)),
+        meanFwd20: mean(rows.map(e => e.fwd20)),
+      });
   }
 
   // Brier scores the confidence number against the directional outcome, so it
@@ -5853,30 +6020,26 @@ function recCalibration(list, { absThresholdPct = null, thresholdFor = null } = 
       }, 0) / scored.length).toFixed(4)
     : null;
 
-  /* The magnitude table, built over the same rows but only those with a bar.
-     `barPct` is reported per rating so the number the hit was scored against is
-     visible rather than implied. */
   let byRatingMagnitude = null;
   if (!magnitudeReason) {
     byRatingMagnitude = {};
     for (const r of ['BUY', 'HOLD', 'SELL']) {
       const rows = withBar.filter(e => e.rating === r);
-      const hits = (r === 'HOLD' || !rows.length) ? null
-        : rows.filter(e => r === 'BUY' ? e.fwd20 >= barFor(e) : e.fwd20 <= -barFor(e)).length;
       const bars = rows.map(e => barFor(e)).filter(Number.isFinite).sort((a, b) => a - b);
-      byRatingMagnitude[r] = {
-        n:       rows.length,
-        hitRate: hits == null ? null : +(hits / rows.length).toFixed(4),
-        // Median of the per-entry bars actually applied — one number cannot
-        // describe a pooled set spanning several tickers, so this is explicitly
-        // the median bar, not "the" bar.
-        barPct:  bars.length ? +bars[Math.floor(bars.length / 2)].toFixed(2) : null,
-      };
+      byRatingMagnitude[r] = cell(r, rows,
+        e => (r === 'BUY' ? e.fwd20 >= barFor(e) : e.fwd20 <= -barFor(e)),
+        e => st(e)?.magBase ?? null, {
+          // Median of the per-entry bars actually applied — one number cannot
+          // describe a pooled set spanning several tickers, so this is explicitly
+          // the median bar, not "the" bar.
+          barPct: bars.length ? +bars[Math.floor(bars.length / 2)].toFixed(2) : null,
+        });
     }
   }
 
   return {
-    n, minN: REC_CALIB_MIN_N, reason: null, brier, brierN: scored.length, byRating,
+    n, minN: REC_CALIB_MIN_N, ratingMinN: REC_RATING_MIN_N,
+    reason: null, brier, brierN: scored.length, byRating,
     byRatingMagnitude, magnitudeReason, magnitudeN: withBar.length,
   };
 }
@@ -5884,10 +6047,26 @@ function recCalibration(list, { absThresholdPct = null, thresholdFor = null } = 
 async function handleTrack(ticker, env, origin) {
   if (!env.REC_LOG) return err('REC_LOG KV not bound', 500, origin);
   const list = (await env.REC_LOG.get(`rec:${ticker.toUpperCase()}`, 'json')) || [];
+  const trackRates = new Map();
+  try {
+    const r = baseRatesFrom(await readMoveSeries(ticker, env), 20);
+    if (r) trackRates.set(ticker.toUpperCase(), r);
+  } catch (_) {}
   return json({
     ticker:      ticker.toUpperCase(),
     entries:     list,
-    calibration: recCalibration(list),
+    /* One extra KV read so this payload carries base rates too. The new rule —
+       no rate on screen without the benchmark for the same population — is
+       retroactive, and this endpoint feeds the Recommendation History card.
+       The per-rating floor arrives here for free, so the n=1 100% cell is
+       already fixed on that card. NOTE the card itself still renders only the
+       raw rate; surfacing `baseRate` / `edgePts` there is a separate commit,
+       since it means touching index.html. */
+    calibration: recCalibration(list, {
+      statsFor: (e) => statsForEntry(
+        { ...e, ticker: e.ticker || ticker.toUpperCase() },
+        trackRates),
+    }),
     _meta: srcMeta('KV forward log', {
       ttlSeconds: TTL.track,
       asOf: list[list.length - 1]?.d || null,
@@ -5922,13 +6101,18 @@ async function handleTrack(ticker, env, origin) {
    stale pooled figure is strictly better than none — but `ptDate` and `ts` ride
    along so the reader can age it. */
 const POOLED_CALIB_KEY    = 'calib:pooled';
-const POOLED_CALIB_SCHEMA = 1;
+/* SCHEMA 2 — every rate cell now carries `baseRate` / `edgePts`, and the
+   per-rating floor can null a `hitRate` that schema 1 would have published. A
+   schema-1 record read as schema 2 would show rates with no benchmark beside
+   them, which the new rule forbids, so the reader rejects it outright. */
+const POOLED_CALIB_SCHEMA = 2;
 
 /**
  * Build the pooled record from the per-ticker lists the caller already holds.
- * `barByTicker` maps TICKER -> median 20-session absolute move in PERCENT.
+ * `ratesByTicker` maps TICKER -> `baseRatesFrom()` output: the magnitude bar and
+ * the direction-matched base rates for that name.
  */
-function buildPooledCalibration(listsByTicker, barByTicker) {
+function buildPooledCalibration(listsByTicker, ratesByTicker) {
   const all = [];
   let contributing = 0;
   for (const [tkr, list] of listsByTicker) {
@@ -5943,16 +6127,14 @@ function buildPooledCalibration(listsByTicker, barByTicker) {
     if (used) contributing++;
   }
 
-  const calib = recCalibration(all, {
-    thresholdFor: e => barByTicker.get(String(e.ticker || '').toUpperCase()) ?? null,
-  });
+  const calib = recCalibration(all, { statsFor: e => statsForEntry(e, ratesByTicker) });
 
   return {
     schema: POOLED_CALIB_SCHEMA,
     ts: Date.now(),
     d: ptDate(),
     tickersContributing: contributing,
-    tickersWithBar: [...barByTicker.keys()].length,
+    tickersWithBar: ratesByTicker.size,
     ...calib,
   };
 }
@@ -6054,19 +6236,19 @@ async function fillForwardReturns(env) {
        reason and resolve on the next firing. They are deliberately NOT sequenced:
        chaining them would mean a hang in the sweep also blocks the forward fill,
        trading a one-day delay for a permanent robustness regression. */
-    const barByTicker = new Map();
+    const ratesByTicker = new Map();
     for (const [tkr, list] of listsByTicker) {
       if (!list.some(e => Number.isFinite(e.fwd20))) continue;
       const m = await readMoveSeries(tkr, env);
-      const bar = medianAbsMovePct(m, 20);
-      if (Number.isFinite(bar)) barByTicker.set(tkr, bar);
+      const rates = baseRatesFrom(m, 20);
+      if (rates) ratesByTicker.set(tkr, rates);
     }
 
-    const pooled = buildPooledCalibration(listsByTicker, barByTicker);
+    const pooled = buildPooledCalibration(listsByTicker, ratesByTicker);
     await env.REC_LOG.put(POOLED_CALIB_KEY, JSON.stringify(pooled));
     console.log(
       `[cron] pooled calibration: n=${pooled.n} across ${pooled.tickersContributing} ticker(s), `
-      + `magnitude n=${pooled.magnitudeN} over ${barByTicker.size} with a bar`
+      + `magnitude n=${pooled.magnitudeN} over ${ratesByTicker.size} with a bar`
       + `${pooled.reason ? ` · sign-scored unresolved: ${pooled.reason}` : ''}`
       + `${pooled.magnitudeReason ? ` · magnitude unresolved: ${pooled.magnitudeReason}` : ''}`);
   } catch (e) {

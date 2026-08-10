@@ -78,12 +78,14 @@ const M = new Function(
     grab('moveWindows'), grab('lowerBound'), grab('upperBound'), grab('coverageAt'),
     grab('snapHorizon'), grab('buildMoveSeries'), grab('terminalValue'), grab('payoffAt'),
     grab('capitalOf'), grab('maxGainOf'), grab('expectancyFrom'),
-    grabConst('REC_CALIB_MIN_N'), grab('medianAbsMovePct'), grab('recCalibration'),
+    grabConst('REC_CALIB_MIN_N'), grabConst('REC_RATING_MIN_N'),
+    grab('medianAbsMovePct'), grab('baseRatesFrom'), grab('statsForEntry'), grab('recCalibration'),
   ].join('\n') +
   '\nreturn { moveWindows, coverageAt, snapHorizon, buildMoveSeries, terminalValue, payoffAt,'
   + ' capitalOf, maxGainOf, expectancyFrom, MOVES_HORIZONS, COVERAGE_MIN_INDEPENDENT,'
   + ' EPISODE_CONCENTRATION_WARN, SESSIONS_PER_YEAR, MOVES_1Y_SESSIONS,'
-  + ' medianAbsMovePct, recCalibration, REC_CALIB_MIN_N };',
+  + ' medianAbsMovePct, recCalibration, baseRatesFrom, statsForEntry,'
+  + ' REC_CALIB_MIN_N, REC_RATING_MIN_N };',
 )();
 
 let fails = 0;
@@ -639,34 +641,55 @@ console.log('   magnitude hit rate to 0% or 100% while looking entirely plausibl
   rowStr('  no series -> null, no fixed-percent stand-in', M.medianAbsMovePct(null, 20), null);
   rowStr('  unsupported horizon -> null', M.medianAbsMovePct(built, 365), null);
 
-  console.log('\n   DIRECTION IS RETAINED. A BUY that collapsed is NOT a magnitude hit —');
-  console.log('   a pure |fwd20| test would score it as one, which is not "far enough to pay".');
+  console.log('\n   DIRECTION IS RETAINED, and every rate carries its BASE RATE.');
+  console.log('   A pure |fwd20| test would score a BUY that collapsed as a hit; it is not.');
+  console.log(`   Per-rating floor REC_RATING_MIN_N = ${M.REC_RATING_MIN_N} — a cell below it publishes`);
+  console.log('   NO rate at all, with a reason naming the actual count.');
+  const mk = (rating, vals) => vals.map(v => ({ rating, fwd20: v, confidence: 70, ticker: 'X' }));
+  //  BUY  12 rows: 4 clear +10, 3 up-but-small, 5 down  -> sign 7/12, magnitude 4/12
+  //  SELL 10 rows: 3 clear -10, 2 down-but-small, 5 up  -> sign 5/10, magnitude 3/10
   const entries = [
-    { rating: 'BUY', fwd20:  20, confidence: 70 },   // up and far      -> hit
-    { rating: 'BUY', fwd20: -20, confidence: 70 },   // far but DOWN    -> miss
-    { rating: 'BUY', fwd20:   2, confidence: 70 },   // up but small    -> miss (sign-scored hit)
-    { rating: 'BUY', fwd20:  15, confidence: 70 },   // up and far      -> hit
-    { rating: 'SELL', fwd20: -20, confidence: 70 },  // down and far    -> hit
-    { rating: 'SELL', fwd20:  20, confidence: 70 },  // far but UP      -> miss
-    { rating: 'HOLD', fwd20:  30, confidence: 50 },
-    { rating: 'HOLD', fwd20: -30, confidence: 50 },
-    { rating: 'BUY', fwd20:   1, confidence: 70 },
-    { rating: 'BUY', fwd20:   3, confidence: 70 },
+    ...mk('BUY',  [20, 15, 12, 30, 2, 1, 3, -20, -5, -1, -30, -2]),
+    ...mk('SELL', [-20, -15, -12, -5, -1, 20, 5, 1, 30, 2]),
   ];
-  const c = M.recCalibration(entries, { absThresholdPct: 10 });
-  console.log(`   bar = 10%, BUY rows = ${c.byRating.BUY.n}`);
-  // 6 BUY rows: +20, -20, +2, +15, +1, +3.
-  //   sign-scored  (fwd20 > 0)   -> +20, +2, +15, +1, +3        = 5/6
-  //   magnitude    (fwd20 >= 10) -> +20, +15                    = 2/6
-  row('   BUY sign-scored  (fwd20 > 0)', c.byRating.BUY.hitRate, +(5 / 6).toFixed(4), 1e-4);
-  row('   BUY magnitude    (fwd20 >= +10)', c.byRatingMagnitude.BUY.hitRate, +(2 / 6).toFixed(4), 1e-4);
-  row('   SELL magnitude   (fwd20 <= -10)', c.byRatingMagnitude.SELL.hitRate, 1 / 2, 1e-9);
-  rowStr('   HOLD magnitude stays null (no directional claim)', c.byRatingMagnitude.HOLD.hitRate, null);
+  // Bar 10%, with base rates chosen distinct from every hit rate so edgePts
+  // cannot coincidentally match.
+  const statsFor = () => ({ barPct: 10, signBase: 0.40, magBase: 0.25 });
+  const c = M.recCalibration(entries, { statsFor });
+  console.log('');
+  row('   BUY sign-scored  (fwd20 > 0)', c.byRating.BUY.hitRate, +(7 / 12).toFixed(4), 1e-4);
+  row('   BUY magnitude    (fwd20 >= +10)', c.byRatingMagnitude.BUY.hitRate, +(4 / 12).toFixed(4), 1e-4);
+  row('   SELL sign-scored (fwd20 < 0)', c.byRating.SELL.hitRate, +(5 / 10).toFixed(4), 1e-4);
+  row('   SELL magnitude   (fwd20 <= -10)', c.byRatingMagnitude.SELL.hitRate, +(3 / 10).toFixed(4), 1e-4);
+  rowStr('   HOLD stays null (no directional claim)', c.byRating.HOLD.hitRate, null);
   console.log('   -> the BUY that fell 20% is excluded from BOTH, as it must be.');
 
-  console.log('\n   SIGN-SCORED IS UNAFFECTED BY THE BAR — the two are reported side by side,');
-  console.log('   never one instead of the other.');
-  const noBar = M.recCalibration(entries);
+  console.log('\n   BASE RATE AND EDGE ON EVERY CELL — a rate with no benchmark is unreadable:');
+  row('   BUY sign baseRate', c.byRating.BUY.baseRate, 0.40, 1e-9);
+  row('   BUY sign edgePts', c.byRating.BUY.edgePts, +(((7 / 12) - 0.40) * 100).toFixed(1), 0.06);
+  row('   BUY magnitude baseRate', c.byRatingMagnitude.BUY.baseRate, 0.25, 1e-9);
+  row('   BUY magnitude edgePts', c.byRatingMagnitude.BUY.edgePts, +(((4 / 12) - 0.25) * 100).toFixed(1), 0.06);
+  const negEdge = M.recCalibration(entries, { statsFor: () => ({ barPct: 10, signBase: 0.90, magBase: 0.90 }) });
+  const neg = negEdge.byRating.BUY.edgePts;
+  if (!(neg < 0)) fails++;
+  console.log(`   ${neg < 0 ? 'ok  ' : 'FAIL'} a rate BELOW its base rate reports a NEGATIVE edge: ${neg} pts`);
+  console.log('        (that state is what disables sort influence — see directionalRead)');
+
+  console.log('\n   THE PER-RATING FLOOR — total clears REC_CALIB_MIN_N, a thin rating does not:');
+  const thin = [...mk('BUY', [15]), ...mk('HOLD', [1,2,3,4,5,6,7,8,9,10,11])];
+  const tc = M.recCalibration(thin, { statsFor });
+  rowStr('   total resolved clears REC_CALIB_MIN_N', tc.reason, null);
+  rowStr('   BUY n', tc.byRating.BUY.n, 1);
+  rowStr('   BUY hitRate is NULL, not 100%', tc.byRating.BUY.hitRate, null);
+  rowStr('   BUY magnitude hitRate is NULL too', tc.byRatingMagnitude.BUY.hitRate, null);
+  const names = typeof tc.byRating.BUY.hitRateReason === 'string'
+    && tc.byRating.BUY.hitRateReason.includes('1 of ' + M.REC_RATING_MIN_N);
+  if (!names) fails++;
+  console.log(`   ${names ? 'ok  ' : 'FAIL'} the reason names the count: ${tc.byRating.BUY.hitRateReason}`);
+  console.log('        (before the floor this rendered a confident 100% from one call)');
+
+  console.log('\n   SIGN-SCORED IS UNAFFECTED BY THE BAR — side by side, never instead:');
+  const noBar = M.recCalibration(entries, { statsFor: () => ({ barPct: null, signBase: 0.40, magBase: null }) });
   row('   BUY sign-scored without a bar', noBar.byRating.BUY.hitRate, c.byRating.BUY.hitRate, 1e-9);
   rowStr('   magnitude table null without a bar', noBar.byRatingMagnitude, null);
   const hasReason = typeof noBar.magnitudeReason === 'string' && noBar.magnitudeReason.length > 0;
