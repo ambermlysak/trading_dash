@@ -421,7 +421,7 @@ must keep an `async ` prefix or an async function becomes a sync one whose
 
 ---
 
-## 7. Gaps found on re-reading this file cold, 2026-08-10 ~12:55 PT
+## 7. Gaps found on re-reading this file cold, 2026-08-10 ~11:45 PT
 
 Added after compaction, before the sweep. Everything above is frozen measurement;
 this section is correction to the *method* of item 4, not to any number.
