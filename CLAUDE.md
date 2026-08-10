@@ -1373,6 +1373,30 @@ sequential, expanded/sort state in `sessionStorage` under `trading_dash_long_ope
 | cache hit (`?cached=1` or fresh) | 0 | 1 | **1** | one KV read |
 | `/api/long/batch`, 22 symbols | 0 | 22 | **22** | one KV read per symbol |
 
+**Re-measured 2026-08-09 after move coverage was added, and the crumb is why the
+figure looks unstable.** Three consecutive `?refresh=1` calls on one local isolate:
+
+| call | extFetches | bindingOps | capCost | what differs |
+|---|---|---|---|---|
+| 1st (cold isolate) | 9 | 10 | **19** | crumb fetched *and* written to KV |
+| 2nd, 3rd | 7 | 8 | **15** | crumb served from in-memory cache |
+
+In production the intermediate case is the common one — **16–17**, where the crumb
+is in KV but not in that isolate's memory, costing one KV read and no fetch. Full
+binding accounting for the crumb-in-memory path, which sums to exactly the observed
+8 with nothing unattributed:
+
+```
+riskFreeRate (econ:dgs3mo)   1     directionalRead (analysis:, rec:)   2
+readPremiumRow               1     readMoveSeries                      1   ← added
+recordIvSample (long-live)   1 ←   storeLongRow                        1
+ivHistory (list)             1                                    total 8
+```
+
+The pre-change figure of 6 was measured on a request whose crumb was already in
+memory; the +2 is this feature and the rest is the crumb tier. **Quote the tier,
+not a bare number** — a single measurement of this path is ambiguous by ±4.
+
 The earlier figures of 4 and 7 were `extFetches` only and understated the real
 cost by 125–143%. Do not quote them.
 
@@ -1672,6 +1696,31 @@ Deployment requires approval — do not run npx wrangler deploy without asking f
 Kill background processes when a task completes. Don't leave wrangler dev, wrangler tail, or http servers running between tasks.
 
 Add a "Verification standard" section to CLAUDE.md:
+
+## A single negative probe right after a deploy is UNCONFIRMED, not a failure
+
+**Re-probe after ~60 seconds before acting on it.** For roughly a minute after
+`wrangler deploy`, requests can still land on a stale isolate serving pre-deploy
+code, and there is no marker in the response saying so.
+
+This needs to be a rule rather than left to judgement, because **the stale-isolate
+signature is identical to a genuinely failed deploy**. Observed 2026-08-09, 23
+seconds after deploying the coverage commit:
+
+- the new gate field (`gates.episodeConcentrationWarn`) was **absent** — exactly
+  what a build that never shipped looks like
+- `long:` rows were still served under the **old schema number** — exactly what a
+  `LONG_SCHEMA` bump that never landed looks like
+
+Both read correctly a minute later; the deploy had been fine the whole time. The
+natural response to that signature is to redeploy or start debugging the bump, and
+both would have been wrong — a redeploy in particular would have looked like it
+"fixed" the problem and buried the real behaviour.
+
+So: **treat the first post-deploy probe as advisory only.** Confirm a suspected bad
+deploy on a second probe at least a minute later before changing anything. This
+applies to KV-shape checks especially, since a stale isolate reads and writes the
+same namespace as the new one.
 
 ## Verification standard
 

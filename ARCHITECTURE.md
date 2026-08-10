@@ -327,6 +327,43 @@ Constants: `EPISODE_CONCENTRATION_WARN` and the episode assignment in
 in **both** directions, because a test that only proves de-clustering collapses
 things passes on code that always answers 1.
 
+## Design note: expectancy always resolves on 3y — the 1y fallback is unreachable
+
+`attachCoverage()` picks the array expectancy runs on with
+`const arr = h.sorted3y || h.sorted1y`. **That fallback can never be taken**, and
+this is a structural property, not an observation about current data.
+
+The 1y series is built as `c3y.slice(-min(len, 252))` — a *suffix* of the 3y one.
+So:
+
+- if the 3y series holds **≤ 252** sessions the two arrays are **identical**, and
+  they resolve or fail together;
+- if it holds **> 252**, then `len(3y) > len(1y)`, and since
+  `independent = (len − N) / N` is increasing in `len`, `independent3y >
+  independent1y` at every horizon.
+
+Either way `sorted3y === null` implies `independent3y < 4` implies
+`independent1y < 4` implies `sorted1y === null`. **3y resolves whenever 1y does.**
+Confirmed exhaustively: 154 ticker × horizon pairs across the full 22-name
+watchlist, **0 cases** where 3y is null and 1y is not; 242 scored candidates, 172
+on 3y, **0 on 1y**, 70 unresolved.
+
+Two consequences worth keeping straight, because they are easy to conflate:
+
+- **The `cov 1y` column is alive.** `coverage1y` reads `h.sorted1y` directly, not
+  through the expectancy fallback, and renders a number on 88 of the horizons the
+  watchlist reaches. The 1y/3y comparison the screen exists to show is unaffected.
+- **Only the 1y *expectancy* path is dead**, and with it the "51% of 1y candidates
+  flag" figure from the concentration calibration — that describes a population
+  that never reaches the expectancy code. `EPISODE_CONCENTRATION_WARN = 1` is
+  calibrated on the 3y distribution (27%), which is the only one that renders, so
+  the threshold is right for a stronger reason than originally stated.
+
+The `|| h.sorted1y` is left in place as a defensive no-op, but **it must not be
+read as a live branch**: any change to `MOVES_1Y_SESSIONS`, the slicing, or the
+independence rule should re-derive the argument above rather than assume the
+fallback protects anything.
+
 ## Section-by-section data source map
 
 **Everything on both pages runs on real data.** There are no mock generators left

@@ -3226,12 +3226,11 @@ function renderLong(data) {
     and the figure is how many separate episodes it takes to reach half the positive P/L. <b>LOW is the
     warning</b>, the opposite polarity to the share it replaced: 1 means the expectancy rests on a single
     market move rather than on a property of the trade; 8 is unremarkable. Flagged at
-    <b>${g.episodeConcentrationWarn ?? 1} or below</b>, calibrated on the 3y distribution (1 occurs on ~27% of
-    3y candidates, versus ~51% on 1y). <b>The flag always names its window</b> — "half the expected value from
-    ONE 3y episode" — because a 252-session series holds fewer distinct episodes, so the same candidate can
-    flag on one window and not the other. That is correct, not a defect, and an unlabelled warning icon would
-    read as a bug at exactly the moment the number is working. Nothing is dimmed, hidden or reordered on
-    it.<br>
+    <b>${g.episodeConcentrationWarn ?? 1} or below</b>, where 1 occurs on ~27% of candidates. <b>Expectancy
+    always resolves on the 3y series</b> — the 1y series is a suffix of it, so it can never support a horizon
+    the 3y one does not — which is why the flag reads "one 3y episode" and names its window rather than
+    leaving you to infer it. (The <b>cov 1y</b> column is unaffected and is measured directly.) Nothing is
+    dimmed, hidden or reordered on the flag.<br>
     <b>Expectancy assumes the position is held to expiry.</b> No assignment, no early close and no IV path
     between now and then is modelled — so it understates any structure that would realistically be closed
     early, which is most of them. It is a relative ranking, not a P&L forecast. Lane A is held out of the

@@ -2959,8 +2959,21 @@ function attachCoverage(cand, st, { moves, spot, dte, pBe }) {
     if (out.coverage3y != null) out.gap3y = +((out.coverage3y - pBe) * 100).toFixed(1);
   }
 
-  // Expectancy runs on the 3y array when it exists, falling back to 1y — and the
-  // window used is NAMED rather than left implicit.
+  /* Expectancy runs on the 3y array, and the window used is NAMED rather than
+     left implicit.
+
+     THE `|| h.sorted1y` FALLBACK IS UNREACHABLE, and that is structural rather
+     than a fact about today's data. `c1y` is a SUFFIX of `c3y`, so either the two
+     arrays are identical (≤252 sessions) or `len(3y) > len(1y)`; `independent =
+     (len − N)/N` is increasing in `len`, so `independent3y >= independent1y`
+     always. Hence `sorted3y === null` implies `sorted1y === null`. Verified over
+     154 ticker × horizon pairs: 0 counterexamples, 0 of 172 resolved candidates
+     scored on 1y.
+
+     It stays as a defensive no-op, but do NOT read it as a live branch — it
+     protects nothing. Any change to MOVES_1Y_SESSIONS, the slicing, or the
+     independence rule must re-derive that argument. NOTE this says nothing about
+     `coverage1y`, which reads `h.sorted1y` DIRECTLY and is very much alive. */
   const arr = h.sorted3y || h.sorted1y;
   const arrLabel = h.sorted3y ? '3y' : '1y';
   if (!arr) {
