@@ -534,6 +534,10 @@ reaches them; they are here to explain why the key count exceeds the skip count.
 > skip-if-exists still is not firing; 22 skips means it is matching something it
 > should not.
 
+**↑ THAT PREDICTION IS WRONG AND WAS FALSIFIED AT 13:15. Corrected in §7.6.**
+It put the skip on the cron. The cron is the side that deliberately does *not*
+skip.
+
 Two documented invariants verified live in passing: KV metadata is exactly the
 three flat numbers `{"atmIv","spot","dte"}`, and the front-expiry split is
 coherent — names with weeklies resolve to 08-17 at dte 7, names without to the
@@ -552,3 +556,82 @@ which it has now done. Removing it is a two-file change **plus a deploy**, so it
 waits until after item 4 rather than landing mid-measurement. CLAUDE.md rule #2
 still says "a single cron" and should be reconciled in the same commit that
 removes it.
+
+---
+
+## 8. Observed 13:15 PT — corrections that move the 14:00 predictions
+
+### 8.1 The watchlist is 35, not 22 — every per-symbol figure above is undersized
+
+`DEFAULT_WATCHLIST` in `worker.js` is the 22 names §4 lists. But
+`watchlist:tickers` in production holds **33**, and both sweeps take the **union**:
+
+```
+[...new Set([...saved, ...DEFAULT_WATCHLIST])]
+```
+
+33 saved ∪ {MRK, JPM} from the default = **35**. `recordWatchlistIv` slices to 50,
+`collectMoveSeries` to `LONG_MAX_SYMBOLS` (**60**) — neither clips at 35.
+
+The 13 names in the saved list but not the default: **AVGO, APLD, INTC, ARM, SMR,
+HD, MRVL, KTOS, VST, MSFT, DELL, MDB, SHOP**. So MSFT/DELL/MDB/SHOP are **on** the
+watchlist; §7.4 called them off-watchlist, which was read off §4's stale 22.
+
+**Revised 4(a) predictions.** §3's measured `binding = 2N + 3` (22 → 47 ✓) gives:
+
+| | N=22 (§3, measured) | **N=35 (today, predicted)** |
+|---|---|---|
+| `extFetches` | 2 | **2** — 35 symbols ÷ 20 per spark request = 2 requests |
+| `bindingOps` | 47 | **73** = 2 gets + 35 `readMoveSeries` + 35 puts + 1 put |
+| `capCost` | 49 | **75** |
+| keys written | ~22 | **~35** |
+
+`extFetches 2` survives only because 35 ≤ 40. At 41 watchlist names it becomes 3,
+and a future reader comparing to "2" would see a regression that is arithmetic.
+
+### 8.2 4(c) — prediction falsified, and the mechanism is the opposite way round
+
+Observed: `[cron] iv samples recorded for 35/35 tickers`. No skips, and all three
+sampled keys were overwritten by the cron at 20:15 UTC:
+
+| ticker | 11:50 page-view | 13:15 cron | `src` after |
+|---|---|---|---|
+| AAPL | 22.41 / 306.805 | **21.52 / 308.26** | *(none)* |
+| TWLO | 57.75 / 248.55 | **51.72 / 250.06** | *(none)* |
+| MSFT | 27.06 / 509.7 | **24.49 / 506.06** | *(none)* |
+
+**This is correct behaviour, not a failure.** `recordIvSample(ticker, snap, env,
+{ src, skipIfPresent })` takes the skip as an *option*, and the precedence comment
+above it says plainly: *"the warm path passes `skipIfPresent` and the cron does
+not — watchlist names: the 1:15pm cron always wins, whatever the page does."*
+`recordWatchlistIv` calls it with **no options**, so it overwrites by design; the
+absent `src` field is the signature of a cron write.
+
+So **skip-if-exists lives on the warm `longRow` path** (`{ src: 'long-warm',
+skipIfPresent: true }`), not on the cron, and item 4(c) has **not** been exercised
+by the sweep. It needs a warm long request:
+
+1. read `iv:{T}:2026-08-10` — currently cron-written, no `src`, ts ~20:15
+2. `GET /api/long/{T}?refresh=1` — writes `src: 'long-live'` (the live path passes
+   `src` only, no skip)
+3. `GET /api/long/{T}?refresh=1` again — `premium:{T}` is now fresh, so the **warm**
+   branch runs and passes `skipIfPresent: true`
+4. read the key again
+
+**Pass = the body after step 4 is byte-identical to step 3** (same `ts`, still
+`long-live`). A `long-warm` src appearing on a ticker that already had a sample
+means the skip did not fire. Nothing logs `'skipped'`, so the unchanged `ts` is
+the only observable.
+
+Separately confirmed working at 13:30: `[cron] iv sweep already ran today,
+skipping` — that is the sweep-level daily dedup on `ivsweep:last`, a different
+mechanism from the per-key skip and not what 4(c) is about.
+
+### 8.3 4(d) — `benchmarkedN` should now RISE above 75
+
+§5's 75-of-112 was computed when only 22 names could have a move series.
+`ratesByTicker` can now reach **35**, so more BUY entries carry a bar and
+`benchmarkedN` should increase. The edge figures will therefore move off
+53.3 / 61.4 / −8.1 legitimately — **that is a population change, not a
+regression**, and it must be reported as one. The §5 figures stay authoritative
+for the 22-name population they describe.
