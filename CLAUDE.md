@@ -683,7 +683,7 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Six checks exist, all of which print computed vs
+There is no build step. Seven checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
 (Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
@@ -698,7 +698,10 @@ binding, `this`-binding through the proxy, and the failure paths that must retur
 a working `env`), `node long-fixtures.check.mjs` (the three Long-screen paths
 live data cannot reach: `buyableFrom()`'s `rank` branch, which stays unreachable
 until 60 days of IV history exist; Lane A with **two** listed Januaries; and the
-shared `ivPlausible()` guard at its boundaries), and `node nd2.check.mjs` (the Long tab's `P(BE)@exp`,
+shared `ivPlausible()` guard at its boundaries), `node lane-e.check.mjs` (Lane E's two-sided half:
+two-sided coverage against brute force including a zero-contribution tail, two-sided pBe against a
+series-erf reference, both payoff functions across all four breakevens, and the drift split across
+trending / range-bound / downtrending regimes), and `node nd2.check.mjs` (the Long tab's `P(BE)@exp`,
 theta and vega — N(d2) against a reference series-erf **and** against
 e^{rT}·(−∂C/∂K) by central difference, which is a structurally different
 derivation and so catches "right arithmetic, wrong quantity"; greeks against
@@ -1319,7 +1322,7 @@ data is still empty — `primeTabs()` has usually painted it already.
 | **Watchlist** | `#watchlist` | The 14-column table, sortable, with expandable rows and the consolidated Recommendation column. |
 | **Sectors** | `#sectors` | All 11 SPDR sectors, ETF % change plus a Claude-picked opportunity and avoid per sector. |
 | **Premium** | `#premium` | The short-premium screen. **Renamed from "Options"** — the old tab was a V/OI unusual-activity recap on the nearest expiration and was deleted outright, along with `handleOptionsRecap()` and its Claude flow synthesis. |
-| **Long** | `#long` | The long-premium screen — the mirror of Premium. Four lanes (LEAPS / swing / debit verticals / calendars), gated on vol being *cheap* and the debit being structurally payable. See the Long-screen section below for everything that inverts. |
+| **Long** | `#long` | The long-premium screen — the mirror of Premium. Five lanes (LEAPS / swing / debit verticals / calendars / straddle+strangle), gated on vol being *cheap* and the debit being structurally payable. See the Long-screen section below for everything that inverts. |
 
 Note the Premium tab is the only one that fetches on interaction rather than on
 load: expanding a row is what spends the subrequests. Sectors and Scanner use
@@ -1574,10 +1577,100 @@ cost by 125–143%. Do not quote them.
   listed strike nearest the *breakeven* and that strike is named on the card; if it quotes nothing
   usable the cell is `n/a` with the reason — **never** backfilled from ATM IV.
 
-**Four lanes.** A = stock replacement, the two nearest Januaries ≥365 DTE, 0.85/0.70Δ ITM calls. B =
+**Five lanes.** A = stock replacement, the two nearest Januaries ≥365 DTE, 0.85/0.70Δ ITM calls. B =
 directional swing, first monthly ≥30 and ≥60 DTE, 0.55/0.40Δ. C = debit verticals on B's already-fetched
 chains (zero extra subrequests), long ~0.55Δ short ~0.25Δ, **actual leg deltas reported, not the
-targets**. D = calendar/diagonal.
+targets**. D = calendar/diagonal. E = straddle + strangle.
+
+### Lane E — straddle and strangle
+
+**The lane does not exist to surface these trades. It exists to say, before one is
+put on, whether the required move has historically happened** — and most of the
+time the honest answer is no. A lane that renders something tradeable on every
+name would defeat its own purpose. It reuses Lane B's already-fetched monthlies,
+so it costs **zero extra subrequests**.
+
+**The pair is never split.** Straddle and strangle always render together for the
+same expiry, stacked. The strangle cuts the debit and cuts coverage by *more* —
+a property of the structure rather than of any quote, so seeing it once is the
+point. If one fails to price the other still renders and the missing one carries
+its reason. Measured on live chains 2026-08-10: NVDA 2026-09-18, the strangle
+saved **$11.80/share and gave up 6.2 pts** of 3y coverage; AAPL, **$9.80 for
+6.7 pts**.
+
+**Strike selection invents nothing.** The straddle takes the listed strike nearest
+spot (`nearestTradeableStrike()` — a plausible IV *and* a quoted ask, which
+`ivNearPrice()` does not check because it answers a different question). The
+strangle uses **`PREM_TARGETS[0]` (0.30Δ)** on each side — the premium screen's
+canonical wide/OTM leg delta, already used to pick exactly this kind of strike on
+both sides. `LANE_E_STRANGLE_TARGET` is *derived from* `PREM_TARGETS`, not copied,
+so the two cannot drift. `PREM_TARGETS[1]` (0.16Δ) would give a second, wider
+strangle; the pair rule calls for one.
+
+**The headline is the product**: `required / expected / typical realized`, one
+line, three numbers, in that order. Required is the **wider** breakeven as % from
+spot — the narrow side flatters the structure and is not what has to happen.
+Typical realized is `medianAbsMovePct()` at the snapped horizon. Live 2026-08-10,
+NVDA 39d: **required 11.61% / expected 12.86% / typical realized 7.35%** — the
+typical move has *not* covered it, which is the lane working.
+
+**Four gates, and failing one renders the lane WITH THE GATE NAMED** — never
+hidden, never blank. `status: 'gated'`, `gateFailed[]`, `gateDetail{}`:
+`vol-not-cheap` (`buyableFrom` returned false — **null is not a failure**, it means
+no basis yet) · `no-catalyst-inside` (no earnings date within the expiry) ·
+`hostile-term` (`termStructure > 0`, backwardation) · `no-coverage`. Hiding a
+failure would make "no straddle worth looking at" and "no data for this name"
+identical on screen.
+
+**The `analysis:` rating is deliberately NOT a gate.** It measured a negative edge
+(sign-scored BUY 50.5% against a 60.5% base rate), which is why the alignment tag
+is informational-only; gating a lane on a measured non-edge would reintroduce
+exactly what was disabled. A straddle makes no directional claim anyway.
+
+**Two-sided coverage and P(BE) are COMPOSED, not extensions.** `coverageTwoSided()`
+calls `coverageAt()` twice and `probBeyondEither()` calls `probBeyondBreakeven()`
+twice. `coverageAt` is load-bearing on every other lane and was not touched;
+composition also yields the tail split, which is required output rather than a
+diagnostic. Both assert `beLower < beUpper` and return null on crossed breakevens,
+so the sum is a probability and not an over-count. The one-sided figure would
+understate a straddle by **26.7 pts at ±10% / 45 DTE** — an error with no shape to
+it, which is why it gets its own check script.
+
+**THE TAILS ARE RENDERED APART AND NEVER SUMMED.** `coverageUpper*` /
+`coverageLower*` are separate fields, null on one-sided candidates (a long call
+*has* no lower tail — not the same as one measuring 0). A straddle covering 24%
+split 22↑/2↓ is closer to a long call than a volatility trade; 13↑/11↓ is an
+actual volatility trade, and the total alone cannot tell them apart.
+
+**It is drift ÷ σ that drives the split, not raw drift — measured, and the naive
+version is wrong.** Across all 35 stored series at ±10% / 45 sessions
+(2026-08-10), up-tail share correlates **0.902 with drift÷σ and 0.038 with drift
+alone**. A fixed threshold is a large move for JPM (σ 6.4% → 89% up-share on 5.7%
+drift) and trivial for QUBT (σ 62% → 49% up-share on 75% drift). The first draft
+of this note claimed raw drift and the near-zero correlation caught it. Five of 35
+names are lopsided past 80/20: JPM, TSM, AVGO, NVDA, AAPL.
+
+**The earnings-straddle limitation is on screen, not in a comment.** Expectancy
+and coverage both assume **hold to expiry**. The trade actually worth considering
+into a print is buy-before / sell-after — a two-day vega trade — and IV crush can
+take that position down even when the move happens. Where a catalyst sits inside
+the expiry the card renders `holdToExpiryCaveat` as visible text. **No IV-crush
+model is attempted**: there is no vol-surface history in this codebase to build
+one from, so the limitation is stated and the derivation stops, exactly as Lane D
+refuses rather than assuming a future IV.
+
+**`upsideTruncated` fires on both** — `maxGainOf` returns null for `straddle` and
+`strangle`, so expectancy is scored only as far as the largest observed window.
+The concentration flag renders on this lane with its window named inline, same as
+everywhere else.
+
+`node lane-e.check.mjs` covers the two-sided half in six sections: two-sided pBe
+against a series-erf reference at five prices, two-sided coverage against a
+brute-force loop over raw closes (including a tail contributing exactly 0, which
+must not read as null), both payoff functions at five prices spanning all four
+breakevens, the bound and breakeven-crossing guards, `upsideTruncated`, and the
+tail split across synthetic trending / range-bound / downtrending regimes.
+**70 comparisons.**
 
 **Lane A's two Januaries usually collapse.** §2's "nearest 540 DTE" and "nearest January ≥365 DTE" pick
 the same expiry on all but ~7 days a year, so the second slot is the *next* January out. Expect it to be

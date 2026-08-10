@@ -2152,7 +2152,9 @@ function premiumRowMeta(row) {
    generic hover — a stale row whose fields are simply absent reads on screen as
    "no measurement available", which misattributes our own cache to the ticker
    (honesty rule 17). Same rule the golden-cross payload follows. */
-const LONG_SCHEMA      = 2;
+// 3: Lane E (straddle/strangle) adds the two-sided coverage split and the
+//    lane-E entry shape. A row cached under 2 has neither, so it must retire.
+const LONG_SCHEMA      = 3;
 const LONG_FRESH_MS    = 4 * 3600_000;   // freshness horizon — drives the stale badge
 const LONG_ROW_TTL     = 24 * 3600;      // KV retention: outlives freshness so stale can render
 const LONG_MAX_SYMBOLS = 60;
@@ -2170,6 +2172,22 @@ const LANE_B_DTES      = [30, 60];       // first monthly at or beyond each
 const LANE_B_TARGETS   = [0.55, 0.40];
 const LANE_C_LONG      = 0.55;
 const LANE_C_SHORT     = 0.25;
+
+/* Lane E — straddle and strangle, ALWAYS AS A PAIR.
+ *
+ * The lane does not exist to surface these trades. It exists to answer, before
+ * one is put on, whether the required move has historically happened — and most
+ * of the time the honest answer is no, which the lane must be willing to say
+ * rather than rendering something tradeable.
+ *
+ * STRIKE SELECTION REUSES EXISTING RULES. No new selection rule is invented:
+ *   · straddle — the listed strike nearest spot, via `nearestTradeableStrike()`
+ *   · strangle — `PREM_TARGETS[0]` (0.30Δ) on each side. That is the premium
+ *     screen's canonical wide/OTM leg delta, already used to pick exactly this
+ *     kind of strike on both the put and call sides. `PREM_TARGETS[1]` (0.16Δ)
+ *     would give a second, wider strangle; the pair rule calls for one.
+ * Derived from PREM_TARGETS rather than copied, so the two cannot drift. */
+const LANE_E_STRANGLE_TARGET = PREM_TARGETS[0];
 
 /* Gate constants. Shipped to the frontend in `gates` so neither HTML file
    hardcodes a threshold — the same reason volRegime() lives in the Worker. */
@@ -2469,6 +2487,60 @@ function coverageAt(sorted, threshold, dir) {
   return dir === 'down'
     ? upperBound(sorted, threshold) / n
     : (n - lowerBound(sorted, threshold)) / n;
+}
+
+/**
+ * TWO-SIDED coverage, for a structure that pays on either tail.
+ *
+ *   P(r ≥ +reqUp) + P(r ≤ reqDown)     with reqDown < 0 < reqUp
+ *
+ * COMPOSED FROM `coverageAt`, NOT AN EXTENSION OF IT. `coverageAt` is load-bearing
+ * on every other lane, and widening its contract to serve one caller would put the
+ * two-sided branch inside the function every one-sided candidate already runs
+ * through. Composition also produces the split for free — and the split is not a
+ * diagnostic here, it is required output (see below).
+ *
+ * THE TAILS ARE RETURNED SEPARATELY AND MUST BE RENDERED SEPARATELY. On a trending
+ * name drift inflates one tail and deflates the other, so a healthy-looking total
+ * can rest almost entirely on one side: 24% split 22/2 is a long call wearing a
+ * straddle's name, and 24% split 13/11 is an actual volatility trade. Summing them
+ * on screen destroys exactly the distinction this lane exists to draw.
+ *
+ * The two events are disjoint (`reqDown < 0 < reqUp`), so the sum is a probability
+ * and not an over-count. That is asserted rather than assumed: crossed or equal
+ * thresholds return null, because a "straddle" whose breakevens overlap is not a
+ * structure whose coverage means anything.
+ */
+function coverageTwoSided(sorted, reqUp, reqDown) {
+  if (!Array.isArray(sorted) || !sorted.length) return null;
+  if (!Number.isFinite(reqUp) || !Number.isFinite(reqDown)) return null;
+  if (!(reqDown < reqUp)) return null;
+  const upper = coverageAt(sorted, reqUp, 'up');
+  const lower = coverageAt(sorted, reqDown, 'down');
+  if (upper == null || lower == null) return null;
+  return { upper, lower, total: upper + lower };
+}
+
+/**
+ * Risk-neutral P(finish beyond EITHER breakeven).
+ *
+ * Composed from two `probBeyondBreakeven` calls — the call side above `beUpper`,
+ * the put side below `beLower` — because a straddle's payoff needs both tails and
+ * the one-sided figure would understate it by roughly half.
+ *
+ * Each leg takes its OWN sigma, from the listed strike nearest that breakeven,
+ * following the same rule single-leg candidates use. Skew is real: the put-side
+ * vol is normally the higher of the two, and averaging them or reusing ATM would
+ * quietly misprice the side that carries most of the tail.
+ *
+ * Disjoint for the same reason as the coverage above, so the sum is a probability.
+ */
+function probBeyondEither({ spot, beUpper, beLower, tYears, volUp, volDown, rate }) {
+  if (!Number.isFinite(beUpper) || !Number.isFinite(beLower) || !(beLower < beUpper)) return null;
+  const up   = probBeyondBreakeven({ spot, breakeven: beUpper, tYears, vol: volUp,   rate, type: 'call' });
+  const down = probBeyondBreakeven({ spot, breakeven: beLower, tYears, vol: volDown, rate, type: 'put'  });
+  if (up == null || down == null) return null;
+  return { up, down, total: up + down };
 }
 
 /** Calendar DTE → trading sessions, snapped to the nearest precomputed horizon.
@@ -2885,6 +2957,14 @@ function attachCoverage(cand, st, { moves, spot, dte, pBe }) {
        positive gap is NOT a pure "vol is cheap here" signal, and on a trending
        name the drift term dominates it entirely. */
     drift1y: null, drift3y: null,
+    /* TWO-SIDED SPLIT — populated only for Lane E, null everywhere else. Carried
+       as separate fields rather than folded into `coverage*` because the total is
+       the misleading number on a trending name and the UI must be able to show
+       the tails apart. Null on a one-sided candidate is correct and meaningful:
+       a long call HAS no lower tail, which is not the same as one measuring 0. */
+    coverageUpper1y: null, coverageLower1y: null,
+    coverageUpper3y: null, coverageLower3y: null,
+    coverageTwoSided: false,
     coverageReason: null,
     expectancyMean: null, expectancyMedian: null,
     expectancyEpisodesTo50: null, expectancyEpisodes: null, expectancyEpisodesReason: null,
@@ -2928,16 +3008,33 @@ function attachCoverage(cand, st, { moves, spot, dte, pBe }) {
   out.drift1y = h.drift1y ?? null;
   out.drift3y = h.drift3y ?? null;
 
-  const reqMove = Number.isFinite(cand.breakeven) && spot > 0 ? cand.breakeven / spot - 1 : null;
-  const dir = cand.type === 'PUT' ? 'down' : 'up';
-  if (reqMove == null) {
-    out.coverageReason = 'no breakeven to measure against';
-    out.expectancyReason = out.coverageReason;
-    return out;
-  }
+  /* TWO-SIDED (Lane E) vs ONE-SIDED. The branch is on the candidate carrying BOTH
+     breakevens, not on its `type` — a straddle has no single direction, and
+     inferring one from `type` is how a two-tailed structure ends up measured on
+     one tail. Everything below this block (expectancy, episodes, concentration) is
+     shared and unchanged: those already handle straddle/strangle through
+     `payoffAt`, which pays on both tails without knowing it is doing so. */
+  const twoSided = Number.isFinite(cand.beUpper) && Number.isFinite(cand.beLower) && spot > 0;
 
-  out.coverage1y = coverageAt(h.sorted1y, reqMove, dir);
-  out.coverage3y = coverageAt(h.sorted3y, reqMove, dir);
+  if (twoSided) {
+    out.coverageTwoSided = true;
+    const reqUp   = cand.beUpper / spot - 1;
+    const reqDown = cand.beLower / spot - 1;
+    const c1 = coverageTwoSided(h.sorted1y, reqUp, reqDown);
+    const c3 = coverageTwoSided(h.sorted3y, reqUp, reqDown);
+    if (c1) { out.coverage1y = c1.total; out.coverageUpper1y = c1.upper; out.coverageLower1y = c1.lower; }
+    if (c3) { out.coverage3y = c3.total; out.coverageUpper3y = c3.upper; out.coverageLower3y = c3.lower; }
+  } else {
+    const reqMove = Number.isFinite(cand.breakeven) && spot > 0 ? cand.breakeven / spot - 1 : null;
+    const dir = cand.type === 'PUT' ? 'down' : 'up';
+    if (reqMove == null) {
+      out.coverageReason = 'no breakeven to measure against';
+      out.expectancyReason = out.coverageReason;
+      return out;
+    }
+    out.coverage1y = coverageAt(h.sorted1y, reqMove, dir);
+    out.coverage3y = coverageAt(h.sorted3y, reqMove, dir);
+  }
   if (out.coverage1y == null && out.coverage3y == null) {
     out.coverageReason = h.reason3y || h.reason1y || 'no window at this horizon is supported by the stored history';
   } else if (out.coverage1y == null) {
@@ -3263,6 +3360,157 @@ function verticalCandidate(chainSide, ctx, type) {
     spreadPct: +worstSpread.toFixed(4),
     spreadMax,
     openInterest: Math.min(longOpt.openInterest ?? 0, shortOpt.openInterest ?? 0),
+    flags,
+    ...cov,
+  };
+}
+
+/** The listed contract nearest a price that is actually tradeable: a plausible IV
+ *  and a quoted ask. `ivNearPrice()` answers a different question — it returns the
+ *  strike/IV pair for a P(BE) sigma and does not care whether the thing can be
+ *  bought — so it cannot stand in here. */
+function nearestTradeableStrike(list, price, atmIvDec) {
+  const usable = (list || []).filter(o =>
+    Number.isFinite(o?.strike) &&
+    Number.isFinite(o?.impliedVolatility) &&
+    ivPlausible(o.impliedVolatility, atmIvDec) &&
+    Number.isFinite(o?.ask) && o.ask > 0);
+  if (!usable.length || !Number.isFinite(price)) return null;
+  return usable.reduce((best, o) =>
+    Math.abs(o.strike - price) < Math.abs(best.strike - price) ? o : best);
+}
+
+/**
+ * Lane E — one straddle or strangle, fully priced and measured.
+ *
+ * Both structures are built by this one function because they differ only in
+ * strike selection: same two legs, same debit-is-the-ask rule, same two-sided
+ * breakevens, same payoff shape. `kind` is 'straddle' or 'strangle' and feeds
+ * `payoffAt` unchanged — those payoff functions already exist from the §6.2 work
+ * and are NOT reimplemented here.
+ *
+ * WHY THE PAIR IS NEVER SPLIT. The strangle cuts the debit and cuts coverage by
+ * more. That is a property of the structure rather than of any particular quote,
+ * so seeing the two side by side once is the point of the lane. The caller
+ * renders both or renders the missing one with its reason — never one alone.
+ */
+function laneECandidate(chain, ctx, kind) {
+  const { spot, rate, dte, tYears, emPct, spreadMax, atmIv, moves } = ctx;
+  if (!Number.isFinite(rate) || atmIv == null || !(spot > 0)) return null;
+  const atmDec = atmIv / 100;
+
+  let callOpt, putOpt;
+  if (kind === 'straddle') {
+    // Same strike both sides — the listed strike nearest spot. Resolved on the
+    // call side and then matched on the put side so the two legs cannot end up on
+    // different strikes, which would silently make it a strangle.
+    callOpt = nearestTradeableStrike(chain?.calls, spot, atmDec);
+    if (!callOpt) return null;
+    putOpt = (chain?.puts || []).find(o => o.strike === callOpt.strike
+      && Number.isFinite(o?.impliedVolatility) && ivPlausible(o.impliedVolatility, atmDec)
+      && Number.isFinite(o?.ask) && o.ask > 0) || null;
+    if (!putOpt) return null;
+  } else {
+    callOpt = nearestDelta(chain?.calls, spot, rate, tYears, 'call', LANE_E_STRANGLE_TARGET, { atmIv: atmDec });
+    putOpt  = nearestDelta(chain?.puts,  spot, rate, tYears, 'put',  LANE_E_STRANGLE_TARGET, { atmIv: atmDec });
+    if (!callOpt || !putOpt) return null;
+    // A strangle needs the call above the put. Equal strikes IS a straddle, and
+    // returning it under the strangle label would make the pair report the same
+    // structure twice while appearing to compare two.
+    if (!(callOpt.strike > putOpt.strike)) return null;
+  }
+
+  const cq = quoteOf(callOpt), pq = quoteOf(putOpt);
+  if (cq.ask == null || pq.ask == null) return null;
+
+  const cg = bsGreeks({ spot, strike: callOpt.strike, tYears, vol: callOpt.impliedVolatility, rate, type: 'call' });
+  const pg = bsGreeks({ spot, strike: putOpt.strike,  tYears, vol: putOpt.impliedVolatility,  rate, type: 'put'  });
+  if (!cg || !pg) return null;
+
+  const debit    = cq.ask + pq.ask;                 // per share, both legs bought
+  const debitPer = +(debit * 100).toFixed(2);       // per contract — what expectancy divides by
+  const beUpper  = callOpt.strike + debit;
+  const beLower  = putOpt.strike  - debit;
+  if (!(beLower > 0) || !(beUpper > beLower)) return null;
+
+  const upPct   = (beUpper / spot - 1) * 100;       // signed +
+  const downPct = (1 - beLower / spot) * 100;       // reported as a magnitude
+  // REQUIRED MOVE is the WIDER of the two breakevens. The narrow side flatters the
+  // structure and is not what has to happen for the trade to work in both
+  // directions — the headline number has to be the harder one.
+  const requiredPct = Math.max(upPct, downPct);
+  const beEm = Number.isFinite(emPct) && emPct > 0 ? requiredPct / emPct : null;
+
+  // Sigma per side from the strike nearest THAT breakeven, never ATM and never
+  // shared between the tails — put skew is real and normally makes the two differ.
+  const ivUp   = ivNearPrice(chain?.calls, beUpper);
+  const ivDown = ivNearPrice(chain?.puts,  beLower);
+  const pb = (ivUp && ivDown)
+    ? probBeyondEither({ spot, beUpper, beLower, tYears, volUp: ivUp.iv, volDown: ivDown.iv, rate })
+    : null;
+
+  const st = kind === 'straddle'
+    ? { kind: 'straddle', strike: callOpt.strike, debit: debitPer }
+    : { kind: 'strangle', callStrike: callOpt.strike, putStrike: putOpt.strike, debit: debitPer };
+
+  /* Both breakevens go across, which is what selects the two-sided branch in
+     attachCoverage. `breakeven` is ALSO passed, set to the upper one, purely as
+     the independent anchor for expectancyFrom's guard 1 — a straddle's payoff
+     crosses zero at both, so either satisfies it. */
+  const cov = attachCoverage(
+    { type: kind.toUpperCase(), breakeven: beUpper, beUpper, beLower },
+    st,
+    { moves, spot, dte, pBe: pb?.total ?? null },
+  );
+
+  const worstSpread = Math.max(cq.spreadPct ?? 0, pq.spreadPct ?? 0);
+  const flags = [];
+  if (worstSpread > spreadMax) flags.push('wide-spread');
+  if (Math.min(callOpt.openInterest ?? 0, putOpt.openInterest ?? 0) < LONG_MIN_OI) flags.push('thin-oi');
+
+  return {
+    lane: 'E',
+    kind,
+    type: kind.toUpperCase(),
+    status: worstSpread > spreadMax ? 'illiquid' : 'ok',
+    callStrike: callOpt.strike,
+    putStrike: putOpt.strike,
+    // Actual leg deltas, not the targets they were selected against — the same
+    // rule Lane C follows.
+    callDelta: +cg.delta.toFixed(4),
+    putDelta:  +pg.delta.toFixed(4),
+    netDelta:  +(cg.delta + pg.delta).toFixed(4),
+    targetDelta: kind === 'strangle' ? LANE_E_STRANGLE_TARGET : null,
+    targetDeltaSource: kind === 'strangle' ? 'PREM_TARGETS[0]' : 'nearest listed strike to spot',
+    callIv: +(callOpt.impliedVolatility * 100).toFixed(2),
+    putIv:  +(putOpt.impliedVolatility * 100).toFixed(2),
+    callAsk: cq.ask, putAsk: pq.ask,
+    debit: debitPer,
+    debitPerShare: +debit.toFixed(2),
+    maxLoss: debitPer,
+    beUpper: +beUpper.toFixed(2),
+    beLower: +beLower.toFixed(2),
+    beUpperPct: +upPct.toFixed(2),
+    beLowerPct: +downPct.toFixed(2),
+    requiredPct: +requiredPct.toFixed(2),
+    requiredSide: upPct >= downPct ? 'upside' : 'downside',
+    beEm: beEm == null ? null : +beEm.toFixed(3),
+    pBe: pb ? +pb.total.toFixed(4) : null,
+    pBeUp:   pb ? +pb.up.toFixed(4)   : null,
+    pBeDown: pb ? +pb.down.toFixed(4) : null,
+    pBeIvUp:   ivUp   ? +(ivUp.iv * 100).toFixed(2)   : null,
+    pBeIvDown: ivDown ? +(ivDown.iv * 100).toFixed(2) : null,
+    pBeIvStrikeUp:   ivUp?.strike   ?? null,
+    pBeIvStrikeDown: ivDown?.strike ?? null,
+    pBeReason: pb != null ? null
+      : (!Number.isFinite(rate) ? 'no risk-free rate — P(BE) suppressed rather than computed at r=0'
+                                : 'no listed strike near one of the breakevens quotes a usable IV; '
+                                  + 'ATM IV is not substituted, and a one-sided P(BE) is not shown in its place'),
+    netVega:  +(cg.vega + pg.vega).toFixed(2),
+    thetaDay: +((cg.theta + pg.theta) / 365 * 100).toFixed(2),
+    openInterest: Math.min(callOpt.openInterest ?? 0, putOpt.openInterest ?? 0),
+    spreadPct: +worstSpread.toFixed(4),
+    spreadMax,
     flags,
     ...cov,
   };
@@ -3789,6 +4037,125 @@ async function longRow(sym, env, { rate, premium }) {
   const beOk = bestBeEm == null ? null : bestBeEm <= LONG_BE_EM_MAX;
   const dim  = gate.buyable === false || beOk === false;
 
+  /* ── Lane E — straddle + strangle, on Lane B's already-fetched monthlies ────
+     Zero extra subrequests, the same arrangement Lanes C and D use.
+
+     THE LANE ALWAYS RENDERS. Failing a gate produces an entry naming the gate
+     that failed, never a hidden or blank one: "this did not qualify, and here is
+     why" is the product. Hiding it would make "no straddle worth looking at" and
+     "no data for this name" identical on screen.
+
+     THE RATING IS DELIBERATELY NOT A GATE. `analysis:{TICKER}` measured a NEGATIVE
+     edge (sign-scored BUY 50.5% against a 60.5% base rate, 2026-08-10), which is
+     why the alignment tag is informational-only. Gating a lane on a measured
+     non-edge would reintroduce exactly what was just disabled — and a straddle
+     makes no directional claim in the first place. */
+  for (const [exp, chain] of [[bExp1, bChain1], [bExp2, bChain2]]) {
+    if (exp == null) continue;
+    const iso = expiryIso(exp), edte = dteOf(exp);
+    const entry = { lane: 'E', expiry: iso, dte: edte, candidates: [], gateFailed: [], gateDetail: {} };
+
+    if (!chain || !Number.isFinite(rate)) {
+      entry.status = !chain ? 'error' : 'no-rate';
+      entry.reason = !chain ? 'expiry chain did not load'
+                            : 'no risk-free rate — greeks suppressed rather than computed at r=0';
+      lanes.push(entry);
+      continue;
+    }
+    const ectx = ctxFor(exp, chain);
+    entry.atmIv = ectx.atmIv;
+    entry.expectedMovePct = ectx.emPct == null ? null : +ectx.emPct.toFixed(2);
+
+    /* GATE 1 — vol is not rich. `buyable === null` is NOT a failure: it means no
+       basis to judge yet (rank still collecting, no HV30), and treating it as a
+       fail is the bug that dimmed the whole Premium tab for three months. */
+    if (gate.buyable === false) {
+      entry.gateFailed.push('vol-not-cheap');
+      entry.gateDetail.vol = `IV is not cheap enough to buy premium — ${gate.reason}`;
+    }
+    /* GATE 2 — a catalyst sits INSIDE the expiry. Without one there is no reason
+       to expect the move that has to happen; a straddle on no catalyst is paying
+       theta for a coin flip. */
+    const catalystIn = earnIso != null && iso != null && earnIso >= etToday() && earnIso <= iso;
+    if (!catalystIn) {
+      entry.gateFailed.push('no-catalyst-inside');
+      entry.gateDetail.catalyst = earnIso == null
+        ? 'no scheduled earnings date from Yahoo, so no catalyst can be confirmed inside this expiry'
+        : `next earnings ${earnIso} falls outside this expiry (${iso})`;
+    }
+    // GATE 3 — term structure. Positive termStructure is backwardation: the front
+    // premium a buyer pays is the rich end of the curve.
+    if (termStructure != null && termStructure > 0) {
+      entry.gateFailed.push('hostile-term');
+      entry.gateDetail.term = `front IV is ${termStructure.toFixed(1)} pts richer than back `
+        + '(backwardation) — buying the rich end of the curve';
+    }
+
+    const straddle = laneECandidate(chain, ectx, 'straddle');
+    const strangle = laneECandidate(chain, ectx, 'strangle');
+
+    /* THE PAIR IS NEVER SPLIT. If one fails to price, the other still renders and
+       the missing one is reported with its reason — the comparison between them is
+       the point, and a lone straddle silently drops the fact that the strangle
+       costs less and covers disproportionately less. */
+    if (straddle) entry.candidates.push(straddle);
+    else entry.candidates.push({ lane: 'E', kind: 'straddle', status: 'not-priced',
+      reason: 'no strike near spot quotes a plausible IV and an ask on both the call and put side' });
+    if (strangle) entry.candidates.push(strangle);
+    else entry.candidates.push({ lane: 'E', kind: 'strangle', status: 'not-priced',
+      reason: `no ${LANE_E_STRANGLE_TARGET}-delta pair on this expiry quotes a plausible IV and an ask `
+        + 'on both sides, with the call strike above the put' });
+
+    // GATE 4 — coverage has to resolve, or there is no measured answer to give and
+    // the lane has nothing to say that the other lanes do not already say better.
+    const covOk = straddle && straddle.coverage3y != null;
+    if (!covOk) {
+      entry.gateFailed.push('no-coverage');
+      entry.gateDetail.coverage = straddle
+        ? (straddle.coverageReason || 'coverage does not resolve at this horizon')
+        : 'the straddle did not price, so there is no breakeven to measure coverage against';
+    }
+
+    /* THE HEADLINE — three numbers, one line, in this order:
+         required move / expected move / typical realized move
+       Everything else on the card is supporting detail. `typicalRealizedPct` is
+       the median ABSOLUTE N-session move from the stored series at this horizon,
+       which is the honest comparator for a structure that pays on either tail. */
+    const snap = snapHorizon(edte);
+    entry.headline = {
+      requiredPct:  straddle?.requiredPct ?? null,
+      expectedPct:  entry.expectedMovePct,
+      typicalRealizedPct: snap ? medianAbsMovePct(moves, snap.horizon) : null,
+      horizon: snap?.horizon ?? null,
+      sessions: snap?.sessions ?? null,
+      reason: straddle ? null : 'no straddle priced, so there is no required move to state',
+    };
+
+    /* THE EARNINGS-STRADDLE CAVEAT — visible text, not a comment.
+       Expectancy and coverage both assume HOLD TO EXPIRY. The trade actually worth
+       considering into a print is buy-before / sell-after: a two-day vega trade,
+       not a 45-day terminal-value trade. IV crush can take that position down even
+       when the move happens, and these figures do not model it.
+       NO IV-CRUSH MODEL IS ATTEMPTED. There is no vol-surface history in this
+       codebase to support one, so the limitation is stated and the derivation
+       stops — the same refusal Lane D makes rather than assuming a future IV. */
+    if (catalystIn) {
+      entry.holdToExpiryCaveat =
+        'These figures assume the position is HELD TO EXPIRATION. The straddle actually worth '
+        + `considering into the ${earnIso} print is buy-before / sell-after — a two-day vega trade, `
+        + 'not a terminal-value trade over ' + edte + ' days. IV crush after the print can take that '
+        + 'position down even when the move happens, and NOTHING here models it: there is no vol-surface '
+        + 'history in this codebase to model it from. Coverage and expectancy below describe a trade you '
+        + 'would probably not put on.';
+    }
+
+    entry.status = entry.gateFailed.length ? 'gated' : 'ok';
+    if (entry.gateFailed.length) {
+      entry.reason = `did not qualify: ${entry.gateFailed.join(', ')}`;
+    }
+    lanes.push(entry);
+  }
+
   const frontDte = frontMeta.dte;
   return {
     symbol: sym,
@@ -3955,6 +4322,11 @@ async function handleLongBatch(params, origin, env) {
       A: { targets: LANE_A_TARGETS, minDte: LEAPS_MIN_DTE, targetDte: LEAPS_TARGET_DTE },
       B: { targets: LANE_B_TARGETS, dtes: LANE_B_DTES },
       C: { long: LANE_C_LONG, short: LANE_C_SHORT },
+      // `strangleDeltaSource` ships the PROVENANCE, not just the number: the whole
+      // point of reusing PREM_TARGETS[0] is that no new selection rule was
+      // invented, and a bare 0.3 on the frontend would lose that.
+      E: { strangleDelta: LANE_E_STRANGLE_TARGET, strangleDeltaSource: 'PREM_TARGETS[0]',
+           straddleRule: 'nearest listed strike to spot' },
     },
     gates: {
       ivrBuyMax: IVR_BUY_MAX, ratioBuyMax: RATIO_BUY_MAX,

@@ -588,6 +588,27 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .long-supp { font-family: var(--sans); font-size: 10px; color: var(--ink-3); background: var(--bg-2);
   border-left: 2px solid var(--violet); padding: 7px 10px; margin-top: 6px; border-radius: 0 3px 3px 0; line-height: 1.45; }
 .long-flag { font-family: var(--mono); font-size: 8px; color: var(--amber); margin-left: 4px; }
+
+/* Lane E. The headline is the product — three numbers on one line — so it is
+   sized above the table rather than inside it. */
+.lane-e-headline { font-family: var(--mono); font-size: 12px; color: var(--ink-1); background: var(--bg-2);
+  padding: 9px 11px; border-radius: 3px; margin: 6px 0; display: flex; flex-wrap: wrap;
+  align-items: baseline; gap: 8px; line-height: 1.5; }
+.lane-e-num { font-size: 14px; color: var(--ink-0); font-weight: 600; }
+.lane-e-num.req  { color: var(--amber); }
+.lane-e-num.real { color: var(--cyan); }
+.lane-e-sep { color: var(--ink-3); }
+.lane-e-verdict { font-family: var(--sans); font-size: 10px; padding: 2px 7px; border-radius: 3px; }
+.lane-e-verdict.good { background: rgba(35,209,139,0.16); color: var(--bull); }
+.lane-e-verdict.bad  { background: rgba(242,95,92,0.16);  color: var(--bear); }
+.lane-e-gates { font-family: var(--sans); font-size: 10px; color: var(--ink-2); background: var(--bg-2);
+  border-left: 2px solid var(--amber); padding: 7px 10px; margin: 6px 0; border-radius: 0 3px 3px 0; line-height: 1.5; }
+.lane-e-gates ul { margin: 4px 0 0 14px; padding: 0; }
+.lane-e-gates li { margin: 2px 0; }
+/* The tail split. `lopsided` fires past 80/20 — at that point the total is one
+   tail and the structure is not behaving as a volatility trade. */
+.lane-e-split { font-family: var(--mono); font-size: 9px; color: var(--ink-3); margin-left: 4px; }
+.lane-e-split.lopsided { color: var(--amber); }
 .long-ages { font-family: var(--mono); font-size: 9px; color: var(--ink-3); margin-top: 8px; line-height: 1.5; }
 
 .prem-chip { font-family: var(--mono); font-size: 9px; padding: 2px 7px; border-radius: 3px; background: var(--bg-3); color: var(--ink-2); letter-spacing: 0.04em; white-space: nowrap; }
@@ -2948,6 +2969,101 @@ function longCalendarTable(entry) {
     lane, and that is deliberate.</b> ${esc(c.suppressed.reason)}</div>`;
 }
 
+/** Lane E — straddle + strangle, ALWAYS AS A PAIR.
+ *
+ *  The lane's job is not to surface these trades. It is to say whether the move
+ *  they require has historically happened, and most of the time the honest answer
+ *  is no. So a failed gate renders the lane WITH THE GATE NAMED rather than
+ *  hiding it: "did not qualify, here is why" is the product.
+ */
+function longLaneETable(entry) {
+  const h = entry.headline || {};
+  const gated = (entry.gateFailed || []).length > 0;
+
+  /* THE HEADLINE — three numbers, one line, in this order. Everything below is
+     supporting detail. `required` is the WIDER breakeven, because the narrow side
+     flatters the structure and is not what has to happen. */
+  const num = (v, cls = '') => v == null
+    ? '<span class="muted">—</span>'
+    : `<span class="lane-e-num ${cls}">${v.toFixed(1)}%</span>`;
+  const verdict = (h.requiredPct != null && h.typicalRealizedPct != null)
+    ? (h.typicalRealizedPct >= h.requiredPct ? 'has' : 'has NOT')
+    : null;
+  const headline = `<div class="lane-e-headline">
+    <span title="The WIDER of the two breakevens, as % from spot. The narrower side is not what has to happen.">required ${num(h.requiredPct, 'req')}</span>
+    <span class="lane-e-sep">/</span>
+    <span title="The 1σ move the chain is pricing for this expiry.">expected ${num(h.expectedPct)}</span>
+    <span class="lane-e-sep">/</span>
+    <span title="MEASURED: the median ABSOLUTE ${h.horizon ?? '?'}-session move from the stored 3y series. The honest comparator for a structure that pays on either tail.">typical realized ${num(h.typicalRealizedPct, 'real')}</span>
+    ${verdict ? `<span class="lane-e-verdict ${verdict === 'has' ? 'good' : 'bad'}">the typical move ${verdict} covered this</span>` : ''}
+  </div>${h.reason ? `<div class="prem-note">${esc(h.reason)}</div>` : ''}`;
+
+  const gates = gated
+    ? `<div class="lane-e-gates"><b>Did not qualify — ${esc(entry.gateFailed.join(', '))}.</b><ul>${
+        Object.values(entry.gateDetail || {}).map(v => `<li>${esc(v)}</li>`).join('')}</ul>
+       <div class="prem-note">Shown rather than hidden: "no straddle worth looking at here" and "no data for
+       this name" must not look the same.</div></div>`
+    : '';
+
+  // §6 — the earnings-straddle limitation, in visible text and never a tooltip.
+  const caveat = entry.holdToExpiryCaveat
+    ? `<div class="long-supp"><b>These figures assume HOLD TO EXPIRY.</b> ${esc(
+        entry.holdToExpiryCaveat.replace('These figures assume the position is HELD TO EXPIRATION. ', ''))}</div>`
+    : '';
+
+  const pct = (v, d = 1) => v == null ? '—' : (v * 100).toFixed(d) + '%';
+  /* THE SPLIT IS RENDERED APART AND NEVER SUMMED IN THE CELL. On a trending name
+     the total can rest almost entirely on one tail — 24% split 22/2 is a long call
+     wearing a straddle's name. Summing destroys exactly that distinction. */
+  const splitCell = (c, win) => {
+    const up = c[`coverageUpper${win}`], lo = c[`coverageLower${win}`], tot = c[`coverage${win}`];
+    if (tot == null) return '<span class="muted">—</span>';
+    const share = tot > 0 && up != null ? up / tot : null;
+    const lop = share != null && (share > 0.8 || share < 0.2);
+    return `<span title="Upper tail ${pct(up)} + lower tail ${pct(lo)} = ${pct(tot)}. Rendered apart deliberately: on a trending name one tail carries the total.">${
+      pct(tot)}</span> <span class="lane-e-split ${lop ? 'lopsided' : ''}">${pct(up, 0)}<span class="lane-e-sep">↑</span>${pct(lo, 0)}<span class="lane-e-sep">↓</span></span>`;
+  };
+
+  const rows = (entry.candidates || []).map((c) => {
+    if (c.status === 'not-priced') {
+      return `<tr class="dim"><td>${esc(c.kind)}</td><td colspan="10">${esc(c.reason)}</td></tr>`;
+    }
+    const conc = c.concentrationLabel
+      ? ` <span class="long-tag warn" title="${esc(c.concentrationNote || '')}">⚑ ${esc(c.concentrationLabel)}</span>` : '';
+    const trunc = c.upsideTruncated
+      ? ` <span class="long-tag noread" title="${esc(c.upsideTruncatedReason || '')}">upside truncated</span>` : '';
+    return `<tr>
+      <td><b>${esc(c.kind)}</b> ${c.kind === 'strangle' ? esc(c.putStrike + 'P/' + c.callStrike + 'C') : esc(String(c.callStrike))}${trunc}</td>
+      <td>${money(c.debitPerShare)}</td>
+      <td title="Lower / upper breakeven.">${fmt(c.beLower)} / ${fmt(c.beUpper)}</td>
+      <td title="Required move on each side, as % from spot.">−${c.beLowerPct}% / +${c.beUpperPct}%</td>
+      <td>${nOrDash(c.beEm, 2, '×')}</td>
+      <td title="MODELLED, two-sided: N(d2) above the upper breakeven + P below the lower. Up ${pct(c.pBeUp)} / down ${pct(c.pBeDown)}, each from the strike nearest ITS OWN breakeven — put skew is real.">${pct(c.pBe)}</td>
+      <td>${splitCell(c, '1y')}</td>
+      <td>${splitCell(c, '3y')}</td>
+      <td title="cov − p(be) in points. A modest negative gap is the variance risk premium.">${c.gap3y == null ? '—' : (c.gap3y > 0 ? '+' : '') + c.gap3y}</td>
+      <td>${c.expectancyMean == null ? '—' : (c.expectancyMean * 100).toFixed(0) + '%'}${conc}</td>
+      <td>${c.openInterest == null ? '—' : fmtVol(c.openInterest)}</td>
+    </tr>${candDetail(c)}`;
+  }).join('');
+
+  return headline + gates + caveat + `<table class="prem-cands">
+    <thead><tr>
+      <th>Structure</th><th>Debit</th><th>Breakevens</th><th>% move</th><th>BE/EM</th>
+      <th>p(be)</th><th>cov 1y ↑/↓</th><th>cov 3y ↑/↓</th><th>gap</th><th>E[R]</th><th>OI</th>
+    </tr></thead><tbody>${rows}</tbody></table>
+    <div class="prem-note"><b>The two tails are shown apart and never summed into one number.</b>
+    Drift inflates one tail and deflates the other, so coverage can look healthy while resting almost
+    entirely on one side. A straddle covering 24% split 22↑/2↓ is closer to a long call than to a
+    volatility trade; 13↑/11↓ is an actual volatility trade. Read the split, not the total.
+    <br><b>It is drift RELATIVE TO THE NAME'S OWN VOLATILITY that decides this, not raw drift.</b>
+    Measured across all 35 stored series at ±10% / 45 sessions (2026-08-10): the up-tail share
+    correlates <b>0.902</b> with drift÷σ and only <b>0.038</b> with drift on its own. A fixed move is
+    a large one for JPM (σ 6.4%, 89% up-share on 5.7% drift) and a trivial one for QUBT (σ 62%, 49%
+    up-share on 75% drift) — so a big trend on a wild name can still split evenly, and a small trend
+    on a quiet one need not.</div>`;
+}
+
 /* Lane headers no longer hardcode their sort — it is now selectable and can fall
    back, and a header claiming an order the table is not in would be worse than no
    header at all. `laneSortLine()` states the order actually in effect. */
@@ -2956,12 +3072,16 @@ const LANE_META = {
   B: ['Lane B · Directional swing',          'calls and puts · nearest 0.55 and 0.40 delta'],
   C: ['Lane C · Debit verticals',            'long ~0.55Δ, short ~0.25Δ · debit is long ask − short bid'],
   D: ['Lane D · Calendar / diagonal',        'sell the front monthly, buy the back · intentionally thin — see the note'],
+  E: ['Lane E · Straddle + strangle',        'always as a pair · straddle at the strike nearest spot, strangle at 0.30Δ each side (PREM_TARGETS[0]) · answers whether the required move has actually happened'],
 };
 
 /** What this lane is actually sorted by, plus the Sharpe control — which has no
  *  visible column and would otherwise be an invisible feature. */
 function laneSortLine(lane, cands) {
-  if (lane === 'D') return '';
+  // D and E are fixed shapes, not sorted lists — D is one calendar, E is a pair
+  // whose whole point is the comparison between its two members. Offering a sort
+  // would imply an ordering that carries no meaning.
+  if (lane === 'D' || lane === 'E') return '';
   const eff = laneSortInEffect(lane, cands);
   const spec = LONG_CAND_SORTS[eff.col] || LONG_CAND_SORTS.beem;
   const arrow = eff.dir === 1 ? 'ascending' : 'descending';
@@ -3026,7 +3146,7 @@ function longDetail(r) {
   const basis  = r.directional?.calibration?.basis || null;
 
   // Lane sections in order, each labelled with what it is and how it is sorted.
-  const laneOrder = ['A', 'B', 'C', 'D'];
+  const laneOrder = ['A', 'B', 'C', 'D', 'E'];
   const lanesHtml = laneOrder.map((lane) => {
     const entries = (r.lanes || []).filter(l => l.lane === lane);
     if (!entries.length) return '';
@@ -3040,7 +3160,13 @@ function longDetail(r) {
         ${entry.ltcgEligible ? '<span class="prem-chip muted" title="Expiry sits beyond the 366-day long-term line.">LTCG possible</span>' : ''}
         ${entry.atmIv != null ? `<span class="long-lane-sub">ATM IV ${entry.atmIv.toFixed(1)}% · expected move ±${entry.expectedMovePct}%</span>` : ''}
       </div>`;
-      if (entry.status !== 'ok' && !((entry.candidates || []).length)) {
+      /* Lane E is exempt from the early-out: `status: 'gated'` with candidates
+         present is its NORMAL failing state, and the gate detail is the thing
+         worth reading. Bailing here would hide exactly what the lane exists for. */
+      if (lane !== 'E' && entry.status !== 'ok' && !((entry.candidates || []).length)) {
+        return head + `<div class="prem-note">${esc(entry.reason || 'unavailable')}.</div>`;
+      }
+      if (lane === 'E' && !((entry.candidates || []).length)) {
         return head + `<div class="prem-note">${esc(entry.reason || 'unavailable')}.</div>`;
       }
       // Strikes dropped for quoting an implausible IV are declared, not hidden —
@@ -3049,6 +3175,7 @@ function longDetail(r) {
         ? `<div class="prem-note">${esc(entry.ivOutlierNote)}</div>` : '';
       return head + (lane === 'C' ? longVerticalTable(entry, scored, basis)
                    : lane === 'D' ? longCalendarTable(entry)
+                   : lane === 'E' ? longLaneETable(entry)
                    : longSingleTable(entry, scored, basis)) + outliers;
     }).join('');
     return `<div class="long-lane">
