@@ -114,6 +114,30 @@ were documented as "zero outbound calls"; that is true of *fetches* and false of
 *subrequests* — they cost **exactly one KV read per symbol**, so a 22-name
 watchlist paints for **22** against the cap, not 0. Both now report `_instr`.
 
+**`_instr` IS A COUNTER DELTA, NOT A PER-JOB TOTAL — two concurrent jobs
+contaminate each other.** `instrMark()` / `instrSince()` bracket a span of *time*
+and subtract invocation-wide counters. Anything else running inside that bracket
+is attributed to whichever job stamped the payload. On a firing that dispatches
+two jobs through `ctx.waitUntil`, the per-job figures are **upper bounds on that
+job and lower bounds on the invocation**, not measurements of either.
+
+Observed 2026-08-10 on the `forward-returns+moves` branch: `collectMoveSeries`
+reported `extFetches 5, bindingOps 76` where its own structure predicts `2` and
+`73`. The +3 landed on **both** counters, `fillForwardReturns` was demonstrably
+mid-run (its `/BTC` failure logged before the sweep's line and its summary after),
+and `invocationFetches` read 5 at stamp time against the ~45 chart fetches the
+fill went on to make. The sweep's own cost was almost certainly the predicted
+`2 / 73`; the stamped figure is the branch's, not the job's.
+
+So: **quote a per-job `_instr` only for a job that ran alone, and say which case
+you are in.** The N=22 sweep figure of `2 / 47 / 49` is trustworthy precisely
+because it was measured in isolation and matches `2N + 3` exactly. When two jobs
+share a firing, `invocationCapCost` is the honest number and the per-job split is
+an inference. This is not a defect to fix — a per-job counter would need
+async-context tracking the runtime does not offer — but an unlabelled per-job
+figure from a shared firing is a measurement that is quietly wrong, which is the
+failure this whole section exists to prevent.
+
 **Coverage is declared, not assumed.** `instrWrapBindings` does not name
 `REC_LOG` — it walks `env` and wraps everything binding-*shaped* (an object or
 function carrying at least one callable member; a secret is a string, a `[vars]`
@@ -1141,9 +1165,26 @@ the series every coverage figure is measured against would never surface as an
 error — it would quietly shift the most recent window. By 2:00pm the bar is
 settled. (`fillForwardReturns` guards the same hazard from the other side with
 `bars[idx].iso < today`.) Both jobs share that invocation's subrequest budget:
-`ctx.waitUntil` does not get its own. **Measured cost of the sweep: `extFetches` 2,
-`bindingOps` 47, `capCost` 49** for a 22-name watchlist — one `yahooSparkCloses`
-call at 20 symbols per request, then one KV read and one write per symbol.
+`ctx.waitUntil` does not get its own.
+
+**Cost of the sweep, and the reason two numbers are quoted.** The model is
+`bindingOps = 2N + 3` (one read + one write per symbol, plus the dedup get, the
+watchlist get and the dedup put) and `extFetches = ceil(N/20)` (spark takes 20
+symbols per request). Measured in isolation at N=22: `2 / 47 / 49`, matching
+exactly. Observed in production 2026-08-10 at **N=35**: `extFetches 5,
+bindingOps 76, capCost 81`, against a predicted `2 / 73 / 75`.
+
+**The excess is the instrumentation, not the sweep — see the concurrency caveat
+in rule #1.** `fillForwardReturns` runs concurrently on the same firing, and
+`instrSince()` measures an invocation-wide counter delta, so its fetches land
+inside the sweep's bracket. The +3 appears on *both* counters, and
+`invocationFetches` was 5 at stamp time against the ~45 charts the fill went on
+to do — the fill had only started.
+
+**N is 35, not 22.** Both sweeps take `watchlist:tickers` ∪ `DEFAULT_WATCHLIST`;
+the saved list holds 33 and the default 22, unioning to 35. `extFetches` stays at
+2 only because 35 ≤ 40 — **at 41 watchlist names it becomes 3**, which a later
+reader would otherwise read as a regression.
 
 **Check the UTC hour in both DST regimes before scheduling anything.** The 13F job used to run at 3pm PT, which is 22:00 UTC under PDT but **23:00 under PST** — outside this window — so it silently never ran for the winter half of the year. It moved to 10am PT (17:00/18:00 UTC), inside the window in both. Every other job was already safe; this one was not.
 
@@ -1415,6 +1456,20 @@ recordIvSample (long-live)   1     readMoveSeries                      1
 ivHistory (list)             1     storeLongRow                        1
                                                                  total 9
 ```
+
+**That 9 is the premium-COLD figure. Premium-warm is 8, and the missing op is
+`ivHistory`** — on the warm path `ivRank`, `historyDays` and `rankReason` are
+reused from `premium:{TICKER}`, so the list call never happens. Verified live
+2026-08-10 on AAPL: warm `ext 4 / bind 8 / cap 12`, cold `ext 8 / bind 10 /
+cap 18`. Do not "fix" the warm path to 9 by re-adding a history read.
+
+**`?refresh=1` on `/api/long/:ticker` does NOT force the premium row to refetch.**
+`refreshLongTicker()` reuses `premium:{TICKER}` whenever it is inside
+`PREMIUM_FRESH_MS`, independently of the long endpoint's own refresh flag. So a
+bare `?refresh=1` on a ticker whose premium row is cold takes the **cold** path
+every time, and the warm branch cannot be reached by repeating the call. To
+exercise it, seed `/api/premium/:ticker?refresh=1` first. This cost a wasted test
+cycle when the warm-path IV skip was being verified.
 
 History of that figure: **6** before move coverage (measured with the crumb already
 in memory), **8** after it (`readMoveSeries` + `recordIvSample`), **9** after pooled

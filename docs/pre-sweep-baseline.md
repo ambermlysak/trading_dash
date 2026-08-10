@@ -635,3 +635,107 @@ mechanism from the per-key skip and not what 4(c) is about.
 53.3 / 61.4 / −8.1 legitimately — **that is a population change, not a
 regression**, and it must be reported as one. The §5 figures stay authoritative
 for the 22-name population they describe.
+
+### 8.4 ITEM 4 RESULTS — all four complete, 14:00–14:10 PT
+
+Sweep log, verbatim:
+
+```
+[cron] 2026-08-10 Mon 14:00 PT · branch=forward-returns+moves
+[cron] forward fill /BTC: chart failed — Yahoo 404
+[cron] move-series sweep: 35 written, 0 already current, 0 not returned by spark,
+       0 with thin history · {"extFetches":5,"bindingOps":76,"capCost":81,
+       "settledRejected":0,"invocationFetches":5,"invocationCapCost":82,
+       "scope":"scheduled","measured":true,"bindingsWrapped":["REC_LOG"],
+       "bindingsSkipped":[],"cacheApiCounted":false,"phase":"complete"}
+[cron] forward fill: 23 value(s) across 42 ticker(s)
+[cron] pooled calibration: n=300 across 50 ticker(s), magnitude n=276 over 33 with a bar
+```
+
+**(a) PASS with one caveat.** 35 keys written, `skipped 0` as predicted (`prev`
+was null everywhere), `settledRejected 0`, `phase: complete`. Largest value
+**QUBT 61,359 B** against §6.2's 61,496 B — schema-2 pair shape confirmed at
+scale. `extFetches 5 / bindingOps 76` against the predicted `2 / 73`: the +3 on
+both counters is the concurrent `fillForwardReturns` inside the same `_instr`
+bracket, now written up as the concurrency caveat in CLAUDE.md rule #1. AAPL's
+horizon nulls read back from stored KV exactly as §6.3 froze them — nulls at
+3y{180, 365} and 1y{90, 180, 365}, all five reason strings verbatim, at 751
+sessions vs 753 (the 3y window rolled).
+
+**(b) PASS — the round-trip loses nothing.** Ran as the three-column test from
+§7.1. Parity held first: all 8 tickers' stored `asOfClose` equals fresh spark's
+last session (2026-08-10), so column (ii) is a faithful rebuild.
+
+- **(i) vs (ii): identical.** 40 non-null horizon arrays compared pair-by-pair,
+  **0 differing**, and the scored distributions match exactly at n=198.
+- **(ii) vs (iii): 5 of 198 candidates moved**, all between adjacent bins in the
+  sparse tail — `4` 16↔15, `5` 13↔12, `6` 7↔9, max 26 vs 25. Pure drift.
+
+Every headline figure is unchanged from the frozen table: **==1 26.8% · ≤2 52.5%
+· ≤3 68.2% · p50 2 · p75 4 · p90 8**. `EPISODE_CONCENTRATION_WARN = 1` still rests
+on the 26.8% it was calibrated against.
+
+> The first run of this script scored **0 candidates** on both columns — wrong
+> field names (`winners` / `episodesTo50` for `expectancyWinRate` /
+> `expectancyEpisodesTo50`) — and printed **"IDENTICAL"**, because two empty sets
+> compare equal. That is the codebase's own recurring failure in miniature. The
+> script now refuses a verdict when either set is empty.
+
+**(c) PASS, after the prediction in §7.4 was falsified.** The cron does not skip
+(§8.2). The warm `longRow` path does, and reaching it needs a fresh
+`premium:{TICKER}` — `?refresh=1` on the long endpoint does **not** refetch the
+premium row, so repeating that call takes the cold path every time. Seeding
+`/api/premium/AAPL?refresh=1` first gave `premiumWarm=True`, and the sample was
+byte-identical before and after:
+
+```
+before  {"atmIv":21.66,...,"ts":"2026-08-10T21:08:54.878Z"}
+after   {"atmIv":21.66,...,"ts":"2026-08-10T21:08:54.878Z"}     ← unchanged
+```
+
+Warm cost `ext 4 / bind 8 / cap 12`; cold `ext 8 / bind 10 / cap 18`. The warm 8
+is one below §3's 9 because `ivHistory()` is skipped when the rank is reused.
+
+**(d) PASS.** `calib:pooled` written by `fillForwardReturns`, schema 2,
+`d: 2026-08-10`, `magnitudeN 276` over `tickersWithBar 33` — **the §7.3 race did
+not bite**; the sweep finished before the fill read `moves:`. Resolving against
+real data, not the fixture:
+
+| | rate | base | edge | n / benchmarkedN |
+|---|---|---|---|---|
+| BUY sign | 50.46% | 60.54% | **−10.1** | 116 / **109** |
+| BUY magnitude | 20.18% | 33.72% | **−13.5** | 109 / 109 |
+
+`benchmarkedN` rose 75 → 109 exactly as §8.3 predicted, so these supersede §5 on
+population, not on correctness — §5 remains right for the 22-name population.
+**The negative edge persists and the sign edge widened.** SELL correctly nulls at
+`n=4` with the per-rating floor reason; HOLD nulls with the no-directional-claim
+reason. Bar 7.34% vs the pre-sweep 7.38%. `brier 0.3057` over 121.
+
+### 8.5 Incidental finding: `rec:/BTC` is a malformed key
+
+One of the 63 `rec:` keys is named `/BTC`, the only one failing
+`/^[A-Z][A-Z.\-]{0,9}$/`. It 404s its chart fetch on **every** 2pm run — one
+wasted external fetch and a `warn` line daily, forever. Harmless to the
+calibration (it contributes no resolved outcome) but it is permanent noise in the
+log that a future reader will spend time on. Deleting a KV key is destructive and
+was not done unasked.
+
+---
+
+## 9. This file has served its purpose
+
+All four parts of item 4 are complete and recorded in §8.4. The durable findings
+have been moved into `CLAUDE.md`:
+
+- the `_instr` concurrency caveat (rule #1) — the widest-reaching of them
+- the sweep's `2N + 3` / `ceil(N/20)` cost model and the N=35 universe
+- premium-warm being 8 binding ops, not 9, and why
+- `?refresh=1` on `/api/long/` not refetching the premium row
+
+What remains here is a frozen snapshot with no maintained value. **This file can
+be deleted.** Two things would need a home first if they are ever acted on:
+`rec:/BTC` (§8.5), and the still-open follow-ups from the earlier session —
+a structural baseline for `gap`, recalibrating `EPISODE_CONCENTRATION_WARN` now
+that a full sweep exists (the 26.8% held, so there is nothing to change today),
+and surfacing `baseRate`/`edgePts` on `index.html`'s Recommendation History card.
