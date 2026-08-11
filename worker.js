@@ -346,10 +346,61 @@ const SNAPSHOT_SYMBOLS = {
   '^VIX':  'VIX',
 };
 
-const DEFAULT_WATCHLIST = [
-  'PLTR','NVDA','AMD','AAPL','AMZN','GOOGL','QUBT','TWLO','NOW','TSM',
-  'MU','APP','CRCL','CRWV','MRK','UNH','TSLA','PANW','RDDT','CAVA','JPM','HOOD',
-];
+/* ── THE SWEEP UNIVERSE — `watchlist:tickers`, and nothing else ─────────────
+ *
+ * `DEFAULT_WATCHLIST` is GONE. Every sweep used to read
+ * `watchlist:tickers ∪ DEFAULT_WATCHLIST`, which meant the server permanently
+ * covered names the dashboard did not show: measured 2026-08-11, the saved list
+ * held 33 and the sweeps ran over 35, with MRK and JPM computed and stored on
+ * every firing without ever appearing on screen. Two sources kept in agreement
+ * is a thing to maintain; one source is a thing that cannot diverge.
+ *
+ * THE COST OF THAT DELETION IS A NEW FAILURE MODE, and it is closed here rather
+ * than noted. With the fallback gone, an absent / unparseable / empty
+ * `watchlist:tickers` yields ZERO names — and a sweep that writes zero keys is
+ * indistinguishable from a cron that never fired, which is the exact signature
+ * that already cost this codebase weeks (rule #7). Worse, the IV and move sweeps
+ * stamp their dedup key on the way out, so a silent zero would persist all day.
+ *
+ * So this returns `null`, never `[]`, and logs at ERROR with a marker that can be
+ * grepped. Callers that own a dedup key MUST refuse before stamping it, so the
+ * next firing retries.
+ *
+ * @returns {Promise<string[]|null>} the universe, or null if there isn't one.
+ */
+async function sweepUniverse(env, job, cap = 60) {
+  let raw = null, why = null;
+  try {
+    raw = await env?.REC_LOG?.get('watchlist:tickers', 'json');
+  } catch (e) {
+    why = `KV read failed — ${e.message}`;
+  }
+  if (!why) {
+    if (raw == null)             why = 'key is absent (no dashboard has ever saved a watchlist)';
+    else if (!Array.isArray(raw)) why = `key holds ${typeof raw}, not an array`;
+    else if (!raw.length)         why = 'key holds an empty array';
+  }
+  if (!why) {
+    const cleaned = [...new Set(raw.map(t => String(t).toUpperCase().trim()))]
+      .filter(t => REC_SYMBOL_RE.test(t));
+    const dropped = raw.length - cleaned.length;
+    if (!cleaned.length) why = `all ${raw.length} entries failed the symbol-shape test`;
+    else {
+      if (dropped > 0) {
+        console.warn(`[cron] ${job}: dropped ${dropped} watchlist entr${dropped === 1 ? 'y' : 'ies'} `
+          + 'that are not valid symbol shapes');
+      }
+      return cleaned.slice(0, cap);
+    }
+  }
+  /* UNMISTAKABLE, and at error level. "0 written" in an otherwise cheerful log
+     line is the thing this exists to prevent being mistaken for a quiet success. */
+  console.error(`[cron] !! EMPTY-UNIVERSE !! ${job} has ZERO tickers to sweep: watchlist:tickers ${why}. `
+    + 'REFUSING to run rather than writing nothing — a sweep that covers zero names looks identical to a '
+    + 'cron that never fired. Fix: open the dashboard, which pushes its watchlist on load. '
+    + 'No dedup key has been stamped, so the next firing will retry.');
+  return null;
+}
 
 const SECTOR_ETFS = {
   'XLK':  'Technology',
@@ -4550,14 +4601,10 @@ async function recordWatchlistIv(env) {
     if (last === ptDate()) { console.log('[cron] iv sweep already ran today, skipping'); return; }
   } catch (_) {}
 
-  let tickers = [...DEFAULT_WATCHLIST];
-  try {
-    const saved = await env?.REC_LOG?.get('watchlist:tickers', 'json');
-    if (Array.isArray(saved) && saved.length) {
-      tickers = [...new Set([...saved, ...DEFAULT_WATCHLIST].map(t => String(t).toUpperCase()))];
-    }
-  } catch (_) {}
-  tickers = tickers.slice(0, 50); // each ticker costs 1–2 chain fetches
+  // REFUSES on an empty universe, and does so BEFORE `ivsweep:last` is stamped
+  // below — otherwise a zero-name run would dedup itself out for the whole day.
+  const tickers = await sweepUniverse(env, 'iv sweep', 50); // 1–2 chain fetches each
+  if (!tickers) return;
 
   let ok = 0;
   for (let i = 0; i < tickers.length; i += 5) {
@@ -6481,14 +6528,9 @@ async function collectMoveSeries(env) {
     if (last === ptDate()) { console.log('[cron] move-series sweep already ran today, skipping'); return; }
   } catch (_) {}
 
-  let tickers = [...DEFAULT_WATCHLIST];
-  try {
-    const saved = await env.REC_LOG.get('watchlist:tickers', 'json');
-    if (Array.isArray(saved) && saved.length) {
-      tickers = [...new Set([...saved, ...DEFAULT_WATCHLIST].map(t => String(t).toUpperCase()))];
-    }
-  } catch (_) {}
-  tickers = tickers.slice(0, LONG_MAX_SYMBOLS);
+  // Same refusal, and for the same reason: `movesweep:last` is stamped below.
+  const tickers = await sweepUniverse(env, 'move-series sweep', LONG_MAX_SYMBOLS);
+  if (!tickers) return;
 
   let series;
   try {
@@ -8379,6 +8421,18 @@ async function generateDailySnapshot(env) {
     timeZone: 'America/Los_Angeles',
   });
 
+  /* The opportunity/avoid universe. THIS SITE DEGRADES WORSE THAN THE SWEEPS DO:
+     with the old `DEFAULT_WATCHLIST.join(', ')` and an empty list the prompt read
+     "choose from: " — an empty constraint, which does not stop the model, it just
+     stops constraining it. The briefing would name arbitrary tickers and look
+     entirely normal. So an absent universe changes the INSTRUCTION rather than
+     interpolating nothing: the model is told to return null and why. */
+  const pickUniverse = await sweepUniverse(env, 'briefing opportunity/avoid', 60);
+  const pickLine = pickUniverse && pickUniverse.length
+    ? `For opportunity and avoid, choose from: ${pickUniverse.join(', ')}.`
+    : 'There is no saved watchlist, so you have no universe to pick from. Return null for BOTH '
+      + '"opportunity" and "avoid" — do NOT substitute tickers of your own choosing.';
+
   const prompt = `You are a professional stock market analyst. Today is ${today}.
 
 MARKET DATA:
@@ -8404,7 +8458,7 @@ Generate a morning market briefing as valid JSON with exactly these fields:
   "avoid": { "ticker": "SYMBOL", "reason": "1-2 sentences" }
 }
 
-newsCards must have exactly 8 items. For opportunity and avoid, choose from: ${DEFAULT_WATCHLIST.join(', ')}.
+newsCards must have exactly 8 items. ${pickLine}
 If you reference an FOMC meeting or CPI release, use ONLY the macro calendar above — never a date recalled from training data.
 Return ONLY valid JSON, no markdown fences.`;
 
@@ -8474,19 +8528,15 @@ Return ONLY valid JSON, no markdown fences.`;
 }
 
 /* ── Cron: refresh per-ticker watchlist analysis ──
-   Uses the user's persisted watchlist (saved from the dashboard) unioned with
-   DEFAULT_WATCHLIST so the morning briefing's opportunity/avoid picks are always
-   covered too. Each ticker is written to analysis:{TICKER} for the batch endpoint
-   to serve, so the consolidated recommendation renders instantly on page load. */
+   Covers exactly `watchlist:tickers` — the dashboard's own list and nothing
+   more. Each ticker is written to analysis:{TICKER} for the batch endpoint to
+   serve, so the consolidated recommendation renders instantly on page load. */
 async function refreshWatchlistAnalyses(env) {
-  let tickers = [...DEFAULT_WATCHLIST];
-  try {
-    const saved = await env?.REC_LOG?.get('watchlist:tickers', 'json');
-    if (Array.isArray(saved) && saved.length) {
-      tickers = [...new Set([...saved, ...DEFAULT_WATCHLIST].map(t => String(t).toUpperCase()))];
-    }
-  } catch (_) {}
-  tickers = tickers.slice(0, 60); // safety cap on subrequest volume
+  /* This one SKIPS rather than refuses: it owns no dedup key, so there is
+     nothing to poison, and the morning briefing around it still has value
+     without per-ticker analyses. The error is logged either way. */
+  const tickers = await sweepUniverse(env, 'watchlist analyses', 60);
+  if (!tickers) return;
 
   for (let i = 0; i < tickers.length; i += 5) {
     await allSettledCounted(
@@ -8658,14 +8708,9 @@ async function generateMiddaySnapshot(env) {
   }
 
   // ── Watchlist intraday state + confirmed earnings for the next trading day ──
-  let tickers = [...DEFAULT_WATCHLIST];
-  try {
-    const saved = await env?.REC_LOG?.get('watchlist:tickers', 'json');
-    if (Array.isArray(saved) && saved.length) {
-      tickers = [...new Set([...saved, ...DEFAULT_WATCHLIST].map(t => String(t).toUpperCase()))];
-    }
-  } catch (_) {}
-  tickers = tickers.slice(0, 25); // subrequest budget: one quoteSummary each
+  // Skips this SECTION on an empty universe; the pulse's narrative and movers do
+  // not depend on it, so losing the whole midday job would be the worse trade.
+  const tickers = (await sweepUniverse(env, 'midday watchlist state', 25)) || [];
 
   // Next trading day (PT): skip weekends
   const ptNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));

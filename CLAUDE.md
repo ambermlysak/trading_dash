@@ -683,7 +683,7 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Eight checks exist, all of which print computed vs
+There is no build step. Nine checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
 (Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
@@ -1140,7 +1140,7 @@ differs from its retention, both are given and the reason is in the notes.
 | `market:goldencross` | 2h | Golden-cross setups (served fresh for 1h via `GOLDEN_TTL`) |
 | `scanner:{preset}` | 5min | Day-trading scanner results (served fresh for 90s via `SCAN_TTL`) |
 | `auction:{DATE}:{SYMBOLS}` | 20h | Closing-auction block trades, keyed by ET date |
-| `watchlist:tickers` | none | Saved watchlist, pushed by the dashboard; also seeds scan universes |
+| `watchlist:tickers` | none | **The ONLY sweep universe.** Pushed by the dashboard on every load, not just on edit. `DEFAULT_WATCHLIST` is deleted, so an absent or unusable value makes `sweepUniverse()` refuse loudly rather than sweep zero names. Also seeds scan universes |
 | `rec:{TICKER}` | none | Recommendation history, one entry per PT trading day (up to 500) |
 | `recfwd:last` | 2d | PT date of the last forward-return fill. **Outside the `rec:` prefix** so the fill sweep's own `list()` cannot see it. |
 | `admin:token` | none | Bearer token gating the `/api/admin/*` routes |
@@ -1241,10 +1241,66 @@ inside the sweep's bracket. The +3 appears on *both* counters, and
 `invocationFetches` was 5 at stamp time against the ~45 charts the fill went on
 to do — the fill had only started.
 
-**N is 35, not 22.** Both sweeps take `watchlist:tickers` ∪ `DEFAULT_WATCHLIST`;
-the saved list holds 33 and the default 22, unioning to 35. `extFetches` stays at
-2 only because 35 ≤ 40 — **at 41 watchlist names it becomes 3**, which a later
-reader would otherwise read as a regression.
+**N is whatever `watchlist:tickers` holds — 33 as of 2026-08-11.** It was 35: the
+sweeps used to take `watchlist:tickers` ∪ `DEFAULT_WATCHLIST`, so the server
+permanently covered two names (MRK, JPM) the dashboard never showed. The union is
+gone; see the empty-universe rule below. `extFetches` is `ceil(N/20)` and stays at
+2 only while **N ≤ 40** — at 41 names it becomes 3, which a later reader would
+otherwise read as a regression.
+
+### The sweep universe has ONE source, and an empty one REFUSES
+
+`sweepUniverse(env, job, cap)` is the only way a cron gets tickers, and it reads
+**`watchlist:tickers` and nothing else**. `DEFAULT_WATCHLIST` is deleted.
+
+**Dropping the fallback removed a divergence and created a failure mode**, so the
+mode is closed in the same place. With no default, an absent, unparseable, empty
+or all-invalid key yields zero names — and **a sweep that writes zero keys is
+indistinguishable from a cron that never fired**, which is rule #7's signature
+exactly. Worse, the IV and move sweeps stamp a dedup key on the way out, so a
+silent zero would have persisted for the rest of the day.
+
+So `sweepUniverse` returns **`null`, never `[]`**, and logs at ERROR with a
+greppable marker:
+
+```
+[cron] !! EMPTY-UNIVERSE !! iv sweep has ZERO tickers to sweep: watchlist:tickers
+key is absent (no dashboard has ever saved a watchlist). REFUSING to run rather
+than writing nothing … No dedup key has been stamped, so the next firing will retry.
+```
+
+Four causes produce four distinguishable messages (absent / empty / wrong type /
+KV threw), because one indistinguishable "no tickers" would just move the problem.
+
+**Callers split on whether they own a dedup key**, and the split is deliberate:
+
+| caller | on `null` | why |
+|---|---|---|
+| `recordWatchlistIv` | **refuse before stamping `ivsweep:last`** | so the next firing retries |
+| `collectMoveSeries` | **refuse before stamping `movesweep:last`** | same |
+| `refreshWatchlistAnalyses` | skip | owns no dedup key; the briefing around it still has value |
+| `generateMiddaySnapshot` | skip that section only | the pulse's narrative and movers do not depend on it |
+| briefing opportunity/avoid prompt | **change the instruction** | see below |
+
+**The prompt site degraded worse than the sweeps and is the one to understand.**
+It interpolated `DEFAULT_WATCHLIST.join(', ')` into *"For opportunity and avoid,
+choose from: …"*. With an empty list that reads **"choose from: "** — an empty
+constraint does not stop the model, it stops *constraining* it, so the briefing
+would have named arbitrary tickers and looked entirely normal. It now switches to
+an explicit instruction to return `null` for both and not substitute its own.
+
+**The dashboard asserts its watchlist on every load**, not only on edit.
+`syncWatchlistToServer()` used to run only from `saveWatchlist()`, so a browser
+that never edited never pushed — a fresh profile would render `DEFAULT_WL`, push
+nothing, and leave every sweep refusing indefinitely. `init()` now pushes
+`getWatchlist()` on load, which makes the browser assert what it is showing and
+keeps the screen and the sweeps from drifting. `DEFAULT_WL` stays in
+`dashboard.html` as the **client's** empty state — that is a bootstrap default,
+not a second source of truth.
+
+`node sweep-universe.check.mjs` covers all of it — cleaning, dedup, cap, junk
+dropping, and that **every** unusable shape returns null with a distinguishable
+ERROR. **37 comparisons.**
 
 **Check the UTC hour in both DST regimes before scheduling anything.** The 13F job used to run at 3pm PT, which is 22:00 UTC under PDT but **23:00 under PST** — outside this window — so it silently never ran for the winter half of the year. It moved to 10am PT (17:00/18:00 UTC), inside the window in both. Every other job was already safe; this one was not.
 
@@ -2004,6 +2060,37 @@ So: **treat the first post-deploy probe as advisory only.** Confirm a suspected 
 deploy on a second probe at least a minute later before changing anything. This
 applies to KV-shape checks especially, since a stale isolate reads and writes the
 same namespace as the new one.
+
+## Name the population a distribution was measured over
+
+**Every reported distribution states which population produced it, explicitly.**
+Not "138 Lane F candidates" but "138 candidates over the 33 names the sweeps
+cover" — because the screen and the sweeps have had different populations before
+and could again.
+
+This is the same defect as the base-rate rule one level up: a rate without its
+base rate is unreadable, and a distribution without its population is
+unverifiable. Both were reported here in a form that quietly implied the reader
+was seeing what was measured.
+
+Concretely, three populations have already been in play at once and were nearly
+reconciled against each other:
+
+| population | what it was |
+|---|---|
+| **35** | `watchlist:tickers` ∪ `DEFAULT_WATCHLIST` — what the sweeps covered |
+| **33** | `watchlist:tickers` — what the dashboard rendered |
+| **22** | `DEFAULT_WL` — what a *fresh browser profile* renders, and what a test session mistook for the real list |
+
+The 22 was a test artifact escalated to a finding: a Chrome profile with no
+`localStorage` fell back to `DEFAULT_WL`, and the resulting "the frontend renders
+a hardcoded 22" was wrong in a way that would have driven a real change. The union
+deletion converges the first two at 33; the third remains the correct bootstrap
+default and is not a source of truth.
+
+**When quoting any distribution, say the N and where it came from.** If a figure
+was measured over a population the reader cannot see, that is the most important
+thing about it.
 
 ## A newly rendered figure gets eyes on it before the commit is done
 

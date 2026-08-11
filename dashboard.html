@@ -3424,6 +3424,17 @@ async function init() {
   const hashTab = location.hash.slice(1) === 'premium' ? 'long' : location.hash.slice(1);
   if (hashTab && document.getElementById('tab-' + hashTab)) switchTab(hashTab);
 
+  /* ASSERT THE WATCHLIST ON EVERY LOAD, not only on edit.
+     `watchlist:tickers` is now the sweeps' ONLY universe — the Worker's
+     DEFAULT_WATCHLIST union is gone. But `syncWatchlistToServer()` previously ran
+     only from `saveWatchlist()`, so a browser that never edited its list never
+     pushed one: a fresh profile would render DEFAULT_WL, push nothing, and leave
+     every sweep refusing on an empty universe indefinitely.
+     Pushing on load closes that by making the browser assert what it is showing,
+     so the screen and the sweeps cannot drift. Debounced 800ms inside the sync,
+     idempotent, and gated like any other KV write. */
+  syncWatchlistToServer(getWatchlist());
+
   // Market data
   await Promise.allSettled([
     loadMarketStrip(),
