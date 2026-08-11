@@ -737,6 +737,7 @@ GET  /api/track/:ticker           Read rating history from KV
 GET  /api/market/snapshot         Index + futures + commodities strip
 GET  /api/market/movers           Pre-market / day gainers + losers (≥±10%)
 GET  /api/market/ipos             Upcoming IPO calendar (12h KV cache)
+GET  /api/watchlist               The saved list (read path for the adopt-on-empty bootstrap)
 GET  /api/watchlist/batch         Bulk fundamentals + RSI + SMA/EMA cross + Claude analysis
 GET  /api/daily                   Daily Claude synthesis (served from KV)
 GET  /api/market/sectors          Sector summaries + top opportunity/avoid per sector (4h KV cache)
@@ -1140,6 +1141,7 @@ differs from its retention, both are given and the reason is in the notes.
 | `market:goldencross` | 2h | Golden-cross setups (served fresh for 1h via `GOLDEN_TTL`) |
 | `scanner:{preset}` | 5min | Day-trading scanner results (served fresh for 90s via `SCAN_TTL`) |
 | `auction:{DATE}:{SYMBOLS}` | 20h | Closing-auction block trades, keyed by ET date |
+| `watchlist:prev` | none | Previous watchlist, snapshotted before every overwrite — a one-step undo for a clobbered list |
 | `watchlist:tickers` | none | **The ONLY sweep universe.** Pushed by the dashboard on every load, not just on edit. `DEFAULT_WATCHLIST` is deleted, so an absent or unusable value makes `sweepUniverse()` refuse loudly rather than sweep zero names. Also seeds scan universes |
 | `rec:{TICKER}` | none | Recommendation history, one entry per PT trading day (up to 500) |
 | `recfwd:last` | 2d | PT date of the last forward-return fill. **Outside the `rec:` prefix** so the fill sweep's own `list()` cannot see it. |
@@ -1289,14 +1291,40 @@ constraint does not stop the model, it stops *constraining* it, so the briefing
 would have named arbitrary tickers and looked entirely normal. It now switches to
 an explicit instruction to return `null` for both and not substitute its own.
 
-**The dashboard asserts its watchlist on every load**, not only on edit.
-`syncWatchlistToServer()` used to run only from `saveWatchlist()`, so a browser
-that never edited never pushed — a fresh profile would render `DEFAULT_WL`, push
-nothing, and leave every sweep refusing indefinitely. `init()` now pushes
-`getWatchlist()` on load, which makes the browser assert what it is showing and
-keeps the screen and the sweeps from drifting. `DEFAULT_WL` stays in
-`dashboard.html` as the **client's** empty state — that is a bootstrap default,
-not a second source of truth.
+**The dashboard bootstraps with READ-THEN-ADOPT, and pushes only on an edit or an
+empty server.** `initWatchlist()` runs before anything reads the list:
+
+| local | server | action |
+|---|---|---|
+| populated | — | use it. **No push** — an unedited load asserts nothing |
+| empty | populated | **ADOPT** into localStorage. No push |
+| empty | empty | seed `DEFAULT_WL` and push. Nothing can be destroyed |
+| empty | **read failed** | render defaults, **adopt nothing, push nothing** |
+
+**The first version of this was a data-loss bug and the shape is worth keeping.**
+It pushed `getWatchlist()` on every load; on an empty localStorage that returns
+`DEFAULT_WL`, so a new device, a cleared profile or an incognito window would have
+silently replaced a populated server list with the 22 bare defaults — and every
+sweep would have followed it, with no fallback left to bound the damage. It was
+only survivable in testing by seeding localStorage from the server first, which is
+the tell: **needing a workaround to avoid destroying data while testing IS the bug
+report.** A failed read must never be mistaken for an empty server.
+
+`DEFAULT_WL` stays in `dashboard.html` as the **client's** empty state — a
+bootstrap default, not a second source of truth.
+
+**`POST /api/watchlist/save` snapshots before it overwrites.** The previous value
+goes to `watchlist:prev` on every save, and a shrink past 30% logs at WARN naming
+both counts and the dropped tickers. It does **not** block: replacing 33 names
+with 22 is indistinguishable from a legitimate edit down to 22, so the guard makes
+the event visible and recoverable rather than refusing it. Recoverability is
+precisely what the `DEFAULT_WATCHLIST` deletion removed — before it, a clobbered
+list still swept the defaults.
+
+**`GET /api/watchlist`** exists only so the adopt path can tell "the server has 33"
+from "the server has nothing". Origin-gated, NOT secret-gated: requiring the key
+would make adoption fail exactly when the key is misconfigured, which is the moment
+it most needs to not overwrite anything.
 
 `node sweep-universe.check.mjs` covers all of it — cleaning, dedup, cap, junk
 dropping, and that **every** unusable shape returns null with a distinguishable

@@ -105,7 +105,92 @@ console.log('\n══ 5. A missing binding is a refusal, not a crash ══');
 row('env with no REC_LOG', await M.sweepUniverse({}, 'testjob', 60), null);
 row('env undefined',       await M.sweepUniverse(undefined, 'testjob', 60), null);
 
+/* ══════════════════════════════════════════════════════════════════════════════
+   PART TWO — the OTHER end of the same single source of truth.
+
+   `sweepUniverse` protects the sweeps from a bad `watchlist:tickers`. This
+   protects `watchlist:tickers` from a bad browser. They belong in one script
+   because the deletion of DEFAULT_WATCHLIST created both risks at once: with no
+   fallback, a clobbered key is no longer bounded by anything.
+
+   The first version of the bootstrap pushed `getWatchlist()` on every load, which
+   on an empty localStorage is DEFAULT_WL — so a new device, a cleared profile or
+   an incognito window would silently replace a populated server list with the
+   bare defaults. Extracted from dashboard.html by source, for the same reason the
+   Worker functions are: it is the shipped code or it proves nothing.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const dash = fs.readFileSync('dashboard.html', 'utf8');
+function grabDash(name) {
+  let i = dash.indexOf(`async function ${name}(`);
+  if (i < 0) throw new Error('missing ' + name + ' in dashboard.html');
+  let p = dash.indexOf('(', i), depth = 0, j = p;
+  do { if (dash[j] === '(') depth++; else if (dash[j] === ')') depth--; j++; } while (depth > 0);
+  let d = 0, k = dash.indexOf('{', j);
+  do { if (dash[k] === '{') d++; else if (dash[k] === '}') d--; k++; } while (d > 0);
+  return dash.slice(i, k);
+}
+const DEFAULT_WL_SRC = dash.match(/^const DEFAULT_WL = (\[[^\]]*\]);/m);
+if (!DEFAULT_WL_SRC) throw new Error('missing DEFAULT_WL');
+
+/** Run initWatchlist() against a stubbed browser + server, and report what it did. */
+function runBootstrap({ local, server, readThrows }) {
+  const store = {};
+  if (local !== undefined) store['trading_dash_watchlist'] = JSON.stringify(local);
+  const pushes = [];
+  const ctx = {
+    WL_KEY: 'trading_dash_watchlist',
+    DEFAULT_WL: JSON.parse(DEFAULT_WL_SRC[1].replace(/'/g, '"')),
+    localStorage: { getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = v; } },
+    apiFetch: async () => { if (readThrows) throw new Error('network down'); return { tickers: server }; },
+    saveWatchlist: (t) => { pushes.push(t); store['trading_dash_watchlist'] = JSON.stringify(t); },
+    console: { log() {}, warn() {} },
+  };
+  const fn = new Function(...Object.keys(ctx), `${grabDash('initWatchlist')}; return initWatchlist();`);
+  return fn(...Object.values(ctx)).then(r => ({
+    ...r,
+    pushed: pushes.length ? pushes[0].length : null,
+    stored: store['trading_dash_watchlist'] ? JSON.parse(store['trading_dash_watchlist']).length : null,
+  }));
+}
+
+console.log('\n══ 6. BOOTSTRAP: a fresh browser must never push defaults over a real list ══');
+const POP = ['AAPL', 'NVDA', 'MRVL', 'DELL'];
+
+console.log('\n   local populated -> use it, push nothing:');
+{
+  const r = await runBootstrap({ local: POP, server: ['ZZZZ'] });
+  row('source', r.source, 'local');
+  row('pushed nothing', r.pushed, null);
+  row('kept local', r.stored, 4);
+}
+console.log('\n   local EMPTY, server populated -> ADOPT, push nothing (THE BUG CASE):');
+{
+  const r = await runBootstrap({ local: undefined, server: POP });
+  row('source', r.source, 'adopted');
+  row('*** pushed NOTHING — defaults did not clobber ***', r.pushed, null);
+  row('adopted the server list into localStorage', r.stored, 4);
+}
+console.log('\n   local empty AND server empty -> seed defaults (nothing to destroy):');
+{
+  const r = await runBootstrap({ local: undefined, server: null });
+  row('source', r.source, 'seeded');
+  row('pushed the defaults', r.pushed, 22);
+}
+console.log('\n   local empty, server read FAILED -> adopt nothing, push nothing:');
+{
+  const r = await runBootstrap({ local: undefined, server: POP, readThrows: true });
+  row('source', r.source, 'read-failed');
+  row('*** pushed NOTHING on a failed read ***', r.pushed, null);
+  row('did not persist anything', r.stored, null);
+}
+console.log('\n   an empty-array localStorage counts as empty, not as a list:');
+{
+  const r = await runBootstrap({ local: [], server: POP });
+  row('source', r.source, 'adopted');
+  row('pushed nothing', r.pushed, null);
+}
+
 console.error = realErr; console.warn = realWarn;
 process.exitCode = reportVerdict({
-  label: 'sweep-universe.check', comparisons: T.comparisons, failures: T.failures, minComparisons: 37,
+  label: 'sweep-universe.check', comparisons: T.comparisons, failures: T.failures, minComparisons: 50,
 });

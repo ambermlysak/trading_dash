@@ -7249,14 +7249,69 @@ async function handleMarketIPOs(origin, env) {
 
 // Persist the user's watchlist so the 6am cron can refresh analysis for exactly
 // the tickers on their Watchlist tab (not just the static default list).
+/* ── GET /api/watchlist ──────────────────────────────────────────────────────
+   Exists so a browser with an EMPTY localStorage can ADOPT the saved list rather
+   than pushing its own defaults over it. Without this read there is no way for a
+   fresh profile to tell "the server has 33 names" from "the server has nothing",
+   and it guesses — which is how a new device silently reset the one key every
+   sweep now depends on.
+
+   Origin-gated only, like every other GET. It is not secret-gated: it returns the
+   user's own ticker list to their own dashboard, and requiring the key here would
+   make the adopt path fail exactly when the key is misconfigured — the moment it
+   most needs to not overwrite anything. */
+async function handleWatchlistList(origin, env) {
+  let tickers = null, reason = null;
+  try {
+    const saved = await env?.REC_LOG?.get('watchlist:tickers', 'json');
+    if (Array.isArray(saved) && saved.length) tickers = saved;
+    else reason = saved == null ? 'no watchlist saved yet' : 'saved value is empty or not an array';
+  } catch (e) {
+    reason = `KV read failed — ${e.message}`;
+  }
+  return json({
+    tickers, count: tickers?.length ?? 0, reason,
+    _meta: srcMeta('Cloudflare KV', { ok: !!tickers, ttlSeconds: null }),
+  }, 200, origin);
+}
+
+/* SHRINK GUARD. A save that replaces 33 names with 22 is indistinguishable from a
+   legitimate edit down to 22 — same request, same shape — so this does NOT block.
+   What it does is make the event visible and RECOVERABLE, which is what the
+   DEFAULT_WATCHLIST deletion took away: before it, a clobbered watchlist still
+   swept the defaults, so the damage was bounded. Now it is not.
+     · the previous value is copied to `watchlist:prev` before every overwrite,
+       giving a one-step undo
+     · a shrink past SHRINK_WARN_PCT logs at WARN naming both counts
+   Blocking was considered and rejected: the user is allowed to delete tickers,
+   and a screen that refuses to save is worse than a log line. */
+const WL_SHRINK_WARN_PCT = 0.30;
+
 async function handleWatchlistSave(request, origin, env) {
   const body = await request.json().catch(() => null);
   const tickers = Array.isArray(body?.tickers)
     ? [...new Set(body.tickers.map(t => String(t).trim().toUpperCase()).filter(Boolean))].slice(0, 60)
     : null;
   if (!tickers || !tickers.length) return err('tickers required', 400, origin);
+
+  let prev = null;
+  try { prev = await env?.REC_LOG?.get('watchlist:tickers', 'json'); } catch (_) {}
+  const prevCount = Array.isArray(prev) ? prev.length : 0;
+
+  if (prevCount) {
+    try {
+      await env?.REC_LOG?.put('watchlist:prev', JSON.stringify({ tickers: prev, replacedAt: Date.now() }));
+    } catch (e) { console.warn('[watchlist] prev snapshot failed:', e.message); }
+  }
+  if (prevCount && tickers.length < prevCount * (1 - WL_SHRINK_WARN_PCT)) {
+    console.warn(`[watchlist] SHRINK: ${prevCount} -> ${tickers.length} names `
+      + `(-${prevCount - tickers.length}). Legitimate if you deleted tickers; if a fresh browser `
+      + 'pushed its defaults over a populated list, the previous value is in watchlist:prev. '
+      + `Dropped: ${prev.filter(t => !tickers.includes(String(t).toUpperCase())).join(', ')}`);
+  }
+
   await env?.REC_LOG?.put('watchlist:tickers', JSON.stringify(tickers));
-  return json({ ok: true, count: tickers.length }, 200, origin);
+  return json({ ok: true, count: tickers.length, previousCount: prevCount }, 200, origin);
 }
 
 async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
@@ -9136,6 +9191,9 @@ export default {
             if (g) return g;
             return await handleWatchlistSave(request, origin, env);
           }
+          // Read path for the adopt-on-empty bootstrap. Deliberately NOT
+          // secret-gated — see the note on the handler.
+          if (!sub || sub === 'list') return await handleWatchlistList(origin, env);
           return err('unknown watchlist route', 404, origin);
         case 'admin':
           if (sub === 'refresh-daily' && request.method === 'POST') {

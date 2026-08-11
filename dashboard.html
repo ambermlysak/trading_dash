@@ -1488,6 +1488,60 @@ function saveWatchlist(tickers) {
   syncWatchlistToServer(tickers);
 }
 
+/* ── Bootstrap: READ THEN ADOPT, never push defaults over a populated server ──
+ *
+ * `watchlist:tickers` is now the ONLY universe every cron sweep runs over — the
+ * Worker's DEFAULT_WATCHLIST union is gone, so a bad value is no longer bounded
+ * by a fallback. That makes any write from this page consequential.
+ *
+ * THE BUG THIS REPLACES: the first version pushed `getWatchlist()` on every load.
+ * On an empty localStorage that returns DEFAULT_WL, so a new device, a cleared
+ * profile or an incognito window would have silently replaced a populated server
+ * list with the 22 bare defaults — and every sweep would have followed it. It was
+ * only survivable in testing by seeding localStorage from the server first, which
+ * is the tell: needing a workaround to avoid destroying data while testing IS the
+ * bug report.
+ *
+ * The rule now: **push only on an actual edit, or when the server is also empty.**
+ *
+ *   local populated              -> use it. No push; an unedited load asserts nothing.
+ *   local empty, server has one  -> ADOPT the server's list into localStorage. No push.
+ *   local empty, server empty    -> genuinely nothing anywhere: seed DEFAULT_WL and
+ *                                   push it. Nothing can be destroyed.
+ *   local empty, read FAILED     -> render the defaults so the page works, but do
+ *                                   NOT adopt and do NOT push. A failed read must
+ *                                   never be mistaken for an empty server.
+ */
+async function initWatchlist() {
+  let local = null;
+  try { local = JSON.parse(localStorage.getItem(WL_KEY)); } catch (_) {}
+  if (Array.isArray(local) && local.length) return { source: 'local', count: local.length };
+
+  let server = null, failed = false;
+  try {
+    const r = await apiFetch('/watchlist');
+    server = Array.isArray(r?.tickers) && r.tickers.length ? r.tickers : null;
+  } catch (e) {
+    failed = true;
+    console.warn('[watchlist] bootstrap read failed — not adopting and NOT pushing:', e.message);
+  }
+
+  if (server) {
+    localStorage.setItem(WL_KEY, JSON.stringify(server));
+    console.log(`[watchlist] adopted ${server.length} tickers from the server (empty profile)`);
+    return { source: 'adopted', count: server.length };
+  }
+  if (failed) {
+    // Rendering the defaults is fine; PERSISTING or pushing them is not, because
+    // the server may hold a real list this browser simply could not read.
+    return { source: 'read-failed', count: 0 };
+  }
+  // Server is genuinely empty. This is the only case that may write defaults.
+  saveWatchlist(DEFAULT_WL.slice());
+  console.log('[watchlist] server had no list; seeded the defaults');
+  return { source: 'seeded', count: DEFAULT_WL.length };
+}
+
 // Push the watchlist to the Worker so the 6am cron refreshes analysis
 // (the consolidated recommendation) for exactly the tickers on this tab.
 let wlSyncTimer = null;
@@ -3424,16 +3478,8 @@ async function init() {
   const hashTab = location.hash.slice(1) === 'premium' ? 'long' : location.hash.slice(1);
   if (hashTab && document.getElementById('tab-' + hashTab)) switchTab(hashTab);
 
-  /* ASSERT THE WATCHLIST ON EVERY LOAD, not only on edit.
-     `watchlist:tickers` is now the sweeps' ONLY universe — the Worker's
-     DEFAULT_WATCHLIST union is gone. But `syncWatchlistToServer()` previously ran
-     only from `saveWatchlist()`, so a browser that never edited its list never
-     pushed one: a fresh profile would render DEFAULT_WL, push nothing, and leave
-     every sweep refusing on an empty universe indefinitely.
-     Pushing on load closes that by making the browser assert what it is showing,
-     so the screen and the sweeps cannot drift. Debounced 800ms inside the sync,
-     idempotent, and gated like any other KV write. */
-  syncWatchlistToServer(getWatchlist());
+  // Bootstrap the watchlist BEFORE anything reads it — see initWatchlist().
+  await initWatchlist();
 
   // Market data
   await Promise.allSettled([
