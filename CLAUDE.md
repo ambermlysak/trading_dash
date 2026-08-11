@@ -1662,7 +1662,16 @@ refuses rather than assuming a future IV.
 **`upsideTruncated` fires on both** — `maxGainOf` returns null for `straddle` and
 `strangle`, so expectancy is scored only as far as the largest observed window.
 The concentration flag renders on this lane with its window named inline, same as
-everywhere else.
+everywhere else, and **it fires more here than anywhere else**: `==1` on **28.6%**
+of 140 Lane E candidates against **18.8%** of 420 Lane B/C candidates, same day,
+same payloads. The cause is breakeven distance, not two-sidedness — full write-up
+and the mechanism in `ARCHITECTURE.md`.
+
+**Most names do not qualify, and that is the lane working.** Measured live
+2026-08-10 across all 35: **64 of 70 entries gated (91%)**, failing
+`no-catalyst-inside` 44 times, `hostile-term` 36, `vol-not-cheap` 30. Only six
+entries passed every gate — NVDA (both monthlies), MRVL (both), TSM and MU. A
+build of this lane that renders something tradeable on most names has a bug.
 
 `node lane-e.check.mjs` covers the two-sided half in six sections: two-sided pBe
 against a series-erf reference at five prices, two-sided coverage against a

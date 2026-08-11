@@ -334,6 +334,74 @@ Constants: `EPISODE_CONCENTRATION_WARN` and the episode assignment in
 in **both** directions, because a test that only proves de-clustering collapses
 things passes on code that always answers 1.
 
+### Lane E concentrates MORE than the one-sided lanes — measured, with the mechanism
+
+Measured 2026-08-10 against the deployed build across all 35 watchlist names, both
+populations from the **same payloads on the same day** so they are population-matched
+rather than compared across sessions:
+
+| | n | ==1 | ≤2 | ≤3 | median | p90 | max |
+|---|---|---|---|---|---|---|---|
+| **Lane E** (straddle + strangle, two-sided) | **140** | **28.6%** | 70.7% | 92.1% | 2 | 3 | 5 |
+| — straddles only | 70 | 27.1% | 70.0% | 88.6% | 2 | 4 | 5 |
+| — strangles only | 70 | 30.0% | 71.4% | 95.7% | 2 | 3 | 4 |
+| **Lane B/C** (single-leg + verticals, one-sided) | **420** | **18.8%** | 56.7% | 80.5% | 2 | 4 | 7 |
+
+**`==1` fires on 28.6% of Lane E candidates against 18.8% on Lane B/C — 9.8 points
+more often, roughly 1.5×.** Do not reconcile either against the earlier
+`REALISTIC 3y` table (n=198, 26.8%): that was a synthetic long-call population at
+fixed moneyness multipliers, a third population again.
+
+**The mechanism is the breakeven distance, not two-sidedness as such.** A Lane E
+structure must clear a two-leg debit, so its breakevens sit far out — NVDA
+2026-09-18 required 11.61% against a 0.55Δ call's few percent. Far breakevens mean
+**few winning windows**, and the few winners cluster into the handful of large
+market episodes. A near-the-money call wins on many moderate moves spread across
+many episodes. So the concentration is a consequence of *where the breakeven is*,
+and any future structure with distant breakevens should be expected to behave the
+same way.
+
+Note the distribution is also **tighter**, not merely shifted: max 5 against 7, p90
+3 against 4. More mass at 1 *and* less in the long tail, consistent with the same
+mechanism — fewer winners overall leaves less room for a candidate whose positive
+P/L is spread thinly.
+
+**The prediction that led here was right for the wrong evidence.** It was expected
+that `==1` would fire frequently on this lane; the two tickers first inspected
+(NVDA, AAPL) scored 3 and 4 and looked like a falsification. They were simply not
+representative — n=2 out of 140.
+
+### The up-tail share tracks drift ÷ σ, not drift — a general result
+
+This is **not a Lane E detail.** It applies to any coverage figure read against
+realized drift, which includes the `gap` confound on every lane.
+
+Measured across all 35 stored `moves:` series at a fixed ±10% required move, N=45,
+3y window (2026-08-10):
+
+```
+corr(up-tail share, drift ÷ σ) = 0.902
+corr(up-tail share, raw drift) = 0.038
+```
+
+**Raw drift is the wrong x-axis and the near-zero correlation says so.** A fixed
+threshold is a large move for a quiet name and a trivial one for a wild one:
+
+| ticker | σ (45-session) | 3y drift | up-tail share |
+|---|---|---|---|
+| JPM | 6.4% | 5.7% | **89%** |
+| QUBT | 62% | 75.5% | **49%** |
+
+JPM has a *tenth* of QUBT's drift and a far more lopsided split. So "on a trending
+name the up-tail carries the coverage" is only true relative to that name's own
+volatility — a big trend on a wild name can still split evenly, and a small trend
+on a quiet one need not. The first draft of the Lane E legend asserted raw drift
+and was corrected by measuring it.
+
+Five of 35 names are lopsided past 80/20, all upward: **JPM (89%), TSM (89%),
+AVGO (84%), NVDA (81%), AAPL (80%)**. One is lopsided downward: CRCL (26%), the
+only name with negative 3y drift (−9.9%).
+
 ## Design note: expectancy always resolves on 3y — and why the 1y fallback was deleted
 
 `attachCoverage()` runs expectancy on `h.sorted3y` and **nothing else**. It briefly
