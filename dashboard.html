@@ -2588,8 +2588,13 @@ function longCreditTable(entry, scored, basis) {
       <td title="Actual leg deltas, not the ${entry.targets || '0.30/0.16'} targets they were selected against.">${
         c.shortDelta.toFixed(2)} / ${c.longDelta.toFixed(2)}</td>
       <td>${fmt(c.width)}</td>
-      <td title="Credit is the short leg's BID minus the wing's ASK — what a seller can actually hit.">${money(c.creditPerShare)}</td>
-      <td class="lane-f-maxloss" title="width × 100 − credit = ${c.width} × 100 − ${c.credit} = ${c.maxLoss}. This is also the capital expectancy divides by, computed once so the two cannot drift.">${money(c.maxLoss / 100)}</td>
+      <!-- BOTH PER CONTRACT. The first draft printed credit per share ($2.50) beside
+           max loss per share ($7.50), under a heading the lane defines as
+           width × 100 − credit — so the cell read $7.50 while its own tooltip said
+           750. Per-contract is also the number actually at risk, which is the whole
+           point of the lane; the per-share quote lives in the tooltip. -->
+      <td title="Short leg's BID minus the wing's ASK — what a seller can actually hit. Quoted per share: ${money(c.creditPerShare)}.">${money(c.credit)}</td>
+      <td class="lane-f-maxloss" title="width × 100 − credit = ${c.width} × 100 − ${c.credit} = ${c.maxLoss}. Per contract, and it is also the capital expectancy divides by — computed once so the two cannot drift.">${money(c.maxLoss)}</td>
       <td title="Credit ÷ capital at risk. NOT annualised against a share position — this structure has no share leg.">${pct(c.returnOnRisk, 0)}</td>
       <td>${fmt(c.breakeven)}</td>
       <td>${nOrDash(c.beEm, 2, '×')}</td>
@@ -2602,8 +2607,8 @@ function longCreditTable(entry, scored, basis) {
   }).join('');
   return `<table class="prem-cands">
     <thead><tr>
-      <th>Structure</th><th>Δ short/long</th><th>Width</th><th>Credit</th>
-      <th class="lane-f-maxloss">Max loss</th><th>Ret/risk</th>
+      <th>Structure</th><th>Δ short/long</th><th>Width</th><th title="Per contract. Per share in the tooltip on each cell.">Credit</th>
+      <th class="lane-f-maxloss">Max loss</th><th title="Credit ÷ max loss. Both per contract, so the ratio is unaffected by the unit.">Ret/risk</th>
       <th>Breakeven</th><th>BE/EM</th><th>p(be)</th>
       <th>cov 1y/3y</th><th>gap</th><th>E[R]</th><th>OI</th>
     </tr></thead><tbody>${rows}</tbody></table>
