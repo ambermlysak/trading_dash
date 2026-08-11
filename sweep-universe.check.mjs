@@ -233,7 +233,74 @@ console.log('\n══ 7. Passive sync must never push a list this browser did no
   })(), 0);
 }
 
+/* ══════════════════════════════════════════════════════════════════════════════
+   PART THREE — THE CALLERS. `sweepUniverse` returning null is only half the
+   guard; the half that matters is that the sweeps REFUSE **without stamping their
+   dedup key**. A sweep that logs the error and then stamps `ivsweep:last` anyway
+   has deduped itself out for the rest of the day, which converts a loud failure
+   back into a silent one.
+
+   These run the SHIPPED functions against a stub KV. That is a real execution of
+   the real source — but in Node with a fake binding, not in the deployed isolate.
+   Production cannot be made to reproduce this without emptying the live watchlist
+   and waiting for a cron, and the dashboard would reseed it in the meantime.
+   ═══════════════════════════════════════════════════════════════════════════ */
+console.log('\n══ 8. Both sweeps REFUSE on an empty universe, without stamping the dedup key ══');
+
+/** A KV stub that records every write and holds no watchlist. */
+function stubEnv({ watchlist = null } = {}) {
+  const writes = [];
+  return {
+    writes,
+    env: {
+      REC_LOG: {
+        get: async (k) => (k === 'watchlist:tickers' ? watchlist : null),
+        put: async (k, v) => { writes.push(k); },
+        list: async () => ({ keys: [], list_complete: true }),
+        delete: async () => {},
+      },
+    },
+  };
+}
+
+for (const [job, fnName, dedupKey] of [
+  ['iv sweep',           'recordWatchlistIv', 'ivsweep:last'],
+  ['move-series sweep',  'collectMoveSeries', 'movesweep:last'],
+]) {
+  const deps = [
+    grab('sweepUniverse'),
+    `const REC_SYMBOL_RE = ${m[1]};`,
+    'const LONG_MAX_SYMBOLS = 60;',
+    'const MOVES_SWEEP_KEY = "movesweep:last";',
+    'const ptDate = () => "2026-08-10";',
+    'const instrMark = () => null;',
+    'const instrSince = () => ({ measured: false });',
+    'const allSettledCounted = async (p) => Promise.allSettled(p);',
+    'const ivSnapshot = async () => null;',
+    'const recordIvSample = async () => null;',
+    'const yahooSparkCloses = async () => new Map();',
+    'const readMoveSeries = async () => null;',
+    'const buildMoveSeries = () => ({ sessions: 0 });',
+    'const movesKey = (s) => "moves:" + s;',
+    'const lastSessionIso = () => "2026-08-10";',
+    'const MOVES_RANGE = "3y";',
+    'const MOVES_HORIZONS = [5,10,20,45,90,180,365];',
+    'const MOVES_TTL = 604800;',
+    grab(fnName),
+  ].join('\n');
+  const run = new Function('console', `${deps}\nreturn ${fnName};`)({ log() {}, warn() {}, error(...a) { errs.push(a.join(' ')); } });
+
+  for (const [label, watchlist] of [['key absent', null], ['empty array', []]]) {
+    errs = [];
+    const { env, writes } = stubEnv({ watchlist });
+    await run(env);
+    row(`${job} · ${label} · refused`, errs.some(e => e.includes('!! EMPTY-UNIVERSE !!')), true);
+    row(`${job} · ${label} · did NOT stamp ${dedupKey}`, writes.includes(dedupKey), false);
+    row(`${job} · ${label} · wrote nothing at all`, writes.length, 0);
+  }
+}
+
 console.error = realErr; console.warn = realWarn;
 process.exitCode = reportVerdict({
-  label: 'sweep-universe.check', comparisons: T.comparisons, failures: T.failures, minComparisons: 55,
+  label: 'sweep-universe.check', comparisons: T.comparisons, failures: T.failures, minComparisons: 67,
 });
