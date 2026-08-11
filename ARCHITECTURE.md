@@ -36,7 +36,7 @@ moved into the Worker and shipped in the payload (`volRegime`, gate thresholds).
 
 ## The two pages
 
-**`dashboard.html`** — seven tabs, all deep-linkable by hash:
+**`dashboard.html`** — **six** tabs, all deep-linkable by hash:
 
 | Tab | Contents | Data path |
 |---|---|---|
@@ -45,21 +45,27 @@ moved into the Worker and shipped in the payload (`volRegime`, gate thresholds).
 | Scanner | Momentum / HOD · Pre-Market Gappers · All Movers · **Golden Cross Setup** | first three `/api/market/scanner`; golden cross has its own endpoint and renderer |
 | Watchlist | 14 columns, sortable, expandable rows, one consolidated Recommendation | `/api/watchlist/batch` |
 | Sectors | 11 SPDR sectors, ETF change + Claude opportunity/avoid per sector | `/api/market/sectors`, 4h KV |
-| **Premium** | Short-premium screen: collapsed rows, expand to fetch | `/api/premium/batch` (KV only) + `/api/premium/:ticker` on expand |
-| **Long** | Long-premium screen: LEAPS / swing / debit verticals / calendars, collapsed rows, expand to fetch | `/api/long/batch` (KV only) + `/api/long/:ticker` on expand |
+| **Long** | **The only options screen.** Six lanes — LEAPS / swing / debit verticals / calendars / straddle+strangle / defined-risk credit spreads. Collapsed rows, expand to fetch | `/api/long/batch` (KV only) + `/api/long/:ticker` on expand |
 
-The Premium tab replaced an "Options" tab that showed a V/OI unusual-activity
-recap of the nearest expiration. That view is deleted, not moved — it answered
-"what traded today", and at the nearest expiration the answer is mostly 0DTE churn.
-Premium and Long are the only tabs that fetch upstream on interaction rather than
-on load; Sectors and Scanner paint a KV snapshot immediately and revalidate behind
-it, so no tab requires a click to show data.
+**There is no Premium tab.** It existed from 2026-08 until **2026-08-10**, when it
+was merged into the Long screen as **Lane F** — short premium is secondary here and
+now sits as one lane of six, ranked by the same expectancy as everything else. Its
+row model, its naked CSP/covered-call pricing and `/api/premium/*` are all deleted;
+the route returns **410** naming the replacement. The KV key `premium:{TICKER}`
+survives but means something different — see the shared-header note below. It in
+turn had replaced an "Options" V/OI recap, also deleted rather than moved.
 
-**Painting is cheap, not free.** `primeTabs()` fires both batch reads on every page
-load, and each costs one KV read per symbol — 22 apiece on a 22-name watchlist,
-which counts against the same 10,000 pool as an outbound fetch. A full dashboard
-page load measures **capCost ≈ 133–140** across the 12 requests it triggers (≈90 in
-steady state, once the sectors cache is warm). The cap meters per *invocation*, so
+**Long is the only tab that fetches upstream on interaction** rather than on load;
+Sectors and Scanner paint a KV snapshot immediately and revalidate behind it, so no
+tab requires a click to show data.
+
+**Painting is cheap, not free.** `primeTabs()` fires the Long batch read on every
+page load, costing one KV read per symbol — 33 on the current watchlist — which
+counts against the same 10,000 pool as an outbound fetch. A full dashboard page
+load measured **capCost ≈ 133–140** across 12 requests on 2026-08-08 (≈90 in steady
+state, once the sectors cache is warm); that figure predates the Premium tab's
+deletion, which removed one batch read of ~22–33, so the current total is lower and
+has not been re-measured. The cap meters per *invocation*, so
 the figure that matters against 10,000 is the largest single request — ~47 for a
 cold sectors rebuild, 22 for a batch read — not the page-load total.
 
@@ -142,8 +148,8 @@ in this codebase and shipped:
    so the same formula would produce a plausible-looking number measuring nothing at all. Those cards
    render **n/a** with the reason, not a figure. The temptation is always to fill the cell — a blank
    looks like a bug and a number looks like work — but a wrong number is the more expensive of the two.
-11. **"We have not looked yet" is not the same as "there is nothing there."** The premium screen
-   rendered four different situations as one dim red block: no row computed yet, no options listed,
+11. **"We have not looked yet" is not the same as "there is nothing there."** The since-deleted premium
+   screen rendered four different situations as one dim red block: no row computed yet, no options listed,
    options listed but nothing priced, and a failed fetch. Only the third is a finding about the
    ticker; the first is a fact about our own scheduler and the fourth is worth retrying. Collapsing
    them cost the user the ability to act on any of them — and it made a scheduling gap look like a
@@ -475,9 +481,11 @@ So:
 
 Either way `sorted3y === null` implies `independent3y < 4` implies
 `independent1y < 4` implies `sorted1y === null`. **3y resolves whenever 1y does.**
-Confirmed exhaustively: 154 ticker × horizon pairs across the full 22-name
-watchlist, **0 cases** where 3y is null and 1y is not; 242 scored candidates, 172
-on 3y, **0 on 1y**, 70 unresolved.
+Confirmed exhaustively: 154 ticker × horizon pairs across the watchlist **as it
+stood at 22 names (2026-08-09)**, **0 cases** where 3y is null and 1y is not; 242
+scored candidates, 172 on 3y, **0 on 1y**, 70 unresolved. The argument is
+structural rather than empirical, so a larger watchlist does not weaken it — but
+the population is named because it is not the current one (33).
 
 **`coverage1y` AND THE 1y EXPECTANCY PATH ARE DIFFERENT THINGS, AND THEY WILL BE
 CONFLATED.** Keep them apart:
@@ -709,9 +717,9 @@ GET  /api/quote/:ticker            Yahoo quoteSummary (multi-module) + Alpaca ov
 GET  /api/chart/:ticker            ?range=1y&interval=1d
 GET  /api/options/:ticker          ?date=<unix>
 GET  /api/iv/:ticker               ATM IV front/back, term structure, IV rank, HV30, POP ladder
-GET  /api/premium/batch?symbols=   Premium screen — no fetches; 1 KV read/symbol (22 = capCost 22)
-GET  /api/premium/:ticker          One ticker (?refresh=1 forces, ?cached=1 never fetches)
-GET  /api/long/batch?symbols=      Long screen — no fetches; 1 KV read/symbol (22 = capCost 22)
+GET  /api/premium/*                REMOVED 2026-08-10 — returns 410. Became Lane F of the Long screen.
+GET  /api/watchlist                The saved list; read path for the adopt-on-empty bootstrap
+GET  /api/long/batch?symbols=      Long screen — no fetches; 1 KV read/symbol (33 = capCost 33)
 GET  /api/long/:ticker             One ticker (?refresh=1 forces, ?cached=1 never fetches)
 GET  /api/insider/:ticker          SEC EDGAR Form 4, last 90 days
 GET  /api/short/:ticker            FINRA consolidated short interest (Yahoo fallback)
@@ -773,6 +781,23 @@ The prototype implements **forward-logging from day one**:
 
 ---
 
+## Build position — steps 1–4 SHIPPED, step 5 next
+
+This is the authoritative record of where the build stands. **All four steps below
+are live in production as of 2026-08-11.** Nothing in this document describes them
+as planned; if you find language that does, it is stale and wrong.
+
+| step | what it was | status |
+|---|---|---|
+| **1** | **`moveCoverage`** — measured historical move frequency, `moves:{TICKER}`, coverage / gap / drift / expectancy / de-clustered episode concentration | **SHIPPED** 2026-08-09 |
+| **2** | **Pooled calibration + magnitude-scored outcome** — `calib:pooled`, per-rating floor, base rates beside every rate | **SHIPPED** 2026-08-10 |
+| **3** | **Lane E** — straddle + strangle, two-sided coverage and P(BE), the hold-to-expiry caveat | **SHIPPED** 2026-08-10 |
+| **4** | **Premium merged into Long as Lane F** — defined-risk credit spreads; the standalone Premium tab, its row model and `/api/premium/*` deleted | **SHIPPED** 2026-08-10 |
+| **5** | **`macroRegime`** | **NEXT — not started, no spec written yet** |
+
+Everything under "Not yet done" is genuinely outstanding. It does **not** include
+steps 1–4.
+
 ## Not yet done
 
 Items 1, 2, 5 and 6 of the original list are **done** (SEC EDGAR Form 4 + 13F, FINRA
@@ -786,13 +811,13 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
 
 2. **Confirmed-vs-estimated earnings dates.** Yahoo returns
    `earningsDateIsEstimate` and nothing in the codebase reads it. Every earnings
-   date on the catalyst card, the watchlist column and the premium screen's
-   `insideFront` flag is presented with equal confidence whether the company has
-   confirmed the date or Yahoo guessed it from last year's pattern. That matters
-   most exactly where it is used hardest: the premium screen picks a "clean"
-   expiry by asking whether earnings falls inside it, and an estimated date can be
-   off by a week. Surface the flag and let the expiry selection say when it is
-   working from an estimate.
+   date on the catalyst card, the watchlist column and the Long screen is presented
+   with equal confidence whether the company confirmed it or Yahoo guessed it from
+   last year's pattern. **This got MORE load-bearing, not less, when the premium
+   screen was deleted**: Lane E gates on whether a catalyst falls inside the expiry
+   (`no-catalyst-inside`), so an estimated date off by a week can flip a gate on
+   the lane whose whole value is refusing 91% of candidates. Surface the flag and
+   let the gate say when it is working from an estimate.
 
 3. **Position awareness.** The app knows nothing about what is actually held, so
    every recommendation is written as if from flat. Missing: cost basis, days to
@@ -828,10 +853,14 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    fetch and no request-path race. **That baseline is itself drift-contaminated**
    (honesty rule 26) and whatever spec it gets must say so.
 
-7. **Recalibrate `EPISODE_CONCENTRATION_WARN` once a full watchlist sweep exists.**
-   It is set to 1, from a distribution measured by computing coverage on the fly
-   over 8 tickers. The first stored-`moves:` sweep is the point to re-derive it
-   across all 22 names and confirm the storage round-trip has not shifted it.
+7. ~~**Recalibrate `EPISODE_CONCENTRATION_WARN` once a full watchlist sweep
+   exists.**~~ — **DONE 2026-08-10.** The first stored sweep landed and the
+   threshold was re-derived from stored pairs: the storage round-trip is exact
+   (40 of 40 arrays identical pair-for-pair, 0 differing), and `==1` held at
+   **26.8%** on the calibration population, unchanged. It was then measured per
+   lane on real candidates: **Lane B/C 18.8%** (n=420), **Lane E 28.6%** (n=140),
+   **Lane F 0.0%** (n=138). `1` stands. See the mechanism correction above — that
+   exercise is also what falsified the breakeven-distance explanation.
 
 8. **Base rates on `index.html`'s Recommendation History card.** The rule is that
    no rate renders without its base rate, and it applies retroactively.

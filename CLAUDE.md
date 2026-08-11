@@ -107,9 +107,11 @@ at the top of `fetch()` and `scheduled()` to wrap every binding. `instrMark()` /
 
 **Quote `capCost`, never `extFetches`.** `extFetches` alone was reported as the
 cost of a long-screen ticker and understated it by **125–143%**: measured on AAPL
-2026-08-08, premium-warm is 4 external + 5 binding = **9**, and premium-cold is
-7 external + 6 binding = **13** (17 when the Yahoo crumb is also cold, which adds
-2 fetches and 2 KV ops). The `/api/long/batch` and `/api/premium/batch` endpoints
+2026-08-08, premium-warm was 4 external + 5 binding = **9**, and premium-cold
+7 external + 6 binding = **13**. Those binding figures are SUPERSEDED — measured
+live 2026-08-11 the path is premium-warm **4 ext / 8 bind / 12 cap** and
+premium-cold **7 ext / 11 bind / 18 cap**, the growth being move coverage, pooled
+calibration and the shared-header write. The `/api/long/batch` and `/api/premium/batch` endpoints
 were documented as "zero outbound calls"; that is true of *fetches* and false of
 *subrequests* — they cost **exactly one KV read per symbol**, so a 22-name
 watchlist paints for **22** against the cap, not 0. Both now report `_instr`.
@@ -1125,7 +1127,7 @@ differs from its retention, both are given and the reason is in the notes.
 | `moves:{TICKER}` | **7d** | The historical N-session return distribution behind the Long tab's measured `cov` column, its `gap`, and the expectancy ranking. Banked by the 2:00pm PT sweep. **~60 KB/ticker measured** (largest QUBT 61,496 bytes, 2026-08-09); KV's ceiling is 25 MB. Stores sorted **`[return, startIdx]` pairs**, not bare numbers — see below. |
 | `movesweep:last` | 2d | PT date of the last move-series sweep, for dedup. **Outside the `moves:` prefix** so nothing scanning that prefix can read it as a ticker — the same rule as `ivsweep:last`. |
 | `premium:{TICKER}` | **24h retention / 4h freshness** | One premium-screen row. The two differ on purpose — see below. |
-| `long:{TICKER}` | **24h retention / 4h freshness** (`LONG_FRESH_MS`) | One long-screen row: four lanes, both timestamps, the buy gate and the directional read. Same freshness/retention split as `premium:` and for the same reason — past 4h the row still renders, badged stale. |
+| `long:{TICKER}` | **24h retention / 4h freshness** (`LONG_FRESH_MS`) | One long-screen row: **six lanes** (A–F), both timestamps, the buy gate and the directional read. Same freshness/retention split as `premium:` and for the same reason — past 4h the row still renders, badged stale. |
 | `cik:map` | 30d | SEC ticker→CIK map from `company_tickers.json` |
 | `insider:{TICKER}` | 12h | Parsed SEC Form 4 report |
 | `short:{TICKER}` | 6h, or **15min** on the Yahoo fallback | FINRA short interest. The short TTL on the fallback is deliberate: a labelled estimate should be retried soon, not cached like the official figure. |
@@ -1142,7 +1144,7 @@ differs from its retention, both are given and the reason is in the notes.
 | `scanner:{preset}` | 5min | Day-trading scanner results (served fresh for 90s via `SCAN_TTL`) |
 | `auction:{DATE}:{SYMBOLS}` | 20h | Closing-auction block trades, keyed by ET date |
 | `watchlist:prev` | none | Previous watchlist, snapshotted before every overwrite — a one-step undo for a clobbered list |
-| `watchlist:tickers` | none | **The ONLY sweep universe.** Pushed by the dashboard on every load, not just on edit. `DEFAULT_WATCHLIST` is deleted, so an absent or unusable value makes `sweepUniverse()` refuse loudly rather than sweep zero names. Also seeds scan universes |
+| `watchlist:tickers` | none | **The ONLY sweep universe.** Written by the dashboard on an EDIT, or on load only when this key is empty (read-then-adopt — see the bootstrap rule; an unconditional on-load push clobbered it once). `DEFAULT_WATCHLIST` is deleted, so an absent or unusable value makes `sweepUniverse()` refuse loudly rather than sweep zero names. Also seeds scan universes |
 | `rec:{TICKER}` | none | Recommendation history, one entry per PT trading day (up to 500) |
 | `recfwd:last` | 2d | PT date of the last forward-return fill. **Outside the `rec:` prefix** so the fill sweep's own `list()` cannot see it. |
 | `admin:token` | none | Bearer token gating the `/api/admin/*` routes |
@@ -1394,7 +1396,7 @@ exactly like a real one.
 ### Frontends
 
 `dashboard.html` — macro landing view with **six tabs**. Every tab is deep-linkable
-by hash (`dashboard.html#premium`), and `switchTab()` only lazy-loads a tab whose
+by hash (`dashboard.html#long`; `#premium` redirects to `#long`), and `switchTab()` only lazy-loads a tab whose
 data is still empty — `primeTabs()` has usually painted it already.
 
 | Tab | `#hash` | What it is |
@@ -1624,10 +1626,10 @@ cost by 125–143%. Do not quote them.
   listed strike nearest the *breakeven* and that strike is named on the card; if it quotes nothing
   usable the cell is `n/a` with the reason — **never** backfilled from ATM IV.
 
-**Five lanes.** A = stock replacement, the two nearest Januaries ≥365 DTE, 0.85/0.70Δ ITM calls. B =
+**Six lanes.** A = stock replacement, the two nearest Januaries ≥365 DTE, 0.85/0.70Δ ITM calls. B =
 directional swing, first monthly ≥30 and ≥60 DTE, 0.55/0.40Δ. C = debit verticals on B's already-fetched
 chains (zero extra subrequests), long ~0.55Δ short ~0.25Δ, **actual leg deltas reported, not the
-targets**. D = calendar/diagonal. E = straddle + strangle.
+targets**. D = calendar/diagonal. E = straddle + strangle. F = defined-risk credit spreads (the merged Premium screen).
 
 ### Lane E — straddle and strangle
 

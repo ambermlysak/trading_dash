@@ -1,3 +1,19 @@
+> # ⚠ SUPERSEDED — HISTORICAL SPEC, DO NOT BUILD FROM THIS
+>
+> **This was the step-1 spec. It shipped on 2026-08-09, and three further steps
+> have shipped on top of it.** It is kept for the reasoning behind `moveCoverage`,
+> not as a statement of scope.
+>
+> **Its scope section is now actively misleading.** It says this commit *"does not
+> merge the Premium and Long tabs, does not add a straddle lane"* and repeats both
+> under §9 "What is explicitly out of scope". **Both have since been built and are
+> live**: Lane E (straddle + strangle) shipped 2026-08-10, and the Premium tab was
+> merged into the Long screen as Lane F the same day. A reader taking §9 at face
+> value would treat shipped features as forbidden work.
+>
+> **For the authoritative build position, read `ARCHITECTURE.md` → "Build
+> position".** For how any of it actually works, `CLAUDE.md`.
+
 # Task: Add `moveCoverage` and expectancy ranking
 
 Read `CLAUDE.md` and `ARCHITECTURE.md` in full before writing any code. If anything
