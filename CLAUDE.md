@@ -1613,6 +1613,24 @@ drift) and trivial for QUBT (σ 62% → 49% up-share on 75% drift). The first dr
 of this note claimed raw drift and the near-zero correlation caught it. Five of 35
 names are lopsided past 80/20: JPM, TSM, AVGO, NVDA, AAPL.
 
+**THREE OF THE FOUR GATES READ THE SHARED HEADER, so on a warm run the verdict is
+computed on data up to 4h old.** `vol-not-cheap` ← `ivRank`/`ivHvRatio`,
+`no-catalyst-inside` ← `earnings`, `hostile-term` ← `termStructure` — all in
+`sharedFields`. Only `no-coverage` is independent, coming from `moves:`.
+
+`hostileTerm` is the live one: front IV − back IV, both moving intraday, so near
+zero a stale read can **flip** it. This lane's value is that it refuses 91% of
+candidates, which makes "a gate that passes something it should have refused,
+silently" the failure mode that matters.
+
+**The verdict is AGED, not suppressed.** A verdict marked *"computed on 3h-old vol
+data"* is more useful than no verdict. The chip renders **on the gate verdict
+itself** — where the eye lands — not in the legend and not on the row header, and
+it renders in **both** states: a passing verdict used to be the *absence* of a
+gate block, so the one case where staleness can do real harm had nothing on screen
+to age. Quiet when live, cyan under an hour, amber past it. Suppression would need
+a case where staleness makes the verdict actively meaningless; none is known.
+
 **The earnings-straddle limitation is on screen, not in a comment.** Expectancy
 and coverage both assume **hold to expiry**. The trade actually worth considering
 into a print is buy-before / sell-after — a two-day vega trade — and IV crush can
@@ -1986,6 +2004,41 @@ So: **treat the first post-deploy probe as advisory only.** Confirm a suspected 
 deploy on a second probe at least a minute later before changing anything. This
 applies to KV-shape checks especially, since a stale isolate reads and writes the
 same namespace as the new one.
+
+## A newly rendered figure gets eyes on it before the commit is done
+
+**Any commit that puts a NEW number on screen requires browser verification of
+that number before it is called complete.** Not "the script passed", not "the
+payload is correct" — the rendered cell, read in a browser, against the value it
+claims to be.
+
+**A value that is only ever wrong at the render layer cannot be caught by a check
+script.** Lane F shipped with the max-loss cell computing `money(c.maxLoss / 100)`
+and printing **`$7.50` where `width × 100 − credit = 750`** — a 100× error on the
+single figure the lane exists to show, contradicting its own tooltip. Every layer
+below it was right: the Worker computed 750, `lane-f.check.mjs` verified 750
+against a hand-computed 750, 138 of 138 production candidates matched
+`width × 100 − credit` exactly. **The bug lived entirely in the division inside
+the `<td>`, and nothing that tests the Worker can see inside a `<td>`.**
+
+This generalises past unit errors. The render layer is where a value gets divided,
+rounded, `toFixed`-ed, formatted as a percent when it is a fraction, labelled with
+one column's heading while carrying another's, or dropped into the wrong cell
+entirely. None of that is reachable from a test that stops at the JSON.
+
+So, for any commit that adds a rendered figure:
+
+1. Confirm the Pages byte count first (`curl … | wc -c` against local), because a
+   stale bundle makes the whole check meaningless — see the propagation rule.
+2. Open the page and read the actual cell.
+3. **Hand-check it against its own definition**, ideally the one in its tooltip.
+   The Lane F bug was visible the instant the cell and the tooltip were read
+   together, and invisible in every other way.
+
+The corollary is that the fix is cheap and the omission is not: this bug survived
+a full verification round — eight check scripts, a 35-name production sweep, and a
+side-by-side against a local rebuild — and was found in the first ten seconds of
+looking at the page.
 
 ## An empty comparison is not a pass
 

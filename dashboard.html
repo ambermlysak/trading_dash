@@ -605,6 +605,15 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
   border-left: 2px solid var(--amber); padding: 7px 10px; margin: 6px 0; border-radius: 0 3px 3px 0; line-height: 1.5; }
 .lane-e-gates ul { margin: 4px 0 0 14px; padding: 0; }
 .lane-e-gates li { margin: 2px 0; }
+/* A passing verdict is not a warning, so it takes the neutral rail — but it is
+   still rendered, because a pass on stale data is the case that can hurt. */
+.lane-e-gates.passed { border-left-color: var(--bull); }
+/* The age rides ON the verdict. `live` stays quiet; `warm` and `stale` escalate,
+   because the question the eye is asking is "does this verdict describe now?" */
+.lane-e-age { font-family: var(--mono); font-size: 9px; padding: 1px 6px; border-radius: 3px;
+  margin-left: 6px; white-space: nowrap; background: var(--bg-3); color: var(--ink-3); }
+.lane-e-age.warm  { background: rgba(94,197,234,0.16); color: var(--cyan); }
+.lane-e-age.stale { background: rgba(244,183,64,0.18); color: var(--amber); font-weight: 600; }
 /* The tail split. `lopsided` fires past 80/20 — at that point the total is one
    tail and the structure is not behaving as a volatility trade. */
 .lane-e-split { font-family: var(--mono); font-size: 9px; color: var(--ink-3); margin-left: 4px; }
@@ -2485,9 +2494,36 @@ function longCalendarTable(entry) {
  *  is no. So a failed gate renders the lane WITH THE GATE NAMED rather than
  *  hiding it: "did not qualify, here is why" is the product.
  */
-function longLaneETable(entry) {
+function longLaneETable(entry, shared) {
   const h = entry.headline || {};
   const gated = (entry.gateFailed || []).length > 0;
+
+  /* ── AGE THE GATE VERDICT, not the row header ────────────────────────────
+     THREE of the four gates read the SHARED header, not the live chain:
+       vol-not-cheap      <- ivRank / ivHvRatio
+       no-catalyst-inside <- earnings
+       hostile-term       <- termStructure
+     Only `no-coverage` comes from `moves:`. On a warm read that header can be
+     up to LONG/PREMIUM_FRESH_MS (4h) old, so the verdict is a statement about
+     data of that age rather than about the chain quoted beside it.
+
+     `hostileTerm` is the live one: front IV − back IV, both moving intraday, so
+     a stale read can flip it near zero — and this lane's value is that it
+     REFUSES 91% of candidates. A gate that passes something it should have
+     refused, silently, is the failure that matters.
+
+     NOT SUPPRESSED, deliberately: a verdict marked "computed on 3h-old vol
+     data" is more useful than no verdict. The age rides ON the verdict where
+     the eye lands, not in the legend and not on the row header. */
+  const warm = shared?.from === 'premium-row' && Number.isFinite(shared?.ageMs);
+  const mins = warm ? Math.max(0, Math.round(shared.ageMs / 60000)) : 0;
+  const ageTxt = mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`;
+  // Amber past an hour: inside an hour the drift in term structure is small
+  // enough that the verdict is about the same market it appears to describe.
+  const ageCls = !warm ? '' : mins >= 60 ? 'stale' : 'warm';
+  const ageChip = warm
+    ? `<span class="lane-e-age ${ageCls}" title="Three of the four gates read the shared IV/earnings header rather than the chain quoted beside them — vol-not-cheap (IV rank / IV-HV), no-catalyst-inside (earnings date) and hostile-term (term structure). That header was read ${ageTxt} before this chain. Term structure is the one that moves intraday: near zero a stale read can flip the hostile-term verdict. Only no-coverage is independent of it.">⏱ gates computed on ${ageTxt}-old vol data</span>`
+    : `<span class="lane-e-age live" title="The header was fetched with this chain, so every gate describes the same moment.">⏱ gates on live data</span>`;
 
   /* THE HEADLINE — three numbers, one line, in this order. Everything below is
      supporting detail. `required` is the WIDER breakeven, because the narrow side
@@ -2507,12 +2543,18 @@ function longLaneETable(entry) {
     ${verdict ? `<span class="lane-e-verdict ${verdict === 'has' ? 'good' : 'bad'}">the typical move ${verdict} covered this</span>` : ''}
   </div>${h.reason ? `<div class="prem-note">${esc(h.reason)}</div>` : ''}`;
 
+  /* The verdict renders in BOTH states. A passing verdict used to render as the
+     absence of a gate block, which meant the one case where staleness can do
+     real harm — a gate passing something it should have refused — was also the
+     case with nothing on screen to age. */
   const gates = gated
-    ? `<div class="lane-e-gates"><b>Did not qualify — ${esc(entry.gateFailed.join(', '))}.</b><ul>${
+    ? `<div class="lane-e-gates"><b>Did not qualify — ${esc(entry.gateFailed.join(', '))}.</b> ${ageChip}<ul>${
         Object.values(entry.gateDetail || {}).map(v => `<li>${esc(v)}</li>`).join('')}</ul>
        <div class="prem-note">Shown rather than hidden: "no straddle worth looking at here" and "no data for
        this name" must not look the same.</div></div>`
-    : '';
+    : `<div class="lane-e-gates passed"><b>All four gates passed.</b> ${ageChip}
+       <div class="prem-note">vol not rich · catalyst inside the expiry · term structure not hostile ·
+       coverage resolves at this horizon.</div></div>`;
 
   // §6 — the earnings-straddle limitation, in visible text and never a tooltip.
   const caveat = entry.holdToExpiryCaveat
@@ -2740,7 +2782,10 @@ function longDetail(r) {
         ? `<div class="prem-note">${esc(entry.ivOutlierNote)}</div>` : '';
       return head + (lane === 'C' ? longVerticalTable(entry, scored, basis)
                    : lane === 'D' ? longCalendarTable(entry)
-                   : lane === 'E' ? longLaneETable(entry)
+                   : lane === 'E' ? longLaneETable(entry, {
+                       from: r.sharedFrom,
+                       ageMs: (r.ts != null && r.sharedTs != null) ? r.ts - r.sharedTs : null,
+                     })
                    : lane === 'F' ? longCreditTable(entry, scored, basis)
                    : longSingleTable(entry, scored, basis)) + outliers;
     }).join('');
