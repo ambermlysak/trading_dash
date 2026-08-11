@@ -371,6 +371,51 @@ that `==1` would fire frequently on this lane; the two tickers first inspected
 (NVDA, AAPL) scored 3 and 4 and looked like a falsification. They were simply not
 representative — n=2 out of 140.
 
+### CORRECTION: the driver is the WIN RATE, not breakeven distance
+
+The Lane E write-up above explains its concentration by **breakeven distance** —
+far breakevens → few winning windows → the winners cluster into a handful of
+episodes. It predicted that credit spreads, whose breakevens are also far out,
+would sit nearer Lane B/C than Lane E.
+
+**Lane F falsified it.** Measured 2026-08-10 over 698 candidates across every
+lane, same day:
+
+| lane | n | mean episodesTo50 | ==1 | mean winRate | mean \|bePct\| |
+|---|---|---|---|---|---|
+| B | 280 | 2.10 | 26.1% | 30.2% | 10.37 |
+| C | 140 | 3.47 | 4.3% | 40.2% | 4.92 |
+| E | 140 | 2.09 | 28.6% | 33.6% | 22.48 |
+| **F** | **138** | **6.05** | **0.0%** | **76.0%** | **14.19** |
+
+Lane F has the **second-farthest breakevens and the least concentration of any
+lane** — the opposite of what distance predicts, and further from Lane B/C than
+Lane E is rather than nearer.
+
+```
+corr(episodesTo50, winRate) =  0.691   (n=698, all lanes)
+corr(episodesTo50, |bePct|) = -0.233
+```
+
+**The real driver is how many windows WIN.** Many winners spread across many
+episodes; few winners concentrate into the largest moves. Breakeven distance is
+only a *proxy* for that, and it is a good one **within debit structures**, where
+a farther breakeven mechanically means fewer winners — restricted to Lanes
+A/B/C/E the distance correlation is the stronger of the two (−0.432 against
+0.319). A credit spread breaks the coincidence: it wins by *not* reaching its
+breakeven, so a far breakeven means MORE winners, not fewer.
+
+**Read the general lesson, not the specific numbers.** The original explanation
+was fitted on a population where the proxy and the thing moved together, and it
+was stated as the mechanism rather than as a correlate. That is the same
+proxy-vs-thing failure the `top3Share` note above describes, committed while
+documenting the fix for it. When an explanation is only ever tested where two
+candidate causes agree, it has not been tested.
+
+**Consequence worth knowing:** `EPISODE_CONCENTRATION_WARN = 1` **never fires on
+Lane F** — 0 of 138. That is correct rather than a coverage gap: a structure that
+wins 76% of the time does not rest its expectancy on a single market episode.
+
 ### The up-tail share tracks drift ÷ σ, not drift — a general result
 
 This is **not a Lane E detail.** It applies to any coverage figure read against
@@ -538,9 +583,54 @@ Where a paid feed would still add something real, it is named in the notes.
 | 14 | Overall rating + confidence | Claude synthesis, JSON schema; confidence renders Low/Moderate/High, never a % | **real** | — |
 | 15 | Recommendation history + calibration | Cloudflare KV forward log; `fwd5`/`fwd20` filled by a 2pm PT cron; hit rate and Brier score once n ≥ 10 | **real** | — |
 | 16 | News flow | Alpaca news when keyed, Yahoo `search` otherwise | **real** | Benzinga ($177) |
-| — | Premium screen (dashboard) | Yahoo chain via `/api/premium/:ticker`, one ticker per request: term structure, expected move, 0.30/0.16-delta strikes, credit, ROC, annualised ROC, POP | **real** | ORATS for a historical IV surface |
-| — | Long screen (dashboard) | Yahoo chain via `/api/long/:ticker`, one ticker per request: four lanes, ask-based debit, breakeven, BE/EM, extrinsic %, leverage, annualised carry, theta, vega, `P(BE)@exp` from N(d2). Reuses `premium:{TICKER}`'s slower-moving fields when fresh (4 external fetches) and refetches them when not (7) | **real** — Lane D's breakeven/BE/EM/P(BE)/carry are **suppressed**, not estimated | ORATS for a historical IV surface; a term-structure model would unlock Lane D |
+| — | ~~Premium screen (dashboard)~~ | **DELETED 2026-08-10.** Became Lane F of the Long screen. See the aROC note below | — | — |
+| — | Long screen (dashboard) | Yahoo chain via `/api/long/:ticker`, one ticker per request: six lanes, ask-based debit (bid-based credit on F), breakeven, BE/EM, extrinsic %, leverage, annualised carry, theta, vega, `P(BE)@exp` from N(d2). Reuses `premium:{TICKER}`'s slower-moving fields when fresh (4 external fetches) and refetches them when not (8) | **real** — Lane D's breakeven/BE/EM/P(BE)/carry are **suppressed**, not estimated | ORATS for a historical IV surface; a term-structure model would unlock Lane D |
 | — | Long screen · `cov` / `gap` / `E[R]` / `E[$]` | **Measured** from `moves:{TICKER}` — 3y of Yahoo daily closes banked by the 2pm PT sweep (2 external fetches for the whole watchlist), then overlapping N-session windows. `cov` is an empirical frequency, `p(be)` beside it is modelled; `E[R]` is mean P/L over those windows ÷ capital risked | **real** — 1y/3y never averaged; horizons the history cannot support return null naming the numbers; `gapBaseline` null this release | ORATS for a historical IV surface would let `pBe` be checked against a *measured* IV rather than only against realized moves |
+
+## Design note: the naked-margin aROC denominator, and why it is gone
+
+The deleted premium screen ranked every row by **annualised return on capital**:
+
+```
+roc  = credit / (strike × 100 − credit)
+aroc = roc × 365 / dte
+```
+
+On the put side that denominator is the cash a cash-secured put ties up, which is
+defensible. **On the call side it was the naked-margin equivalent** — the capital
+a broker would hold against an uncovered short call. The screen said so in its
+legend, and the legend was the problem rather than the fix.
+
+**It is the wrong denominator for the person using this dashboard.** Nobody sells
+uncovered calls here; a short call is sold against shares. For a share-holder the
+capital at risk is not the naked-margin requirement — it is the position already
+owned, whose cost basis this codebase does not know and cannot know. So the number
+was computed against a capital base the user did not have, for a structure they
+would not put on, and then used as the **primary sort key** for the whole screen.
+
+Three distinct faults, worth separating because only the first is obvious:
+
+1. **Not comparable across sides.** Put-side aROC and call-side aROC used
+   different capital bases, so ranking them in one list ordered by an inconsistent
+   unit. A row could outrank another purely by being on the other side.
+2. **Not comparable to anything else in the app.** Every other return figure is
+   over capital genuinely at risk. This one was not, so it could not be read
+   against `E[R]` or against a debit structure's return.
+3. **It flattered exactly the structures with unbounded risk.** Naked margin is
+   far smaller than the loss a short call can actually produce, so the worse the
+   tail, the better the number looked. A ranking metric that rewards unbounded
+   risk is not a weak metric; it points the wrong way.
+
+**Lane F's replacement is `returnOnRisk = credit / (width × 100 − credit)`** —
+credit over the real, bounded max loss, identical in construction on both sides,
+and the same quantity `expectancyFrom` divides by. It is **not annualised**,
+deliberately: annualising invites comparison across DTEs that the expectancy sort
+already handles properly, and the `× 365 / dte` factor was doing most of the work
+in the old ranking.
+
+**Do not reintroduce an annualised ROC against a naked or share-based denominator.**
+If a covered-call view is ever wanted it needs a real cost basis, which means
+position awareness this app does not have — see the position-unaware note on Lane F.
 
 ## If you ever want to pay for data
 

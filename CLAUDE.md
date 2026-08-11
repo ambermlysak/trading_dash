@@ -53,9 +53,9 @@ are free of the cap.
 **Read this before treating 10,000 as permission to fan out.** Every structure in
 this codebase that avoids fan-out stays exactly as it is:
 
-- `/api/premium/batch` and `/api/long/batch` remain **KV reads that make no
+- `/api/long/batch` remains a **KV read that makes no
   outbound fetch** (they still cost one KV read per symbol — cheap, not free);
-  `/api/premium/:ticker` and `/api/long/:ticker` remain the only paths that touch Yahoo.
+  `/api/long/:ticker` remains the only path that touches Yahoo.
 - **Load all is strictly sequential** on both tabs, one awaited request at a time.
 - The deleted KV queue that once drained the premium sweep across cron firings
   **stays deleted**.
@@ -683,7 +683,7 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Seven checks exist, all of which print computed vs
+There is no build step. Eight checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
 (Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
@@ -720,8 +720,7 @@ All data flows through the Worker. CORS is enforced via `ALLOWED_ORIGINS` allowl
 GET  /api/quote/:ticker           Yahoo quoteSummary (multi-module) + Alpaca price overlay
 GET  /api/chart/:ticker           Yahoo v8 OHLCV (?range=1y&interval=1d)
 GET  /api/options/:ticker         Yahoo v7 options chain
-GET  /api/premium/batch?symbols=  Premium screen, KV only — no fetches; 1 KV read/symbol
-GET  /api/premium/:ticker         One ticker (?refresh=1 rebuilds it, ~5 subrequests)
+POST /api/premium/*             REMOVED — returns 410. Became Lane F of the Long screen.
 GET  /api/long/batch?symbols=     Long screen, KV only — no fetches; 1 KV read/symbol
 GET  /api/long/:ticker            One ticker (4 measured warm / 7 cold)
 GET  /api/insider/:ticker         SEC EDGAR Form 4, last 90 days (12h KV)
@@ -801,7 +800,7 @@ and the card is visibly labelled a proxy. With no vol reading at all the strateg
 
 `volRegime()` **lives in `worker.js`**, not in the page. It arrives on `/api/iv` as `regime` and on
 `/api/premium` per row, with its thresholds as `gates` (`IVR_HIGH` 70 / `IVR_LOW` 30 /
-`RATIO_HIGH` 1.2 / `RATIO_LOW` 0.9 / `IVR_SELL_MIN` 50). It used to be computed in `index.html`; the
+`RATIO_HIGH` 1.2 / `RATIO_LOW` 0.9). It used to be computed in `index.html`; the
 premium screen on `dashboard.html` needs the identical gate, and two copies of a threshold across two
 HTML files is exactly how they drift apart. `index.html` is now only a reader — do not reintroduce a
 local copy.
@@ -1310,7 +1309,7 @@ exactly like a real one.
 
 ### Frontends
 
-`dashboard.html` — macro landing view with **seven tabs**. Every tab is deep-linkable
+`dashboard.html` — macro landing view with **six tabs**. Every tab is deep-linkable
 by hash (`dashboard.html#premium`), and `switchTab()` only lazy-loads a tab whose
 data is still empty — `primeTabs()` has usually painted it already.
 
@@ -1321,10 +1320,9 @@ data is still empty — `primeTabs()` has usually painted it already.
 | **Scanner** | `#scanner` | Four presets. Three (Momentum / HOD, Pre-Market Gappers, All Movers) hit `/api/market/scanner` and share `renderScanner()`; **Golden Cross Setup** hits `/api/market/golden-cross` and uses `renderGoldenCross()`. `loadScanner()` branches on the preset for endpoint, renderer, header copy and legend. |
 | **Watchlist** | `#watchlist` | The 14-column table, sortable, with expandable rows and the consolidated Recommendation column. |
 | **Sectors** | `#sectors` | All 11 SPDR sectors, ETF % change plus a Claude-picked opportunity and avoid per sector. |
-| **Premium** | `#premium` | The short-premium screen. **Renamed from "Options"** — the old tab was a V/OI unusual-activity recap on the nearest expiration and was deleted outright, along with `handleOptionsRecap()` and its Claude flow synthesis. |
-| **Long** | `#long` | The long-premium screen — the mirror of Premium. Five lanes (LEAPS / swing / debit verticals / calendars / straddle+strangle), gated on vol being *cheap* and the debit being structurally payable. See the Long-screen section below for everything that inverts. |
+| **Long** | `#long` | The only options screen. **Six lanes** (LEAPS / swing / debit verticals / calendars / straddle+strangle / defined-risk credit spreads). The standalone Premium tab was merged in as Lane F on 2026-08-10 — short premium is secondary and now sits as one lane among six, ranked by the same expectancy as everything else. |
 
-Note the Premium tab is the only one that fetches on interaction rather than on
+Note the Long tab is the only one that fetches on interaction rather than on
 load: expanding a row is what spends the subrequests. Sectors and Scanner use
 stale-while-revalidate (`?cached=1` paints the KV snapshot, then the normal
 endpoint revalidates behind it), so **no tab requires a click to show data**.
@@ -1332,149 +1330,114 @@ endpoint revalidates behind it), so **no tab requires a click to show data**.
 The `index.html` "Options Volume · V/OI Screen" card is a *different thing* and
 still exists — real Yahoo chain volume and open interest, on the per-ticker page.
 
-**The Premium tab (`#tab-premium`) replaced the Options flow recap.** The old view showed the nearest
-expiration filtered to volume/OI ≥ 2×, which answers "what traded today" — and at the nearest
-expiration the answer is mostly 0DTE and expiry-week churn, the wrong question for selling 20–45 DTE
-premium against earnings dates. `handleOptionsRecap()` and its Claude flow synthesis are **deleted**.
-The separate "Options Volume · V/OI Screen" card on `index.html` is untouched: that one is real Yahoo
-chain data and was never part of this.
+### Lane F — defined-risk credit spreads (the merged Premium screen)
 
-`/api/premium` returns one row per watchlist ticker:
+**THE STANDALONE PREMIUM TAB IS GONE.** It was a separate surface weighted as
+though selling were the primary activity, and it priced **naked** single legs —
+a cash-secured put and a covered call. Both were wrong for how this dashboard is
+used: options are bought here on high-conviction directional setups, and short
+premium is secondary, defined-risk and quick to decide. It is now **one lane of
+six** on the Long tab.
 
-- front/back ATM IV and `termStructure`.
+**Deleted, and nothing else consumed any of it** (verified by grep across
+`worker.js`, `dashboard.html` and `index.html` before removal):
+`premiumRow`, `pickCandidates`, `sellableFrom`, `handlePremiumBatch`,
+`handlePremiumTicker`, `premiumRowMeta`, `refreshPremiumTicker`,
+`PREM_MIN_DTE`, `PREM_MAX_SYMBOLS`, `IVR_SELL_MIN`, `RATIO_SELL_MIN`, the
+`#tab-premium` panel and ~24 KB of its JS. **`/api/premium/*` returns 410**,
+not 404 and not silently absent — a stale bookmark or a cached frontend should be
+told the route was retired and where it went.
 
-  **`termStructure = front − back`. POSITIVE means front IV is RICHER than back —
-  that is backwardation, and it is the earnings-crush setup.** This is the single
-  easiest thing in the codebase to get backwards, and the original spec for this
-  feature had it inverted (it asked to flag *negative* values as backwardation).
-  Both `/api/iv` and `/api/premium/:ticker` compute it the same way so the two
-  endpoints cannot disagree, `backwardation` is `termStructure > 0`, and the chip
-  (`◤`) and the legend both state the sign on screen. If you find yourself
-  "fixing" the sign, re-read this first.
-- `expectedMove` = spot × ATM IV × √(dte/365) through front expiry, in dollars and percent.
-- next earnings from `calendarEvents.earnings.earningsDate[0]` — deliberately the **same field the
-  watchlist's Earnings column reads**, because two tabs quoting different earnings dates for one
-  ticker is a bug the user finds before we do. Past dates are discarded, not shown as upcoming.
-- two candidate expiries: `clean` (first monthly ≥ 21 DTE with no earnings inside) and `post` (first
-  monthly expiring after the print). They collapse to one `clean+post` leg when earnings already sits
-  before the first monthly ≥ 21 DTE. **A missing clean leg is a finding, not a gap** — when the print
-  lands inside 21 DTE, every monthly from here spans it, and `cleanMissing` says so rather than
-  leaving an absent row that reads as missing data.
-- per candidate: nearest 0.30- and 0.16-delta put and call, **OTM only** (a short strike is OTM by
-  definition, and without that filter a sparse chain hands back an ITM strike whose |delta| happens to
-  sit nearer the target). Delta uses each strike's **own** implied vol, so put skew is respected.
-  Credit is the **bid**, not the mid — what a seller can actually hit. `roc = credit / (strike × 100 −
-  credit)`, `aroc = roc × 365/dte`. On the call side that denominator is the naked-margin equivalent,
-  not the cost of shares in a covered call; the legend says so, because the same number under two
-  capital bases would not be comparable.
+**What survived, and why each is still load-bearing:**
 
-**The screen loads on demand, one ticker per request.** Cloudflare caps subrequests **per
-invocation**. One ticker costs a *measured* ~4.8 outbound fetches (1 expiry list + 1 quoteSummary
-for earnings + ~2.8 dated expiry chains); a 22-name watchlist is ~110. That did not fit under the
-old Workers Free cap of 50 and comfortably fits the current 10,000 (rule #1) — **the on-demand
-design is retained on purpose and is not to be changed without a decision**: the screen is used one
-or two names at a time, and **the Yahoo crumb rate-limits long before the subrequest budget does,
-which is why the higher cap changes nothing here**. **Chunking inside a handler does nothing for
-this** — the cap is per invocation, not per chunk. Re-measure with a counting `fetch` wrapper before
-changing anything here; do not estimate it.
+| survives | why |
+|---|---|
+| `PREM_TARGETS` (0.30/0.16) | feeds Lane F's short leg and wing, and Lane E's strangle |
+| `ivPlausible` / `IV_OUTLIER_MULT` / `ivOutlierNote` | the strike-selection guard, always shared |
+| `ivRankFrom` | also feeds `/api/iv` and the earnings facts payload |
+| `nextEarningsIso` | also feeds `longRow` |
+| `volRegime` | `/api/iv` **and index.html** |
+| **`premium:{TICKER}`** | **repurposed — see below** |
 
-There was briefly a KV queue drained across cron firings to work around that. It is gone. The screen
-is used one or two names at a time when deciding what to sell, so fetching all 22 daily was solving a
-problem nobody had at the cost of a queue, a cursor, a seed step and a share of every cron firing.
+**`premium:{TICKER}` survived the tab, but it had to change hands.** It is no
+longer a screen row; it is the **shared IV/earnings header** `longRow` reuses on
+its warm path. Deleting the tab removed its ONLY writer (there was never a cron
+write — `refreshPremiumTicker` had exactly one caller, the route). Left alone,
+the warm branch would have become permanently unreachable and every Long request
+would run cold: **8 external Yahoo fetches instead of 4**, doubling crumb pressure
+on a 35-name sequential "Load all" — and crumb rate-limiting, not the subrequest
+cap, is the binding constraint there. So `refreshLongTicker` now writes it, but
+**only when it ran cold**: rewriting on a warm run would refresh `ts` without
+refreshing the data, producing a stale record that reports itself as fresh.
+`PREM_SCHEMA` 2 → 3 retires every old full-row value.
 
-- `GET /api/premium/batch?symbols=` is a **cache-status read, not a data fetch**: no outbound fetches,
-  so the tab paints every watchlist ticker on load without touching Yahoo. It is **not free** — one KV
-  read per symbol, measured `capCost 22` for a 22-name watchlist, and KV counts against the same pool.
-  Cheap, not free. Tickers with nothing cached come back in `missing[]` as `not-loaded`.
-- `GET /api/premium/:ticker` is the only path that spends subrequests, and spends ~5. Bare = serve
-  cache if inside `PREMIUM_FRESH_MS`, else refetch. `?refresh=1` always refetches (the ↻ control).
-  `?cached=1` never fetches.
-- **Freshness (4h) and KV retention (24h) are deliberately different.** If KV evicted at exactly the
-  freshness horizon there would be nothing left to render as stale — and "stale" is the honest state
-  for a 5-hour-old chain, more useful than a blank row. Past 4h the cached row still shows, badged
-  stale, and revalidates behind itself.
-- **Load all is strictly sequential**, one awaited request at a time, with a progress line and a Stop
-  control. Firing 22 concurrently would put 22 invocations against Yahoo at once and get the crumb
-  rate-limited — a different failure from the subrequest cap but just as effective. `premInflight`
-  guarantees a ticker is never fetched twice concurrently, since expand and Load all can both reach
-  for the same row. **Expand all never fetches**; it only opens what is already loaded.
+**The lane: short ~0.30Δ, long ~0.16Δ, put side and call side**, on Lane B's
+already-fetched monthlies — zero extra subrequests, the same arrangement as
+Lanes C, D and E.
 
-**Row `status` distinguishes three failures that used to render identically as dim red:**
-`ok` · `no-options` (nothing listed — nothing to screen) · `no-iv` (options listed but the front expiry
-quotes no usable IV — a real finding about a thin name, which will not fix itself) · `error` (the fetch
-failed; transient, worth retrying). `pending` is never stored — it is what the batch endpoint reports
-for a ticker the sweep has not reached. Conflating "we have not looked yet" with "this name has no
-tradeable options" hides both.
+**`maxLoss = width × 100 − credit` is the point of the lane.** It renders in the
+danger treatment, and it is **also the capital `expectancyFrom` divides by** —
+computed once so the figure on the card and the denominator behind E[R] cannot
+drift. Using the credit instead would inflate expectancy by 2.3–3.2× on real
+candidates and pin every credit row to the top of the screen. Credit is the short
+leg's **bid** minus the wing's **ask**.
 
-**Two gates, two different jobs — `volRegime()` and `IVR_SELL_MIN`.** They look
-like duplication and are not:
+**No expectancy above 1.0 — and know when that bound can legitimately break.**
+Measured 0 of 138 across all 35 names, highest 28.0%. The ceiling is
+`credit / (width × 100 − credit)`, which exceeds 1 only when the credit is more
+than **half** the width; at 0.30/0.16 deltas that is not a normal quote. So a Lane
+F expectancy above 1.0 is a denominator bug until proven otherwise — but it is not
+*arithmetically* impossible, and `lane-f.check.mjs` §4 prints the algebra rather
+than asserting a law that does not hold.
 
-- `volRegime()` (worker.js) answers *"is vol rich or cheap enough to justify a
-  volatility structure at all?"* — `IVR_HIGH` 70 / `IVR_LOW` 30, with
-  `RATIO_HIGH` 1.2 / `RATIO_LOW` 0.9 as the IV/HV30 proxy. It gates the strategy
-  cards on `index.html`: iron condor and CSP need `elevated`, straddle needs
-  `depressed`.
-- `IVR_SELL_MIN` (50) answers a *different* question: *"is this row worth the
-  user's attention on a screen sorted by yield?"* It is a display threshold for
-  dimming, not a trading gate, and 50 is the median rather than the 70th
-  percentile because a screen that dims everything below 70 shows almost nothing.
+**THE DIRECTION INVERSION, which is the easiest thing here to get wrong.** For
+every other lane `coverage` is the frequency with which the stock **moved past**
+the breakeven, and that is the win. A credit spread wins when it **does not**. So
+Lane F reports coverage and `pBe` as the probability of the WIN, which inverts
+the direction relative to a long option of the same side:
 
-Keeping them separate is deliberate. Collapsing them would mean either dimming
-rows that still qualify for a structure, or recommending structures on rows the
-screen calls uninteresting. `IVR_SELL_MIN` lives beside the `volRegime` constants
-so the relationship is visible, and both ship to the frontend in `gates` — neither
-frontend hardcodes a threshold.
+- bull put spread → wins ABOVE → `dir: 'up'` at a negative threshold
+- bear call spread → wins BELOW → `dir: 'down'` at a positive threshold
 
-**The gate is tri-state, and a null rank is not a fail.** `sellableFrom()` returns
-`{ sellable, basis, reason }` with `basis` falling through in order:
+A long put uses `'down'` and a long call `'up'`, so this is the **opposite** of
+what `attachCoverage`'s type inference picks — hence `covDir` is passed
+explicitly, and `probBeyondBreakeven` is called with the opposite `type`.
+Getting it from `type` would put the LOSS frequency in the column Lane B uses for
+its win frequency: measured **54.1 points out** on a real 0.30-delta short.
 
-| basis | when | test |
-|---|---|---|
-| `rank` | `ivRank` exists (≥60 days of history) | `ivRank × 100 ≥ IVR_SELL_MIN` (50) |
-| `proxy` | no rank yet, but HV30 exists | `ivHvRatio ≥ RATIO_SELL_MIN` (**1.0×**) |
-| `none` | neither | `sellable: null` — **not** a fail |
+**What the lane deliberately does NOT get:**
 
-`sellable` was originally `ivRank != null && ivRank * 100 >= IVR_SELL_MIN`, which
-treats a null rank as below-threshold. Since `ivRank` is null until 60 days of
-samples exist, **that dimmed every row on the tab for the entire collection
-window** — three months of a screen reading as if nothing were worth selling. The
-proxy was already computed and already drove the regime chip; the gate simply
-never consulted it.
+- **No rating gate.** `analysis:` is informational-only — it measured a negative
+  edge, and gating a lane on a measured non-edge reintroduces what was disabled.
+- **No vol gate of its own.** `buyableFrom` is now the only vol gate on the
+  screen and it does not apply here.
+- **No position awareness, and this is a correctness constraint rather than a
+  missing feature.** The screen cannot know whether shares are held, so nothing in
+  the lane may imply a covered position: no covered-call framing, no share-based
+  capital, no assignment modelling. Every card is a defined-risk spread on its own
+  terms, and `positionNote` says so on the row.
+- **No special placement.** It sorts with the rest on expectancy and renders last.
 
-`RATIO_SELL_MIN = 1.0` is the proxy analogue of "at or above the median": implied
-vol is pricing at least as much movement as the stock has actually realised. It is
-coarser than a percentile and is labelled a proxy everywhere it surfaces.
-`sellable: null` renders **neutral, not dim** — "no basis to judge" is not the same
-as "fails the gate". `sellableReason` names the deciding number, so "IVR 34" and
-"rank collecting, proxy 0.94×" are distinguishable on hover.
+**It does not dominate the sort, confirmed rather than assumed.** Measured across
+16 candidates each: NVDA ranks 7–10, AAPL 5/7/9/10, PLTR 7–10. Lane F never took a
+top-4 slot on any of the three. Expectancy handles credit structures correctly
+because it divides by real capital at risk — the high win rate is offset by the
+small max gain, which is exactly what a probability-only ranking would miss.
 
-**POP is delta-derived, and the card says so.** `1 − |Δ|` of the short strike;
-`1 − (|Δcall| + |Δput|)` for an iron condor. Delta is Black-Scholes computed in the
-Worker from each strike's **own** implied vol — not ATM IV — so put skew is
-respected, and the `/api/iv` `pop` ladder carries real listed strikes so the leg
-printed is one that exists.
+**Lane F has no gates, so it has no gate rate** — the Lane E figure (91% gated)
+has no analogue here. What it has is a *pricing* rate: **70 of 70 entries priced,
+138 candidates, 0% unpriced** across all 35 names. If it ever fails it reports
+`no-iv` with the reason.
 
-**Debit structures render `n/a`, not a number.** For a bull call spread, bear put
-spread or long straddle the break-even sits inside the long strike, so `1 − |Δ|` is
-simply the wrong quantity — it would produce a plausible-looking figure measuring
-nothing. Three of seven cards therefore show `n/a` with the reason on hover. The
-temptation is always to fill the cell; a wrong number costs more than a blank one.
+**`episodesTo50` never fires the concentration flag on this lane** — `==1` on
+**0 of 138**, mean 6.05 against Lane B's 2.10. This falsified the breakeven-distance
+mechanism written up for Lane E; the driver is the **win rate**, not breakeven
+distance. Full correction in `ARCHITECTURE.md`.
 
-**`Hist Win` stays suppressed** pending a real backtest of the structure on the
-underlying. It sits directly beside POP precisely so the difference between a
-formula and a measurement is visible. Do not wire it to anything derived.
-
-Rows sort by `bestAroc` (the best annualised ROC among the row's candidates), nulls last. Rows failing
-the gate are **dimmed, never hidden**: a thin-premium name has to look unattractive, and hiding it
-makes "no vol edge here" and "no data for this ticker" render identically.
-
-**The tab is a collapsed list.** Every ticker as a full-height block made a 22-name watchlist several
-screens of scrolling with no way to compare rows. Each row is one summary line — ticker, spot, front
-IV, IV rank or proxy, term-structure chip, days to earnings, best annualised ROC — and expands on
-click. Headers sort on any of those (alphabetical by default, annualised ROC descending being the
-useful one); unavailable rows always sink regardless of sort, and nulls sort last in **both**
-directions because a missing value is not a small value. Expanded state persists per ticker in
-`sessionStorage` — it is "where was I", not a durable preference.
+`node lane-f.check.mjs` covers the credit payoffs at five prices each (their
+**first-ever caller** — those branches existed since the §6.2 work and had never
+executed), `capitalOf`, both guards, the ≤1.0 ceiling and the direction
+inversion. **36 comparisons.**
 
 ### The Long tab — the long-premium screen
 
@@ -1542,7 +1505,7 @@ cap 18`. Do not "fix" the warm path to 9 by re-adding a history read.
 `PREMIUM_FRESH_MS`, independently of the long endpoint's own refresh flag. So a
 bare `?refresh=1` on a ticker whose premium row is cold takes the **cold** path
 every time, and the warm branch cannot be reached by repeating the call. To
-exercise it, seed `/api/premium/:ticker?refresh=1` first. This cost a wasted test
+exercise it the premium header must already be fresh. This cost a wasted test
 cycle when the warm-path IV skip was being verified.
 
 History of that figure: **6** before move coverage (measured with the crumb already
@@ -1559,10 +1522,10 @@ cost by 125–143%. Do not quote them.
 **Everything that inverts, because an inverted thing that looks like a copy is how this gets broken:**
 
 - **Debit is the ASK**, the mirror of Premium's credit-is-the-bid. On a vertical it is long ask − short bid.
-- **Low IV rank is the good state.** `buyableFrom()` mirrors `sellableFrom()` — same tri-state
+- **Low IV rank is the good state.** `buyableFrom()` inherits the deleted `sellableFrom()`'s shape — same tri-state
   fallthrough, opposite direction: `IVR_BUY_MAX` 40 on rank, `RATIO_BUY_MAX` 0.95 on the IV/HV30 proxy,
   `buyable: null` when neither exists (renders **neutral, not dim** — the same null-is-not-a-fail rule
-  that greyed the Premium tab for three months). Note `buyable` is **not** `!sellable`: an IV rank of 55
+  that greyed the old Premium tab for three months). Note `buyable` is **not** `!sellable`: an IV rank of 55
   is neither rich enough to sell nor cheap enough to buy, which is a real and common state.
 - **The dim gate is two-part**: not-rich vol **AND** best-candidate BE/EM ≤ 1.0. Cheap vol alone is not
   enough — a name can have depressed IV and still price every breakeven outside its own expected move.

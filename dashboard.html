@@ -609,6 +609,11 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
    tail and the structure is not behaving as a volatility trade. */
 .lane-e-split { font-family: var(--mono); font-size: 9px; color: var(--ink-3); margin-left: 4px; }
 .lane-e-split.lopsided { color: var(--amber); }
+
+/* Lane F. Max loss is the figure the lane exists to show, so it gets the danger
+   treatment rather than sitting as an ordinary cell among twelve others. */
+.lane-f-maxloss { color: var(--bear) !important; font-weight: 600; }
+th.lane-f-maxloss { color: var(--bear) !important; }
 .long-ages { font-family: var(--mono); font-size: 9px; color: var(--ink-3); margin-top: 8px; line-height: 1.5; }
 
 .prem-chip { font-family: var(--mono); font-size: 9px; padding: 2px 7px; border-radius: 3px; background: var(--bg-3); color: var(--ink-2); letter-spacing: 0.04em; white-space: nowrap; }
@@ -694,7 +699,6 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
     <button class="tab-btn" data-tab="scanner">Scanner</button>
     <button class="tab-btn" data-tab="watchlist">Watchlist</button>
     <button class="tab-btn" data-tab="sectors">Sectors</button>
-    <button class="tab-btn" data-tab="premium">Premium</button>
     <button class="tab-btn" data-tab="long">Long</button>
   </nav>
   <div class="topbar-right"><span id="clock"></span></div>
@@ -936,23 +940,6 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 </div>
 
 <!-- Premium tab -->
-<div class="tab-panel" id="tab-premium">
-  <div class="main" style="max-width:none">
-    <div class="tab-header">
-      <div>
-        <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">
-          Premium <span class="src-tag" id="premium-badge"></span>
-        </div>
-        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Short-premium screen · one row per watchlist ticker · monthly expiries ≥ 21 DTE · ranked by annualised ROC</div>
-      </div>
-      <button class="wl-btn refresh" id="premium-refresh-btn">↺ Refresh</button>
-    </div>
-    <div id="premium-content">
-      <div class="loading" style="padding:40px;text-align:center;">Loading premium screen…</div>
-    </div>
-  </div>
-</div>
-
 <div class="tab-panel" id="tab-long">
   <div class="main" style="max-width:none">
     <div class="tab-header">
@@ -1752,7 +1739,6 @@ function switchTab(tab) {
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tab));
   if (tab === 'watchlist' && Object.keys(wlData).length === 0) loadWatchlistBatch();
   if (tab === 'sectors'   && !sectorsData) loadSectors();
-  if (tab === 'premium'   && !premiumData) loadPremium();
   if (tab === 'long'      && !longData)    loadLong();
   if (tab === 'scanner'   && !scannerData) loadScanner();
 }
@@ -1769,9 +1755,8 @@ async function primeTabs() {
   await Promise.allSettled([
     loadSectors({ cached: true }),
     loadScanner(null, { cached: true }),
-    // Premium and Long have no cached/live split: their list views ARE KV reads
-    // and fetch nothing. Rows fetch when expanded, one at a time.
-    loadPremium(),
+    // Long has no cached/live split: its list view IS a KV read and fetches
+    // nothing. Rows fetch when expanded, one at a time.
     loadLong(),
   ]);
   // Revalidate in the background. Failures are already swallowed by each loader,
@@ -1907,482 +1892,6 @@ function initColumnResize() {
   tbody.addEventListener('mouseout',   e => { if (!e.target.closest('.ai-cell')) tip.style.display = 'none'; });
   tbody.addEventListener('mouseleave', () => { tip.style.display = 'none'; });
 })();
-
-/* ─── Premium screen ───────────────────────────────────────────────────────────
- * One collapsed summary line per ticker; click to expand the candidate table.
- * Every ticker rendered as a full-height block made the tab unnavigable — a
- * 22-name watchlist was several screens of scrolling with no way to compare rows.
- *
- * Data comes from /api/premium/batch, which reads KV and makes no outbound calls.
- * The chain fetches happen on expand, one ticker per request, because firing the
- * whole watchlist at once gets Yahoo's crumb rate-limited. That constraint is
- * unchanged by the Worker's 10,000-subrequest cap — the cap is not what stops
- * fan-out here. The per-row ↻ hits /api/premium/:ticker?refresh=1 — ~5 subrequests.
- */
-let premiumData = null;
-let premiumLoading = false;
-let premiumSort = { col: 'symbol', dir: 1 };
-
-const PREM_OPEN_KEY = 'trading_dash_premium_open';
-const PREM_SORT_KEY = 'trading_dash_premium_sort';
-
-const pctOf = (v, d = 1) => v == null ? '—' : (v * 100).toFixed(d) + '%';
-
-/* Expanded rows survive a refresh — collapsing everything on every reload was
- * its own navigation problem. sessionStorage, not localStorage: this is
- * "where was I", not a durable preference. */
-function premOpenSet() {
-  try { return new Set(JSON.parse(sessionStorage.getItem(PREM_OPEN_KEY)) || []); }
-  catch (_) { return new Set(); }
-}
-function premOpenSave(set) {
-  try { sessionStorage.setItem(PREM_OPEN_KEY, JSON.stringify([...set])); } catch (_) {}
-}
-function premSortLoad() {
-  try {
-    const s = JSON.parse(sessionStorage.getItem(PREM_SORT_KEY));
-    if (s && typeof s.col === 'string' && (s.dir === 1 || s.dir === -1)) premiumSort = s;
-  } catch (_) {}
-}
-function premSortSave() {
-  try { sessionStorage.setItem(PREM_SORT_KEY, JSON.stringify(premiumSort)); } catch (_) {}
-}
-
-async function loadPremium() {
-  const el = document.getElementById('premium-content');
-  const symbols = getWatchlist();
-  if (!symbols.length) {
-    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--ink-3)">Add tickers to your watchlist to screen them for premium.</div>';
-    return;
-  }
-  if (premiumLoading) return;
-  premiumLoading = true;
-
-  const btn = document.getElementById('premium-refresh-btn');
-  if (btn) { btn.disabled = true; btn.textContent = '↺ Loading…'; }
-  if (!premiumData) el.innerHTML = '<div class="loading" style="padding:40px;text-align:center">Reading cached rows…</div>';
-
-  try {
-    // Cache-status read only. Zero outbound calls, so painting the whole
-    // watchlist on load puts no Yahoo traffic behind a page load at all.
-    const data = await apiFetch(`/premium/batch?symbols=${symbols.join(',')}`, { cache: 'no-store' });
-    premiumData = data;
-    renderPremium(data);
-  } catch (e) {
-    if (!premiumData) el.innerHTML = `<div style="padding:40px;color:var(--bear)">Premium screen failed: ${esc(e.message)}</div>`;
-  } finally {
-    premiumLoading = false;
-    if (btn) { btn.disabled = false; btn.textContent = '↺ Refresh'; }
-  }
-}
-
-/* ── The only path that spends subrequests ───────────────────────────────────
- * One ticker per request, ~5 subrequests. The limit that matters is Yahoo's
- * crumb rate-limiting, not the Worker's 10,000-per-invocation cap.
- * `inflight` guarantees a ticker is never fetched twice concurrently — the
- * expand handler and Load all can both reach for the same row. */
-const premInflight = new Map();
-
-function fetchPremiumRow(sym, { force = false } = {}) {
-  if (premInflight.has(sym)) return premInflight.get(sym);
-  const p = (async () => {
-    const qs = force ? '?refresh=1' : '';
-    const res = await apiFetch(`/premium/${encodeURIComponent(sym)}${qs}`, { cache: 'no-store' });
-    if (!res.row) throw new Error(res.missing?.reason || 'no row returned');
-    premiumData.rows = (premiumData.rows || []).filter(r => r.symbol !== sym).concat(res.row);
-    premiumData.missing = (premiumData.missing || []).filter(m => m.symbol !== sym);
-    return res.row;
-  })().finally(() => premInflight.delete(sym));
-  premInflight.set(sym, p);
-  return p;
-}
-
-/** Mark a row busy in place, so expanding does not blank the list. */
-function setRowBusy(sym, busy, label) {
-  const btn = document.querySelector(`[data-prem-refresh="${sym}"]`);
-  if (btn) { btn.textContent = busy ? '⋯' : '↻'; btn.classList.toggle('busy', busy); }
-  const line = document.querySelector(`[data-prem-row="${sym}"]`);
-  if (line) line.classList.toggle('busy', busy);
-  const slot = document.querySelector(`[data-prem-loading="${sym}"]`);
-  if (slot && label) slot.textContent = label;
-}
-
-/** Expanding a row is what fetches it. */
-async function expandPremiumRow(sym) {
-  const open = premOpenSet();
-  open.add(sym); premOpenSave(open);
-
-  const have = (premiumData.rows || []).find(r => r.symbol === sym);
-  const age  = have?.ts ? Date.now() - have.ts : null;
-  const fresh = age != null && age < (premiumData.freshMs || 14_400_000);
-
-  renderPremium(premiumData);
-  // A fresh cached row needs no network at all.
-  if (have && fresh) return;
-
-  setRowBusy(sym, true, have ? 'refreshing stale chain data…' : 'fetching option chain…');
-  try {
-    await fetchPremiumRow(sym);
-  } catch (e) {
-    premiumData.missing = (premiumData.missing || [])
-      .filter(m => m.symbol !== sym)
-      .concat({ symbol: sym, status: 'error', reason: `fetch failed: ${e.message}` });
-  }
-  renderPremium(premiumData);
-}
-
-/** ↻ — always refetch, whatever the cache says. */
-async function refreshPremiumRow(sym) {
-  const open = premOpenSet(); open.add(sym); premOpenSave(open);
-  renderPremium(premiumData);
-  setRowBusy(sym, true, 'refreshing…');
-  try { await fetchPremiumRow(sym, { force: true }); }
-  catch (e) {
-    premiumData.missing = (premiumData.missing || [])
-      .filter(m => m.symbol !== sym)
-      .concat({ symbol: sym, status: 'error', reason: `refresh failed: ${e.message}` });
-  }
-  renderPremium(premiumData);
-}
-
-/* ── Load all: strictly sequential ───────────────────────────────────────────
- * One request at a time, awaited. Firing 22 concurrently would put 22 separate
- * invocations against Yahoo at once and get the crumb rate-limited, which is a
- * different failure from the subrequest cap but just as effective. The progress
- * line is the honest UI for something that takes ~a minute. */
-let premLoadAllAbort = false;
-
-async function loadAllPremium() {
-  const symbols = getWatchlist();
-  const todo = symbols.filter(s => {
-    const r = (premiumData.rows || []).find(x => x.symbol === s);
-    return !r || !r.ts || (Date.now() - r.ts) >= (premiumData.freshMs || 14_400_000);
-  });
-  if (!todo.length) { renderPremium(premiumData); return; }
-
-  premLoadAllAbort = false;
-  let done = 0;
-  const bar = () => {
-    const el = document.getElementById('prem-progress');
-    if (el) {
-      el.textContent = `Loading ${done}/${todo.length} — one ticker per request, roughly ${
-        Math.max(1, Math.round((todo.length - done) * 2.5))}s left. Click Stop to halt.`;
-    }
-  };
-  document.getElementById('prem-loadall').style.display = 'none';
-  document.getElementById('prem-stopall').style.display = '';
-  bar();
-
-  for (const sym of todo) {
-    if (premLoadAllAbort) break;
-    setRowBusy(sym, true, 'fetching…');
-    try { await fetchPremiumRow(sym); }
-    catch (e) {
-      premiumData.missing = (premiumData.missing || [])
-        .filter(m => m.symbol !== sym)
-        .concat({ symbol: sym, status: 'error', reason: `fetch failed: ${e.message}` });
-    }
-    done++;
-    renderPremium(premiumData);
-    bar();
-  }
-
-  const el = document.getElementById('prem-progress');
-  if (el) el.textContent = premLoadAllAbort ? `Stopped after ${done}/${todo.length}.` : `Loaded ${done}/${todo.length}.`;
-  const lb = document.getElementById('prem-loadall'), sb = document.getElementById('prem-stopall');
-  if (lb) lb.style.display = '';
-  if (sb) sb.style.display = 'none';
-}
-
-/* ── Status presentation ─────────────────────────────────────────────────────
- * These used to render identically as dim red, which conflated a fact about our
- * scheduler with a finding about the ticker. They are different things and the
- * user has to be able to act on them differently: `pending` resolves itself,
- * `no-iv` never will, `error` is worth retrying. */
-const PREM_STATUS = {
-  'not-loaded': { label: 'not loaded',   cls: 'muted', hint: 'Nothing fetched for this ticker yet. Expand the row (or press ↻) to fetch it — one ticker, one request.', loadable: true },
-  'no-options': { label: 'no options',   cls: 'muted', hint: 'This ticker has no listed options at all — nothing to screen.' },
-  'no-iv':      { label: 'no IV',        cls: 'amber', hint: 'Options are listed but the front expiry quotes no usable implied vol. Too thin to price — a real finding about the name, not a fetch problem.' },
-  error:        { label: 'fetch failed', cls: 'bear',  hint: 'The upstream fetch failed. Usually transient — try ↻.' },
-};
-
-function premCandidates(leg) {
-  if (leg.reason && !leg.candidates.length) {
-    return `<div class="prem-note${/suppressed/.test(leg.reason) ? ' bad' : ''}">${esc(leg.reason)}.</div>`;
-  }
-  if (!leg.candidates.length) {
-    return '<div class="prem-note">No strike on this expiry carried both a quoted implied vol and a usable delta.</div>';
-  }
-  const rows = leg.candidates.map((c) => `
-    <tr class="${c.sparse ? 'sparse' : ''}">
-      <td class="${c.type.toLowerCase()}">${c.type} ${c.strike}</td>
-      <td>${c.targetDelta.toFixed(2)}</td>
-      <td>${Math.abs(c.delta).toFixed(3)}</td>
-      <td title="Delta-derived approximation under a lognormal assumption — 1 − |Δ| — not a backtested frequency.">${c.pop == null ? '—' : (c.pop * 100).toFixed(0) + '%'}</td>
-      <td>${c.otmPct.toFixed(1)}%</td>
-      <td>${c.iv.toFixed(1)}%</td>
-      <td>${c.bid == null ? '—' : '$' + c.bid.toFixed(2)}</td>
-      <td>${c.credit == null ? '—' : '$' + c.credit.toFixed(0)}</td>
-      <td>${pctOf(c.roc, 2)}</td>
-      <td class="${c.aroc != null && c.aroc >= 0.30 ? 'hot' : ''}">${pctOf(c.aroc, 1)}</td>
-      <td>${c.openInterest == null ? '—' : fmtVol(c.openInterest)}</td>
-    </tr>`).join('');
-
-  const sparseNote = leg.candidates.some(c => c.sparse)
-    ? '<div class="prem-note">A greyed row means the 0.30 and 0.16 targets resolved to the same listed strike — the chain has no distinct strike between them.</div>'
-    : '';
-
-  // Strikes dropped for quoting an implausible IV against this expiry's own ATM.
-  // Declared rather than hidden: the exclusion is a fact about Yahoo's quote,
-  // not about the ticker, and a silently narrowed chain is unauditable.
-  const outlierNote = leg.ivOutlierNote
-    ? `<div class="prem-note">${esc(leg.ivOutlierNote)}</div>` : '';
-
-  return `<table class="prem-cands">
-    <thead><tr>
-      <th>Strike</th><th>Target Δ</th><th>Actual Δ</th><th>POP</th><th>OTM</th><th>IV</th>
-      <th>Bid</th><th>Credit</th><th>ROC</th><th>Ann. ROC</th><th>OI</th>
-    </tr></thead>
-    <tbody>${rows}</tbody>
-  </table>${sparseNote}${outlierNote}`;
-}
-
-const LEG_LABEL = {
-  clean:        ['Earnings-free expiry', 'cyan'],
-  post:         ['First expiry after earnings', 'amber'],
-  'clean+post': ['Earnings-free and post-earnings (same expiry)', 'cyan'],
-};
-
-/** The always-visible one-line summary. */
-function premSummary(r, open) {
-  const st = !r.ok ? (PREM_STATUS[r.status] || PREM_STATUS.error) : null;
-
-  if (st) {
-    // `not-loaded` stays clickable — expanding it is how you fetch it. The other
-    // three are terminal states with nothing to expand into.
-    return `<div class="prem-line recessive ${st.loadable ? 'loadable' : ''}" data-prem-row="${esc(r.symbol)}">
-      <span class="prem-caret">${st.loadable ? '▸' : ''}</span>
-      <a class="prem-sym" href="${EQUITY_URL}?t=${esc(r.symbol)}" onclick="event.stopPropagation()">${esc(r.symbol)}</a>
-      <span class="prem-chip ${st.cls}" title="${esc(st.hint)}">${esc(st.label)}</span>
-      <span class="prem-reason" data-prem-loading="${esc(r.symbol)}" title="${esc(r.reason || st.hint)}">${esc(r.reason || st.hint)}</span>
-      <button class="prem-refresh" data-prem-refresh="${esc(r.symbol)}" title="Fetch this ticker now (~5 subrequests, one request)">↻</button>
-    </div>`;
-  }
-
-  const ivr = r.ivRank != null
-    ? `<span class="prem-col ivr ${r.sellable ? 'good' : ''}">IVR ${(r.ivRank * 100).toFixed(0)}</span>`
-    : `<span class="prem-col ivr proxy" title="IV rank needs 60 days of history; ${r.historyDays}/${r.rankTargetDays} collected. Showing the IV/HV30 proxy instead.">${
-        r.ivHvRatio != null ? `IV/HV ${r.ivHvRatio.toFixed(2)}×` : 'no rank'}</span>`;
-
-  const term = r.termStructure == null
-    ? '<span class="prem-col term muted">—</span>'
-    : `<span class="prem-col term ${r.backwardation ? 'am' : 'muted'}" title="${
-        r.backwardation
-          ? `Front ATM IV is ${r.termStructure.toFixed(2)} points above the back expiry. Term structure is front − back, so backwardation reads positive here — the earnings-crush setup.`
-          : 'Front ATM IV is below the back expiry (term structure = front − back). Normal contango.'
-      }">${r.backwardation ? '◤' : '◢'} ${(r.termStructure > 0 ? '+' : '') + r.termStructure.toFixed(2)}</span>`;
-
-  const dte = r.daysToEarnings == null
-    ? '<span class="prem-col earn muted" title="No scheduled earnings date from Yahoo.">—</span>'
-    : `<span class="prem-col earn ${r.earnings?.insideFront ? 'bear' : ''}" title="Earnings ${esc(r.earnings?.iso || '')}${r.earnings?.insideFront ? ' — inside the front expiry' : ''}">E−${r.daysToEarnings}d</span>`;
-
-  return `<div class="prem-line ${r.sellable === false ? 'dim' : ''}" data-prem-row="${esc(r.symbol)}">
-    <span class="prem-caret">${open ? '▾' : '▸'}</span>
-    <a class="prem-sym" href="${EQUITY_URL}?t=${esc(r.symbol)}" onclick="event.stopPropagation()">${esc(r.symbol)}</a>
-    <span class="prem-col spot">$${fmt(r.spot)}</span>
-    <span class="prem-col iv" title="Front expiry ${esc(r.front.expiry)} · ${r.front.dte}d">${r.front.atmIv.toFixed(1)}%</span>
-    <span title="${esc(r.sellableReason || '')}">${ivr}</span>
-    ${term}
-    ${dte}
-    <span class="prem-col aroc ${r.bestAroc != null && r.bestAroc >= 0.30 ? 'hot' : ''}" title="Best annualised ROC across this row's candidate strikes.">${pctOf(r.bestAroc, 1)}</span>
-    <button class="prem-refresh" data-prem-refresh="${esc(r.symbol)}" title="Rebuild just this ticker (~5 subrequests)">↻</button>
-  </div>`;
-}
-
-/** The expanded detail, built only for rows that are actually open. */
-function premDetail(r) {
-  const em = r.expectedMove;
-  const legsHtml = r.legs.map((leg) => {
-    const [label, cls] = LEG_LABEL[leg.kind] || [leg.kind, 'muted'];
-    return `<div class="prem-leg">
-      <div class="prem-leg-head">
-        <span class="prem-chip ${cls}">${esc(label)}</span>
-        <span>${esc(leg.expiry)} · ${leg.dte} DTE</span>
-        ${leg.holdsEarnings ? '<span class="prem-chip bear">holds the print</span>' : ''}
-      </div>
-      ${premCandidates(leg)}
-    </div>`;
-  }).join('');
-
-  const missing = r.cleanMissing ? `<div class="prem-note">${esc(r.cleanMissing)}.</div>` : '';
-  const gate = r.sellableReason ? `<div class="prem-note">${esc(r.sellableReason)}</div>` : '';
-  const age = r.ts ? `<div class="prem-note">Chain data as of ${new Date(r.ts).toLocaleString()}.</div>` : '';
-
-  return `<div class="prem-detail">
-    <div class="prem-metrics">
-      <div><div class="prem-metric-l">Front ATM IV</div><div class="prem-metric-v">${r.front.atmIv.toFixed(1)}%</div>
-        <div class="prem-metric-v sub">${esc(r.front.expiry)} · ${r.front.dte}d</div></div>
-      <div><div class="prem-metric-l">Back ATM IV</div><div class="prem-metric-v">${r.back ? r.back.atmIv.toFixed(1) + '%' : '—'}</div>
-        <div class="prem-metric-v sub">${r.back ? esc(r.back.expiry) + ' · ' + r.back.dte + 'd' : 'no monthly after front'}</div></div>
-      <div><div class="prem-metric-l">Term structure</div><div class="prem-metric-v ${r.backwardation ? 'am' : ''}">${r.termStructure == null ? '—' : (r.termStructure > 0 ? '+' : '') + r.termStructure.toFixed(2)}</div>
-        <div class="prem-metric-v sub">front − back</div></div>
-      <div><div class="prem-metric-l">Expected move</div><div class="prem-metric-v">±${em.pct.toFixed(2)}%</div>
-        <div class="prem-metric-v sub">±$${em.dollars.toFixed(2)} by ${esc(em.expiry)}</div></div>
-      <div><div class="prem-metric-l">HV30</div><div class="prem-metric-v">${r.hv30 == null ? '—' : r.hv30.toFixed(1) + '%'}</div>
-        <div class="prem-metric-v sub">IV/HV ${r.ivHvRatio == null ? '—' : r.ivHvRatio.toFixed(2) + '×'}</div></div>
-      <div><div class="prem-metric-l">Earnings</div><div class="prem-metric-v">${r.earnings?.iso ? esc(r.earnings.iso) : '—'}</div>
-        <div class="prem-metric-v sub">${r.earnings?.iso ? (r.earnings.insideFront ? 'inside front expiry' : `in ${r.daysToEarnings}d`) : esc(r.earnings?.reason || '')}</div></div>
-    </div>
-    ${legsHtml}${missing}${gate}${age}
-  </div>`;
-}
-
-const PREM_SORTS = {
-  symbol: { label: 'Ticker',    get: r => r.symbol,          dirDefault:  1, text: true },
-  spot:   { label: 'Spot',      get: r => r.spot,            dirDefault: -1 },
-  iv:     { label: 'Front IV',  get: r => r.front?.atmIv,    dirDefault: -1 },
-  ivr:    { label: 'IV rank',   get: r => r.ivRank,          dirDefault: -1 },
-  term:   { label: 'Term',      get: r => r.termStructure,   dirDefault: -1 },
-  earn:   { label: 'Earnings',  get: r => r.daysToEarnings,  dirDefault:  1 },
-  aroc:   { label: 'Ann. ROC',  get: r => r.bestAroc,        dirDefault: -1 },
-};
-
-function sortPremiumRows(rows) {
-  const spec = PREM_SORTS[premiumSort.col] || PREM_SORTS.symbol;
-  const dir  = premiumSort.dir;
-  return [...rows].sort((a, b) => {
-    // Unavailable rows always sink, whatever the sort — they have no values to
-    // compare and they are not what the screen is for.
-    if (a.ok !== b.ok) return a.ok ? -1 : 1;
-    const av = spec.get(a), bv = spec.get(b);
-    if (spec.text) return String(av).localeCompare(String(bv)) * dir;
-    // Nulls last in BOTH directions: a missing value is not a small value.
-    if (av == null && bv == null) return a.symbol.localeCompare(b.symbol);
-    if (av == null) return 1;
-    if (bv == null) return -1;
-    return (av - bv) * dir || a.symbol.localeCompare(b.symbol);
-  });
-}
-
-function setPremiumSort(col) {
-  const spec = PREM_SORTS[col];
-  if (!spec) return;
-  premiumSort = premiumSort.col === col
-    ? { col, dir: -premiumSort.dir }
-    : { col, dir: spec.dirDefault };
-  premSortSave();
-  renderPremium(premiumData);
-}
-
-function renderPremium(data) {
-  const el = document.getElementById('premium-content');
-  setBadge('premium-badge', data._meta);
-
-  const rows = data.rows || [];
-  const missing = (data.missing || []).map(m => ({ ...m, ok: false, legs: [], bestAroc: null }));
-  const all = [...rows, ...missing];
-  if (!all.length) {
-    el.innerHTML = '<div style="padding:40px;text-align:center;color:var(--ink-3)">No tickers to screen.</div>';
-    return;
-  }
-
-  const open = premOpenSet();
-  const gates = data.gates || { ivrSellMin: 50, ratioSellMin: 1 };
-
-  const head = Object.entries(PREM_SORTS).map(([key, spec]) => {
-    const on = premiumSort.col === key;
-    return `<span class="prem-col hcol ${key} ${on ? 'sorted' : ''}" data-prem-sort="${key}">${spec.label}${
-      on ? (premiumSort.dir === 1 ? ' ▲' : ' ▼') : ''}</span>`;
-  }).join('');
-
-  const okRows    = all.filter(r => r.ok).length;
-  const dimRows   = all.filter(r => r.ok && r.sellable === false).length;
-  const freshMs   = data.freshMs || 14_400_000;
-  const staleRows = all.filter(r => r.ok && r.ts && (Date.now() - r.ts) >= freshMs).length;
-  const unloaded  = all.filter(r => r.status === 'not-loaded').length;
-  const hours     = Math.round(freshMs / 3600_000);
-
-  const legend = `<div class="prem-legend">
-    <b>Rows load on demand — expand one to fetch it.</b> Each ticker is a single request
-    (~5 chain fetches), so nothing is fetched on page load and the
-    whole watchlist is never fetched at once — firing them together gets rate-limited upstream. Results cache for ${hours}h; re-expanding inside that
-    window makes no network call at all. <b>↻</b> forces a refetch regardless of age.<br>
-    Term structure = front ATM IV − back ATM IV, so <b>backwardation reads positive</b> (◤) and marks the
-    earnings-crush setup. Expected move = spot × ATM IV × √(dte/365).
-    Candidates are the listed strikes nearest 0.30 and 0.16 delta, OTM only, delta from Black-Scholes on each
-    strike's own implied vol. POP = 1 − |Δ|, a delta-derived approximation, not a backtested frequency.
-    Credit is the <b>bid</b>; ROC = credit / (strike × 100 − credit); annualised ROC = ROC × 365/DTE.<br>
-    ${okRows ? `${dimRows} of ${okRows} priced rows are dimmed — IV rank below ${gates.ivrSellMin}, or the
-    IV/HV30 proxy below ${Number(gates.ratioSellMin ?? 1).toFixed(2)}× while the rank is still collecting.
-    Hover a row for which of the two applied and the actual number.` : ''}
-  </div>`;
-
-  const controls = `<div class="prem-controls">
-    <button class="wl-btn" id="prem-loadall"${unloaded ? '' : ' disabled'}>Load all${unloaded ? ` (${unloaded})` : ''}</button>
-    <button class="wl-btn" id="prem-stopall" style="display:none">Stop</button>
-    <button class="wl-btn" id="prem-expand-all">Expand all</button>
-    <button class="wl-btn" id="prem-collapse-all">Collapse all</button>
-    <span class="prem-progress" id="prem-progress">${
-      unloaded ? `Load all fetches one ticker at a time — about ${Math.max(1, Math.round(unloaded * 2.5))}s for ${unloaded}.` : ''
-    }</span>
-    <span class="prem-count">${okRows} loaded${staleRows ? ` · ${staleRows} stale` : ''} · ${all.length - okRows} not loaded</span>
-  </div>`;
-
-  const body = sortPremiumRows(all).map((r) => {
-    const loading = premInflight.has(r.symbol);
-    const isOpen  = r.ok && open.has(r.symbol);
-    // An open row still in flight shows a loading panel rather than collapsing
-    // or rendering an empty table.
-    const detail = isOpen ? premDetail(r)
-      : (loading && open.has(r.symbol))
-        ? `<div class="prem-detail"><div class="prem-loading" data-prem-loading="${esc(r.symbol)}">Fetching option chain for ${esc(r.symbol)}…</div></div>`
-        : '';
-    return `<div class="prem-row ${isOpen ? 'open' : ''} ${loading ? 'busy' : ''}">
-      ${premSummary(r, isOpen)}
-      ${detail}
-    </div>`;
-  }).join('');
-
-  el.innerHTML = legend + controls
-    + `<div class="prem-head-row">${head}<span class="prem-col hcol pad"></span></div>`
-    + body;
-}
-
-/* Delegated: the row list is re-rendered wholesale on every sort and refresh, so
- * per-element listeners would have to be rebound each time. */
-document.getElementById('premium-content').addEventListener('click', (e) => {
-  const refresh = e.target.closest('[data-prem-refresh]');
-  if (refresh) { e.stopPropagation(); refreshPremiumRow(refresh.dataset.premRefresh); return; }
-
-  const sortBtn = e.target.closest('[data-prem-sort]');
-  if (sortBtn) { setPremiumSort(sortBtn.dataset.premSort); return; }
-
-  if (e.target.closest('#prem-loadall'))  { loadAllPremium(); return; }
-  if (e.target.closest('#prem-stopall'))  { premLoadAllAbort = true; return; }
-  if (e.target.closest('#prem-expand-all')) {
-    // Expands only what is already loaded. It must never trigger fetches —
-    // that is Load all's job, and Load all is sequential on purpose.
-    premOpenSave(new Set((premiumData?.rows || []).filter(r => r.ok).map(r => r.symbol)));
-    renderPremium(premiumData); return;
-  }
-  if (e.target.closest('#prem-collapse-all')) {
-    premOpenSave(new Set());
-    renderPremium(premiumData); return;
-  }
-
-  const line = e.target.closest('[data-prem-row]');
-  if (!line) return;
-  const sym = line.dataset.premRow;
-  // Terminal states (no options / no IV / failed) have nothing to expand into.
-  if (line.classList.contains('recessive') && !line.classList.contains('loadable')) return;
-
-  const open = premOpenSet();
-  if (open.has(sym)) { open.delete(sym); premOpenSave(open); renderPremium(premiumData); return; }
-  expandPremiumRow(sym);   // expanding is what fetches
-});
-
-document.getElementById('premium-refresh-btn').addEventListener('click', () => loadPremium());
-premSortLoad();
 
 /* ═══════════════════════════════════════════════════════════════════════════
    LONG TAB — the long-premium screen
@@ -3064,6 +2573,53 @@ function longLaneETable(entry) {
     on a quiet one need not.</div>`;
 }
 
+/** Lane F — defined-risk credit spreads. The max-loss figure is the point of the
+ *  lane, so it is rendered in the danger treatment and never as an ordinary cell. */
+function longCreditTable(entry, scored, basis) {
+  if (!entry.candidates.length) {
+    return `<div class="prem-note">${esc(entry.reason || 'no credit spread prices on this expiry')}.</div>`;
+  }
+  const pct = (v, d = 1) => v == null ? '—' : (v * 100).toFixed(d) + '%';
+  const rows = entry.candidates.map((c) => {
+    const conc = c.concentrationLabel
+      ? ` <span class="long-tag warn" title="${esc(c.concentrationNote || '')}">⚑ ${esc(c.concentrationLabel)}</span>` : '';
+    return `<tr>
+      <td><b>${esc(c.structure)}</b><br><span class="long-tag noread">${esc(c.shortStrike + '/' + c.longStrike)}</span></td>
+      <td title="Actual leg deltas, not the ${entry.targets || '0.30/0.16'} targets they were selected against.">${
+        c.shortDelta.toFixed(2)} / ${c.longDelta.toFixed(2)}</td>
+      <td>${fmt(c.width)}</td>
+      <td title="Credit is the short leg's BID minus the wing's ASK — what a seller can actually hit.">${money(c.creditPerShare)}</td>
+      <td class="lane-f-maxloss" title="width × 100 − credit = ${c.width} × 100 − ${c.credit} = ${c.maxLoss}. This is also the capital expectancy divides by, computed once so the two cannot drift.">${money(c.maxLoss / 100)}</td>
+      <td title="Credit ÷ capital at risk. NOT annualised against a share position — this structure has no share leg.">${pct(c.returnOnRisk, 0)}</td>
+      <td>${fmt(c.breakeven)}</td>
+      <td>${nOrDash(c.beEm, 2, '×')}</td>
+      <td title="MODELLED: probability of finishing on the PROFITABLE side of the breakeven. Inverted relative to a long option of the same side — a credit spread wins by the stock NOT getting there.">${pct(c.pBe)}</td>
+      <td title="MEASURED: share of historical windows in which the stock stayed on the winning side. Same inversion as p(be), so cov and p(be) estimate the same event.">${pct(c.coverage1y)} / ${pct(c.coverage3y)}</td>
+      <td>${c.gap3y == null ? '—' : (c.gap3y > 0 ? '+' : '') + c.gap3y}</td>
+      <td>${c.expectancyMean == null ? '—' : (c.expectancyMean * 100).toFixed(0) + '%'}${conc}</td>
+      <td>${c.openInterest == null ? '—' : fmtVol(c.openInterest)}</td>
+    </tr>${candDetail(c)}`;
+  }).join('');
+  return `<table class="prem-cands">
+    <thead><tr>
+      <th>Structure</th><th>Δ short/long</th><th>Width</th><th>Credit</th>
+      <th class="lane-f-maxloss">Max loss</th><th>Ret/risk</th>
+      <th>Breakeven</th><th>BE/EM</th><th>p(be)</th>
+      <th>cov 1y/3y</th><th>gap</th><th>E[R]</th><th>OI</th>
+    </tr></thead><tbody>${rows}</tbody></table>
+    <div class="long-supp"><b>Max loss is width × 100 − credit, and it is the number that matters here.</b>
+    It is also the capital expectancy divides by, so E[R] is a return on the amount genuinely at risk
+    rather than on the credit received — using the credit would post expectancies in the hundreds of
+    percent and pin every credit row to the top of the screen.
+    <br><b>This screen cannot see whether you hold shares.</b> Nothing in this lane is a covered
+    position: every card is a defined-risk spread on its own terms. The old premium tab priced naked
+    cash-secured puts and covered calls against a naked-margin denominator, which was wrong for a
+    share-holder and is gone.
+    <br><b>cov and p(be) are inverted here relative to every other lane</b> — a credit spread wins when
+    the stock does NOT reach the breakeven, so both figures report the probability of the WIN, which is
+    what makes them comparable with the other lanes' columns rather than with each other's opposite.</div>`;
+}
+
 /* Lane headers no longer hardcode their sort — it is now selectable and can fall
    back, and a header claiming an order the table is not in would be worse than no
    header at all. `laneSortLine()` states the order actually in effect. */
@@ -3073,6 +2629,7 @@ const LANE_META = {
   C: ['Lane C · Debit verticals',            'long ~0.55Δ, short ~0.25Δ · debit is long ask − short bid'],
   D: ['Lane D · Calendar / diagonal',        'sell the front monthly, buy the back · intentionally thin — see the note'],
   E: ['Lane E · Straddle + strangle',        'always as a pair · straddle at the strike nearest spot, strangle at 0.30Δ each side (PREM_TARGETS[0]) · answers whether the required move has actually happened'],
+  F: ['Lane F · Defined-risk credit spreads', 'short ~0.30Δ, long ~0.16Δ · max loss = width × 100 − credit · position-unaware: never a covered position'],
 };
 
 /** What this lane is actually sorted by, plus the Sharpe control — which has no
@@ -3146,7 +2703,10 @@ function longDetail(r) {
   const basis  = r.directional?.calibration?.basis || null;
 
   // Lane sections in order, each labelled with what it is and how it is sorted.
-  const laneOrder = ['A', 'B', 'C', 'D', 'E'];
+  // Lane F sits last and does not lead: short premium is secondary on this
+  // screen, and it participates in the ordinary cross-lane expectancy sort
+  // rather than getting placement of its own.
+  const laneOrder = ['A', 'B', 'C', 'D', 'E', 'F'];
   const lanesHtml = laneOrder.map((lane) => {
     const entries = (r.lanes || []).filter(l => l.lane === lane);
     if (!entries.length) return '';
@@ -3176,6 +2736,7 @@ function longDetail(r) {
       return head + (lane === 'C' ? longVerticalTable(entry, scored, basis)
                    : lane === 'D' ? longCalendarTable(entry)
                    : lane === 'E' ? longLaneETable(entry)
+                   : lane === 'F' ? longCreditTable(entry, scored, basis)
                    : longSingleTable(entry, scored, basis)) + outliers;
     }).join('');
     return `<div class="long-lane">
@@ -3806,8 +3367,11 @@ async function init() {
   setInterval(tickClock, 1000);
   initColumnResize();
 
-  // Support deep-linking: dashboard.html#watchlist (or #midday etc.) opens that tab directly
-  const hashTab = location.hash.slice(1);
+  // Support deep-linking: dashboard.html#watchlist (or #midday etc.) opens that tab directly.
+  // `#premium` is redirected rather than ignored: the tab became Lane F of the Long
+  // screen, and an existing bookmark silently landing on Market would read as the
+  // deep link being broken rather than the tab having moved.
+  const hashTab = location.hash.slice(1) === 'premium' ? 'long' : location.hash.slice(1);
   if (hashTab && document.getElementById('tab-' + hashTab)) switchTab(hashTab);
 
   // Market data
