@@ -2120,6 +2120,63 @@ default and is not a source of truth.
 was measured over a population the reader cannot see, that is the most important
 thing about it.
 
+## A workaround adopted to make a test safe is evidence about production
+
+**If a procedure has to be careful to avoid damage, the code permits the damage.**
+The care is not a property of the test. It is a finding about the system, and it
+belongs in the report as a defect rather than as a footnote about method.
+
+Verifying the watchlist bootstrap, this appeared verbatim in a report:
+
+> *"I seeded the browser from the server's list on a same-origin page first, then
+> loaded the dashboard … your watchlist is untouched."*
+
+That sentence is a bug report. Seeding was necessary because an unseeded load
+would have overwritten a populated list with the defaults — which is precisely
+what a new device, a cleared profile or an incognito window does, with nobody
+present to seed it. The workaround was described as diligence and shipped as
+diligence; the defect it was compensating for went unfixed until the next round,
+when it fired and destroyed the list for real.
+
+The test for this is one question, asked whenever a verification step needs a
+precaution: **would a real user, doing this ordinary thing, have taken that
+precaution?** If not, the precaution is concealing a defect.
+
+Related shapes worth recognising, all the same failure:
+
+- seeding or repairing state *before* an operation so it stays safe
+- running against a copy because the real thing would be damaged
+- ordering steps carefully to avoid a destructive intermediate state
+- "just don't click that while it's loading"
+
+## When you remove a fallback, audit what it was BOUNDING — not just what reads it
+
+Deleting `DEFAULT_WATCHLIST` was scoped by grepping its five read sites, all of
+which were handled. That grep was the wrong question, and the right one was never
+asked: **what was this fallback making survivable?**
+
+`loadWatchlistBatch()` had always ended with a passive
+`syncWatchlistToServer(getWatchlist())`, which on a fresh profile pushes
+`DEFAULT_WL`. That was near-harmless for as long as the Worker unioned the
+defaults back in — a clobbered list still swept the right names, so the defect
+was real but bounded. **Removing the union armed it.** The push site did not
+change, was not in either commit's diff, and would not have surfaced in a review
+of either one. It then overwrote a 33-name watchlist with 22.
+
+So a fallback removal has two scopes, and the second is the one that bites:
+
+| scope | question | how to find it |
+|---|---|---|
+| direct | what reads this? | grep the identifier |
+| **latent** | **what was tolerable only because this existed?** | grep the *data* it defended — every writer of the key, not just its readers |
+
+For `watchlist:tickers` that meant auditing every **write** path, not the reads.
+There were two, and only one was in the commit.
+
+**A latent defect activated by an unrelated change is invisible to diff review by
+construction**, because the activating change and the defect are in different
+places. The only defence is asking what the removed thing was protecting.
+
 ## A newly rendered figure gets eyes on it before the commit is done
 
 **Any commit that puts a NEW number on screen requires browser verification of
