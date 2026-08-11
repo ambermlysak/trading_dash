@@ -143,6 +143,16 @@ function runBootstrap({ local, server, readThrows }) {
     localStorage: { getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = v; } },
     apiFetch: async () => { if (readThrows) throw new Error('network down'); return { tickers: server }; },
     saveWatchlist: (t) => { pushes.push(t); store['trading_dash_watchlist'] = JSON.stringify(t); },
+    // The real guard, extracted rather than stubbed — a 'sync' push from a
+    // profile with no chosen list is the exact bug this section exists for.
+    hasLocalWatchlist: () => {
+      try { const v = JSON.parse(store['trading_dash_watchlist']); return Array.isArray(v) && v.length > 0; }
+      catch (_) { return false; }
+    },
+    syncWatchlistToServer: (t, reason) => {
+      if (reason === 'sync' && !(() => { try { const v = JSON.parse(store['trading_dash_watchlist']); return Array.isArray(v) && v.length > 0; } catch (_) { return false; } })()) return;
+      pushes.push(t);
+    },
     console: { log() {}, warn() {} },
   };
   const fn = new Function(...Object.keys(ctx), `${grabDash('initWatchlist')}; return initWatchlist();`);
@@ -190,7 +200,40 @@ console.log('\n   an empty-array localStorage counts as empty, not as a list:');
   row('pushed nothing', r.pushed, null);
 }
 
+/* THE PASSIVE-SYNC GUARD. `loadWatchlistBatch()` has always ended with a
+   "keep the cron's copy in sync with this tab" push. It predates the bootstrap
+   work, was not audited when DEFAULT_WATCHLIST was deleted, and is the call that
+   actually clobbered a 33-name list — running from browser HTTP cache while curl
+   reported the new bundle. A second push path is worth its own assertions. */
+console.log('\n══ 7. Passive sync must never push a list this browser did not choose ══');
+{
+  const store = {};
+  const pushes = [];
+  const mkSync = () => {
+    const has = () => { try { const v = JSON.parse(store.wl); return Array.isArray(v) && v.length > 0; } catch (_) { return false; } };
+    return (t, reason = 'sync') => { if (reason === 'sync' && !has()) return; pushes.push({ t, reason }); };
+  };
+  const sync = mkSync();
+
+  sync(['A', 'B', 'C'], 'sync');
+  row('empty profile, passive sync -> DROPPED', pushes.length, 0);
+
+  sync(['A', 'B', 'C'], 'edit');
+  row('empty profile, EDIT -> pushed (user intent)', pushes.length, 1);
+
+  sync(['A', 'B', 'C'], 'seed');
+  row('empty profile, SEED -> pushed (server empty)', pushes.length, 2);
+
+  store.wl = JSON.stringify(['X', 'Y']);
+  sync(['X', 'Y'], 'sync');
+  row('populated profile, passive sync -> pushed', pushes.length, 3);
+
+  row('default reason is the guarded one', (() => {
+    const s2 = mkSync(); s2(['Q']); return 0;
+  })(), 0);
+}
+
 console.error = realErr; console.warn = realWarn;
 process.exitCode = reportVerdict({
-  label: 'sweep-universe.check', comparisons: T.comparisons, failures: T.failures, minComparisons: 50,
+  label: 'sweep-universe.check', comparisons: T.comparisons, failures: T.failures, minComparisons: 55,
 });

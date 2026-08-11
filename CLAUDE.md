@@ -2145,7 +2145,21 @@ So, for any commit that adds a rendered figure:
 
 1. Confirm the Pages byte count first (`curl … | wc -c` against local), because a
    stale bundle makes the whole check meaningless — see the propagation rule.
-2. Open the page and read the actual cell.
+2. **Then confirm the BROWSER is running that bundle, which is a separate
+   question.** `curl` bypasses the browser's HTTP cache; the browser does not.
+   Checking the CDN and concluding the page is current is a category error, and it
+   caused real damage: a verification run reported the new bundle by byte count
+   while the tab executed the *previous* commit's code from cache — the version
+   with the unconditional watchlist push — and it overwrote a 33-name list with
+   the 22 defaults. Assert an identifier from the new code inside the page:
+
+   ```js
+   typeof someNewFunction            // 'function', not 'undefined'
+   document.documentElement.outerHTML.includes('async function initWatchlist')
+   ```
+
+   A hard reload is not sufficient on its own; verify, do not assume.
+3. Open the page and read the actual cell.
 3. **Hand-check it against its own definition**, ideally the one in its tooltip.
    The Lane F bug was visible the instant the cell and the tooltip were read
    together, and invisible in every other way.

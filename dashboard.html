@@ -1485,7 +1485,17 @@ function getWatchlist() {
 }
 function saveWatchlist(tickers) {
   localStorage.setItem(WL_KEY, JSON.stringify(tickers));
-  syncWatchlistToServer(tickers);
+  syncWatchlistToServer(tickers, 'edit');
+}
+
+/** Does THIS browser hold a watchlist it actually chose? `getWatchlist()` cannot
+ *  answer that — it falls back to DEFAULT_WL, which is exactly how a fresh
+ *  profile ends up pushing the defaults over a populated server list. */
+function hasLocalWatchlist() {
+  try {
+    const v = JSON.parse(localStorage.getItem(WL_KEY));
+    return Array.isArray(v) && v.length > 0;
+  } catch (_) { return false; }
 }
 
 /* ── Bootstrap: READ THEN ADOPT, never push defaults over a populated server ──
@@ -1537,7 +1547,8 @@ async function initWatchlist() {
     return { source: 'read-failed', count: 0 };
   }
   // Server is genuinely empty. This is the only case that may write defaults.
-  saveWatchlist(DEFAULT_WL.slice());
+  localStorage.setItem(WL_KEY, JSON.stringify(DEFAULT_WL.slice()));
+  syncWatchlistToServer(DEFAULT_WL.slice(), 'seed');
   console.log('[watchlist] server had no list; seeded the defaults');
   return { source: 'seeded', count: DEFAULT_WL.length };
 }
@@ -1545,7 +1556,30 @@ async function initWatchlist() {
 // Push the watchlist to the Worker so the 6am cron refreshes analysis
 // (the consolidated recommendation) for exactly the tickers on this tab.
 let wlSyncTimer = null;
-function syncWatchlistToServer(tickers) {
+/**
+ * @param {string[]} tickers
+ * @param {'edit'|'seed'|'sync'} reason — WHY this browser is writing the one key
+ *   every cron sweep now depends on. Every call site must say, because the
+ *   answer decides whether the write is allowed at all:
+ *
+ *     'edit' — the user added or removed a ticker. Always pushed.
+ *     'seed' — the bootstrap confirmed the server has NOTHING. Always pushed;
+ *              there is nothing to destroy.
+ *     'sync' — a passive "keep the cron in step with this tab" write. Pushed
+ *              ONLY if this browser holds a list it actually chose.
+ *
+ * THE 'sync' GUARD IS THE WHOLE POINT. `getWatchlist()` falls back to
+ * DEFAULT_WL, so a passive sync from a fresh profile pushes the 22 defaults —
+ * and with the Worker's DEFAULT_WATCHLIST union deleted, that silently becomes
+ * the universe for every sweep with no fallback to bound it. This is not
+ * hypothetical: it clobbered a 33-name list during verification.
+ */
+function syncWatchlistToServer(tickers, reason = 'sync') {
+  if (reason === 'sync' && !hasLocalWatchlist()) {
+    console.warn('[wl-sync] skipped a passive sync: this profile has no saved watchlist, '
+      + 'so the push would be DEFAULT_WL and could overwrite a populated server list.');
+    return;
+  }
   clearTimeout(wlSyncTimer);
   wlSyncTimer = setTimeout(() => {
     // Through apiFetch so the shared key rides along — this write seeds the
@@ -1576,7 +1610,11 @@ async function loadWatchlistBatch() {
 
   try {
     const tickers = getWatchlist();
-    syncWatchlistToServer(tickers); // keep the cron's copy in sync with this tab
+    // PASSIVE sync — dropped unless this browser holds a list it chose. This line
+    // predates the bootstrap work and is the SECOND way a fresh profile could
+    // push DEFAULT_WL over a populated server list; it is the one that actually
+    // did it, running from browser cache during verification.
+    syncWatchlistToServer(tickers, 'sync');
     const CHUNK = 15;
     const allStocks = {};
     let anyAnalysisLoading = false;
