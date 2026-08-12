@@ -946,6 +946,25 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
      recent listings where a longer window would be most welcome.
    - It needs a **`MOVES_SCHEMA` bump**, which retires every cached blob and blanks
      the coverage columns until the next 2:00pm sweep.
+   - **THE STRONGEST OBJECTION, AND IT IS A PREREQUISITE RATHER THAN A DETAIL:
+     the refusal is UNIFORM today and would become PARTIAL.** All 66 Lane A
+     candidates refuse, so no ticker is advantaged over another and there is no
+     ranking distortion — the lane is equally silent everywhere. At 10y it splits
+     **23 measured / 10 refusing**. And `moves:` backs the **expectancy ranking**,
+     not only the `cov` column, so Lane A candidates would then be ordered on a
+     basis that exists for some tickers and not others — **PLTR competing against
+     NVDA on a metric only NVDA has.**
+
+     **There is no rule for how a null coverage sorts against a present one within
+     a lane, because it has never been needed.** Uniform refusal has meant the
+     question could not arise. So the range bump is **not self-contained**: it
+     requires that rule to be stated and shipped first, or in the same commit.
+     Sorting nulls last silently demotes every young name; sorting them first
+     promotes them; treating null as zero is a fabricated measurement (honesty
+     rule 22). None of those is obviously right and the choice must be deliberate.
+     Note Lane A currently sorts on cost of carry rather than expectancy, which
+     narrows but does not remove the problem — any lane whose sort key comes from
+     `moves:` inherits it the moment coverage becomes partial.
 
    **Why it is COUPLED to item 14 rather than separate.** Phase 2 needs the same
    schema bump for the `startIdx → date` mapping, so **the two belong in ONE

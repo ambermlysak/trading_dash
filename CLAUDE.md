@@ -584,6 +584,43 @@ into `_instr.settledRejected` on the stored payload (rule #1).
 and a counted `allSettled`.** A job whose only evidence of running is its own
 success is a job you cannot debug when it stops.
 
+#### Every cron job goes through `dispatchJob()` — a sibling must not be able to kill it
+
+Branches run two or three jobs. **Measured 2026-08-11 by forcing each failure
+locally and reading the outcome from KV state**, because a failing invocation
+loses its console output and the logs were not a usable instrument — each job
+stamps its own key on success, so the presence of `daily:eod` / `ivsweep:last` /
+`macrosweep:last` is the decisive evidence:
+
+| forced failure | dispatch | raw `ctx.waitUntil` | via `dispatchJob` |
+|---|---|---|---|
+| macro **rejects**, dispatched last | 3rd | HTTP 500 · eod ✓ iv ✓ macro ✗ | HTTP 200 · eod ✓ iv ✓ macro ✗ |
+| macro **rejects**, dispatched first | 1st | HTTP 500 · eod ✓ iv ✓ macro ✗ | — order is irrelevant |
+| **synchronous throw** at dispatch | 1st | HTTP 500 · **ALL THREE ABSENT** | HTTP 200 · **all three present** |
+
+**A rejected promise never reached its siblings, in either dispatch position. A
+synchronous throw took out the entire branch** — including the two jobs that had
+nothing wrong with them, because everything after the throwing line is never
+reached.
+
+That second row was not reachable at the time: every job is an `async function`,
+which converts a synchronous throw into a rejected promise. But that was a
+property of **each job**, not of the dispatcher — one ordinary refactor from being
+untrue, with a whole branch as the blast radius and nothing on screen to say so.
+`dispatchJob(ctx, name, () => job(env))` makes it a property of the dispatcher.
+
+**It also removes an ambiguity that matters when reading telemetry.** An
+unhandled `waitUntil` rejection marks the whole invocation as an exception, so one
+failed job and a failed branch look identical from the outside. `dispatchJob`
+catches, and logs `!! JOB-FAILED !!` naming the job instead.
+
+**That is a deliberate trade against rule #7's own warning** that `errors: 0` is
+not evidence of success: catching does clean the invocation. What replaces it is a
+greppable ERROR line naming the job — the same trade `allSettledCounted` already
+makes — and the job still stamps no dedup key, so the next firing retries it.
+
+**Never write a bare `ctx.waitUntil(job(env))` in `scheduled()` again.**
+
 #### None of that logging exists unless observability is on
 
 `[observability] enabled = true` in `wrangler.toml` is a **prerequisite for cron

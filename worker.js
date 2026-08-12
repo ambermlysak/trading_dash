@@ -256,6 +256,58 @@ async function allSettledCounted(promises, label) {
   return results;
 }
 
+/**
+ * Dispatch ONE cron job so that nothing it does can reach its siblings.
+ *
+ * TWO DISTINCT FAILURES, established by forcing each one locally 2026-08-11 and
+ * reading the result from KV state rather than from logs (a failing invocation
+ * loses its console output, so the logs were not a usable instrument):
+ *
+ *  1. A REJECTED promise does NOT stop siblings. Forced a rejection in
+ *     `collectMacroState` and fired the 1:15pm branch with it dispatched LAST,
+ *     then FIRST. Both times `daily:eod` and `ivsweep:last` were PRESENT
+ *     afterwards and `macrosweep:last` ABSENT — the other two jobs completed and
+ *     the failed one correctly declined to stamp. Order made no difference.
+ *
+ *  2. A SYNCHRONOUS throw at call time TAKES OUT THE WHOLE BRANCH. Forced one at
+ *     dispatch position 1: `daily:eod`, `ivsweep:last` AND `macrosweep:last` were
+ *     all ABSENT — no job ran at all, including the two that had nothing wrong
+ *     with them. Everything after the throwing line is never reached.
+ *
+ * (2) is not reachable today: every job on every branch is an `async function`,
+ * which converts a synchronous throw into a rejected promise. That is a property
+ * of each job rather than of the dispatcher, so it is one ordinary refactor away
+ * from being untrue — and the blast radius is a whole branch, silently. This
+ * makes the isolation structural instead of incidental.
+ *
+ * ON SWALLOWING THE REJECTION, because rule #7 is explicit that `errors: 0` in
+ * telemetry is not evidence of success. Catching here does remove the
+ * invocation-level exception, and that is a deliberate trade: an invocation
+ * marked failed says only "something on this branch broke", which is exactly the
+ * ambiguity that made a failed job and a failed branch indistinguishable. What
+ * replaces it is a greppable ERROR line naming the job — the same trade
+ * `allSettledCounted` already makes. A job that fails still fails: it stamps no
+ * dedup key, so the next firing retries it.
+ */
+function dispatchJob(ctx, name, run) {
+  let p;
+  try {
+    p = run();
+  } catch (e) {
+    console.error(`[cron] !! JOB-DISPATCH-THREW !! ${name} threw synchronously at dispatch — `
+      + `${e?.message || e}. Every other job on this branch is unaffected and still runs.`);
+    return;
+  }
+  try {
+    ctx.waitUntil(Promise.resolve(p).catch((e) => {
+      console.error(`[cron] !! JOB-FAILED !! ${name} — ${e?.message || e}. Every other job on this `
+        + 'branch is unaffected. No dedup key was stamped by this job, so the next firing retries it.');
+    }));
+  } catch (e) {
+    console.error(`[cron] !! JOB-WAITUNTIL-THREW !! ${name} — ${e?.message || e}`);
+  }
+}
+
 /** Stamp a finished job's instrumentation onto an already-written KV payload.
  *  Fully swallowed: this runs AFTER the payload is safely stored, so the worst
  *  case is a stored `_instr` that still reads `phase: "briefing"`. */
@@ -9868,14 +9920,14 @@ export default {
     let branch = 'idle';                        // in-window wakeup with no job due
     if (h === 6 && m < 30) {
       branch = 'morning-briefing';
-      ctx.waitUntil(generateDailySnapshot(env));       // 6:00am PT morning briefing
+      dispatchJob(ctx, 'morning-briefing', () => generateDailySnapshot(env));   // 6:00am PT
     } else if ((h === 11 && m >= 30) || h === 12) {
       branch = 'midday-pulse';
-      ctx.waitUntil(generateMiddaySnapshot(env));      // 11:30am PT midday pulse (retries to 1pm; KV dedup skips once complete)
+      dispatchJob(ctx, 'midday-pulse', () => generateMiddaySnapshot(env));      // 11:30am PT (retries to 1pm; KV dedup skips once complete)
     } else if (h === 13 && m >= 15 && m < 45) {
       branch = 'eod+iv-sweep+macro';
-      ctx.waitUntil(generateEODSummary(env));          // 1:15pm PT EOD summary
-      ctx.waitUntil(recordWatchlistIv(env));           // 1:15pm PT bank one IV sample per watchlist name
+      dispatchJob(ctx, 'eod-summary', () => generateEODSummary(env));           // 1:15pm PT
+      dispatchJob(ctx, 'iv-sweep', () => recordWatchlistIv(env));               // 1:15pm PT one IV sample per watchlist name
       /* 1:15pm PT, NOT the 2:00pm branch. `collectMoveSeries` runs at 2:00pm, so
          a macro record written here is 45 minutes old when the move sweep could
          read it, with no request-path race — the same no-race pattern already
@@ -9883,21 +9935,21 @@ export default {
          Costs 1 external fetch (4 symbols, one spark chunk). Shares this
          invocation's subrequest budget with the two jobs above: `ctx.waitUntil`
          does not get its own. */
-      ctx.waitUntil(collectMacroState(env));           // 1:15pm PT bank one macro state record
+      dispatchJob(ctx, 'macro-state', () => collectMacroState(env));            // 1:15pm PT one macro state record
     } else if (h === 14 && m < 30) {
       branch = 'forward-returns+moves';
-      ctx.waitUntil(fillForwardReturns(env));          // 2:00pm PT resolve 5/20-session forward returns
+      dispatchJob(ctx, 'forward-returns', () => fillForwardReturns(env));       // 2:00pm PT resolve 5/20-session forward returns
       // 2:00pm PT bank the historical move distribution. Placed on THIS branch and
       // not the 1:15pm EOD one because the daily bar is settled by now — see the
       // note on collectMoveSeries(). Both jobs share this invocation's subrequest
       // budget: ctx.waitUntil does not get its own.
-      ctx.waitUntil(collectMoveSeries(env));
+      dispatchJob(ctx, 'move-series', () => collectMoveSeries(env));
     } else if (h === 10) {
       // Fires on all four firings of the hour: a slice is only 4 managers, so
       // four slices a day completes a 20-manager pass in ~1.3 days. 13F-HR lands
       // 45 days after quarter end, so that is ample.
       branch = '13f-slice';
-      ctx.waitUntil(refresh13FIndexIfStale(env));      // 10:00am PT 13F index slice
+      dispatchJob(ctx, '13f-slice', () => refresh13FIndexIfStale(env));         // 10:00am PT 13F index slice
     }
 
     console.log(
