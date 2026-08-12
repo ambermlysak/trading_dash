@@ -74,6 +74,28 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   movesweep:last      — PT date of the last move-series sweep (dedup). Outside
 #                         the `moves:` prefix so nothing scanning that prefix
 #                         picks it up as a ticker.
+#   macro:state         — classified macro regime (constructive / mixed / hostile /
+#                         unavailable) plus the four raw inputs, both term spreads
+#                         and the gates. ~727 B, MACRO_SCHEMA 1. Read on EVERY
+#                         long-screen request, so it is deliberately small.
+#                         90d retained / MACRO_FRESH_MS (26h) fresh — the long
+#                         retention is the outage path, same reasoning as
+#                         econ:dgs3mo: a labelled old macro read beats a blank
+#                         chip, and the card renders its own age.
+#   macro:series        — 756-session (~3y) slice of DERIVED per-session inputs,
+#                         computed over the full 10y pull then sliced so the
+#                         SMA200 is valid from its first session. ~31 KB,
+#                         MACRO_SCHEMA 1, bumped together with macro:state.
+#                         READ BY NOTHING IN PHASE 1 — it exists so phase 2's
+#                         regime-conditioned coverage needs no second collection
+#                         pass. Split from macro:state precisely so the request
+#                         path reads 727 B rather than 31 KB; stripping the slice
+#                         on read would hide that cost, not avoid it.
+#   macrosweep:last     — PT date of the last macro sweep (dedup). Outside the
+#                         `macro:` prefix so nothing scanning that prefix reads
+#                         it as a record — same rule as ivsweep/movesweep.
+#                         Stamped LAST, after both writes, so any failure leaves
+#                         the next firing to retry.
 #   13f:cursor          — which manager the 13F pass is up to (outside 13f:index)
 #   econ:dgs3mo         — FRED 3-month T-bill, risk-free rate for Black-Scholes
 #                         (12h fresh, 90d kept — the long retention is the outage

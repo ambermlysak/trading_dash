@@ -754,7 +754,7 @@ GET  /api/chart/:ticker           Yahoo v8 OHLCV (?range=1y&interval=1d)
 GET  /api/options/:ticker         Yahoo v7 options chain
 POST /api/premium/*             REMOVED — returns 410. Became Lane F of the Long screen.
 GET  /api/long/batch?symbols=     Long screen, KV only — no fetches; 1 KV read/symbol
-GET  /api/long/:ticker            One ticker (4 measured warm / 7 cold)
+GET  /api/long/:ticker            One ticker (capCost 13 warm, 18-20 cold - cold is a RANGE)
 GET  /api/insider/:ticker         SEC EDGAR Form 4, last 90 days (12h KV)
 GET  /api/short/:ticker           FINRA consolidated short interest, 6 settlements (Yahoo fallback)
 GET  /api/13f/:ticker             Super-investor 13F holdings, from a KV reverse index
@@ -1587,9 +1587,26 @@ tickers because one is a coincidence:
 | cache hit (`?cached=1` or fresh) | 0 / 1 / **1** | 0 / 2 / **2** | **+1** |
 
 **Exactly +1 binding op on every path and zero extra external fetches**, which is
-one KV read of the ~640-byte `macro:state` key. The cold column spans 17–20 across
-three tickers on identical code — quote the *delta*, and quote the tier and the
-ticker with any absolute figure.
+one KV read of the ~727-byte `macro:state` key. **The delta is a single number; two
+of the three absolutes are not.**
+
+| path | absolute after | is it one value? |
+|---|---|---|
+| `/api/long/batch`, 33 symbols | **34** | **yes** — `N + 1`, exactly, by construction |
+| `/api/long/:ticker` **warm** | **13** | **yes** — all three tickers identical |
+| `/api/long/:ticker` **cold** | **18–20** | **NO — a range, and quote it as one** |
+
+**COLD IS A RANGE AND THE DOCS HAVE ALREADY ENCODED IT AS A SINGLE VALUE ONCE.**
+Before the macro read it was **17–19** across AAPL / NVDA / PLTR; after, **18–20**.
+Same code, same commit, same minute — the spread is `ivHistory()`'s paged `list()`,
+which walks **one more page for AAPL** than for NVDA or PLTR because AAPL has more
+`iv:AAPL:{DATE}` samples banked. It grows with collection, so this range widens over
+time on its own.
+
+So: **quote the delta (+1, exact), and never quote a bare cold number.** Name the
+tier, the ticker and the crumb state with any absolute — a single measurement of
+this path is ambiguous by ±2 on `iv:` history depth alone, and by a further ±4 on
+crumb state (see the tier table below).
 
 > **SUPERSEDED HISTORY, kept because the breakdown column still explains where the
 > external fetches go.** The table below was measured 2026-08-08 and its binding

@@ -21,6 +21,14 @@
  *      the stored slice describes a different regime from the rendered chip.
  *   8. The head/series split: `macro:state` stays small, `macro:series` carries
  *      the slice, and the classifier saw the SMOOTHED field.
+ *   9. Phase 1 ranks nothing — asserted against the source, not assumed.
+ *  10. `collectMacroState`'s exact cost with stub bindings (isolated by
+ *      construction, because `_instr` cannot separate it from the two other jobs
+ *      on its cron branch), and every refusal path leaving the dedup key unstamped.
+ *  11. THE THREE MISSING-RECORD CAUSES. A cold start on a freshly deployed Worker
+ *      and a sweep that has been refusing for days are different facts with
+ *      different fixes; one message for both is the collapsed-state failure of
+ *      honesty rule 11.
  */
 import fs from 'fs';
 import { tally, record, reportVerdict, populated } from './check-harness.mjs';
@@ -462,6 +470,65 @@ console.log('\n§10 collectMacroState — cost counted with stub bindings, and r
       await C({}).then(() => true).catch(() => false), true);
 }
 
+/* ── 11. THE THREE MISSING-RECORD CAUSES ──────────────────────────────────── */
+console.log('\n§11 readMacroState — a cold start must not read like a data failure');
+{
+  /* A freshly deployed Worker has no `macro:state` until the first 1:15pm PT
+     firing. That is EXPECTED. A sweep that last completed three days ago has been
+     REFUSING, which is an upstream failure worth acting on. One message for both
+     is the collapsed-states failure honesty rule 11 is named for. */
+  const R = new Function([
+    grabConst('MACRO_KEY'), grabConst('MACRO_SERIES_KEY'), grabConst('MACRO_SWEEP_KEY'),
+    grabConst('MACRO_SCHEMA'), grabConst('MACRO_FRESH_MS'), grabConst('MACRO_TREND_FAST'),
+    grabConst('MACRO_TREND_SLOW'), grabConst('MACRO_SMOOTH_SESSIONS'),
+    grabConst('T_BACK'), grabConst('T_CONTANGO'), grabConst('MACRO_GATES'),
+    'const ptDate = () => "2026-08-11";',
+    grab('readMacroState'), 'return readMacroState;',
+  ].join('\n'))();
+
+  const mkEnv = (store, count) => ({ REC_LOG: {
+    get: async (k) => { count.n++; return store[k] ?? null; },
+  } });
+
+  const cases = [
+    ['never-collected', {}, 'never completed'],
+    ['stale-sweep', { 'macrosweep:last': '2026-08-08' }, 'REFUSING'],
+    ['record-missing', { 'macrosweep:last': '2026-08-11' }, 'storage fault'],
+    ['schema', { 'macro:state': { schema: 99 } }, 'retires'],
+  ];
+  const seen = new Set();
+  for (const [want, store, phrase] of cases) {
+    const count = { n: 0 };
+    const r = await R(mkEnv(store, count));
+    row(`cause: ${want}`, r.unavailableCause, want);
+    row(`  ...state is unavailable`, r.state, 'unavailable');
+    row(`  ...reason names the situation ("${phrase}")`, r.reason.includes(phrase), true);
+    row(`  ...reads macrosweep:last only when needed`, count.n, want === 'schema' ? 1 : 2);
+    seen.add(r.reason);
+    console.log(`         ${want}: ${r.reason.slice(0, 118)}…`);
+  }
+  row('ALL FOUR reasons are distinct strings', seen.size, cases.length);
+  row('never-collected does NOT claim an upstream failure',
+      /fail|refus|error|fault/i.test([...cases].find(c => c[0] === 'never-collected') &&
+        (await R(mkEnv({}, { n: 0 }))).reason.replace('NOT a data failure', '')), false);
+  row('stale-sweep DOES name the failure and where to look',
+      (await R(mkEnv({ 'macrosweep:last': '2026-08-08' }, { n: 0 }))).reason.includes('!! MACRO-COLLECT !!'), true);
+  row('stale-sweep carries the last successful date',
+      (await R(mkEnv({ 'macrosweep:last': '2026-08-08' }, { n: 0 }))).lastSweptOn, '2026-08-08');
+
+  // The happy path must still cost exactly one binding op.
+  const good = { 'macro:state': { schema: 1, state: 'constructive', ts: Date.now(), hostileVia: null } };
+  const c2 = { n: 0 };
+  const ok = await R(mkEnv(good, c2));
+  row('HAPPY PATH is still exactly ONE binding op', c2.n, 1);
+  row('  ...and carries no unavailableCause', ok.unavailableCause, undefined);
+  row('  ...and declares usedForRanking false', ok.usedForRanking, false);
+  row('  ...and never reads macro:series', JSON.stringify(ok).includes('macro:series'), false);
+  // A KV throw must degrade to unavailable, not propagate.
+  const boom = { REC_LOG: { get: async () => { throw new Error('KV down'); } } };
+  row('KV throw degrades to unavailable', (await R(boom)).state, 'unavailable');
+}
+
 console.log('');
 process.exit(reportVerdict({
   label: 'macroRegime phase 1',
@@ -470,5 +537,5 @@ process.exit(reportVerdict({
   /* The OBSERVED count, set at the exact number this run performs. A change in
      population is something a human should have to notice and update
      deliberately, not something that slides. */
-  minComparisons: 119,
+  minComparisons: 144,
 }));

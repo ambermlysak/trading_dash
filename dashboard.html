@@ -3022,8 +3022,24 @@ function macroChip(m) {
   const g = m.gates || {};
 
   if (state === 'unavailable') {
+    /* THE CAUSE IS NAMED, because a cold start and an upstream failure must not
+       read the same. A freshly deployed Worker has no record until the first
+       1:15pm PT firing — that is expected; a sweep that last completed days ago
+       has been refusing, and that is worth acting on. Collapsing the two is the
+       same failure the premium screen shipped for three months. */
+    const cause = m.unavailableCause || 'unknown';
+    const headline = {
+      'never-collected': 'macro not collected yet',
+      'stale-sweep':     'macro collection failing',
+      'record-missing':  'macro record missing',
+      schema:            'macro record retired',
+    }[cause] || 'macro unavailable';
+    // Amber only where something is actually wrong; a cold start is not a fault.
+    const tone = (cause === 'stale-sweep' || cause === 'record-missing') ? 'stale' : '';
     return `<div class="macro-chip unavailable">
-      <span class="macro-state">macro unavailable</span>
+      <span class="macro-state">${esc(headline)}</span>
+      <span class="macro-age ${tone}" title="Which of the three missing-record situations this is. They have different causes and different fixes, so they are not collapsed into one message.">${esc(cause)}${
+        m.lastSweptOn ? ` · last collected ${esc(m.lastSweptOn)}` : ''}</span>
       <span class="macro-note">${esc(m.reason || 'no macro record.')}
         Nothing is substituted — an absent read and a computed state must not look the same.</span>
     </div>`;

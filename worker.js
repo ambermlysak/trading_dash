@@ -7009,18 +7009,51 @@ async function readMacroState(env) {
   let rec = null;
   try { rec = await env?.REC_LOG?.get(MACRO_KEY, 'json'); } catch (_) { rec = null; }
   if (!rec || rec.schema !== MACRO_SCHEMA) {
-    /* "We have not looked yet" is not "there is nothing there" (honesty rule 11).
-       The collector REFUSES rather than storing an unavailable record, so an
-       absent key means the sweep has not run or declined to write — which is a
-       fact about our scheduler, and the reason says so. */
+    /* "We have not looked yet" is not "there is nothing there" (honesty rule 11)
+       — and THREE situations produce a missing record, which must not collapse
+       into one sentence on the card:
+
+         never-collected  the sweep has never completed. This is the state of a
+                          freshly deployed Worker until the first 1:15pm PT
+                          firing, and it is EXPECTED, not a fault.
+         stale-sweep      the sweep last completed on some earlier date and has
+                          not completed since — i.e. it has been REFUSING. That
+                          is an upstream failure and it is the one worth acting on.
+         record-missing   the sweep completed today but the record is gone
+                          (expired, or deleted out from under us).
+
+       A cold-start blank reading identically to a data failure is the collapsed
+       state the premium screen shipped for three months (honesty rule 11), so
+       `macrosweep:last` is consulted to separate them. THE EXTRA READ HAPPENS
+       ONLY ON THIS PATH — the happy path stays at exactly one binding op, and
+       this branch has no data to render anyway. */
+    let sweptOn = null;
+    if (!rec) { try { sweptOn = await env?.REC_LOG?.get(MACRO_SWEEP_KEY); } catch (_) {} }
+    const today = ptDate();
+    const cause = rec ? 'schema'
+                : !sweptOn ? 'never-collected'
+                : sweptOn === today ? 'record-missing'
+                : 'stale-sweep';
+    const reason = {
+      schema: `the stored record is schema ${rec?.schema}, not ${MACRO_SCHEMA} — it retires rather than `
+            + 'rendering under field meanings it was not written for. The next 1:15pm PT firing rewrites it.',
+      'never-collected': 'the macro collection has never completed, so there is nothing to show yet. This is '
+            + 'the expected state of a newly deployed Worker until the first 1:15pm PT firing — it is NOT a '
+            + 'data failure and says nothing about the market.',
+      'record-missing': `the collection completed today (${today}) but the record is not in KV. That is a `
+            + 'storage fault rather than an upstream one; the next firing will dedup out, so it clears tomorrow.',
+      'stale-sweep': `the collection last completed on ${sweptOn} and has not completed since — it has been `
+            + 'REFUSING, which means an upstream failure (Yahoo spark, or a symbol missing from the response). '
+            + 'Grep the Worker logs for "!! MACRO-COLLECT !!". This one is worth acting on.',
+    }[cause];
+
     return {
       schema: MACRO_SCHEMA, state: 'unavailable', hostileVia: null,
-      label: 'Macro state unavailable — no record',
+      unavailableCause: cause,
+      lastSweptOn: sweptOn || null,
+      label: `Macro state unavailable — ${cause}`,
       provisional: false,
-      reason: rec ? `stored record is schema ${rec.schema}, not ${MACRO_SCHEMA} — it retires rather than `
-                  + 'rendering under the current field meanings'
-                  : 'the 1:15pm PT macro collection has not run, or refused on an upstream failure. '
-                  + 'This is a fact about our own scheduler, not about the market.',
+      reason,
       asOfClose: null, spySpread: null, qqqSpread: null, vixLevel: null,
       vixTermSpread: null, vixTermSpreadSmoothed: null, vixTermRatio: null,
       gates: MACRO_GATES, ts: null,
@@ -9650,7 +9683,8 @@ export default {
           }, 410, origin);
         case 'long':
           // `batch` is a KV read so the tab paints without touching Yahoo, and a
-          // bare ticker is the only spender (12 warm / 18 cold measured). Never
+          // bare ticker is the only spender (capCost 13 warm, 18-20 cold - cold is
+          // a range, see the measured table in CLAUDE.md). Never
           // fan out across the watchlist.
           if (sub === 'batch') return await handleLongBatch(url.searchParams, origin, env);
           return await handleLongTicker(sub, url.searchParams, origin, env);

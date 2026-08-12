@@ -890,7 +890,26 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    the card still renders only the raw rate. Surfacing the benchmark means touching
    `index.html`, which is a separate commit.
 
-12. **`macroRegime` phase 2 — does macro state actually SEPARATE outcomes?**
+12. **THE CALIBRATION ELIGIBILITY GAP — open, and the most consequential loose
+   thread in the repo.** Reconciling the BUY figures on 2026-08-11 established
+   *which* numbers ship (50.5 / 60.5 / −10.1 and 20.2 / 33.7 / −13.5, n=109
+   benchmarked of 300 resolved) and left a hole underneath them: the superseded
+   ad-hoc figures reported **75 benchmarked of 290 resolved on the same date**.
+   Two cross-checks — a hand recount of NVDA at 9/19 = 0.4737 and a brute-force
+   rebuild of `baseRatesFrom` from raw closes — confirm the **arithmetic**.
+   **Neither confirms the ELIGIBILITY RULE**: which rows are admitted to the
+   benchmarked set at all. If the ad-hoc script excluded ~34 entries for a reason
+   nobody wrote down, `recCalibration()` is admitting them wrongly and every rate
+   inherits it.
+
+   **This is load-bearing rather than academic.** The Long tab's directional
+   alignment tag is disabled *on these figures* — `sortDisabled: true`,
+   re-enabled only at `edgePts > 0` — so the eligibility rule decides whether a
+   shipped ranking behaviour is correctly disabled. Needs its own task: reconstruct
+   what the ad-hoc script filtered on, and either justify `recCalibration()`'s
+   population or narrow it. Do not close it by re-running the same arithmetic.
+
+13. **`macroRegime` phase 2 — does macro state actually SEPARATE outcomes?**
    Phase 1 displays the state and deliberately does not rank on it. Phase 2 is the
    measurement that could earn a ranking influence, and nothing else can:
    `moves:{TICKER}` stores `[return, startIdx]` pairs, so if each historical
