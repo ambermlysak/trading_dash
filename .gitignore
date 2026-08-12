@@ -3,4 +3,8 @@ node_modules/
 .dev.vars
 *.log
 
+# Local Claude Code permission grants — machine-specific, and publishing them
+# is free reconnaissance on a public repo. .claude/skills/ IS tracked.
+.claude/settings.local.json
+
 long-tab-prompt.md

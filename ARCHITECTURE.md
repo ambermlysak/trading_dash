@@ -807,6 +807,16 @@ This is the authoritative record of where the build stands. **All four steps bel
 are live in production as of 2026-08-11.** Nothing in this document describes them
 as planned; if you find language that does, it is stale and wrong.
 
+**This file is authoritative for build position, data sources and design decisions —
+not for the whole system.** The record is six files, and this is one of them:
+`CLAUDE.md` (rules, Worker invariants, workflow — resident every session),
+`ARCHITECTURE.md` (this file), `.claude/skills/worker-internals/SKILL.md` (Worker
+endpoints, KV keys and TTLs, cron, external data sources),
+`.claude/skills/long-screen/SKILL.md` (Lanes A–F, move coverage, macro regime),
+`docs/rules-evidence.md` (the measured runs behind rules 1–7), and
+`docs/failure-modes.md` (the incident record behind the nine named failure modes).
+The two skills load on demand, not every session.
+
 | step | what it was | status |
 |---|---|---|
 | **1** | **`moveCoverage`** — measured historical move frequency, `moves:{TICKER}`, coverage / gap / drift / expectancy / de-clustered episode concentration | **SHIPPED** 2026-08-09 |
