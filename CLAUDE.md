@@ -2359,6 +2359,44 @@ There were two, and only one was in the commit.
 construction**, because the activating change and the defect are in different
 places. The only defence is asking what the removed thing was protecting.
 
+## The frontend is ALWAYS newer than the Worker for a while — render that state
+
+**The two halves of this app deploy on different triggers.** `dashboard.html` and
+`index.html` go live on GitHub Pages **the moment a commit is pushed**;
+`wrangler deploy` is **manual**. So every feature that touches both passes through
+a window — minutes or days — where **the page is running new code against a Worker
+that has never heard of the field it is looking for.** It is also exactly where a
+Worker rollback lands, and where anyone visiting the site sits in the meantime.
+
+**A field that is ABSENT is a different state from a field that is present and
+empty, and the absent one is the one that gets forgotten.** `macroChip(m)` opened
+with `if (!m) return ''`. Every *populated* failure was handled — four distinct
+`unavailableCause` values, each with its own reason string, all verified in a
+browser. The fifth case, `data.macro === undefined` because the deployed Worker
+predates the feature, painted **nothing**: container `innerHTML` empty,
+`offsetHeight` 0, zero `.macro-chip` nodes. Confirmed against live Pages and the
+pre-deploy Worker, 2026-08-11.
+
+**A blank does not throw, and that is why it survives review.** It looks like the
+feature was never built rather than like a deployment window, which is honesty
+rule 11 with the states one level further out: *"we have not shipped the Worker
+yet"* is not *"there is nothing here"*.
+
+So, for any change that adds a field to a response the frontend reads:
+
+1. **Handle the absent field explicitly**, as its own named state — not as a falsy
+   check that returns early. `macroChip` synthesises `unavailableCause:
+   'field-absent'` and reads the same as the cold-start case, because for the
+   reader that is what it is.
+2. **Test it against the CURRENTLY DEPLOYED Worker before deploying**, which is
+   free and is the only moment the state exists naturally. Load the live Pages URL
+   cache-busted, or the local page against production `API_BASE`.
+3. `null`, `undefined` and a non-object all take the same path — a payload can
+   carry `macro: null` as easily as omitting the key.
+
+**Never conclude "the frontend handles missing data" from the populated-failure
+tests.** Those exercise a field that exists. This one does not.
+
 ## A newly rendered figure gets eyes on it before the commit is done
 
 **Any commit that puts a NEW number on screen requires browser verification of

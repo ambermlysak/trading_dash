@@ -3017,7 +3017,35 @@ function setLongSort(col) {
  * justifies removing it.
  */
 function macroChip(m) {
-  if (!m) return '';
+  /* ── THE FIFTH MISSING STATE: THE FIELD WAS NEVER SENT ──────────────────────
+     The Worker's four `unavailableCause` values all describe `macro:state` being
+     missing FROM KV. This is a different thing: `data.macro === undefined`,
+     because the deployed Worker predates the feature and never put the field in
+     the envelope at all.
+
+     IT IS A ROUTINE STATE HERE, NOT AN EDGE CASE. The two halves of this app
+     deploy independently and on different triggers — `dashboard.html` goes live
+     on GitHub Pages the moment a commit is pushed, while `wrangler deploy` is
+     manual. So EVERY frontend-first feature passes through a window where the
+     page is newer than the Worker, and it is also exactly where a Worker
+     rollback lands.
+
+     This used to `return ''`, which painted NOTHING: container `innerHTML` empty,
+     `offsetHeight` 0, zero `.macro-chip` nodes. Verified against live Pages +
+     the pre-deploy Worker on 2026-08-11. A blank does not throw, which is why it
+     survives review — and it is indistinguishable from the feature not existing,
+     which is honesty rule 11 exactly. It reads as never-collected, because for
+     the reader that is what it is: no data yet, through no fault of the market. */
+  if (!m || typeof m !== 'object') {
+    m = {
+      state: 'unavailable',
+      unavailableCause: 'field-absent',
+      reason: 'the deployed Worker did not send a macro field at all, so it predates this feature or has '
+            + 'been rolled back. The page and the Worker deploy separately — GitHub Pages updates on push, '
+            + 'wrangler deploy is manual — so this is the expected reading in between, and it is a fact '
+            + 'about the deployment rather than about the market.',
+    };
+  }
   const state = String(m.state || 'unavailable');
   const g = m.gates || {};
 
@@ -3029,6 +3057,10 @@ function macroChip(m) {
        same failure the premium screen shipped for three months. */
     const cause = m.unavailableCause || 'unknown';
     const headline = {
+      // `field-absent` deliberately shares never-collected's headline: for the
+      // reader both mean "no data yet, and that is not a fault". The cause chip
+      // beside it keeps them diagnosable.
+      'field-absent':    'macro not collected yet',
       'never-collected': 'macro not collected yet',
       'stale-sweep':     'macro collection failing',
       'record-missing':  'macro record missing',
