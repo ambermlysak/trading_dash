@@ -2406,9 +2406,37 @@ question is one line: **is this withholding a CONTROL, or a FACT?**
 | site | returns `''` when | verdict |
 |---|---|---|
 | `alignChip` | `align` is absent | **BUG — fixed.** Its own comment says *"Renders ALWAYS"* and it did not. A blank made "no alignment field exists" identical to "the tag was never built", on a tag whose entire status is *informational and disabled by measurement*. Now renders `no tag`, distinct from `no read` (which means the rating store was consulted and held nothing). |
-| `candDetail` | `coverage1y`, `coverage3y` and `expectancyMean` are all null | **BUG — fixed.** `COVERAGE_MIN_INDEPENDENT` nulls coverage **deliberately**, and the Worker computes the exact reason. **Measured against production: 66 of 757 candidates hit this branch and ALL 66 carried a reason** — every one Lane A, whose 365-session horizon 3y of closes structurally cannot support. Sixty-six computed refusals, none on screen. |
+| `candDetail` | `coverage1y`, `coverage3y` and `expectancyMean` are all null | **BUG — fixed.** `COVERAGE_MIN_INDEPENDENT` nulls coverage **deliberately**, and the Worker computes the exact reason. **Measured against production: 66 of 757 candidates hit this branch and ALL 66 carried a reason.** Sixty-six computed refusals, none on screen. See below — the 66 are structural, not a thin sample. |
 | `laneSortLine` | lane is D or E | **CORRECT.** A sort control, not a finding. An absent control makes no claim about data, so there is no state to mistake for another. |
 | `longDetail`'s lane map | a lane has no entries | **CORRECT, for a structural reason.** A lane that finds nothing still emits an entry with its own status and reason, and `readLongRow()` guards `row.schema === LONG_SCHEMA` by strict equality — so a row with a different lane set is rejected whole and renders `not-loaded`. Measured: 0 lanes absent across 33 rows × 6. |
+
+#### The 66 are ARITHMETIC, not a thin sample — file them that way
+
+The count came out of a rendering audit, and filing it as a rendering finding
+would misdescribe it. **Every Lane A candidate refuses, always, and will keep
+refusing at `MOVES_RANGE = '3y'` regardless of ticker, date or sample quality.**
+
+Lane A contracts are 365–900 DTE, so every one snaps to the **365-session**
+horizon. Independent windows are `(S − N) / N`:
+
+| S (sessions) | independent @ N=365 | clears the floor of 4? |
+|---|---|---|
+| 598 | 0.64 | no |
+| 751 (a full 3y series) | **1.06** | no |
+| **1825** | **4.00** | **yes** — the boundary |
+| 2514 (a full 10y series) | 5.89 | yes |
+
+Clearing 4 needs **S ≥ 1825 sessions, about 7.25 years** — more than `MOVES_RANGE`
+holds. **Measured 2026-08-11 across all 33 rows: 0 of 66 Lane A candidates clear
+the floor**, `coverage1y` non-null on 0, `coverage3y` on 0, `expectancyMean` on 0,
+and all 66 at `coverageHorizon: 365`. Not "most" — zero, by construction.
+
+So the fix was to render the refusals, and the *finding* is that the lane can
+never publish coverage at the current range. The lane now says that **once**, at
+lane level, with the per-candidate reasons kept underneath: a reader meeting 66
+identical inline reasons would conclude "these names are short of history", which
+is the wrong inference. Widening the range is queued in `ARCHITECTURE.md` item 13
+and is **coupled to phase 2**, not a standalone change.
 
 **A REFUSED MEASUREMENT IS A FINDING, NOT AN ABSENCE.** That is the whole of it.
 Coverage that declines to publish because the sample cannot carry the horizon is

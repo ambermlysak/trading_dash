@@ -2994,8 +2994,38 @@ function longDetail(r) {
                    : lane === 'F' ? longCreditTable(entry, scored, basis)
                    : longSingleTable(entry, scored, basis)) + outliers;
     }).join('');
+    /* ── LANE A'S COVERAGE REFUSAL IS ARITHMETIC, NOT A THIN SAMPLE ────────────
+       Stated ONCE at the lane, because a reader meeting it as 66 identical
+       inline reasons would infer "these particular names are short of history",
+       which is the wrong conclusion.
+
+       Lane A contracts are 365-900 DTE, so every candidate snaps to the
+       365-session horizon. Independent windows are (S - N) / N; at N=365 with a
+       3y series of ~751 sessions that is 1.06 against a floor of 4. Clearing 4
+       needs S >= 1825 sessions, about 7.25 years of trading days — more than
+       MOVES_RANGE holds, for any ticker, on any date, at any sample quality.
+
+       MEASURED 2026-08-11 across all 33 rows: 0 of 66 Lane A candidates clear
+       the floor, and all 66 snap to horizon 365. Not "most". Zero, always.
+
+       The per-candidate reasons stay: each carries its own numbers, and they are
+       correct per row. This says the general thing once so the specific ones do
+       not have to be generalised from. */
+    const laneNote = lane !== 'A' ? '' : `<div class="prem-note" title="${esc(
+      'Independent windows = (sessions − horizon) ÷ horizon. At the 365-session horizon a 3-year series '
+      + 'gives about 1.06, against COVERAGE_MIN_INDEPENDENT = 4. Reaching 4 would need ~1,825 sessions '
+      + '(~7.25 years). This is a property of the horizon and the stored range, not of any ticker: '
+      + 'measured across the whole watchlist, 0 of 66 Lane A candidates clear it.')}"><b>Lane A never
+      publishes measured coverage, and that is arithmetic rather than a data gap.</b> These contracts
+      score at the <b>365-session</b> horizon, which a 3-year stored series cannot support — it yields
+      about <b>1.06</b> independent windows against a floor of <b>4</b>, and clearing 4 would need roughly
+      <b>7.25 years</b> of history. Every candidate below states its own numbers; none of them will differ
+      in kind. Lane A is also held out of the expectancy sort for the same reason, and keeps its
+      cost-of-carry ordering.</div>`;
+
     return `<div class="long-lane">
       <div class="long-lane-head"><span class="long-lane-title">${esc(title)}</span><span class="long-lane-sub">${esc(sub)}</span></div>
+      ${laneNote}
       ${laneSortLine(lane, laneCands)}
       ${body}
     </div>`;

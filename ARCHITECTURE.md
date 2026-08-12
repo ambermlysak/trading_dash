@@ -909,7 +909,55 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    what the ad-hoc script filtered on, and either justify `recCalibration()`'s
    population or narrow it. Do not close it by re-running the same arithmetic.
 
-13. **`macroRegime` phase 2 — does macro state actually SEPARATE outcomes?**
+13. **`MOVES_RANGE` 3y → 10y — COUPLED TO PHASE 2, and genuinely two-sided.**
+   Ranks below item 12: the eligibility gap underpins a live disablement decision,
+   this only widens a horizon that is currently *honest* about refusing.
+
+   **What it fixes.** Lane A publishes no measured coverage at all, and that is
+   arithmetic rather than a data gap: its contracts snap to the 365-session
+   horizon, where a 3y series gives `(751 − 365)/365 ≈ 1.06` independent windows
+   against `COVERAGE_MIN_INDEPENDENT = 4`. Clearing 4 needs ~1,825 sessions
+   (~7.25y). **Measured 2026-08-11: 0 of 66 Lane A candidates clear it.** The
+   `macroRegime` §1 work already proved spark honours `range=10y`.
+
+   **Verified per ticker, not extrapolated from an index** (10y spark, 2026-08-11,
+   all 33 watchlist names). **23 of 33 would clear the floor; 10 still refuse:**
+
+   | | sessions | ind @365 |
+   |---|---|---|
+   | CRCL / CRWV / RDDT | 297 / 344 / 599 | −0.19 / −0.06 / 0.64 |
+   | ARM / CAVA / APLD / SMR | 729 / 790 / 1080 / 1110 | 1.00 / 1.16 / 1.96 / 2.04 |
+   | HOOD / APP / **PLTR** | 1259 / 1336 / **1470** | 2.45 / 2.66 / **3.03** |
+   | QUBT / MDB / VST … AAPL | 1986 … 2512 | 4.44 … 5.88 |
+
+   **So 10y is not a universal fix**, and PLTR — a core name — still refuses at
+   1,470. Any write-up claiming "10y resolves Lane A" is wrong; it resolves it for
+   the names that have existed long enough, which is a per-ticker floor of 1,825
+   sessions that must be stated wherever the change is described.
+
+   **The arguments against, which are the real ones:**
+   - Storage ~60 KB → ~200 KB per ticker. **Irrelevant** against KV's 25 MB.
+   - **10y reaches to 2016 — a different vol regime, a different rate regime, and
+     for NVDA / PLTR / CRWV a materially different company.** Coverage that clears
+     its floor by borrowing 2017 may be worse than an honest refusal. This is the
+     objection the arithmetic does not answer. Note the uncomfortable shape of it:
+     **10y helps precisely the names where the regime objection is strongest**
+     (the long-listed mega-caps that have re-rated), and does nothing for the
+     recent listings where a longer window would be most welcome.
+   - It needs a **`MOVES_SCHEMA` bump**, which retires every cached blob and blanks
+     the coverage columns until the next 2:00pm sweep.
+
+   **Why it is COUPLED to item 14 rather than separate.** Phase 2 needs the same
+   schema bump for the `startIdx → date` mapping, so **the two belong in ONE
+   commit**. And the coupling is substantive, not just convenient: phase 2's
+   pre-registered expectation was computed at 3y — ~5.3 independent windows per
+   regime at N=45, expected to null at most horizons. At 10y that becomes
+   `(2514/3 − 45)/45 ≈ 17` per regime. **That could move conditioned coverage from
+   "expected to null everywhere" to "actually measurable"**, which is the most
+   consequential thing on this list and the main reason to consider the change at
+   all. Do not do one without deciding the other.
+
+14. **`macroRegime` phase 2 — does macro state actually SEPARATE outcomes?**
    Phase 1 displays the state and deliberately does not rank on it. Phase 2 is the
    measurement that could earn a ranking influence, and nothing else can:
    `moves:{TICKER}` stores `[return, startIdx]` pairs, so if each historical
