@@ -435,13 +435,32 @@ This now covers all eight dispatch sites in `scheduled()`: `morning-briefing`,
 `midday-pulse`, `eod-summary`, `iv-sweep`, `macro-state`, `forward-returns`,
 `move-series`, `13f-slice`.
 
+> ##### THE GREP HALF OF THIS STANDARD HAS NEVER BEEN RUNNABLE — 2026-08-12
+>
+> Reading `!! JOB-FAILED !!` means querying Workers Logs, and the Observability
+> telemetry endpoint
+> (`POST /accounts/{id}/workers/observability/telemetry/query`) returns **403
+> with a valid, freshly-refreshed token**. Wrangler's OAuth scope set —
+> `account:read user:read workers:write workers_kv:write workers_routes:write
+> workers_scripts:write workers_tail:read d1:write pages:write zone:read …` —
+> contains nothing that authorises it; `workers_tail:read` does not.
+>
+> **It requires a Cloudflare API token with Observability Read, and no such token
+> is provisioned.** Until one is, this evidence channel does not exist and
+> everything above rests on the KV stamp alone — which the next section shows is
+> not sufficient either. `wrangler tail` is not a substitute: it streams live
+> events only, so it cannot be pointed at a firing that already happened.
+>
+> **Do not write a verification step that greps for `JOB-FAILED` until the token
+> exists.** A standard nobody can execute reads, at a glance, as one that was.
+
 **`!! JOB-FAILED !!` only fires when a job REJECTS.** A job that catches its own
 failure internally resolves normally, so it prints no line and the grep comes back
 empty on a run that did nothing. The grep is a positive signal, never a negative
-one: a silent grep plus a stamped key is *not* proof of success, and the four jobs
+one: a silent grep plus a stamped key is *not* proof of success, and the five jobs
 in the table below can produce exactly that.
 
-##### KNOWN DEFECT, NOT FIXED — four jobs stamp their dedup key on a failed run
+##### KNOWN DEFECT, NOT FIXED — five jobs stamp their dedup key on a failed run
 
 Measured 2026-08-12 by forcing each failure locally and reading KV through the
 Worker's own binding (logs are unusable here — wrangler dev surfaces only
@@ -467,6 +486,52 @@ The exposure is entirely from failures the jobs swallow themselves.
 **Blind spot:** `morning-briefing` and `midday-pulse` cannot have their
 post-Claude paths exercised locally — with no `ANTHROPIC_API_KEY` in `.dev.vars`
 neither is reached. Those two rows are measured on the *failure* path only.
+
+**Five, not four.** An earlier revision of this section said "four" while the table
+listed five. The count is **five stamping, three safe**, across eight jobs.
+
+##### `iv:` SAMPLE COUNT DOES NOT MEASURE SWEEP SUCCESS — and never has
+
+**Four writers share `iv:{TICKER}:{DATE}`, and the stored record only tells two of
+them apart.** `recordIvSample` puts provenance in the body via `...(src ? { src } : {})`:
+
+| caller | `src` |
+|---|---|
+| `longRow` live path | `'long-live'` |
+| `longRow` warm path | `'long-warm'` (+ `skipIfPresent`) |
+| `/api/iv/:ticker` handler | **none** |
+| `recordWatchlistIv` (the cron) | **none** |
+
+So a sample with no `src` is the cron **or** an ordinary page view, and nothing
+stored separates them. The only remaining separator is behavioural — the sweep
+writes the whole watchlist within seconds of 1:15pm PT, a page view writes one at
+an arbitrary time. **That is an inference from clustering, not a field**, and it
+misclassifies any page view landing inside the window.
+
+**Consequence: sweep completeness cannot be measured retroactively, and a raw
+`iv:` count is actively misleading.** Measured 2026-08-12 over the whole 123-key
+history — the naive count and the timing-classified count disagree on five of nine
+dates, and in one case by 35:
+
+| PT date | dow | `iv:` keys | writes in the 1:15pm window | what it actually was |
+|---|---|---|---|---|
+| 2026-08-04 | Tue | 1 | 0 | no sweep |
+| 2026-08-05 | Wed | 20 | 15 (13:15:17–19) | 3 batches of 5, then nothing |
+| 2026-08-06 | Thu | 16 | 7 (13:15:25–27) | 2 batches with misses, then nothing |
+| 2026-08-07 | Fri | 5 | 0 | no sweep — the Sun–Thu cron bug |
+| 2026-08-08 | Sat | 5 | 0 | market closed, correct |
+| 2026-08-09 | Sun | 6 | 0 | market closed, correct |
+| 2026-08-10 | Mon | **35** | **0** | **no sweep** — all 35 were `long-live` + traffic |
+| 2026-08-11 | Tue | 3 | 0 | **no sweep** |
+| 2026-08-12 | Wed | 32 | 32 (13:15:07–18) | full sweep, 32/33 |
+
+**One full sweep in seven trading days.** `2026-08-10` is the trap: 35 samples
+against a 33-name watchlist reads as a complete sweep and is a sweep that never
+ran.
+
+**If you add a fifth writer, or need this measurable, give the cron its own `src`.**
+It is a one-word change at the call site and it is the difference between a
+measurement and a guess.
 
 #### None of that logging exists unless observability is on
 

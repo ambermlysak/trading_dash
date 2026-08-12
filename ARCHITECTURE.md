@@ -1018,7 +1018,7 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    hostile sessions come from the index-trend clause with the VIX term structure in
    contango; those are unlikely to behave like backwardation episodes.
 
-15. **FOUR CRON JOBS STAMP THEIR DEDUP KEY ON A FAILED RUN — measured, awaiting a
+15. **FIVE CRON JOBS STAMP THEIR DEDUP KEY ON A FAILED RUN — measured, awaiting a
    decision on the fix.** `eod-summary`, `iv-sweep`, `forward-returns`,
    `move-series` and `13f-slice` all stamp after a run that accomplished nothing,
    because each swallows its own per-item failures. The full measured table, the
@@ -1046,7 +1046,79 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    alone** so it can be corrected alongside the fix: the block comment above
    `dispatchJob` claims *"A job that fails still fails: it stamps no dedup key, so
    the next firing retries it."* That holds on the rejection path it was measured
-   against, and not for the four jobs above.
+   against, and not for the five jobs above.
+
+16. **THE IV SWEEP HAS DELIVERED ONE COMPLETE RUN IN SEVEN TRADING DAYS — and this
+   is NOT the same defect as #15.** Measured 2026-08-12 across the whole 123-key
+   `iv:` history; the per-date table is in CLAUDE.md rule #7 under *"`iv:` SAMPLE
+   COUNT DOES NOT MEASURE SWEEP SUCCESS"*. Three distinct problems, none of which
+   #15's stamp fix would touch:
+
+   - **Four dates recorded no sweep at all** (08-04, 08-07, 08-10, 08-11). 08-07 is
+     explained by the known Sun–Thu cron bug. **08-10 and 08-11 are consecutive
+     trading days with no known cause**, and 08-11 is the one that matters: if the
+     sweep ran, failed and stamped, that is #15 firing in production on the path
+     where the data does not backfill. **Undeterminable retroactively** —
+     `ivsweep:last` has been overwritten and the logs are unreachable (see #17).
+   - **Two dates truncated mid-loop** (08-05 at 15, 08-06 at 7). `recordWatchlistIv`
+     runs `Promise.allSettled` over batches of 5, awaited sequentially, so a
+     per-ticker failure is absorbed and the loop continues — **per-ticker failures
+     produce gaps, never truncation.** Stopping cleanly after 3 batches (08-05) or
+     2 (08-06) can only come from the invocation itself ending. **Caveat that
+     cannot be resolved:** the watchlist has grown 14 → 22 → 33 and its size on
+     those dates is recorded nowhere, so 15-of-15 and 15-of-22 are indistinguishable
+     from here.
+   - **Per-ticker misses inside a completed sweep.** 08-06 batch 1 wrote 3 of 5 and
+     batch 2 wrote 4 of 5. Today missed KTOS, 32 of 33 — **not** a structural
+     refusal: KTOS quotes 12 expiries and 88 strikes all carrying IV at spot 63.82,
+     and it has recorded successfully twice by other paths. Today was the first
+     sweep that ever reached KTOS's position in the list, so n=1 and it reads as
+     transient.
+
+   **The prerequisite for any of this becoming measurable is one word:** give the
+   cron its own `src` in `recordIvSample`. Until then the count conflates four
+   writers and `ok/N` lives only in a log line nobody can read.
+
+   `ivRank` needs `IV_RANK_MIN_DAYS`-worth of unbroken daily history and none of
+   these gaps backfill, so every day of delay is permanent.
+
+17. **BLOCKED ON THE ACCOUNT OWNER — two capabilities the verification standard
+   already assumes.** Neither is work to schedule; both are credentials to provide,
+   and until they exist the corresponding checks must be reported as unrun rather
+   than passed.
+
+   - **A Cloudflare API token with Observability Read.** The telemetry query
+     endpoint 403s under wrangler's OAuth scopes (`workers_tail:read` does not
+     cover it), so `!! JOB-FAILED !!`, the `[cron] … branch=` dispatch lines and
+     every job's own completion line — including the IV sweep's `ok/N` — are all
+     unreadable. Workers **Analytics** (GraphQL `workersInvocationsAdaptive`) does
+     work under the current token and gives invocation times, status and
+     subrequests; it gives no log text.
+   - **The Chrome extension reconnected.** The in-page chip assertion — cache-busted
+     load, identifier asserted in the running page, hard throw on stale code —
+     cannot run without it, and CLAUDE.md's own rule says a byte count is not a
+     substitute.
+
+18. **THE TWO SUBREQUEST COUNTERS DISAGREE — recorded, not resolved.** On the
+   2026-08-12 1:15pm invocation, Cloudflare's `workersInvocationsAdaptive` reports
+   **113 subrequests** for the whole invocation, while `_instr` stamped by
+   `generateEODSummary` **9 seconds in, mid-flight**, already reads `extFetches 89 /
+   bindingOps 33 / capCost 122`. A mid-flight snapshot cannot exceed a final total
+   if both count the same events. The 6am invocation, which runs a single job to
+   completion and is therefore clean, disagrees the same way: `capCost` 254
+   (ext 139 / bind 115) against Cloudflare's 153.
+
+   **Hypothesis, not conclusion: Cloudflare's metric excludes KV binding
+   operations.** Not verified — a deliberate experiment would be needed.
+
+   If true, the consequence is two-sided. `capCost` would be *conservative*
+   relative to the platform's own accounting, which is the safe direction, and at
+   113–190 against a 10,000 ceiling nothing is at risk either way. **But the unit
+   the cost discipline is denominated in would then not be the unit the platform
+   enforces** — and rule #1's *"quote `capCost`, never `extFetches`"*, together with
+   the measured 125–143% understatement behind it, was derived assuming the two
+   agree. **That assumption is now open.** Do not restate the understatement figure
+   as settled until this is resolved.
 
 9. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
    Lightweight Charts supports custom drawings; recognition would be rules-based
