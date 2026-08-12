@@ -2397,6 +2397,26 @@ So, for any change that adds a field to a response the frontend reads:
 **Never conclude "the frontend handles missing data" from the populated-failure
 tests.** Those exercise a field that exists. This one does not.
 
+### `return ''` in a render helper is where this hides — audit them all
+
+Fixing `macroChip` prompted an audit of every early empty-string return in
+`dashboard.html`, and **two of the four were the same bug**. The distinguishing
+question is one line: **is this withholding a CONTROL, or a FACT?**
+
+| site | returns `''` when | verdict |
+|---|---|---|
+| `alignChip` | `align` is absent | **BUG — fixed.** Its own comment says *"Renders ALWAYS"* and it did not. A blank made "no alignment field exists" identical to "the tag was never built", on a tag whose entire status is *informational and disabled by measurement*. Now renders `no tag`, distinct from `no read` (which means the rating store was consulted and held nothing). |
+| `candDetail` | `coverage1y`, `coverage3y` and `expectancyMean` are all null | **BUG — fixed.** `COVERAGE_MIN_INDEPENDENT` nulls coverage **deliberately**, and the Worker computes the exact reason. **Measured against production: 66 of 757 candidates hit this branch and ALL 66 carried a reason** — every one Lane A, whose 365-session horizon 3y of closes structurally cannot support. Sixty-six computed refusals, none on screen. |
+| `laneSortLine` | lane is D or E | **CORRECT.** A sort control, not a finding. An absent control makes no claim about data, so there is no state to mistake for another. |
+| `longDetail`'s lane map | a lane has no entries | **CORRECT, for a structural reason.** A lane that finds nothing still emits an entry with its own status and reason, and `readLongRow()` guards `row.schema === LONG_SCHEMA` by strict equality — so a row with a different lane set is rejected whole and renders `not-loaded`. Measured: 0 lanes absent across 33 rows × 6. |
+
+**A REFUSED MEASUREMENT IS A FINDING, NOT AN ABSENCE.** That is the whole of it.
+Coverage that declines to publish because the sample cannot carry the horizon is
+the system working, and it must read that way — dim and neutral, naming its own
+numbers, never a blank row. **Phase 2 depends on this**: regime-conditioned
+coverage is *expected* to null at most horizons, and if a refusal renders as
+nothing then the anticipated result of the entire exercise is invisible.
+
 ## A newly rendered figure gets eyes on it before the commit is done
 
 **Any commit that puts a NEW number on screen requires browser verification of

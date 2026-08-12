@@ -568,6 +568,10 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .cd-v { color: var(--ink-1); margin-right: 12px; }
 .cd-v.up { color: var(--bull); } .cd-v.dn { color: var(--bear); }
 .cd-note { color: var(--amber); cursor: help; }
+/* A REFUSED measurement is not a missing one. The row still renders, dim and
+   neutral — nothing is wrong, the sample simply cannot support the horizon. */
+.cand-detail.refused > td { color: var(--ink-3); }
+.cd-refused { color: var(--ink-3); font-style: italic; }
 /* A rate rendered with no benchmark beside it. Should be rare — the rule is that
    it does not go on screen at all — so it is marked rather than styled quietly. */
 .rate-nobase { color: var(--amber); font-style: italic; cursor: help; }
@@ -2237,7 +2241,22 @@ const money    = v => v == null ? '—' : '$' + v.toFixed(2);
 /** The alignment tag. Renders ALWAYS; reorders only when the rating behind it
  *  has a resolved track record. An unscored tag must not look like a scored one. */
 function alignChip(align, scored, basis) {
-  if (!align) return '';
+  /* "RENDERS ALWAYS" HAS TO BE TRUE. This used to `return ''`, which meant an
+     absent `align` painted nothing — and a blank cell is indistinguishable from
+     the tag never having been built, which is the one thing a tag that is
+     informational-and-disabled-by-measurement must not look like.
+
+     `no read` and an absent field are DIFFERENT FACTS: `no read` means we looked
+     at `analysis:{TICKER}` and found nothing stored; absent means the candidate
+     carries no alignment field at all, because the Worker that wrote the row
+     never produced one. Measured against production 2026-08-11: 0 of 398 A/B/C
+     candidates lack `align`, so this is a deployment-window branch (an older
+     Worker, or a rollback) rather than a live one — the same shape as the macro
+     `field-absent` state, and it gets the same treatment. Neutral tone: nothing
+     is wrong, there is simply no tag to show. */
+  if (!align || typeof align !== 'object' || !align.tag) {
+    return `<span class="long-tag noread" title="This candidate carries no alignment field at all — the Worker that wrote this row did not produce one, which happens when the page is newer than the deployed Worker or after a rollback. That is NOT the same as &quot;no read&quot;, which means the rating store was consulted and held nothing for this ticker. Nothing is substituted and nothing is inferred.">no tag</span>`;
+  }
   const cls = { aligned: 'aligned', counter: 'counter', neutral: 'neutral',
                 'no read': 'noread', 'out-of-horizon': 'horizon' }[align.tag] || 'noread';
   /* `scored` is false everywhere right now — a data-driven disable, not a bug.
@@ -2463,7 +2482,44 @@ function candDetail(c) {
   const p2 = v => v == null ? '—' : ((v > 0 ? '+' : '') + (v * 100).toFixed(1) + '%');
   const g  = v => v == null ? '—' : (v > 0 ? '+' : '') + v.toFixed(0);
   const ep = c.expectancyEpisodesTo50;
-  if (c.coverage1y == null && c.coverage3y == null && c.expectancyMean == null) return '';
+
+  /* ── A REFUSED MEASUREMENT IS A FINDING, NOT AN ABSENCE ─────────────────────
+     This used to `return ''` when all three metrics were null, dropping the whole
+     detail row. But `COVERAGE_MIN_INDEPENDENT` nulls coverage DELIBERATELY when
+     the stored history cannot support the horizon, and the Worker computes an
+     exact reason for it — *"751 sessions of 3y history support only 1.06
+     independent 365-session windows (386 overlapping); the floor is 4"*. Throwing
+     that away made "we refused to measure this" look identical to "there is
+     nothing here", which is the same shape as hiding a Lane E gate failure.
+
+     Measured against production 2026-08-11: **66 of 757 candidates hit this
+     branch and ALL 66 carried a reason** — every one of them Lane A, whose
+     365-session horizon three years of closes structurally cannot support. Sixty-
+     six computed refusals, none of them on screen.
+
+     PHASE 2 DEPENDS ON THIS BEING LEGIBLE. Regime-conditioned coverage is
+     expected to null at most horizons — that is the anticipated result, not a
+     failure — and it has to read as a measurement rather than a blank row.
+
+     The row is dim and neutral: nothing is wrong, the sample simply cannot carry
+     the claim. Nothing is substituted, and no shorter horizon is relabelled. */
+  if (c.coverage1y == null && c.coverage3y == null && c.expectancyMean == null) {
+    const why = c.coverageReason || c.expectancyReason || null;
+    return `<tr class="cand-detail refused"><td colspan="99">
+      <span class="cd-k">measured cov · gap · E[R]</span>
+      <span class="cd-refused" title="${esc(
+        'Not computed, and deliberately so. Coverage is only published where the stored history supports '
+        + 'at least the independent-window floor at this horizon; below it the figure would be a number '
+        + 'with no sample behind it. A refusal is a measurement — it is not a missing value, and no '
+        + 'shorter horizon is relabelled as this one.')}">not computed at this horizon${
+        c.coverageHorizon != null ? ` (${c.coverageHorizon} sessions)` : ''}</span>
+      <span class="cd-v">${why
+        ? esc(why)
+        : esc('the Worker recorded no reason for this — which is itself worth reporting, since every '
+            + 'refusal is supposed to name its own numbers.')}</span>
+    </td></tr>`;
+  }
+
   return `<tr class="cand-detail"><td colspan="99">
     <span class="cd-k">gap</span> <span class="cd-v">${g(c.gap1y)} 1y · ${g(c.gap3y)} 3y</span>
     <span class="cd-k">realized drift</span> <span class="cd-v ${c.drift1y > 0 ? 'up' : c.drift1y < 0 ? 'dn' : ''}"
@@ -2813,9 +2869,16 @@ const LANE_META = {
 /** What this lane is actually sorted by, plus the Sharpe control — which has no
  *  visible column and would otherwise be an invisible feature. */
 function laneSortLine(lane, cands) {
-  // D and E are fixed shapes, not sorted lists — D is one calendar, E is a pair
-  // whose whole point is the comparison between its two members. Offering a sort
-  // would imply an ordering that carries no meaning.
+  /* D and E are fixed shapes, not sorted lists — D is one calendar, E is a pair
+     whose whole point is the comparison between its two members. Offering a sort
+     would imply an ordering that carries no meaning.
+
+     CONFIRMED DELIBERATE in the 2026-08-11 empty-return audit, and it is the one
+     kind of empty return that is safe: THIS IS A CONTROL, NOT A FINDING. An
+     absent sort control makes no claim about data, so there is no state for the
+     reader to mistake for another. Compare `alignChip` and `candDetail` in the
+     same audit, which both returned '' where a *fact* was being withheld and
+     both had to be fixed. */
   if (lane === 'D' || lane === 'E') return '';
   const eff = laneSortInEffect(lane, cands);
   const spec = LONG_CAND_SORTS[eff.col] || LONG_CAND_SORTS.beem;
@@ -2887,6 +2950,17 @@ function longDetail(r) {
   const laneOrder = ['A', 'B', 'C', 'D', 'E', 'F'];
   const lanesHtml = laneOrder.map((lane) => {
     const entries = (r.lanes || []).filter(l => l.lane === lane);
+    /* CONFIRMED DELIBERATE in the 2026-08-11 empty-return audit, and safe for a
+       structural reason rather than a stylistic one: a lane that finds nothing
+       still emits an ENTRY (`status: 'not-listed'` / `'no-iv'` / `'error'` with
+       its reason), so an absent lane is not a data finding — it can only mean the
+       payload does not have that lane at all. And `readLongRow()` guards on
+       `row.schema === LONG_SCHEMA` by strict equality, so a row written by a
+       Worker with a different lane set is rejected WHOLE and renders as
+       `not-loaded`; it can never arrive here as a schema-current row missing a
+       lane. Measured against production 2026-08-11: 0 lanes absent across 33
+       rows × 6 lanes. If that ever becomes reachable, this must name the missing
+       lane rather than skip it silently. */
     if (!entries.length) return '';
     const [title, sub] = LANE_META[lane];
     const laneCands = entries.flatMap(e => e.candidates || []);
