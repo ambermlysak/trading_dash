@@ -412,9 +412,61 @@ catches, and logs `!! JOB-FAILED !!` naming the job instead.
 **That is a deliberate trade against rule #7's own warning** that `errors: 0` is
 not evidence of success: catching does clean the invocation. What replaces it is a
 greppable ERROR line naming the job — the same trade `allSettledCounted` already
-makes — and the job still stamps no dedup key, so the next firing retries it.
+makes.
 
 **Never write a bare `ctx.waitUntil(job(env))` in `scheduled()` again.**
+
+##### What the trade costs: invocation status is no longer evidential on the cron path
+
+**Invocation status and `errors: 0` do not indicate that any cron job succeeded.**
+Since `dispatchJob` catches, a failed job reads as a clean **200** and `errors: 0`
+means only *"nothing escaped uncaught"*. Before it, a failed job at least made the
+invocation look wrong — that signal is gone, deliberately, because it could not
+distinguish one failed job from a failed branch.
+
+**The evidence is two things, neither of which is the invocation:**
+
+1. the job's own **per-job KV stamp** — `daily:snapshot`, `daily:midday`,
+   `daily:eod`, `ivsweep:last`, `macrosweep:last`, `recfwd:last`,
+   `movesweep:last`, `13f:cursor`
+2. a grep for **`!! JOB-FAILED !!`**, which names the job
+
+This now covers all eight dispatch sites in `scheduled()`: `morning-briefing`,
+`midday-pulse`, `eod-summary`, `iv-sweep`, `macro-state`, `forward-returns`,
+`move-series`, `13f-slice`.
+
+**`!! JOB-FAILED !!` only fires when a job REJECTS.** A job that catches its own
+failure internally resolves normally, so it prints no line and the grep comes back
+empty on a run that did nothing. The grep is a positive signal, never a negative
+one: a silent grep plus a stamped key is *not* proof of success, and the four jobs
+in the table below can produce exactly that.
+
+##### KNOWN DEFECT, NOT FIXED — four jobs stamp their dedup key on a failed run
+
+Measured 2026-08-12 by forcing each failure locally and reading KV through the
+Worker's own binding (logs are unusable here — wrangler dev surfaces only
+`warn`/`error` from `waitUntil`). This interacts badly with the trade above: such
+a run is a clean 200, prints no `JOB-FAILED`, **and** dedups itself out of the
+day's remaining firings.
+
+| job | key | on a failed run |
+|---|---|---|
+| `morning-briefing` | `daily:snapshot` | **safe** — writes the placeholder with `ts: 0`, and the dedup demands `isComplete && age<2h`. Measured: two firings, bytes changed, it retried |
+| `midday-pulse` | `daily:midday` | **safe** — returns before the put. Measured: absent after both firings |
+| `macro-state` | `macrosweep:last` | **safe** — refuses before stamping |
+| `eod-summary` | `daily:eod` | **STAMPS.** The Claude `catch` assigns a fallback and falls through to a put with `ts: Date.now()`; the dedup has no content check. Measured: fire 2 skipped, identical hash |
+| `iv-sweep` | `ivsweep:last` | **STAMPS.** `allSettled` turns every rejection into a fulfilled result, so `ok` reaches 0 and the stamp still runs. Measured: 0 `iv:{T}:{DATE}` keys written, key stamped. **Worst consequence** — `ivRank` needs an unbroken daily series and a gap does not backfill |
+| `forward-returns` | `recfwd:last` | **STAMPS.** Per-ticker chart failures `continue` |
+| `move-series` | `movesweep:last` | **STAMPS.** Same `allSettled` shape as the IV sweep |
+| `13f-slice` | `13f:cursor`, `13f:index.lastFullPass` | **STAMPS, for 7 days.** `lastFullPass` is set on wrap unconditionally. Measured: 5 slices with all 20 managers failing left `managersOk: 0` and a set `lastFullPass`; slices 6 and 7 were byte-identical no-ops |
+
+A throw placed immediately *before* each stamp leaves every key absent, on all
+three branches tested — so no stamp sits in a `finally` and none is duplicated.
+The exposure is entirely from failures the jobs swallow themselves.
+
+**Blind spot:** `morning-briefing` and `midday-pulse` cannot have their
+post-Claude paths exercised locally — with no `ANTHROPIC_API_KEY` in `.dev.vars`
+neither is reached. Those two rows are measured on the *failure* path only.
 
 #### None of that logging exists unless observability is on
 

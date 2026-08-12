@@ -1018,6 +1018,36 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    hostile sessions come from the index-trend clause with the VIX term structure in
    contango; those are unlikely to behave like backwardation episodes.
 
+15. **FOUR CRON JOBS STAMP THEIR DEDUP KEY ON A FAILED RUN — measured, awaiting a
+   decision on the fix.** `eod-summary`, `iv-sweep`, `forward-returns`,
+   `move-series` and `13f-slice` all stamp after a run that accomplished nothing,
+   because each swallows its own per-item failures. The full measured table, the
+   forcing method and the per-job verdicts are in **CLAUDE.md rule #7**, under
+   *"KNOWN DEFECT, NOT FIXED"*. Three things make this worth its own item:
+
+   - **The IV sweep is the one that costs data.** A 0-of-33 sweep stamps
+     `ivsweep:last` and dedups itself out for the PT day; `ivRank` needs an
+     unbroken daily series and the gap does not backfill. A day of macro or 13F is
+     recoverable; a day of IV samples is not.
+   - **The 13F window is 7 days, not 1.** `lastFullPass` is stamped on wrap even
+     when all 20 managers failed, and `refresh13FIndexIfStale` then idles.
+   - **`dispatchJob` made it quieter.** Such a run is a clean 200 and prints no
+     `!! JOB-FAILED !!`, so neither of rule #7's two evidence channels sees it.
+
+   **`generateDailySnapshot` already contains the fix pattern** and is the model to
+   copy: it writes its failure placeholder with `ts: 0`, and its dedup demands
+   `isComplete` as well as freshness — two independent guards, both verified to
+   hold. The shape of a fix is to make each stamp conditional on the run having
+   accomplished something, and to decide per job what "something" means (`ok > 0`?
+   `ok >= some fraction of N`?) — that threshold is a judgement call, which is why
+   this is queued rather than done.
+
+   **One line in `worker.js` is now known to be false and is deliberately left
+   alone** so it can be corrected alongside the fix: the block comment above
+   `dispatchJob` claims *"A job that fails still fails: it stamps no dedup key, so
+   the next firing retries it."* That holds on the rejection path it was measured
+   against, and not for the four jobs above.
+
 9. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
    Lightweight Charts supports custom drawings; recognition would be rules-based
    code or a Claude vision call against a chart screenshot.
