@@ -4164,6 +4164,12 @@ async function handleLongBatch(params, origin, env) {
   }));
   rows.sort((a, b) => a.symbol.localeCompare(b.symbol));
 
+  /* ONE macro read for the whole batch — 1 binding op for 33 symbols, not 33.
+     It goes in the ENVELOPE beside `_meta` and is never attached to a row: macro
+     is one fact about the day, and repeating it per row would be 33 copies of
+     the same object and would invite a renderer to draw it per row. */
+  const macro = await readMacroState(env);
+
   const oldest = rows.length ? Math.min(...rows.map(r => r.ts || 0)) : null;
   return json({
     rows, missing, symbols,
@@ -4194,6 +4200,7 @@ async function handleLongBatch(params, origin, env) {
       ...REGIME_GATES,
     },
     rate: rows.find(r => r.rate)?.rate || null,
+    macro,
     _instr: instrSince(mark, 'batch'),
     _meta: srcMeta('KV cache (no fetch)', {
       ttlSeconds: LONG_FRESH_MS / 1000,
@@ -4229,13 +4236,19 @@ async function handleLongTicker(ticker, params, origin, env) {
   const age    = cached?.ts ? Date.now() - cached.ts : null;
   const fresh  = age != null && age < LONG_FRESH_MS;
 
+  /* ENVELOPE, not the row — the same rule as `/api/long/batch`. One extra KV
+     read of the ~640-byte `macro:state` key on every path, cache hits included,
+     so a refreshed row and the header chip beside it describe the same moment.
+     `macro:series` is never read here. */
+  const macro = await readMacroState(env);
+
   if (cached && (fresh || cachedOnly)) {
-    return json({ row: cached, cached: true, stale: !fresh, ageMs: age,
+    return json({ row: cached, cached: true, stale: !fresh, ageMs: age, macro,
                   _instr: stamp('cache-hit'), _meta: longRowMeta(cached) }, 200, origin);
   }
   if (cachedOnly) {
     return json({
-      row: null, cached: true,
+      row: null, cached: true, macro,
       missing: { symbol: sym, status: 'not-loaded', reason: 'not loaded — no cached row for this ticker' },
       _instr: stamp('cache-miss'),
       _meta: srcMeta('KV cache (no fetch)', { ok: false, ttlSeconds: LONG_FRESH_MS / 1000, note: 'nothing cached' }),
@@ -4251,7 +4264,7 @@ async function handleLongTicker(ticker, params, origin, env) {
   // because they differ by roughly a third and a bare number would be ambiguous.
   const row = await refreshLongTicker(sym, env);
   return json({
-    row, cached: false, stale: false, ageMs: 0,
+    row, cached: false, stale: false, ageMs: 0, macro,
     _instr: stamp('complete', { premiumWarm: row.sharedFrom === 'premium-row' }),
     _meta: longRowMeta(row),
   }, 200, origin);
@@ -6564,6 +6577,550 @@ async function collectMoveSeries(env) {
   console.log(
     `[cron] move-series sweep: ${written} written, ${skipped} already current, ${absent} not returned by spark, `
     + `${thin} with thin history · ${JSON.stringify(instrSince(mark, 'complete'))}`,
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MACRO REGIME — phase 1, DISPLAY ONLY
+
+   PHASE 1 DOES NOT AFFECT RANKING, GATING, OR ANY EXISTING FIGURE. That is a
+   deliberate constraint, not an unfinished edge.
+
+   The `analysis:` rating was wired into sort order before anyone measured
+   whether it had edge. When it was finally measured against a base rate it came
+   back NEGATIVE — pooled sign-scored BUY 50.5% against a 60.5% base rate,
+   -10.1 pts — and the sort influence had to be disabled after the fact
+   (`directionalRead()` still carries `sortDisabled`). Macro state is the same
+   shape of thing: a plausible signal that feels like it should matter. So it
+   ships as a DISPLAYED CONDITION with no measured relationship to outcomes, and
+   the card says so in visible text. Sort influence, if it is ever justified,
+   comes out of phase 2's regime-conditioned coverage measurement and nowhere
+   else. Do not add a demotion, a tie-break or a threshold adjustment here.
+
+   ── THE SIGN CONVENTION IS A SUBTRACTION, NOT A RATIO ────────────────────────
+   `vixTermSpread = vix - vix3m`. POSITIVE IS BACKWARDATION AND POSITIVE IS
+   HOSTILE.
+
+   This is not a stylistic choice. `longRow` already stores
+   `termStructure = front - back` with positive meaning backwardation, and Lane E
+   gates `hostile-term` on `termStructure > 0`. A macro field where *below 1.0*
+   meant backwardation would put two opposite polarities for the same concept on
+   one screen — the "inverted thing that looks like a copy" hazard the Long tab
+   section is built around. `vixTermRatio` (vix3m / vix) ships as a display field
+   and MUST NEVER be the classifier.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── TWO KEYS, NOT ONE, AND THE SPLIT IS A REQUEST-PATH COST DECISION ────────
+   The classified state is ~640 bytes; the 756-session phase-2 slice is ~27 KB.
+   A single key would make every `/api/long/*` request read 27 KB out of KV to
+   render a 640-byte chip. Stripping the slice on read does NOT avoid that — the
+   transfer and the JSON.parse have already happened; it only hides them.
+
+   So: `macro:state` is read on the request path and `macro:series` is read by
+   NOTHING in phase 1. Both are written by the same 1:15pm collection, both carry
+   `MACRO_SCHEMA`, and they are bumped together — a state record whose series is
+   from an older shape is exactly the mismatch strict-equality schema checks
+   exist to prevent. */
+const MACRO_KEY        = 'macro:state';
+const MACRO_SERIES_KEY = 'macro:series';
+const MACRO_SWEEP_KEY  = 'macrosweep:last';  // OUTSIDE the `macro:` prefix, so nothing
+                                             // scanning that prefix reads it as a record
+const MACRO_SCHEMA     = 1;
+const MACRO_TTL       = 90 * 24 * 3600;      // 90d retention — see the freshness split below
+/* FRESHNESS AND RETENTION DIFFER ON PURPOSE, the same split as `long:` /
+   `premium:` / `econ:dgs3mo`. The record is written once a trading day by the
+   1:15pm PT branch, so 26h covers a normal weekday cadence plus slack; past that
+   the chip badges stale rather than disappearing. Retention is 90 days because a
+   labelled old macro read beats a blank one — `econ:dgs3mo` moved 7d -> 90d for
+   exactly this reason, and §4's age treatment means an old record is labelled
+   rather than misleading. Note a weekend or holiday legitimately ages the record
+   past 26h; the chip states the age, which is the honest answer. */
+const MACRO_FRESH_MS  = 26 * 3600_000;
+
+/* Field name -> Yahoo symbol. Field names are what the record and the payload
+   use; the carets never leak past this table. */
+const MACRO_SYMBOLS = { spy: 'SPY', qqq: 'QQQ', vix: '^VIX', vix3m: '^VIX3M' };
+
+/* VERIFIED AGAINST THE LIVE API 2026-08-11, because nothing in this codebase had
+   ever fetched a caret symbol through spark — the only other `^VIX` fetch is
+   `handleMarketSnapshot`, which uses /v8/finance/chart. Measured, per symbol,
+   sessions returned at each range:
+     range=1y   ^VIX 253   ^VIX3M 234
+     range=3y   ^VIX 753   ^VIX3M 734   SPY 751   QQQ 751
+     range=10y  ^VIX 2514  ^VIX3M 2492  SPY 2512  QQQ 2512
+     range=max  ^VIX3M 1      <- a Yahoo quirk; do NOT use 'max' here
+   So spark serves carets, ^VIX3M specifically resolves, and 10y is honoured.
+   The counts DISAGREE, which is why alignMacroSeries() keys on date. */
+const MACRO_RANGE       = '10y';   // derivation range — spans 2020 and 2022
+const MACRO_SLICE_DAYS  = 756;     // ~3y of sessions, aligned with MOVES_RANGE, stored for phase 2
+const MACRO_TREND_FAST  = 50;
+const MACRO_TREND_SLOW  = 200;
+
+/* ── THE CLASSIFIER SEES THE SMOOTHED TERM SPREAD, NOT THE RAW ONE ───────────
+   A trailing 5-session mean. Measured over the same 2,293 sessions, at the
+   shipped thresholds:
+
+     input       hostile   hostile run median/p90   transitions   flip rate
+     raw           22.5%             2 /  9              229        10.0%
+     smoothed5     21.7%             7 / 55               98         4.3%
+
+   A two-session median run is not a regime, it is noise wearing a regime label,
+   and a chip that changes every other day trains the reader to ignore it.
+   Smoothing costs 0.8pp of frequency and buys a 3.5x longer median run and 57%
+   fewer transitions. The distribution itself barely moves (median -2.13 vs
+   -2.15, above-zero 7.2% vs 8.0%), so this is de-noising rather than
+   re-definition.
+
+   THE COST OF SMOOTHING IS LAG, AND IT WAS MEASURED BEFORE THE CONSTANT WAS SET
+   rather than assumed away. A 5-session mean drops 34 of 55 raw backwardation
+   episodes (55 runs of median 1 -> 21 of median 5); some of those were noise and
+   some could have been the first days of a real spike. First session classified
+   hostile, raw vs smoothed, on six stress episodes:
+
+     probe         raw onset     smoothed onset   lag   fired via
+     2020-03-16    2020-02-24    2020-02-25        1    term
+     2020-03-23    2020-02-24    2020-02-25        1    term
+     2018-12-24    2018-12-06    2018-12-07        1    term
+     2025-04-07    2025-04-02    2025-04-03        1    term
+     2022-06-16    2022-03-14    2022-03-14        0    trend
+     2022-10-12    2022-03-14    2022-03-14        0    trend
+                                        MEDIAN LAG  1   (mean 0.67, max 1)
+
+   One session, never more. The pre-registered stop condition was a median above
+   3. 2022-10-12 is the instructive one: its raw term clause fired for a single
+   day (2022-10-11) and the smoothed one never crossed — a noise episode
+   correctly suppressed, with the composite state hostile anyway via trend.
+
+   `vixTermSpread` (raw) is stored and rendered beside it. DO NOT CLASSIFY ON THE
+   RAW FIELD: it has the more obvious name and is not the input. `gates
+   .classifierInput` names the deciding field in the payload for that reason. */
+const MACRO_SMOOTH_SESSIONS = 5;
+
+/* ── T_BACK / T_CONTANGO — derived from the distribution, 2026-08-11 ─────────
+   Population: 2,293 classifiable sessions, 2017-05-31 .. 2026-08-11, from a 10y
+   spark pull aligned to 2,492 sessions (199 lost to the SMA200 warm-up).
+
+   vixTermSpread = VIX - VIX3M, raw:
+     min -6.66  p10 -3.67  p25 -2.88  median -2.15  p75 -1.25  p90 -0.30
+     p95 +0.59  max +18.23  mean -1.93   ·   above zero 8.0% (183 sessions)
+
+   T_BACK = 0 — the sign convention's own zero, needing no justification beyond
+   the definition of backwardation. The choice barely matters: hostile runs
+   22.5% at 0, 20.5% at +0.5, 19.4% at +1.0, 18.4% at +2.0, because backwardation
+   is rare and when it happens it is large. REJECTED: +0.5 or +1.0 as a "noise
+   band". They buy 2-3pp of frequency at the cost of a constant that has to be
+   explained, and the noise they were meant to absorb is what the smoothing above
+   actually removes.
+
+   T_CONTANGO = -1.0, derived on the SMOOTHED series because that is what gets
+   classified. Sweep at T_BACK = 0:
+
+     input       T_CONT   constructive   mixed   hostile   transitions
+     smoothed5    -0.5        71.9%       6.4%    21.7%         86
+     smoothed5    -1.0        66.1%      12.3%    21.7%         98
+     smoothed5    -2.0        48.1%      30.3%    21.7%        134
+
+   -1.0 sits between p75 (-1.25) and p90 (-0.30) and keeps constructive clearly
+   dominant, which is the correct shape: contango is the normal condition of the
+   VIX term structure. REJECTED: -2.0, which sits essentially ON the median
+   (-2.15) and would make constructive a coin flip on the term input alone;
+   and -0.5, which crushes `mixed` to 6.4% — a band that narrow is a rounding
+   artifact rather than a state.
+
+   ANTI-TUNING RECORD. Today's values were printed and reported BEFORE these
+   constants were chosen: 2026-08-11, SPY +6.88%, QQQ +12.18%, VIX 15.28,
+   VIX3M 18.91, raw term -3.63, smoothed5 -2.84 -> constructive under every
+   candidate pair tested. Neither threshold changes that.
+
+   CLAUSE ATTRIBUTION, and it does not match the design's premise. Of the 21.7%
+   hostile under the shipping configuration: 'trend' 14.5% of all sessions
+   (66.8% of hostile), 'term' 5.8% (26.8%), 'both' 1.4% (6.4%). The index-trend
+   clause does roughly 2.5x the work of the backwardation clause the spec called
+   load-bearing. That is why `hostileVia` exists and is rendered — 2022-06-16
+   classified HOSTILE at VIX 33.0 with the term spread at -0.54, i.e. while in
+   CONTANGO, and a bare "hostile" would have misdescribed it. Phase 2 should
+   condition on the clause, not only on the state. */
+const T_BACK     = 0;
+const T_CONTANGO = -1.0;
+
+const MACRO_GATES = {
+  backSpread:     T_BACK,       // classifier input ABOVE this reads hostile
+  contangoSpread: T_CONTANGO,   // classifier input BELOW this reads constructive
+  trendFast:      MACRO_TREND_FAST,
+  trendSlow:      MACRO_TREND_SLOW,
+  smoothSessions: MACRO_SMOOTH_SESSIONS,
+  /* Both travel IN THE PAYLOAD, not only in this comment, so no frontend can
+     re-derive the sign the other way round or classify on the wrong field. */
+  sign: 'vixTermSpread = VIX − VIX3M · POSITIVE = backwardation = hostile',
+  classifierInput: 'vixTermSpreadSmoothed',
+};
+
+/**
+ * Align the four macro series ON DATE, never on index.
+ *
+ * MEASURED 2026-08-11 at range=10y: ^VIX returned 2514 sessions, SPY and QQQ
+ * 2512 each, ^VIX3M 2492. Zipping those by index would pair a VIX close with a
+ * VIX3M close up to 22 sessions away and yield a term spread that is
+ * arithmetically fine and describes nothing — the silent-wrong-answer shape this
+ * codebase keeps getting caught by. So each series is keyed by its own session
+ * date and only dates present in ALL FOUR survive.
+ */
+function alignMacroSeries(series) {
+  const byDate = {}, counts = {}, lastPerSymbol = {};
+  for (const [field, sym] of Object.entries(MACRO_SYMBOLS)) {
+    const s = series?.get?.(sym);
+    if (!s?.closes?.length || !Array.isArray(s.timestamps) || s.timestamps.length !== s.closes.length) {
+      return { ok: false, symbol: sym,
+               reason: `${sym} returned no usable dated series — spark drops unknown symbols silently, `
+                     + `and a close array with no matching timestamps cannot be aligned` };
+    }
+    const m = new Map();
+    for (let i = 0; i < s.closes.length; i++) {
+      const v = s.closes[i];
+      if (!Number.isFinite(v)) continue;
+      m.set(new Date(s.timestamps[i] * 1000).toISOString().slice(0, 10), v);
+    }
+    if (!m.size) return { ok: false, symbol: sym, reason: `${sym} returned no finite closes` };
+    byDate[field] = m;
+    counts[sym] = m.size;
+    lastPerSymbol[sym] = [...m.keys()].sort().pop();
+  }
+
+  const fields = Object.keys(MACRO_SYMBOLS);
+  const dates = [...byDate[fields[0]].keys()]
+    .filter(d => fields.every(f => byDate[f].has(d)))
+    .sort();
+  if (!dates.length) return { ok: false, symbol: null, reason: 'the four series share no session date' };
+
+  const out = { ok: true, dates, counts, lastPerSymbol, aligned: dates.length };
+  for (const f of fields) out[f] = dates.map(d => byDate[f].get(d));
+
+  /* A LAGGING INPUT IS THE ONE THING DATE-INTERSECTION CAN HIDE. If ^VIX3M has
+     not published today's value while SPY has, the intersection silently steps
+     back a session and the state describes an older market than the freshest
+     data available. That is what `provisional` is for; it is a rare, observable
+     condition rather than a permanently-true flag. */
+  const newest = Object.values(lastPerSymbol).sort().pop();
+  const lagging = Object.entries(lastPerSymbol).filter(([, d]) => d !== newest).map(([s]) => s);
+  out.lagged = dates[dates.length - 1] !== newest;
+  out.laggingSymbols = lagging;
+  return out;
+}
+
+/** Per-session fast/slow SMA spread, in % of the slow MA. Same quantity and same
+ *  2dp rounding as `crossStateFrom`'s `spread`, so the last element of this
+ *  series equals `smaCrossState(closes).spread` — asserted in macro.check.mjs. */
+function maSpreadSeries(closes, fast = MACRO_TREND_FAST, slow = MACRO_TREND_SLOW) {
+  const sf = smaSeries(closes, fast), ss = smaSeries(closes, slow);
+  if (!sf || !ss) return null;
+  return closes.map((_, i) =>
+    (sf[i] == null || ss[i] == null || !ss[i]) ? null
+      : Math.round((sf[i] - ss[i]) / ss[i] * 100 * 100) / 100);
+}
+
+/**
+ * Classify one session's four inputs. Mirrors `volRegime()`'s shape deliberately
+ * — it is the established regime read here, and a second differently-shaped one
+ * would be a drift hazard.
+ *
+ *   hostile       vixTermSpread > T_BACK, OR both SPY and QQQ spread < 0
+ *   constructive  vixTermSpread < T_CONTANGO AND both SPY and QQQ spread > 0
+ *   mixed         everything else
+ *
+ * ANY NULL INPUT -> 'unavailable', naming which. A partial state computed from
+ * three of four inputs is indistinguishable on screen from a full one, which is
+ * honesty rule 3 applied to a composite. The four are NOT blended into a numeric
+ * score: three states plus the raw numbers keeps every input visible and the
+ * classification auditable.
+ *
+ * `vixLevel` is carried and displayed but does NOT enter the classification —
+ * an absolute fear level is not comparable across regimes. It still counts as a
+ * required input, because a null VIX means the term spread is null too.
+ */
+function macroClassify(inputs, gates = MACRO_GATES) {
+  const { spySpread, qqqSpread, vixLevel, vixTermSpread } = inputs || {};
+  const missing = [];
+  if (!Number.isFinite(spySpread))     missing.push(`SPY ${gates.trendFast}/${gates.trendSlow} SMA spread`);
+  if (!Number.isFinite(qqqSpread))     missing.push(`QQQ ${gates.trendFast}/${gates.trendSlow} SMA spread`);
+  if (!Number.isFinite(vixLevel))      missing.push('VIX level');
+  if (!Number.isFinite(vixTermSpread)) missing.push('VIX term spread (^VIX − ^VIX3M)');
+
+  if (missing.length) {
+    const trendMissing = missing.some(m => m.includes('SMA'));
+    return {
+      state: 'unavailable',
+      hostileVia: null,
+      label: `Macro state unavailable — ${missing.join(', ')} missing`,
+      provisional: false,
+      reason: `${missing.join(', ')} unavailable, so no state is computed. A macro read assembled from `
+            + `${4 - missing.length} of 4 inputs is indistinguishable on screen from a complete one.`
+            + (trendMissing
+                ? ` A trend spread is null below ${gates.trendSlow + EMA_CROSS_SLOPE_BARS} sessions of `
+                  + `closes, which is smaCrossState()'s floor.`
+                : ''),
+    };
+  }
+
+  const backwardated = vixTermSpread > gates.backSpread;
+  const bothDown     = spySpread < 0 && qqqSpread < 0;
+  const bothUp       = spySpread > 0 && qqqSpread > 0;
+  const state = (backwardated || bothDown) ? 'hostile'
+              : (vixTermSpread < gates.contangoSpread && bothUp) ? 'constructive'
+              : 'mixed';
+
+  /* WHICH CLAUSE FIRED, because "hostile" on its own misdescribes the common
+     case. Measured over 2,293 sessions: 66.8% of hostile sessions came from the
+     trend clause alone, 26.8% from backwardation alone, 6.4% from both. So the
+     chip is currently more a trend read than a vol read, and a reader must not
+     have to guess which. 2022-06-16 is the case that proves it: VIX 33.0 with
+     the term spread at -0.54 — hostile while in CONTANGO. Same principle as
+     Lane E naming its failed gate instead of blanking. `null` on every
+     non-hostile state; never an empty string. */
+  const hostileVia = state !== 'hostile' ? null
+                   : (backwardated && bothDown) ? 'both'
+                   : backwardated ? 'term' : 'trend';
+
+  const sgn = v => (v > 0 ? '+' : '') + v.toFixed(2);
+  const because = state === 'hostile'
+    ? [backwardated ? `term ${sgn(vixTermSpread)} above ${sgn(gates.backSpread)} (backwardation)` : null,
+       bothDown ? 'SPY and QQQ both below their 200D' : null].filter(Boolean).join(' and ')
+    : state === 'constructive'
+      ? `term ${sgn(vixTermSpread)} below ${sgn(gates.contangoSpread)} (contango) and both indices above their 200D`
+      : `term ${sgn(vixTermSpread)} between ${sgn(gates.contangoSpread)} and ${sgn(gates.backSpread)}`
+        + (bothUp ? '' : bothDown ? '' : ', indices split');
+
+  return {
+    state,
+    hostileVia,
+    label: `Macro ${state}${hostileVia ? ` (${hostileVia})` : ''} — ${because} · SPY ${sgn(spySpread)}% `
+         + `QQQ ${sgn(qqqSpread)}% vs ${gates.trendSlow}D · VIX ${vixLevel.toFixed(2)} · term ${sgn(vixTermSpread)}`,
+    provisional: false,
+    reason: null,
+  };
+}
+
+/** Trailing mean over the last `n` values, per position. Leading positions
+ *  average what exists rather than returning null — a partial mean at index 0 is
+ *  the raw value, which is the honest answer and not a stand-in for anything. */
+function trailingMean(arr, n) {
+  return arr.map((_, i) => {
+    const w = arr.slice(Math.max(0, i - (n - 1)), i + 1).filter(Number.isFinite);
+    return w.length ? Math.round(w.reduce((a, b) => a + b, 0) / w.length * 100) / 100 : null;
+  });
+}
+
+/**
+ * Build BOTH records from an aligned pull: `{ head, series }`, stored under
+ * `macro:state` and `macro:series` respectively. Split out from the collector so
+ * the check script can drive it with fixtures and so the Part A derivation could
+ * classify every historical session with the SAME code the live read uses.
+ */
+function buildMacroRecord(al, { asOfTs = Date.now(), gates = MACRO_GATES } = {}) {
+  const spySpreads = maSpreadSeries(al.spy);
+  const qqqSpreads = maSpreadSeries(al.qqq);
+  const n = al.dates.length;
+  const last = n - 1;
+
+  const termRaw = al.vix.map((v, i) => {
+    const b = al.vix3m[i];
+    return (Number.isFinite(v) && Number.isFinite(b)) ? Math.round((v - b) * 100) / 100 : null;
+  });
+  /* Smoothed over the FULL pull before slicing, so the slice's first sessions
+     carry a complete trailing window rather than a shorter partial one. */
+  const termSmooth = trailingMean(termRaw, gates.smoothSessions ?? MACRO_SMOOTH_SESSIONS);
+
+  /* The LIVE trend values come from `smaCrossState`, which is the function §1
+     names and which carries the <205-bar null guard. `maSpreadSeries` supplies
+     the history. They compute the same quantity with the same rounding; the
+     check script asserts they agree at the last index rather than trusting it. */
+  const spyState = smaCrossState(al.spy, gates.trendFast, gates.trendSlow);
+  const qqqState = smaCrossState(al.qqq, gates.trendFast, gates.trendSlow);
+
+  const spySpread = spyState?.spread ?? null;
+  const qqqSpread = qqqState?.spread ?? null;
+  const vixLevel  = Number.isFinite(al.vix[last]) ? Math.round(al.vix[last] * 100) / 100 : null;
+
+  /* THE CLASSIFIER IS HANDED THE SMOOTHED SPREAD. `vixTermSpread` (raw) is
+     stored and rendered beside it but decides nothing — see the constants block.
+     Passing the raw one here would silently restore a 2-session median run. */
+  const cls = macroClassify({ spySpread, qqqSpread, vixLevel, vixTermSpread: termSmooth[last] }, gates);
+
+  const vix3mLast = al.vix3m[last];
+  const vixTermRatio = (Number.isFinite(vixLevel) && Number.isFinite(vix3mLast) && vixLevel)
+    ? Math.round(vix3mLast / vixLevel * 1000) / 1000
+    : null;
+
+  const laggedReason = al.lagged
+    ? `One input lagged: ${al.laggingSymbols.join(', ')} had no close on `
+      + `${Object.values(al.lastPerSymbol).sort().pop()}, so the state describes ${al.dates[last]} — `
+      + `the newest session all four share.`
+    : null;
+
+  const head = {
+    schema: MACRO_SCHEMA,
+    state: cls.state,
+    hostileVia: cls.hostileVia,
+    label: cls.label,
+    provisional: cls.provisional || !!al.lagged,
+    reason: [cls.reason, laggedReason].filter(Boolean).join(' ') || null,
+    asOfClose: al.dates[last],
+    spySpread, qqqSpread, vixLevel,
+    vixTermSpread: termRaw[last],              // RAW — displayed, never classified on
+    vixTermSpreadSmoothed: termSmooth[last],   // the value the classifier saw
+    vixTermRatio,                              // display only, never the classifier
+    gates,
+    ts: asOfTs,
+    sessions: { ...al.counts, aligned: al.aligned },
+    range: MACRO_RANGE,
+  };
+
+  /* THE STORED SLICE IS THE DERIVED PER-SESSION STATE, NOT RAW CLOSES.
+     Phase 2 needs the regime each historical window started in, and the trend
+     spreads must be computed over the FULL 10y pull so the SMA200 is valid from
+     the slice's first session. Storing closes instead would force phase 2 to
+     redo that with a shorter runway and quietly different numbers.
+     Read by NOTHING in phase 1 — that is the point of the separate key. */
+  const from = Math.max(0, n - MACRO_SLICE_DAYS);
+  const series = {
+    schema: MACRO_SCHEMA,
+    note: 'derived per-session inputs, computed over the full pull then sliced — phase 2 reads these. '
+        + 'Nothing on the request path reads this key.',
+    ts: asOfTs,
+    asOfClose: al.dates[last],
+    gates,
+    dates:                 al.dates.slice(from),
+    spySpread:             (spySpreads || []).slice(from),
+    qqqSpread:             (qqqSpreads || []).slice(from),
+    vixLevel:              al.vix.slice(from).map(v => Math.round(v * 100) / 100),
+    vixTermSpread:         termRaw.slice(from),
+    vixTermSpreadSmoothed: termSmooth.slice(from),
+  };
+  head.sessions.stored = series.dates.length;
+
+  return { head, series };
+}
+
+/** ONE KV read of the ~640-byte `macro:state` key. `macro:series` is NOT read
+ *  here and must not be — see the two-key note above.
+ *  A schema mismatch reads as ABSENT so an old shape retires rather than
+ *  rendering as blanks: the same strict equality `readMoveSeries` uses, for the
+ *  same reason. */
+async function readMacroState(env) {
+  let rec = null;
+  try { rec = await env?.REC_LOG?.get(MACRO_KEY, 'json'); } catch (_) { rec = null; }
+  if (!rec || rec.schema !== MACRO_SCHEMA) {
+    /* "We have not looked yet" is not "there is nothing there" (honesty rule 11).
+       The collector REFUSES rather than storing an unavailable record, so an
+       absent key means the sweep has not run or declined to write — which is a
+       fact about our scheduler, and the reason says so. */
+    return {
+      schema: MACRO_SCHEMA, state: 'unavailable', hostileVia: null,
+      label: 'Macro state unavailable — no record',
+      provisional: false,
+      reason: rec ? `stored record is schema ${rec.schema}, not ${MACRO_SCHEMA} — it retires rather than `
+                  + 'rendering under the current field meanings'
+                  : 'the 1:15pm PT macro collection has not run, or refused on an upstream failure. '
+                  + 'This is a fact about our own scheduler, not about the market.',
+      asOfClose: null, spySpread: null, qqqSpread: null, vixLevel: null,
+      vixTermSpread: null, vixTermSpreadSmoothed: null, vixTermRatio: null,
+      gates: MACRO_GATES, ts: null,
+      ageMs: null, stale: true, freshMs: MACRO_FRESH_MS,
+      usedForRanking: false,
+      notUsedNote: 'Shown for context. Macro state does not sort, gate or filter anything on this screen — '
+                 + 'it has not been measured against outcomes.',
+    };
+  }
+  const ageMs = Number.isFinite(rec.ts) ? Date.now() - rec.ts : null;
+  return {
+    ...rec,
+    ageMs,
+    stale: ageMs == null ? true : ageMs >= MACRO_FRESH_MS,
+    freshMs: MACRO_FRESH_MS,
+    /* PHASE 1 IS DISPLAY ONLY, and the payload says so rather than leaving it to
+       the frontend's copy. Removing this sentence is a phase 2 decision. */
+    usedForRanking: false,
+    notUsedNote: 'Shown for context. Macro state does not sort, gate or filter anything on this screen — '
+               + 'it has not been measured against outcomes.',
+  };
+}
+
+/**
+ * 1:15pm PT — bank one macro record.
+ *
+ * A SEPARATE SPARK CALL, deliberately not appended to `sweepUniverse()`'s array.
+ * Three reasons and the third would have been silent: that array also drives the
+ * per-ticker write loop (so merged symbols would write `moves:^VIX` keys); it
+ * puts non-watchlist symbols inside the empty-universe refusal logic that was
+ * built to have exactly one source; and `collectMoveSeries` returns early when
+ * `movesweep:last === ptDate()`, so a macro collection nested inside it would
+ * silently not run whenever the move sweep had already run — rule #7's signature
+ * exactly. The merge would have been free on chunk arithmetic (spark chunks at
+ * 20, so 33 and 37 are both 2 chunks — the boundary is 40, not 20). Taken
+ * separately anyway: 1 external fetch/day for total isolation and an independent
+ * range.
+ *
+ * REFUSES BEFORE STAMPING `macrosweep:last`, the same contract `recordWatchlistIv`
+ * and `collectMoveSeries` follow, so the next firing retries. It also never
+ * overwrites a good record with an unavailable one: a partial pull is an upstream
+ * failure to retry, not a finding to publish.
+ */
+async function collectMacroState(env) {
+  if (!env?.REC_LOG) return;
+  const mark = instrMark();
+
+  try {
+    const last = await env.REC_LOG.get(MACRO_SWEEP_KEY);
+    if (last === ptDate()) { console.log('[cron] macro state already collected today, skipping'); return; }
+  } catch (_) {}
+
+  const symbols = Object.values(MACRO_SYMBOLS);
+  let series;
+  try {
+    series = await yahooSparkCloses(symbols, MACRO_RANGE, 4, { withTimestamps: true });
+  } catch (e) {
+    console.error(`[cron] !! MACRO-COLLECT !! spark failed for ${symbols.join(',')} — ${e.message}. `
+      + 'REFUSING to write; no dedup key stamped, so the next firing retries.');
+    return;
+  }
+
+  const al = alignMacroSeries(series);
+  if (!al.ok) {
+    console.error(`[cron] !! MACRO-COLLECT !! ${al.reason}. REFUSING to write rather than storing a partial `
+      + 'state — an existing record is left alone and no dedup key is stamped, so the next firing retries.');
+    return;
+  }
+
+  const { head, series: slice } = buildMacroRecord(al);
+  if (head.state === 'unavailable') {
+    console.error(`[cron] !! MACRO-COLLECT !! ${head.reason} REFUSING to overwrite the stored record with an `
+      + 'unavailable one; no dedup key stamped.');
+    return;
+  }
+
+  /* SERIES FIRST, STATE SECOND, DEDUP LAST. Phase 1 reads only the state key, so
+     writing the series first means a half-written pair never leaves the request
+     path pointing at a state whose series is older. Either write failing skips
+     the dedup stamp, so the next firing rewrites both — the whole thing is
+     idempotent. */
+  const seriesBody = JSON.stringify(slice);
+  const headBody   = JSON.stringify(head);
+  try {
+    await env.REC_LOG.put(MACRO_SERIES_KEY, seriesBody, { expirationTtl: MACRO_TTL });
+    await env.REC_LOG.put(MACRO_KEY, headBody, { expirationTtl: MACRO_TTL });
+  } catch (e) {
+    console.error(`[cron] !! MACRO-COLLECT !! KV write failed — ${e.message}. No dedup key stamped, `
+      + 'so the next firing retries.');
+    return;
+  }
+  try { await env.REC_LOG.put(MACRO_SWEEP_KEY, ptDate(), { expirationTtl: 172800 }); } catch (_) {}
+
+  console.log(
+    `[cron] macro state: ${head.state}${head.hostileVia ? ` (via ${head.hostileVia})` : ''} · `
+    + `asOf ${head.asOfClose} · SPY ${head.spySpread} QQQ ${head.qqqSpread} VIX ${head.vixLevel} · `
+    + `term raw ${head.vixTermSpread} / smoothed${MACRO_SMOOTH_SESSIONS} ${head.vixTermSpreadSmoothed} `
+    + `(VIX−VIX3M, positive=backwardation=hostile; the SMOOTHED one classifies) · `
+    + `sessions ${JSON.stringify(head.sessions)} · macro:state ${headBody.length}B `
+    + `macro:series ${seriesBody.length}B · ${JSON.stringify(instrSince(mark, 'complete'))}`,
   );
 }
 
@@ -9282,9 +9839,17 @@ export default {
       branch = 'midday-pulse';
       ctx.waitUntil(generateMiddaySnapshot(env));      // 11:30am PT midday pulse (retries to 1pm; KV dedup skips once complete)
     } else if (h === 13 && m >= 15 && m < 45) {
-      branch = 'eod+iv-sweep';
+      branch = 'eod+iv-sweep+macro';
       ctx.waitUntil(generateEODSummary(env));          // 1:15pm PT EOD summary
       ctx.waitUntil(recordWatchlistIv(env));           // 1:15pm PT bank one IV sample per watchlist name
+      /* 1:15pm PT, NOT the 2:00pm branch. `collectMoveSeries` runs at 2:00pm, so
+         a macro record written here is 45 minutes old when the move sweep could
+         read it, with no request-path race — the same no-race pattern already
+         specified for the `gap` structural baseline reading `iv:{TICKER}:{DATE}`.
+         Costs 1 external fetch (4 symbols, one spark chunk). Shares this
+         invocation's subrequest budget with the two jobs above: `ctx.waitUntil`
+         does not get its own. */
+      ctx.waitUntil(collectMacroState(env));           // 1:15pm PT bank one macro state record
     } else if (h === 14 && m < 30) {
       branch = 'forward-returns+moves';
       ctx.waitUntil(fillForwardReturns(env));          // 2:00pm PT resolve 5/20-session forward returns

@@ -619,6 +619,39 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .lane-e-split { font-family: var(--mono); font-size: 9px; color: var(--ink-3); margin-left: 4px; }
 .lane-e-split.lopsided { color: var(--amber); }
 
+/* ── Macro chip — ONE per screen, in the Long tab header ─────────────────────
+   Not per row, not per lane, not per candidate. Macro is one fact about the day;
+   repeating it 33 times is noise. Colour is the STATE, and the not-used-for-
+   ranking line is visible body text rather than a tooltip, because a coloured
+   chip beside a ranked list reads as a ranking input unless it says otherwise. */
+.macro-chip { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 10px;
+  margin-top: 8px; padding: 7px 11px; border-radius: 5px; background: var(--bg-2);
+  border: 1px solid var(--bg-3); border-left: 3px solid var(--ink-3);
+  font-family: var(--mono); font-size: 10px; color: var(--ink-2); }
+.macro-chip.constructive { border-left-color: var(--bull); }
+.macro-chip.mixed        { border-left-color: var(--amber); }
+.macro-chip.hostile      { border-left-color: var(--bear); }
+.macro-chip.unavailable  { border-left-color: var(--ink-3); }
+.macro-state { font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.macro-chip.constructive .macro-state { color: var(--bull); }
+.macro-chip.mixed        .macro-state { color: var(--amber); }
+.macro-chip.hostile      .macro-state { color: var(--bear); }
+.macro-chip.unavailable  .macro-state { color: var(--ink-3); }
+/* WHICH CLAUSE FIRED. 66.8% of hostile sessions came from the index-trend clause
+   alone, so a bare "hostile" misdescribes the common case. */
+.macro-via { padding: 1px 5px; border-radius: 3px; background: rgba(242,95,92,0.16);
+  color: var(--bear); font-weight: 600; }
+.macro-num { color: var(--ink-1); }
+.macro-num b { color: var(--ink-0); font-weight: 600; }
+.macro-sep { color: var(--ink-3); }
+/* Same age treatment as Lane E's gate verdict, and for the same reason: the
+   record is written by cron and read per request, so it can be a day old. */
+.macro-age { padding: 1px 6px; border-radius: 3px; background: var(--bg-3); color: var(--ink-3); }
+.macro-age.warm  { background: rgba(94,197,234,0.16); color: var(--cyan); }
+.macro-age.stale { background: rgba(244,183,64,0.18); color: var(--amber); font-weight: 600; }
+.macro-note { flex-basis: 100%; color: var(--ink-3); font-size: 9px; line-height: 1.5; }
+.macro-note b { color: var(--ink-2); }
+
 /* Lane F. Max loss is the figure the lane exists to show, so it gets the danger
    treatment rather than sitting as an ordinary cell among twelve others. */
 .lane-f-maxloss { color: var(--bear) !important; font-weight: 600; }
@@ -956,10 +989,12 @@ th.lane-f-maxloss { color: var(--bear) !important; }
         <div style="font-family:var(--serif);font-size:22px;font-weight:300;color:var(--ink-0);">
           Long <span class="src-tag" id="long-badge"></span>
         </div>
-        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Long-premium screen · LEAPS · swing · debit verticals · calendars · ranked by breakeven vs expected move</div>
+        <div style="font-family:var(--mono);font-size:10px;color:var(--ink-3);margin-top:3px;">Long-premium screen · LEAPS · swing · debit verticals · calendars · straddles · credit spreads · ranked by expectancy</div>
       </div>
       <button class="wl-btn refresh" id="long-refresh-btn">↺ Refresh</button>
     </div>
+    <!-- ONE macro chip for the whole screen. Never per row, never per lane. -->
+    <div id="long-macro"></div>
     <div id="long-content">
       <div class="loading" style="padding:40px;text-align:center;">Loading long screen…</div>
     </div>
@@ -2088,6 +2123,10 @@ function fetchLongRow(sym, { force = false } = {}) {
     if (!res.row) throw new Error(res.missing?.reason || 'no row returned');
     longData.rows = (longData.rows || []).filter(r => r.symbol !== sym).concat(res.row);
     longData.missing = (longData.missing || []).filter(m => m.symbol !== sym);
+    /* Every /api/long/* path carries the macro envelope, so re-age the chip from
+       whichever response arrived last rather than leaving it on the batch read's
+       timestamp. */
+    if (res.macro) longData.macro = res.macro;
     return res.row;
   })().finally(() => longInflight.delete(sym));
   longInflight.set(sym, p);
@@ -2967,9 +3006,71 @@ function setLongSort(col) {
   renderLong(longData);
 }
 
+/* ── The macro chip ──────────────────────────────────────────────────────────
+ * ONE chip, in the Long tab header. Reads `data.macro` from the response
+ * ENVELOPE — never from a row, and never per candidate.
+ *
+ * PHASE 1 IS DISPLAY ONLY, and that sentence is visible body text rather than a
+ * tooltip. A coloured state chip sitting above a ranked list reads as a ranking
+ * input unless it explicitly says it is not one, and macro state has never been
+ * measured against outcomes here. The sentence comes out only when phase 2
+ * justifies removing it.
+ */
+function macroChip(m) {
+  if (!m) return '';
+  const state = String(m.state || 'unavailable');
+  const g = m.gates || {};
+
+  if (state === 'unavailable') {
+    return `<div class="macro-chip unavailable">
+      <span class="macro-state">macro unavailable</span>
+      <span class="macro-note">${esc(m.reason || 'no macro record.')}
+        Nothing is substituted — an absent read and a computed state must not look the same.</span>
+    </div>`;
+  }
+
+  const sgn = (v, d = 2) => v == null ? '—' : (v > 0 ? '+' : '') + Number(v).toFixed(d);
+  const mins = Number.isFinite(m.ageMs) ? Math.round(m.ageMs / 60000) : null;
+  const ageTxt = mins == null ? 'unknown age'
+    : mins >= 1440 ? `${Math.floor(mins / 1440)}d ${Math.floor((mins % 1440) / 60)}h old`
+    : mins >= 60   ? `${Math.floor(mins / 60)}h ${mins % 60}m old`
+    : `${mins}m old`;
+  const ageCls = m.stale ? 'stale' : (mins != null && mins >= 60) ? 'warm' : '';
+
+  /* hostileVia: 'term' | 'trend' | 'both'. Rendered because "hostile" alone
+     misdescribes the common case — 66.8% of hostile sessions came from the
+     index-trend clause with the VIX term structure in contango. */
+  const viaLabel = { term: 'term structure', trend: 'index trend', both: 'term + trend' };
+  const via = m.hostileVia
+    ? `<span class="macro-via" title="Which clause fired. Measured over 2,293 sessions (2017-05-31 … 2026-08-11): the index-trend clause alone produced 66.8% of hostile sessions, backwardation alone 26.8%, both together 6.4%. 2022-06-16 classified hostile at VIX 33.0 with the term spread at −0.54 — i.e. while in contango — which is why this is named rather than left to be guessed.">via ${esc(viaLabel[m.hostileVia] || m.hostileVia)}</span>`
+    : '';
+
+  const back = m.vixTermSpreadSmoothed != null && m.vixTermSpreadSmoothed > 0;
+
+  return `<div class="macro-chip ${esc(state)}">
+    <span class="macro-state" title="${esc(m.label || '')}">macro ${esc(state)}</span>${via}
+    <span class="macro-sep">·</span>
+    <span class="macro-num" title="SPY and QQQ ${g.trendFast ?? 50}-day SMA against their ${g.trendSlow ?? 200}-day, as % of the slower. Both above is one half of the constructive condition; both below is one of the two hostile clauses on its own.">SPY <b>${sgn(m.spySpread, 1)}%</b> QQQ <b>${sgn(m.qqqSpread, 1)}%</b> vs ${g.trendSlow ?? 200}D</span>
+    <span class="macro-sep">·</span>
+    <span class="macro-num" title="^VIX last close. Carried and shown, but it does NOT enter the classification — an absolute fear level is not comparable across regimes.">VIX <b>${m.vixLevel == null ? '—' : Number(m.vixLevel).toFixed(2)}</b></span>
+    <span class="macro-sep">·</span>
+    <span class="macro-num" title="vixTermSpread = ^VIX − ^VIX3M. POSITIVE IS BACKWARDATION AND POSITIVE IS HOSTILE — the same sign convention as the Long tab's own termStructure = front − back, which Lane E gates on. The ${g.smoothSessions ?? 5}-session mean is what classifies; the raw value is shown beside it and decides nothing. Gates: hostile above ${sgn(g.backSpread)}, constructive below ${sgn(g.contangoSpread)}.">term <b>${sgn(m.vixTermSpreadSmoothed)}</b> <span class="macro-sep">(${g.smoothSessions ?? 5}d mean; raw ${sgn(m.vixTermSpread)})</span> ${back ? 'backwardation' : 'contango'}</span>
+    <span class="macro-age ${ageCls}" title="Written once a trading day by the 1:15pm PT cron and read per request, so it can legitimately be up to a day old — and older across a weekend or a holiday. Badged stale past ${Math.round((m.freshMs ?? 0) / 3600000)}h. Classified on the ${esc(m.asOfClose || '?')} close.">⏱ ${esc(ageTxt)} · close ${esc(m.asOfClose || '?')}</span>
+    ${m.provisional && m.reason ? `<span class="macro-note"><b>Provisional.</b> ${esc(m.reason)}</span>` : ''}
+    <span class="macro-note"><b>Shown for context. Macro state does not sort, gate or filter anything on
+      this screen.</b> It has not been measured against outcomes, and a signal that has not been measured
+      must not reorder a list — that is the mistake the directional alignment tag already made here. The
+      three states are read off SPY/QQQ trend and the VIX term structure at fixed thresholds
+      (${sgn(g.backSpread)} / ${sgn(g.contangoSpread)}) derived from 2,293 historical sessions; the four
+      inputs are never blended into a score, so every one of them stays visible above.</span>
+  </div>`;
+}
+
 function renderLong(data) {
   const el = document.getElementById('long-content');
   setBadge('long-badge', data._meta);
+  const macroEl = document.getElementById('long-macro');
+  if (macroEl) macroEl.innerHTML = macroChip(data.macro);
 
   const rows = data.rows || [];
   const missing = (data.missing || []).map(m => ({ ...m, ok: false, lanes: [], bestBeEm: null }));

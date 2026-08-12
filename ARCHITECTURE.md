@@ -4,8 +4,8 @@
 
 ```
 trading_dash/
-├── dashboard.html       # Macro landing view — 7 tabs (market, midday, scanner,
-│                        #   watchlist, sectors, premium, long)
+├── dashboard.html       # Macro landing view — 6 tabs (market, midday, scanner,
+│                        #   watchlist, sectors, long)
 ├── index.html           # Per-ticker research page — hero + 14 numbered cards
 ├── worker.js            # Cloudflare Worker: Yahoo / SEC EDGAR / FINRA / FRED /
 │                        #   Alpaca proxy, Claude calls, KV persistence, cron jobs
@@ -21,7 +21,12 @@ trading_dash/
 ├── instr-bindings.check.mjs # The binding counter: shape detection, automatic
 │                        #   pickup of a new binding, and its failure paths
 ├── cron-gate.check.mjs  # Cron trading-day gate check — weekends, NYSE holidays,
-│                        #   both DST regimes; prints computed vs expected
+│                        #   both DST regimes; prints computed vs expected. Also the
+│                        #   cheapest real ES-MODULE parse of worker.js — `node --check`
+│                        #   parses it as CommonJS and misses duplicate declarations
+macro.check.mjs       # macroRegime phase 1 — sign convention, both thresholds,
+│                        #   hostileVia, date alignment vs brute force, all four
+│                        #   states, and collectMacroState's cost with stub bindings
 ├── cors-check.html      # Open in a BROWSER to verify CORS preflight; curl cannot
 ├── package.json         # wrangler devDependency only; there is no build step
 ├── .dev.vars            # LOCAL SECRETS — gitignored, absent on a fresh clone
@@ -45,7 +50,7 @@ moved into the Worker and shipped in the payload (`volRegime`, gate thresholds).
 | Scanner | Momentum / HOD · Pre-Market Gappers · All Movers · **Golden Cross Setup** | first three `/api/market/scanner`; golden cross has its own endpoint and renderer |
 | Watchlist | 14 columns, sortable, expandable rows, one consolidated Recommendation | `/api/watchlist/batch` |
 | Sectors | 11 SPDR sectors, ETF change + Claude opportunity/avoid per sector | `/api/market/sectors`, 4h KV |
-| **Long** | **The only options screen.** Six lanes — LEAPS / swing / debit verticals / calendars / straddle+strangle / defined-risk credit spreads. Collapsed rows, expand to fetch | `/api/long/batch` (KV only) + `/api/long/:ticker` on expand |
+| **Long** | **The only options screen.** Six lanes — LEAPS / swing / debit verticals / calendars / straddle+strangle / defined-risk credit spreads. Collapsed rows, expand to fetch. Carries the **macro chip** in its header — one per screen, display only | `/api/long/batch` (KV only) + `/api/long/:ticker` on expand |
 
 **There is no Premium tab.** It existed from 2026-08 until **2026-08-10**, when it
 was merged into the Long screen as **Lane F** — short premium is secondary here and
@@ -513,18 +518,30 @@ The Long tab's directional alignment tag renders and has **no sort influence**.
 `affectsSort` is false everywhere. This is a **data-driven disable, not dead code**
 — the machinery is intact and lights up again if the measurement changes.
 
-Measured 2026-08-10 across the whole recommendation log (63 `rec:` keys, 290
-resolved outcomes), against the base rate for the same population and window:
+Read off the shipped `calib:pooled` record via `directionalRead()` on deployed rows,
+2026-08-11 (`pooledAsOf: 2026-08-10`, 300 resolved outcomes), against the base rate
+for the same population and window:
 
-| outcome | rate | base rate | edge | n |
+| outcome | rate | base rate | edge | benchmarked n |
 |---|---|---|---|---|
-| sign-scored BUY (`fwd20 > 0`) | 53.3% | 61.4% | **−8.1 pts** | 75 |
-| magnitude-scored BUY (`fwd20 ≥ median abs move`) | 17.3% | 34.3% | **−16.9 pts** | 75 |
+| sign-scored BUY (`fwd20 > 0`) | **50.5%** | **60.5%** | **−10.1 pts** | 109 |
+| magnitude-scored BUY (`fwd20 ≥ median abs move`) | **20.2%** | **33.7%** | **−13.5 pts** | 109 |
 
-53.3% reads as a coin flip. It is a **negative edge**: these names drifted up, so
-`P(fwd20 > 0)` over the same 20-session windows is 61.4%, and the rating
+50.5% reads as a coin flip. It is a **negative edge**: these names drifted up, so
+`P(fwd20 > 0)` over the same 20-session windows is 60.5%, and the rating
 underperformed simply being long. The magnitude test — the one that actually
 matters for buying options, since "went up at all" does not pay a debit — is worse.
+
+> **SUPERSEDED, 2026-08-11.** This table read **53.3 / 61.4 / −8.1** and
+> **17.3 / 34.3 / −16.9** at **n=75, 290 resolved**. Those figures came from an
+> **ad-hoc analysis script, not from `recCalibration()`** — they carry the same
+> date as the live pooled record and still disagree with it. The values above are
+> what the shipped code emits, cross-checked against a hand recount (NVDA 9/19 =
+> 0.4737, matching the endpoint exactly) and a brute-force rebuild of
+> `baseRatesFrom` from raw closes (median |20d| 7.34% and `P(20d ≥ median)` 0.3575,
+> both exact). Do not restore the old numbers from a stale reading; the full note,
+> including the **unexplained population gap that remains open**, is under "No hit
+> rate goes on screen without its base rate" in `CLAUDE.md`.
 
 **Both outcomes score below their benchmark, so any sort influence would reorder
 candidates on a measured non-edge.** That is worse than reordering on nothing: the
@@ -540,8 +557,10 @@ clearing both floors — not a rate that merely exists.
 > worse; and 173 of 290 entries are HOLD, which is excluded — so the measured
 > signal is thin.
 
-(The n in those caveats was 76 at the time of the analysis; the shipped
-same-population computation puts it at 75. Nothing else changes.)
+(The n in those caveats was 76 at the time of that analysis; the shipped
+computation now reports **109 benchmarked of 300 resolved**. The caveats stand —
+they are about the *shape* of the evidence, and a thin, survivor-biased,
+HOLD-dominated log at n=109 is thin in exactly the same ways it was at n=76.)
 
 Two floors guard the figures behind this. `REC_CALIB_MIN_N` (10) gates the total
 resolved count; **`REC_RATING_MIN_N` (10) gates each rating's own cell**, because a
@@ -593,6 +612,7 @@ Where a paid feed would still add something real, it is named in the notes.
 | 16 | News flow | Alpaca news when keyed, Yahoo `search` otherwise | **real** | Benzinga ($177) |
 | — | ~~Premium screen (dashboard)~~ | **DELETED 2026-08-10.** Became Lane F of the Long screen. See the aROC note below | — | — |
 | — | Long screen (dashboard) | Yahoo chain via `/api/long/:ticker`, one ticker per request: six lanes, ask-based debit (bid-based credit on F), breakeven, BE/EM, extrinsic %, leverage, annualised carry, theta, vega, `P(BE)@exp` from N(d2). Reuses `premium:{TICKER}`'s slower-moving fields when fresh (4 external fetches) and refetches them when not (8) | **real** — Lane D's breakeven/BE/EM/P(BE)/carry are **suppressed**, not estimated | ORATS for a historical IV surface; a term-structure model would unlock Lane D |
+| — | Macro regime chip (Long tab header) | **Yahoo spark** — SPY, QQQ, `^VIX`, `^VIX3M`, 10y, one request/day banked by the 1:15pm PT cron into `macro:state`. SPY/QQQ trend from `smaCrossState(50,200)`; term structure = `^VIX` − `^VIX3M`, 5-session trailing mean | **real** — thresholds derived from 2,293 historical sessions; **phase 1 is display only and ranks nothing** | — |
 | — | Long screen · `cov` / `gap` / `E[R]` / `E[$]` | **Measured** from `moves:{TICKER}` — 3y of Yahoo daily closes banked by the 2pm PT sweep (2 external fetches for the whole watchlist), then overlapping N-session windows. `cov` is an empirical frequency, `p(be)` beside it is modelled; `E[R]` is mean P/L over those windows ÷ capital risked | **real** — 1y/3y never averaged; horizons the history cannot support return null naming the numbers; `gapBaseline` null this release | ORATS for a historical IV surface would let `pBe` be checked against a *measured* IV rather than only against realized moves |
 
 ## Design note: the naked-margin aROC denominator, and why it is gone
@@ -719,7 +739,7 @@ GET  /api/options/:ticker          ?date=<unix>
 GET  /api/iv/:ticker               ATM IV front/back, term structure, IV rank, HV30, POP ladder
 GET  /api/premium/*                REMOVED 2026-08-10 — returns 410. Became Lane F of the Long screen.
 GET  /api/watchlist                The saved list; read path for the adopt-on-empty bootstrap
-GET  /api/long/batch?symbols=      Long screen — no fetches; 1 KV read/symbol (33 = capCost 33)
+GET  /api/long/batch?symbols=      Long screen — no fetches; 1 KV read/symbol + 1 macro read (33 = capCost 34)
 GET  /api/long/:ticker             One ticker (?refresh=1 forces, ?cached=1 never fetches)
 GET  /api/insider/:ticker          SEC EDGAR Form 4, last 90 days
 GET  /api/short/:ticker            FINRA consolidated short interest (Yahoo fallback)
@@ -728,7 +748,7 @@ GET  /api/earnings/:ticker         Last report: numbers, price reaction, call co
 GET  /api/search?q=apple           Ticker search
 GET  /api/news/:ticker             Alpaca news → Yahoo fallback
 GET  /api/peers/:ticker            Yahoo recommendationsBySymbol
-POST /api/claude                   {messages, max_tokens?, system?, output_config?}  ⚠ unauthenticated
+POST /api/claude                   REMOVED — returns 410. Was an unauthenticated LLM passthrough.
 POST /api/log-rec                  {ticker, rating, confidence, price, factors}
 GET  /api/track/:ticker            Rating history + calibration
 GET  /api/daily                    Morning briefing + EOD + midday, from KV
@@ -793,10 +813,11 @@ as planned; if you find language that does, it is stale and wrong.
 | **2** | **Pooled calibration + magnitude-scored outcome** — `calib:pooled`, per-rating floor, base rates beside every rate | **SHIPPED** 2026-08-10 |
 | **3** | **Lane E** — straddle + strangle, two-sided coverage and P(BE), the hold-to-expiry caveat | **SHIPPED** 2026-08-10 |
 | **4** | **Premium merged into Long as Lane F** — defined-risk credit spreads; the standalone Premium tab, its row model and `/api/premium/*` deleted | **SHIPPED** 2026-08-10 |
-| **5** | **`macroRegime`** | **NEXT — not started, no spec written yet** |
+| **5** | **`macroRegime` phase 1** — SPY/QQQ trend + VIX level + VIX term structure, one chip in the Long tab header, **display only: no sort, no gate, no blend** | **SHIPPED** 2026-08-11 |
 
 Everything under "Not yet done" is genuinely outstanding. It does **not** include
-steps 1–4.
+steps 1–5, but it **does** include `macroRegime` **phase 2**, which is specified
+and deliberately unbuilt.
 
 ## Not yet done
 
@@ -868,6 +889,38 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    per-rating floor already reaches that card — so the n=1 100% is fixed there. But
    the card still renders only the raw rate. Surfacing the benchmark means touching
    `index.html`, which is a separate commit.
+
+12. **`macroRegime` phase 2 — does macro state actually SEPARATE outcomes?**
+   Phase 1 displays the state and deliberately does not rank on it. Phase 2 is the
+   measurement that could earn a ranking influence, and nothing else can:
+   `moves:{TICKER}` stores `[return, startIdx]` pairs, so if each historical
+   session index can be mapped to a date, every window can be labelled with the
+   regime it started in and coverage computed conditioned on regime — *"in
+   backwardated-VIX regimes NVDA cleared this breakeven 14% of the time, against
+   31% across all regimes."* `macro:series` already holds the 3y per-session slice
+   precisely so no second collection pass is needed. Mapping `startIdx` to a date
+   needs a **`MOVES_SCHEMA` bump**, which retires every cached blob and blanks the
+   coverage columns until the next 2:00pm sweep — a phase 2 decision, and it was
+   deliberately **not** taken in phase 1.
+
+   **The likely outcome, stated in advance so it is not read as a failure:**
+   conditioning splits an already-thin sample. At N=45 a 3y series gives ~15.8
+   independent windows; split three ways that is ~5.3 per regime against
+   `COVERAGE_MIN_INDEPENDENT = 4` — and 5.3 is optimistic, because regimes arrive
+   in contiguous stretches (measured: median hostile run 7 sessions, p90 55) so
+   conditioned windows are far more autocorrelated than an even split implies.
+   Pooling across the 33 names does not fix it: they share the regime by
+   construction, so pooling adds windows without adding independent observations of
+   the regime. **If conditioned coverage nulls out at most horizons that is a
+   legitimate finding, not something to engineer around.** Do not lower
+   `COVERAGE_MIN_INDEPENDENT` to buy the horizons back; the honest conclusion would
+   be that this dataset cannot support a macro-conditioned claim and `macroRegime`
+   stays informational permanently. Any conditioned figure must be reported against
+   its unconditioned base rate — 14% means nothing without the 31% beside it.
+
+   **Phase 2 should condition on `hostileVia`, not only on `state`.** Two thirds of
+   hostile sessions come from the index-trend clause with the VIX term structure in
+   contango; those are unlikely to behave like backwardation episodes.
 
 9. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
    Lightweight Charts supports custom drawings; recognition would be rules-based

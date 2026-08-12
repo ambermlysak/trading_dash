@@ -153,7 +153,7 @@ it came from. Only figures that **exceed** their derivation need explaining.
 Two things are isolated by construction and need no argument: every **request-path**
 figure (one HTTP request is one invocation running one job), and every cron branch
 that dispatches **one** `waitUntil` — `morning-briefing`, `midday-pulse` and
-`13f-slice`. Only `eod+iv-sweep` and `forward-returns+moves` dispatch two.
+`13f-slice`. `eod+iv-sweep+macro` dispatches THREE and `forward-returns+moves` two.
 
 | figure | branch | derivation | verdict |
 |---|---|---|---|
@@ -685,7 +685,7 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Nine checks exist, all of which print computed vs
+There is no build step. Ten checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
 (Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
@@ -703,13 +703,43 @@ until 60 days of IV history exist; Lane A with **two** listed Januaries; and the
 shared `ivPlausible()` guard at its boundaries), `node lane-e.check.mjs` (Lane E's two-sided half:
 two-sided coverage against brute force including a zero-contribution tail, two-sided pBe against a
 series-erf reference, both payoff functions across all four breakevens, and the drift split across
-trending / range-bound / downtrending regimes), and `node nd2.check.mjs` (the Long tab's `P(BE)@exp`,
+trending / range-bound / downtrending regimes), `node nd2.check.mjs` (the Long tab's `P(BE)@exp`,
 theta and vega — N(d2) against a reference series-erf **and** against
 e^{rT}·(−∂C/∂K) by central difference, which is a structurally different
 derivation and so catches "right arithmetic, wrong quantity"; greeks against
-numerical differentiation). All three extract functions from `worker.js` by
-source, not by import, because every named export in `worker.js` must be a
-function or `workerd` refuses to boot.
+numerical differentiation), and `node macro.check.mjs` (macroRegime phase 1: the
+term-structure SIGN convention, both classification boundaries as strict
+inequalities, `hostileVia`, date alignment against a brute-force intersection,
+`unavailable` with each of the four inputs missing in turn, the trailing mean, the
+two trend derivations agreeing, and `collectMacroState`'s exact cost and every
+refusal path driven with stub bindings). All of them extract functions from
+`worker.js` by source, not by import, because every named export in `worker.js`
+must be a function or `workerd` refuses to boot.
+
+Observed comparison counts, which are also each script's `minComparisons` floor:
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 119** for moves / long-fixtures /
+cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f / sweep-universe /
+macro — **567 comparisons** across the suite.
+
+**`node --check` IS NOT A SUFFICIENT PRE-DEPLOY PARSE, and it gave a false pass on
+this commit.** `worker.js` is an ES module; `node --check` parses it as a CommonJS
+script, where a duplicate `let`/`const` in one scope is **not** an error. A
+`const { head, series }` destructuring shadowing an existing `let series` in
+`collectMacroState` passed `node --check` with exit 0 and threw
+`SyntaxError: Identifier 'series' has already been declared` the moment anything
+loaded it as a module. Reproduced minimally, both ways. That is the same class as
+the non-function named export that once stopped `workerd` from booting — a total
+outage with no partial failure — so the check has to be one that actually parses
+it as a module:
+
+```bash
+node --check worker.js                      # NOT sufficient on its own
+node cron-gate.check.mjs                    # imports worker.js as an ES module
+npx wrangler dev                            # the real workerd startup validation
+```
+
+`cron-gate.check.mjs` is the cheap one and it caught this; run it, or a real
+`wrangler dev` boot, before believing a syntax check.
 
 ## Architecture
 
@@ -1126,6 +1156,9 @@ differs from its retention, both are given and the reason is in the notes.
 | `calib:pooled` | **none** | Pooled recommendation calibration across every `rec:` key — the basis used when a ticker has fewer than `REC_CALIB_MIN_N` resolved outcomes of its own. Written once a trading day by `fillForwardReturns()`; **no TTL on purpose**, since a stale pooled figure beats none and `d`/`ts` ride along so the reader can age it. |
 | `moves:{TICKER}` | **7d** | The historical N-session return distribution behind the Long tab's measured `cov` column, its `gap`, and the expectancy ranking. Banked by the 2:00pm PT sweep. **~60 KB/ticker measured** (largest QUBT 61,496 bytes, 2026-08-09); KV's ceiling is 25 MB. Stores sorted **`[return, startIdx]` pairs**, not bare numbers — see below. |
 | `movesweep:last` | 2d | PT date of the last move-series sweep, for dedup. **Outside the `moves:` prefix** so nothing scanning that prefix can read it as a ticker — the same rule as `ivsweep:last`. |
+| `macro:state` | **90d retention / 26h freshness** (`MACRO_FRESH_MS`) | The classified macro regime — state, `hostileVia`, the four raw inputs, both term spreads, the gates. **~640–730 bytes.** Written by the 1:15pm PT `collectMacroState`; read once per request by `/api/long/batch` and `/api/long/:ticker`. Freshness ≠ retention for the same reason as `econ:dgs3mo`: a labelled old macro read beats a blank one, and the chip renders its own age. A weekend or holiday legitimately ages it past 26h. |
+| `macro:series` | **90d** | The 756-session (~3y) slice of **derived per-session inputs** — dates, SPY/QQQ spreads, VIX level, raw and smoothed term spread — computed over the full 10y pull then sliced, so the SMA200 is valid from the slice's first session. **~31 KB. Read by NOTHING in phase 1**; it exists so phase 2 needs no second collection pass. **THE SPLIT FROM `macro:state` IS A REQUEST-PATH COST DECISION**: one key would mean every `/api/long/*` request pulls 31 KB out of KV to render a 640-byte chip, and stripping the slice on read hides that rather than avoiding it. Both keys carry `MACRO_SCHEMA` and **are bumped together**. |
+| `macrosweep:last` | 2d | PT date of the last macro collection, for dedup. **Outside the `macro:` prefix**, so nothing scanning that prefix can read it as a record — the same rule as `ivsweep:last` and `movesweep:last`. Stamped **last**, after both writes, so any failure leaves the next firing to retry. |
 | `premium:{TICKER}` | **24h retention / 4h freshness** | One premium-screen row. The two differ on purpose — see below. |
 | `long:{TICKER}` | **24h retention / 4h freshness** (`LONG_FRESH_MS`) | One long-screen row: **six lanes** (A–F), both timestamps, the buy gate and the directional read. Same freshness/retention split as `premium:` and for the same reason — past 4h the row still renders, badged stale. |
 | `cik:map` | 30d | SEC ticker→CIK map from `company_tickers.json` |
@@ -1220,7 +1253,7 @@ their own `const TTL = <number>`, which shadowed it silently and turned
 the badge. They are now **`CRUMB_TTL`, `SCAN_TTL`, `GOLDEN_TTL`, `IPO_TTL`**. Any
 new local cache window needs its own name.
 
-**Cron trigger:** a single `*/15 13-22 * * *` UTC cron — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), EOD summary + IV sample sweep (1:15pm PT), the **`forward-returns+moves`** branch (2pm PT — the forward-return fill *and* the move-series sweep), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
+**Cron trigger:** a single `*/15 13-22 * * *` UTC cron — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), the **`eod+iv-sweep+macro`** branch (1:15pm PT — EOD summary, IV sample sweep, and the macro-regime collection), the **`forward-returns+moves`** branch (2pm PT — the forward-return fill *and* the move-series sweep), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
 
 **`collectMoveSeries` runs at 2:00pm PT, not on the 1:15pm EOD branch, and the
 reason is bar settlement rather than load balance.** The NYSE closes at 1:00pm PT,
@@ -1534,25 +1567,45 @@ touches Yahoo, Load all is strictly
 sequential, expanded/sort state in `sessionStorage` under `trading_dash_long_open` /
 `trading_dash_long_sort`. `long:{TICKER}`, `LONG_FRESH_MS` 4h, retention 24h.
 
-**Measured subrequest cost (`_instr` on the response, AAPL 2026-08-08).**
-`capCost` is the number the 10,000 meters — external fetches *and* KV together.
+**Measured subrequest cost.** `capCost` is the number the 10,000 meters — external
+fetches *and* KV together.
 
-> **SUPERSEDED — the binding column below predates move coverage and pooled
-> calibration.** Correct for 2026-08-08 and no longer the live figure. Measured
-> live 2026-08-10 on AAPL: premium-**warm** `4 / 8 / 12`, premium-**cold**
-> `8 / 10 / 18`. The `+3` is `readMoveSeries` + `recordIvSample` + `calib:pooled`,
-> matching the `6 → 8 → 9` history recorded above. All of these are request-path
-> figures and so are isolated by construction — this is staleness, not the `_instr`
-> concurrency contamination. Kept because the *breakdown* column still explains
-> where the external fetches go.
+**Current figures, re-measured 2026-08-11 as a BEFORE/AFTER A/B for the macro
+read.** Both halves ran against the *same local KV state* on `wrangler dev`, which
+is the only way to attribute a one-op delta: a production "before" against a local
+"after" differs by KV *contents* (how many `iv:` pages a `list()` walks, whether
+`analysis:` exists) and would have buried the signal. AAPL / NVDA / PLTR, three
+tickers because one is a coincidence:
+
+| case | before capCost | after capCost | delta |
+|---|---|---|---|
+| `/api/long/batch`, 33 symbols | 0 ext / 33 bind / **33** | 0 / 34 / **34** | **+1** |
+| `/api/long/:ticker` **warm** (all three) | 4 / 8 / **12** | 4 / 9 / **13** | **+1** |
+| `/api/long/:ticker` **cold** — AAPL | 8 / 11 / **19** | 8 / 12 / **20** | **+1** |
+| — NVDA | 8 / 10 / **18** | 8 / 11 / **19** | **+1** |
+| — PLTR | 7 / 10 / **17** | 7 / 11 / **18** | **+1** |
+| cache hit (`?cached=1` or fresh) | 0 / 1 / **1** | 0 / 2 / **2** | **+1** |
+
+**Exactly +1 binding op on every path and zero extra external fetches**, which is
+one KV read of the ~640-byte `macro:state` key. The cold column spans 17–20 across
+three tickers on identical code — quote the *delta*, and quote the tier and the
+ticker with any absolute figure.
+
+> **SUPERSEDED HISTORY, kept because the breakdown column still explains where the
+> external fetches go.** The table below was measured 2026-08-08 and its binding
+> column predates move coverage and pooled calibration; it was corrected once
+> already on 2026-08-10 (premium-warm `4 / 8 / 12`, premium-cold `8 / 10 / 18`,
+> the `+3` being `readMoveSeries` + `recordIvSample` + `calib:pooled`). All of
+> these are request-path figures and so are isolated by construction — this is
+> staleness, not `_instr` concurrency contamination.
 
 | case | extFetches | bindingOps | **capCost** | breakdown |
 |---|---|---|---|---|
-| premium-**warm** | 4 | ~~5~~ → **8** | ~~9~~ → **12** | base list + 3 dated chains (Jan 2028, Sep, Oct) |
-| premium-**cold** | 7–8 | ~~6~~ → **10** | ~~13~~ → **18** | the above + earnings `quoteSummary` + hv30 chart |
-| premium-cold, **crumb also cold** | 9 | 8 → **11** | 17 → **~20** | + 2 crumb fetches and 2 crumb KV ops |
-| cache hit (`?cached=1` or fresh) | 0 | 1 | **1** | one KV read |
-| `/api/long/batch`, 22 symbols | 0 | 22 | **22** | one KV read per symbol |
+| premium-**warm** | 4 | ~~5~~ → 8 → **9** | ~~9~~ → 12 → **13** | base list + 3 dated chains (Jan 2028, Sep, Oct) |
+| premium-**cold** | 7–8 | ~~6~~ → 10 → **11–12** | ~~13~~ → 18 → **18–20** | the above + earnings `quoteSummary` + hv30 chart |
+| premium-cold, **crumb also cold** | 9 | 8 → 11 → **12** | 17 → ~20 → **~21** | + 2 crumb fetches and 2 crumb KV ops |
+| cache hit (`?cached=1` or fresh) | 0 | 1 → **2** | 1 → **2** | one KV read → + the macro read |
+| `/api/long/batch`, 22 symbols | 0 | 22 → **23** | **22** → **23** | one KV read per symbol, + one macro read for the whole batch |
 
 **Warm is 8 and cold is 10 because `ivHistory()` runs only on the cold path** —
 warm reuses `ivRank` / `historyDays` / `rankReason` from `premium:{TICKER}`, so the
@@ -1577,8 +1630,14 @@ riskFreeRate (econ:dgs3mo)   1     directionalRead (analysis:, rec:)   2
 readPremiumRow               1     calib:pooled                        1   ← step 2
 recordIvSample (long-live)   1     readMoveSeries                      1
 ivHistory (list)             1     storeLongRow                        1
-                                                                 total 9
+                                   readMacroState (macro:state)        1   ← step 5
+                                                                total 10
 ```
+
+**`readMacroState` is the tenth, and it is one read of `macro:state` — never
+`macro:series`.** The two-key split exists so this line stays a 640-byte read
+rather than a 31 KB one; if a future change makes the request path touch
+`macro:series`, this accounting is where it must be justified.
 
 **That 9 is the premium-COLD figure. Premium-warm is 8, and the missing op is
 `ivHistory`** — on the warm path `ivRank`, `historyDays` and `rankReason` are
@@ -1672,7 +1731,8 @@ failure would make "no straddle worth looking at" and "no data for this name"
 identical on screen.
 
 **The `analysis:` rating is deliberately NOT a gate.** It measured a negative edge
-(sign-scored BUY 50.5% against a 60.5% base rate), which is why the alignment tag
+(sign-scored BUY 50.5% against a 60.5% base rate, −10.1 pts, n=109 benchmarked of
+300 resolved — the live figures, reconciled 2026-08-11), which is why the alignment tag
 is informational-only; gating a lane on a measured non-edge would reintroduce
 exactly what was disabled. A straddle makes no directional claim anyway.
 
@@ -1759,6 +1819,79 @@ diagram, because a calendar's P/L at the front expiry depends on the back month'
 date* — a term-structure model this codebase does not have. Deriving any of them from an assumed future
 IV would be a plausible number measuring nothing. Cost of carry is likewise absent on Lane C verticals:
 the short leg refunds part of the extrinsic, so the Lane A formula does not describe the structure.
+
+### `macroRegime` — phase 1, and it is DISPLAY ONLY
+
+One chip in the Long tab header. **It does not sort, gate, filter or blend into any
+existing figure, and the card says so in visible body text** — not a tooltip,
+because a coloured state chip above a ranked list reads as a ranking input unless
+it explicitly denies being one. That sentence comes out only when a phase 2
+measurement justifies removing it.
+
+**This shape is deliberate and it is the correction to a specific mistake.** The
+`analysis:` rating was wired into sort order before anyone measured whether it had
+edge; measured against a base rate it came back **negative** (−10.1 pts) and the
+influence had to be disabled after the fact. Macro state is the same kind of
+plausible-feeling signal, so it ships with no ranking influence at all.
+
+| constant | value | what it is |
+|---|---|---|
+| `MACRO_SCHEMA` | 1 | on **both** keys; bumped together |
+| `MACRO_KEY` / `MACRO_SERIES_KEY` | `macro:state` / `macro:series` | see the KV table for why these are separate |
+| `MACRO_SWEEP_KEY` | `macrosweep:last` | dedup, outside the `macro:` prefix |
+| `MACRO_TTL` | 90d | retention on both keys |
+| `MACRO_FRESH_MS` | 26h | stale-badge threshold — one daily write plus slack |
+| `MACRO_SYMBOLS` | `SPY QQQ ^VIX ^VIX3M` | field name → Yahoo symbol; the carets never leak past this table |
+| `MACRO_RANGE` | `10y` | derivation range. **Never `max`** — spark returns 1 session for `^VIX3M` at `max` |
+| `MACRO_SLICE_DAYS` | 756 | ~3y, aligned with `MOVES_RANGE`, stored for phase 2 |
+| `MACRO_TREND_FAST/SLOW` | 50 / 200 | fed to `smaCrossState` |
+| `MACRO_SMOOTH_SESSIONS` | 5 | trailing mean — **the classifier's input** |
+| `T_BACK` | **0** | classifier input above this reads hostile |
+| `T_CONTANGO` | **−1.0** | classifier input below this reads constructive |
+| `MACRO_GATES` | — | ships all of the above plus `sign` and `classifierInput` in the payload |
+
+**THE SIGN CONVENTION IS A SUBTRACTION, NOT A RATIO.** `vixTermSpread = VIX −
+VIX3M`; **positive is backwardation and positive is hostile.** This matches
+`longRow`'s `termStructure = front − back`, which Lane E gates `hostile-term` on at
+`> 0`. A macro field where *below 1.0* meant backwardation would put two opposite
+polarities for the same concept on one screen. `vixTermRatio` ships for display and
+**must never classify**.
+
+**THE CLASSIFIER READS THE SMOOTHED FIELD, AND THE RAW ONE HAS THE MORE OBVIOUS
+NAME.** `vixTermSpread` is raw and decides nothing; `vixTermSpreadSmoothed` is the
+input, and `gates.classifierInput` names it in the payload so no frontend can pick
+the wrong one. Raw gives a **2-session** median hostile run — noise wearing a regime
+label — against **7** smoothed, with transitions cut from 229 to 98 and only 0.8pp
+of frequency given up. **The lag this costs was measured before the constant was
+set**: median **1 session**, mean 0.67, max 1, across six stress episodes.
+
+**`hostileVia` is `'term' | 'trend' | 'both'`, null on every other state, and it
+renders.** Of hostile sessions, **66.8% came from the index-trend clause alone**,
+26.8% from backwardation alone, 6.4% from both — so the chip is currently more a
+trend read than a vol read, and "hostile" on its own misdescribes the common case.
+2022-06-16 is the proof: VIX 33.0, term −0.54, hostile **while in contango**.
+
+**Any null input → `unavailable` naming which.** No partial state is computed from
+three of four; the four are never blended into a score. The collector **refuses**
+rather than storing an `unavailable` record — an absent key means our own scheduler
+did not run, which is a different fact and the reader says so.
+
+**Alignment is BY DATE, never by index.** Measured 2026-08-11 at `range=10y`: `^VIX`
+2514 sessions, SPY and QQQ 2512, `^VIX3M` **2492**. Index-zipping would pair a VIX
+close with a VIX3M close up to 22 sessions away and produce a term spread that is
+arithmetically fine and describes nothing.
+
+**Collection cost: 1 external fetch + 4 binding ops = capCost 5**, counted with stub
+bindings rather than read off `_instr`. **`_instr` cannot measure this job**: it
+shares the 1:15pm branch with the EOD summary and the IV sweep, and `instrSince()`
+subtracts invocation-wide counters over a span of *time*, so their KV calls land
+inside its bracket. Measured on that branch it reported `bindingOps 5` where its
+structure predicts 4 — contamination is strictly additive, so that is an upper
+bound, not a cost. See rule #1.
+
+**Phase 2 is specified but NOT built**, and phase 1 must not foreclose it: the
+`macro:series` slice exists so phase 2 needs no second collection pass. Do **not**
+bump `MOVES_SCHEMA` for it in this release.
 
 ### Move coverage, drift and expectancy — the measured half
 
@@ -2026,18 +2159,48 @@ for the same population and the same window, or it does not render at all.** Not
 a tooltip, not in a legend — beside the number, with the signed difference.
 
 A rate on its own is unreadable, and it is worse than unreadable when it looks
-fine. Measured 2026-08-10 on the recommendation log:
+fine. **These are the figures the shipped code produces**, read off `calib:pooled`
+via `directionalRead()` on deployed rows, 2026-08-11:
 
 | outcome | rate | base rate | edge |
 |---|---|---|---|
-| sign-scored BUY (`fwd20 > 0`) | 53.3% | **61.4%** | **−8.1 pts** |
-| magnitude-scored BUY | 17.3% | **34.3%** | **−16.9 pts** |
+| sign-scored BUY (`fwd20 > 0`) | **50.5%** | **60.5%** | **−10.1 pts** |
+| magnitude-scored BUY | **20.2%** | **33.7%** | **−13.5 pts** |
 
-Both over the same 75 benchmarked BUY outcomes. 53.3% reads as a coin flip — an unremarkable, believable number. It is in fact a
-**negative edge**: these names drifted up, so `P(fwd20 > 0)` over the same 20-session
-windows is 61.5%, and the rating *underperformed simply being long*. Nothing about
-the figure 53.9% reveals that. The benchmark is not context for the number; without
-it there is no number.
+Both over the same **109 benchmarked BUY outcomes, of 300 resolved** in the pooled
+record. 50.5% reads as a coin flip — an unremarkable, believable number. It is in
+fact a **negative edge**: these names drifted up, so `P(fwd20 > 0)` over the same
+20-session windows is 60.5%, and the rating *underperformed simply being long*.
+Nothing about the figure 50.5% reveals that. The benchmark is not context for the
+number; without it there is no number.
+
+> **SUPERSEDED, 2026-08-11 — do not restore these from an older reading.** This
+> table previously said **53.3% / 61.4% / −8.1 pts** and **17.3% / 34.3% /
+> −16.9 pts** over **n=75**, with prose beside it quoting **61.5%** and **53.9%**;
+> the Lane E section said 50.5% / 60.5%. Three statements of one result, and the
+> live check settled it: **the Lane E pair was right and the table was not.**
+>
+> The figures above are what `recCalibration()` / `baseRatesFrom()` / the `cell()`
+> helper actually emit. Verified two ways against independent derivations: a hand
+> recount of NVDA's raw entries gives **9/19 = 0.4737** against the endpoint's
+> `hitRate 0.4737`, and a brute-force sweep over raw spark closes reproduces
+> `baseRatesFrom` — `P(20d > 0)` 0.6247 vs 0.6260 (one session of drift, the stored
+> series being a day older), median |20d move| **7.34% exactly**, and
+> `P(20d ≥ median)` **0.3575 exactly**.
+>
+> **The superseded numbers came from an ad-hoc analysis script, not from
+> `recCalibration()`.** They carry the same date as the live pooled record
+> (`pooledAsOf: 2026-08-10`) and still disagree with it, which is how we know.
+>
+> **OPEN QUESTION — do not treat this as closed.** The population gap is
+> unexplained: **75 benchmarked vs 109, and 290 resolved vs 300, on the same date.**
+> The two cross-checks above validate the ARITHMETIC. Neither validates the
+> ELIGIBILITY RULE — which entries are admitted to the benchmarked set at all. If
+> the ad-hoc script was more restrictive for a reason nobody wrote down, then
+> `recCalibration()` may be admitting ~34 entries it should not, and every figure in
+> this section inherits that. The rates above are the ones the code produces, so
+> they are what ships and what the docs must say; whether the code is admitting the
+> right population is a separate question and it stays open.
 
 The base rate must be **direction-matched and population-matched**: a BUY is scored
 on upside so its benchmark is `P(r ≥ threshold)` on the same underlying and horizon,
