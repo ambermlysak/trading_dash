@@ -7064,7 +7064,29 @@ function moodIsBearMarubozu(k) {
    Piercing and dark cloud test the open against the prior CLOSE rather than the
    prior low/high. The stricter variant requires a gap past the extreme, which
    on index and sector ETFs is close to unreachable — a predicate that cannot
-   fire is worse than no predicate, which this repo has already shipped once. */
+   fire is worse than no predicate, which this repo has already shipped once.
+
+   ── KNOWN WATCH ITEM, UNTESTED AGAINST LIVE DATA — 2026-08-12 ───────────────
+   THESE TWO ARE THE LOOSENED PREDICATES, AND ONLY FIXTURES HAVE EXERCISED THEM.
+   The first live run (15 symbols, 2026-08-12) produced marubozu, engulfing,
+   three-white-soldiers, spinning-top and the direction-neutral shadow names —
+   piercing line and dark cloud cover fired on NEITHER. So the loosening did its
+   job in the test harness and has never been observed against a real chain.
+
+   THE FAILURE MODE TO WATCH IS OVER-FIRING, NOT SILENCE. Moving the open test
+   from the prior extreme to the prior close widens the window, and each of
+   these carries ±2 — so if they fire on ordinary two-day chop rather than on
+   genuine reversals, per-symbol scores skew toward `caution` / `optimism` and
+   away from `neutral`, and the macro blend drifts with them. Nothing errors and
+   nothing looks wrong; the board just reads more decisive than the tape.
+
+   HOW TO CHECK IT, once there is live history: count how often each of the two
+   fires across `mood:state` days against the other patterns. A rate materially
+   above the engulfing rate is the signal to tighten back toward the prior
+   extreme — engulfing is the right comparator because it tests the same two
+   bars and is the strict version of the same idea. Do NOT tighten on a single
+   surprising day: `mood.check.mjs` §1 pins both the firing and the non-firing
+   boundary, so any change has to move those fixtures deliberately. */
 function moodIsBullEngulfing(p, k) {
   return p.bear && k.bull && p.body > 0 && k.body > 0 && k.c > p.o && k.o < p.c;
 }

@@ -616,9 +616,44 @@ Where a paid feed would still add something real, it is named in the notes.
 | 16 | News flow | Alpaca news when keyed, Yahoo `search` otherwise | **real** | Benzinga ($177) |
 | — | ~~Premium screen (dashboard)~~ | **DELETED 2026-08-10.** Became Lane F of the Long screen. See the aROC note below | — | — |
 | — | Long screen (dashboard) | Yahoo chain via `/api/long/:ticker`, one ticker per request: six lanes, ask-based debit (bid-based credit on F), breakeven, BE/EM, extrinsic %, leverage, annualised carry, theta, vega, `P(BE)@exp` from N(d2). Reuses `premium:{TICKER}`'s slower-moving fields when fresh (4 external fetches) and refetches them when not (8) | **real** — Lane D's breakeven/BE/EM/P(BE)/carry are **suppressed**, not estimated | ORATS for a historical IV surface; a term-structure model would unlock Lane D |
-| — | **Market Mood (Market tab)** | **Yahoo `/v8` daily OHLC** — 4 index ETFs (SPY/QQQ/DIA/IWM) + the 11 SPDR sectors, one chart fetch each, banked by the 2:00pm PT cron into `mood:state`. Candlestick patterns are exact OHLC predicates against named ratio thresholds; single-candle reversals are direction-classified by trend context (SMA20 position + prior 5-session return), so the same geometry reads `hammer` in a downtrend and `hanging-man` in an uptrend. Per-symbol score → emotion enum; a weighted blend (indexes ×2, sectors ×1) → macro state; a fixed table → stance | **real, and HYBRID** — every *state* is rules-decided. **One Claude call a day rewrites the already-decided verdict as one sentence and can never change it**: the prompt says so, the schema returns only a sentence, and `moodSentenceUsable()` rejects an answer naming a different state. A fixed template per (state, breadth) pair is the fallback, and `sentenceSource` says which is on screen. **Scored against nothing** — `usedForRanking: false`, it sorts and gates nothing | — |
+| — | **Market Mood (Market tab)** | **Yahoo `/v8` daily OHLC** — 4 index ETFs (SPY/QQQ/DIA/IWM) + the 11 SPDR sectors, one chart fetch each, banked by the 2:00pm PT cron into `mood:state`. Candlestick patterns are exact OHLC predicates against named ratio thresholds; single-candle reversals are direction-classified by trend context (SMA20 position + prior 5-session return), so the same geometry reads `hammer` in a downtrend and `hanging-man` in an uptrend. Per-symbol score → emotion enum; a weighted blend (indexes ×2, sectors ×1) → macro state; a fixed table → stance | **real, and HYBRID** — every *state* is rules-decided. **One Claude call a day rewrites the already-decided verdict as one sentence and can never change it**: the prompt says so, the schema returns only a sentence, and `moodSentenceUsable()` rejects an answer naming a different state. A fixed template per (state, breadth) pair is the fallback, and `sentenceSource` says which is on screen. **Scored against nothing** — `usedForRanking: false`, it sorts and gates nothing. **KNOWN WATCH:** piercing line and dark cloud cover test the open against the prior *close* rather than the prior low/high — loosened so they can fire on ETFs at all, and **untested against live data**; watch for OVER-firing (see below) | — |
 | — | Macro regime chip (Long tab header) | **Yahoo spark** — SPY, QQQ, `^VIX`, `^VIX3M`, 10y, one request/day banked by the 1:15pm PT cron into `macro:state`. SPY/QQQ trend from `smaCrossState(50,200)`; term structure = `^VIX` − `^VIX3M`, 5-session trailing mean | **real** — thresholds derived from 2,293 historical sessions; **phase 1 is display only and ranks nothing** | — |
 | — | Long screen · `cov` / `gap` / `E[R]` / `E[$]` | **Measured** from `moves:{TICKER}` — 3y of Yahoo daily closes banked by the 2pm PT sweep (2 external fetches for the whole watchlist), then overlapping N-session windows. `cov` is an empirical frequency, `p(be)` beside it is modelled; `E[R]` is mean P/L over those windows ÷ capital risked | **real** — 1y/3y never averaged; horizons the history cannot support return null naming the numbers; `gapBaseline` null this release | ORATS for a historical IV surface would let `pBe` be checked against a *measured* IV rather than only against realized moves |
+
+## Known watch: Market Mood's two loosened predicates
+
+**`moodIsPiercingLine` and `moodIsDarkCloudCover` are the only two candlestick
+predicates in the set that were relaxed from their textbook form**, and they are
+the only two that have never fired on live data. Both are recorded here because
+the failure they can produce is silent.
+
+**What was relaxed.** The classical definitions require the second bar to open
+past the prior bar's **low** (piercing) or **high** (dark cloud) — a true gap
+through the extreme. Index and sector ETFs essentially never gap that far, so
+the strict form would have been a predicate that cannot fire, which is the
+`no-leaps` failure this codebase already shipped once (honesty rule 23). Both
+now test the open against the prior **close** instead, which is a genuine
+piercing/dark-cloud reading and a materially wider window.
+
+**Only fixtures have exercised them.** The first live run — 15 symbols,
+2026-08-12 — produced marubozu, engulfing, three-white-soldiers, spinning-top and
+the direction-neutral shadow names. **Neither of these two fired.**
+
+**The failure mode is OVER-firing, not silence.** Each carries ±2, so if they
+trip on ordinary two-day chop rather than on real reversals, per-symbol scores
+skew toward `caution` / `optimism` and away from `neutral`, and the macro blend
+drifts with them. Nothing errors and no cell looks wrong — the board simply reads
+more decisive than the tape did. That is the same shape as the proxy-vs-thing
+failures elsewhere in this file: arithmetic that is correct and a claim that is
+not.
+
+**How to check, once `mood:state` has history.** Count each of the two against
+the **engulfing** rate. Engulfing reads the same two bars and is the strict
+version of the same idea, so it is the correct comparator rather than the whole
+pattern set. A rate materially above engulfing's is the signal to tighten back
+toward the prior extreme. `mood.check.mjs` §1 pins both the firing case and the
+non-firing boundary for each, so tightening is a deliberate fixture change and
+not a threshold nudge.
 
 ## Design note: the naked-margin aROC denominator, and why it is gone
 

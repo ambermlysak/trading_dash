@@ -82,21 +82,40 @@ at the top of `fetch()` and `scheduled()` to wrap every binding. `instrMark()` /
 `/api/premium/batch` endpoints cost **exactly one KV read per symbol**, so a
 22-name watchlist paints for **22** against the cap, not 0.
 
-**`_instr` IS A COUNTER DELTA, NOT A PER-JOB TOTAL — two concurrent jobs
-contaminate each other.** `instrMark()` / `instrSince()` bracket a span of *time*
-and subtract invocation-wide counters. Anything else running inside that bracket
-is attributed to whichever job stamped the payload. On a firing that dispatches
-two jobs through `ctx.waitUntil`, the per-job figures are **upper bounds on that
-job and lower bounds on the invocation**, not measurements of either.
+**`_instr` IS A COUNTER DELTA, NOT A PER-JOB TOTAL — concurrent jobs contaminate
+each other.** `instrMark()` / `instrSince()` bracket a span of *time* and
+subtract invocation-wide counters. Anything else running inside that bracket is
+attributed to whichever job stamped the payload. On a firing that dispatches more
+than one job through `ctx.waitUntil`, the per-job figures are **upper bounds on
+that job and lower bounds on the invocation**, not measurements of either.
+
+**Both multi-job branches are now three jobs deep, so this is the normal case on
+the cron path, not an edge one:**
+
+| branch | PT | jobs |
+|---|---|---|
+| `eod+iv-sweep+macro` | 1:15pm | `eod-summary`, `iv-sweep`, `macro-state` |
+| `forward-returns+moves+mood` | 2:00pm | `forward-returns`, `move-series`, `market-mood` |
 
 So: **quote a per-job `_instr` only for a job that ran alone, and say which case
 you are in.** The N=22 sweep figure of `2 / 47 / 49` is trustworthy precisely
-because it was measured in isolation and matches `2N + 3` exactly. When two jobs
+because it was measured in isolation and matches `2N + 3` exactly. When jobs
 share a firing, `invocationCapCost` is the honest number and the per-job split is
 an inference. This is not a defect to fix — a per-job counter would need
 async-context tracking the runtime does not offer — but an unlabelled per-job
 figure from a shared firing is a measurement that is quietly wrong, which is the
 failure this whole section exists to prevent.
+
+**When a job can only ever run alongside siblings, QUOTE THE DERIVATION, NOT THE
+COUNTER.** `collectMarketMood` is the worked example, because it has no isolated
+firing to be measured in: **15 chart fetches + 1 Anthropic call = 16 ext; 1 dedup
+get + 1 `mood:state` put + 1 dedup put = 3 bindings; capCost 19.** The structure
+is what makes that number checkable; the counter on that branch cannot be. A
+local run with no `ANTHROPIC_API_KEY` (so no Claude call) reported `extFetches
+15, bindingOps 3, capCost 18` against `invocationCapCost 20` on the same firing —
+the derivation and the contamination both visible in one line. `mood.check.mjs`
+§9 asserts the 15 / 1 / 3 / 19 split against stub bindings, which is isolated by
+construction in a way the runtime is not.
 
 **KNOWN GAP — the Cache API.** `caches.default.match/put` and `caches.open()`
 count against the cap and travel over neither `globalThis.fetch` nor `env`, so
@@ -844,6 +863,13 @@ without ever opening that file.
 - `yahooSparkCloses` takes 20 symbols per request; fetches are `ceil(N/20)`
 - Never read `content[0].text` — Opus 5 thinks by default and slot 0 is a
   `thinking` block
+- `claudeText()` **cannot tell a complete answer from a truncated one** — both
+  arrive as text, and the truncated one parses or renders as though it were
+  whole. `workerClaude(prompt, env, maxTokens, schema, { raw: true })` returns
+  `{ text, stopReason }` instead of the bare string so a caller can check
+  `stopReason === 'max_tokens'`. Every existing caller keeps the string by
+  omitting the flag; use `raw` wherever a cut-off answer would be stored or
+  rendered as finished prose (`collectMarketMood` is the only user today)
 - `max_tokens` caps thinking + answer together, not the answer alone
 - IV is carried through this codebase as **percent**; `bsDelta` takes **decimals**
 - `ivRank` is null until 60 days of history exist, and nothing stands in for it
@@ -855,8 +881,10 @@ without ever opening that file.
 - Do not declare a local `const TTL` — `TTL` is a module-level table
 - `premium:{TICKER}` freshness and retention must not be equal
 - `moves:{TICKER}` schema check stays strict equality
-- `mood:state` schema check stays strict equality; Market Mood's states are
-  decided by rules and Claude may only rephrase the verdict, never change it
+- `mood:state` schema check stays strict equality; its freshness (26h, from
+  `TTL.mood`) and retention (7d) must not be equal, same reason as `premium:`
+- Market Mood's states are decided by rules; Claude may only rephrase the
+  verdict, never change it, and `sentenceSource` says which the reader is seeing
 - `calib:pooled` lives in the cron and must never move
 - `scheduled()` gates on the Pacific trading day before dispatching
 

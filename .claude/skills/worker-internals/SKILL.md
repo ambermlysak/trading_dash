@@ -386,6 +386,14 @@ number.
 - **`max_tokens` caps thinking + answer together.** Every per-call budget (`workerClaude(prompt, env, N)`,
   `body.max_tokens` on `/api/claude`) is sized for the *answer*; `CLAUDE_THINKING_HEADROOM` is added on
   top at each of the three call sites. Raising the cap is free — it bounds spend, it doesn't cause it.
+- **`claudeText()` cannot see truncation, and that is a SEPARATE hazard from the thinking-block one.**
+  A capped answer and a complete answer both arrive as text; the capped one parses or renders as
+  though it were whole. So `workerClaude(prompt, env, maxTokens, schema, { raw: true })` returns
+  `{ text, stopReason }` instead of the bare string, letting a caller check
+  `stopReason === 'max_tokens'` and refuse. The flag is opt-in precisely so every existing caller
+  keeps the string return unchanged. Use it wherever a cut-off answer would be **stored or rendered
+  as finished prose** — `collectMarketMood` is the only user today, and it falls back to its house
+  template and records the reason in `sentenceNote` rather than storing half a sentence.
 
 **Ask for JSON with a schema, not with a prompt.** `POST /api/claude` forwards a caller-supplied
 `output_config` (merged with, not replaced by, the effort setting), so the frontend can pass
@@ -547,6 +555,25 @@ series and the one the whole feature exists to read. An unconditional
 "drop if `iso === ptDate()`" would discard a settled bar every day and make the
 2:00pm placement buy nothing over 1:15pm. The guard exists for a manual or
 admin-triggered run, which is the only way a forming bar can reach this code.
+
+**KNOWN WATCH ITEM — the two loosened predicates have never fired on live data.**
+`moodIsPiercingLine` and `moodIsDarkCloudCover` test the open against the prior
+**close** rather than the prior low/high. The strict form needs a gap past the
+extreme, which index and sector ETFs almost never produce, so the strict version
+would have been a predicate that cannot fire — the `no-leaps` failure again. But
+the loosening is only verified by fixtures: the first live run (15 symbols,
+2026-08-12) fired marubozu, engulfing, three-white-soldiers, spinning-top and the
+direction-neutral shadow names, and **neither of these two**.
+
+**Watch for OVER-firing, not silence.** A wider window on a ±2 pattern skews
+per-symbol scores toward `caution` / `optimism` and away from `neutral`, and the
+macro blend drifts with them — nothing errors, the board simply reads more
+decisive than the tape. Once `mood:state` has history, count each of the two
+against the **engulfing** rate: engulfing reads the same two bars and is the
+strict version of the same idea, so it is the right comparator. A rate materially
+above it is the signal to tighten back toward the prior extreme. `mood.check.mjs`
+§1 pins both the firing and the non-firing boundary for each, so tightening is a
+deliberate fixture change rather than a threshold nudge.
 
 **The mood job's Claude call is the only one in this Worker that cannot change
 what it is called about.** The verdict is computed first; the model is handed it
