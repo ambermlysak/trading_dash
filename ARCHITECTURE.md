@@ -1543,6 +1543,37 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
 
    **Nothing was changed.** No fix was needed and none was made.
 
+20. **THE FIVE #15 JOBS HAVE NO STANDING ASSERTIONS — a gap, not a defect, and
+   `market-mood` is the pattern they should match.** Surfaced by #19's audit rather
+   than by a failure.
+
+   `eod-summary`, `iv-sweep`, `forward-returns`, `move-series` and `13f-slice` had
+   their stamp guards verified **once**, on 2026-08-12, by forcing each failure
+   locally and reading KV through the Worker's own binding. That measurement was
+   real and both directions were checked — but it lives in a write-up, not in a
+   runnable check. **Nothing fails if a guard is removed.** The verification cannot
+   be re-run without redoing the forcing by hand, which is why the 2026-08-13 IV
+   sweep guard could only be confirmed by watching production.
+
+   `collectMarketMood` shows the shape to copy: `mood.check.mjs` §9 drives the real
+   function against **stub bindings**, recording every `get`/`put`, and asserts the
+   no-stamp paths individually — dedup skip, one index down, one sector down, a
+   failed payload write — plus *"dedup stamped LAST"* and the dedup key sitting
+   outside the record prefix. Stub bindings are what make it possible: no network,
+   no KV, no forcing, and it is isolated by construction in a way a live firing
+   never is.
+
+   **Why this is queued and not done.** The five jobs fan out over real upstreams
+   and their stub surface is larger than mood's 15 chart fetches — this is a real
+   piece of work, not a mechanical copy. **It is also the only way the guards stay
+   true**: they are now load-bearing for data that never backfills, and a guard
+   nobody can re-test is one edit from silently reverting to the behaviour #15
+   existed to remove.
+
+   Note the asymmetry that makes it worth doing: a guard wrongly **present** costs
+   one extra pass per day; a guard wrongly **absent** costs a permanent hole in a
+   series. Not built.
+
 9. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
    Lightweight Charts supports custom drawings; recognition would be rules-based
    code or a Claude vision call against a chart screenshot.
