@@ -286,8 +286,21 @@ async function allSettledCounted(promises, label) {
  * marked failed says only "something on this branch broke", which is exactly the
  * ambiguity that made a failed job and a failed branch indistinguishable. What
  * replaces it is a greppable ERROR line naming the job — the same trade
- * `allSettledCounted` already makes. A job that fails still fails: it stamps no
- * dedup key, so the next firing retries it.
+ * `allSettledCounted` already makes.
+ *
+ * WHAT THIS LINE USED TO CLAIM, AND WHY IT WAS WRONG. It said "a job that fails
+ * still fails: it stamps no dedup key, so the next firing retries it." That holds
+ * on the REJECTION path this function sees — a throw before the stamp leaves the
+ * key absent, verified — and it was false for the five jobs that swallowed their
+ * own per-item failures and stamped anyway. `dispatchJob` never sees those: they
+ * resolve normally, print no `JOB-FAILED`, and return a clean 200.
+ *
+ * Each of the five now guards its own stamp on the run having accomplished
+ * something, and says so in an ERROR line of its own — `!! IV-SWEEP-INCOMPLETE !!`,
+ * `!! MOVE-SWEEP-INCOMPLETE !!`, `!! FORWARD-FILL-INCOMPLETE !!`,
+ * `!! SLICE-FAILED !!`, and the EOD placeholder's `ts: 0`. So the claim is true
+ * again, but it is true because of THOSE guards and not because of this function.
+ * Do not restate it as a property of `dispatchJob`.
  */
 function dispatchJob(ctx, name, run) {
   let p;
@@ -4497,6 +4510,18 @@ async function recordIvSample(ticker, snap, env, { src = null, skipIfPresent = f
     // Provenance rides in the BODY. It must never go into the metadata, which is
     // capped at 1024 bytes and holds the three flat numbers `ivHistory()` rebuilds
     // the whole series from in one list() pass.
+    //
+    // EVERY CALLER SETS `src`. Two did not until 2026-08-12, and the cost was that
+    // sweep completeness could not be measured at all: the cron and
+    // `/api/iv/:ticker` both wrote unprovenanced, so an `iv:` count conflated a
+    // scheduled sweep with whatever anyone happened to look at. 2026-08-10 showed
+    // 35 samples against a 33-name watchlist and the sweep had not run — every one
+    // of them was `long-live` plus traffic.
+    //
+    // AN ABSENT `src` MEANS PRE-2026-08-12, NOT `'api'`. Historical keys are
+    // deliberately not backfilled: the gaps and their provenance are the evidence
+    // for how biased the series is, and rewriting them would destroy it. Anything
+    // reading `src` must treat absent as UNKNOWN, never as a default.
     ...(src ? { src } : {}),
   };
   await env.REC_LOG.put(
@@ -4609,7 +4634,10 @@ async function handleIv(ticker, params, origin, env, ctx) {
   }
 
   // Record before ranking so today's reading is inside its own window.
-  try { await recordIvSample(sym, snap, env); }
+  // `src: 'api'` — a request-path write, present only for names someone looked at.
+  // This is the viewing-biased half of the series and must be distinguishable from
+  // the scheduled sweep; see the provenance note in recordIvSample().
+  try { await recordIvSample(sym, snap, env, { src: 'api' }); }
   catch (e) { console.warn('[iv] sample write failed:', e.message); }
 
   // Below IV_RANK_MIN_DAYS there is no rank — and no percentile of HV standing in
@@ -4676,13 +4704,38 @@ async function recordWatchlistIv(env) {
     const results = await Promise.allSettled(tickers.slice(i, i + 5).map(async (t) => {
       const snap = await ivSnapshot(t, env);
       if (!snap) return false;
-      await recordIvSample(t, snap, env);
+      // `src: 'sweep'` — the ONLY provenance that makes this series a daily
+      // series rather than a record of what someone opened. Without it, sweep
+      // completeness is unmeasurable: see the note in recordIvSample().
+      await recordIvSample(t, snap, env, { src: 'sweep' });
       return true;
     }));
     ok += results.filter(r => r.status === 'fulfilled' && r.value).length;
   }
-  try { await env?.REC_LOG?.put('ivsweep:last', ptDate(), { expirationTtl: 172800 }); } catch (_) {}
-  console.log(`[cron] iv samples recorded for ${ok}/${tickers.length} tickers`);
+
+  /* STAMP ONLY A COMPLETE RUN. `allSettled` turns every rejection into a fulfilled
+     result, so `ok` can reach 0 with the loop reporting no error at all — and this
+     stamped anyway, dedupping a zero-sample run out of the day's second firing
+     while the invocation reported a clean 200. Measured 2026-08-12: every
+     `ivSnapshot` forced to throw, 0 samples written, key stamped.
+
+     The threshold is `ok === tickers.length`, not `ok > 0`, and that is deliberate:
+     per-ticker writes are idempotent (one key per ticker per PT day), so a retry
+     fills the gaps rather than duplicating work. 2026-08-06 banked 7 of N and a
+     partial-tolerant threshold would have accepted it.
+
+     COST, BOUNDED AND STATED: the 1:15pm window admits exactly two firings, so a
+     name that fails persistently costs one extra pass per day and no more. That is
+     the right trade — `ivRank` needs an unbroken daily series and a missed day
+     never backfills. */
+  const complete = ok === tickers.length;
+  if (complete) {
+    try { await env?.REC_LOG?.put('ivsweep:last', ptDate(), { expirationTtl: 172800 }); } catch (_) {}
+    console.log(`[cron] iv samples recorded for ${ok}/${tickers.length} tickers`);
+  } else {
+    console.error(`[cron] !! IV-SWEEP-INCOMPLETE !! ${ok}/${tickers.length} tickers recorded. NOT stamping `
+      + 'ivsweep:last, so the next firing retries the missing names. Writes are per-ticker idempotent.');
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -5368,17 +5421,33 @@ async function refresh13FSlice(env) {
   };
   store.builtAt = new Date().toISOString();
 
-  const next = at + THIRTEENF_BATCH;
-  const wrapped = next >= SUPER_INVESTORS.length;
-  if (wrapped) store.lastFullPass = new Date().toISOString();
+  /* TWO GUARDS, and this job needed both because its dedup has a SEVEN-DAY window
+     rather than one day.
+
+     1. THE CURSOR DOES NOT ADVANCE PAST A BATCH THAT WHOLLY FAILED. It used to
+        advance unconditionally, so four SEC timeouts retired those managers until
+        the pass wrapped.
+     2. `lastFullPass` IS ONLY SET IF THE PASS REPRESENTS ANY MANAGER AT ALL.
+        It used to be set on wrap regardless. Measured 2026-08-12: five slices with
+        every `fetch13F` throwing left `managersOk: 0` with `lastFullPass` set, and
+        `refresh13FIndexIfStale` then idled — slices 6 and 7 were byte-identical
+        no-ops. A whole week of an index representing nobody. */
+  const batchOk = batch.some(inv => store.byManager[inv.cik]?.ok);
+  const next    = at + THIRTEENF_BATCH;
+  const wrapped = batchOk && next >= SUPER_INVESTORS.length;
+  if (wrapped && store.stats.managersOk > 0) store.lastFullPass = new Date().toISOString();
 
   try {
     await env?.REC_LOG?.put(THIRTEENF_KEY, JSON.stringify(store), { expirationTtl: THIRTEENF_TTL });
     await env?.REC_LOG?.put(THIRTEENF_CURSOR, JSON.stringify({
-      at: wrapped ? 0 : next,
+      at: wrapped ? 0 : (batchOk ? next : at),
       passStartedAt: wrapped ? null : passStartedAt,
     }), { expirationTtl: THIRTEENF_TTL });
   } catch (e) { console.warn('[13f] write failed:', e.message); }
+  if (!batchOk) {
+    console.error(`[13f] !! SLICE-FAILED !! every manager in batch ${at}–${Math.min(next, SUPER_INVESTORS.length) - 1} `
+      + 'failed. Cursor held at ' + at + ' and lastFullPass not set, so the next firing retries this batch.');
+  }
 
   console.log(`[13f] slice ${at}–${Math.min(next, SUPER_INVESTORS.length) - 1} done · `
             + `${store.stats.managersOk}/${store.stats.managersTotal} represented · `
@@ -6439,7 +6508,7 @@ async function fillForwardReturns(env) {
   } while (cursor);
 
   const today = etToday();
-  let tickers = 0, filled = 0;
+  let tickers = 0, filled = 0, chartFailures = 0;
 
   /* Every list this walk reads is retained for the pooled calibration below.
      The scan is the expensive part and it is already being paid for here — see
@@ -6483,6 +6552,7 @@ async function fillForwardReturns(env) {
       bars = chartDailyBars(chart);
     } catch (e) {
       console.warn(`[cron] forward fill ${ticker}: chart failed — ${e.message}`);
+      chartFailures++;
       continue;
     }
     if (bars.length < 2) continue;
@@ -6519,8 +6589,18 @@ async function fillForwardReturns(env) {
     }
   }
 
-  try { await env.REC_LOG.put('recfwd:last', ptDate(), { expirationTtl: 172800 }); } catch (_) {}
-  console.log(`[cron] forward fill: ${filled} value(s) across ${tickers} ticker(s)`);
+  /* STAMP ONLY A COMPLETE RUN. `filled > 0` is the WRONG threshold here — most
+     days nothing is pending and 0 filled is a correct, complete outcome. What
+     makes a run incomplete is a ticker we could not read at all, so the guard is
+     `chartFailures === 0`. Previously each failure just `continue`d and the stamp
+     ran regardless, so a Yahoo outage dedupped the fill out for the whole day. */
+  if (chartFailures === 0) {
+    try { await env.REC_LOG.put('recfwd:last', ptDate(), { expirationTtl: 172800 }); } catch (_) {}
+    console.log(`[cron] forward fill: ${filled} value(s) across ${tickers} ticker(s)`);
+  } else {
+    console.error(`[cron] !! FORWARD-FILL-INCOMPLETE !! ${chartFailures} ticker(s) had no readable chart `
+      + `(${filled} value(s) filled across ${tickers}). NOT stamping recfwd:last, so the next firing retries.`);
+  }
 
   /* ── Pooled calibration, from the lists just read ──────────────────────────
      Wrapped end to end: this is bookkeeping bolted onto a job that has already
@@ -6625,11 +6705,23 @@ async function collectMoveSeries(env) {
     written++;
   }), 'move-series sweep');
 
-  try { await env.REC_LOG.put(MOVES_SWEEP_KEY, ptDate(), { expirationTtl: 172800 }); } catch (_) {}
-  console.log(
-    `[cron] move-series sweep: ${written} written, ${skipped} already current, ${absent} not returned by spark, `
-    + `${thin} with thin history · ${JSON.stringify(instrSince(mark, 'complete'))}`,
-  );
+  /* STAMP ONLY A COMPLETE RUN — same `allSettled` shape as the IV sweep and the
+     same defect: a run where every ticker rejected reported no error and stamped.
+     `absent` counts names spark did not return, which is a real upstream failure
+     and not a reason to call the day done. `skipped` IS accounted for: those names
+     are already current, so written + skipped === N is a complete outcome. */
+  const accountedFor = written + skipped;
+  if (accountedFor === tickers.length) {
+    try { await env.REC_LOG.put(MOVES_SWEEP_KEY, ptDate(), { expirationTtl: 172800 }); } catch (_) {}
+    console.log(
+      `[cron] move-series sweep: ${written} written, ${skipped} already current, ${absent} not returned by spark, `
+      + `${thin} with thin history · ${JSON.stringify(instrSince(mark, 'complete'))}`,
+    );
+  } else {
+    console.error(`[cron] !! MOVE-SWEEP-INCOMPLETE !! ${accountedFor}/${tickers.length} accounted for `
+      + `(${written} written, ${skipped} current, ${absent} absent from spark). NOT stamping ${MOVES_SWEEP_KEY}, `
+      + `so the next firing retries · ${JSON.stringify(instrSince(mark, 'incomplete'))}`);
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -9250,7 +9342,9 @@ async function generateEODSummary(env) {
   const fredEvents = (await getEconReleases(env)).events;
   try {
     const existing = await env?.REC_LOG?.get('daily:eod', 'json');
-    if (existing && Date.now() - existing.ts < 7_200_000) {
+    // `complete` is the content term. Without it a placeholder written on a Claude
+    // failure satisfied this check for two hours and killed the retry.
+    if (existing && existing.complete && Date.now() - existing.ts < 7_200_000) {
       console.log('[cron] eod fresh, skipping');
       return;
     }
@@ -9316,7 +9410,7 @@ Write a concise end-of-day market summary as valid JSON (no markdown):
 
 If you reference an FOMC meeting or CPI release, use ONLY the macro calendar above — never a date recalled from training data.`;
 
-  let eod;
+  let eod, generated = true;
   try {
     const text    = await workerClaude(prompt, env, 500);
     const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
@@ -9324,14 +9418,32 @@ If you reference an FOMC meeting or CPI release, use ONLY the macro calendar abo
   } catch (e) {
     console.error('[cron] eod parse failed:', e.message);
     eod = { headline: `Market closed ${dateStr}`, body: 'Market data unavailable.' };
+    generated = false;
   }
 
+  /* TWO INDEPENDENT GUARDS, copied from generateDailySnapshot — a placeholder must
+     not dedup itself out of the day's remaining firings. This wrote
+     `ts: Date.now()` unconditionally and the dedup above tested freshness with no
+     content term, so ONE Claude hiccup at 1:15pm left "Market data unavailable."
+     on the card until tomorrow, with the second firing skipping and the invocation
+     reporting a clean 200. Measured 2026-08-12: fire 2 skipped, identical hash.
+
+     1. `ts: 0` on the placeholder, so the freshness test cannot match it.
+     2. `complete` in the payload, which the dedup requires as well as freshness —
+        so an old-shape record lacking the field also retries rather than sticking. */
   await env?.REC_LOG?.put(
     'daily:eod',
-    JSON.stringify({ ...eod, ts: Date.now(), _instr: instrSince(mark, 'complete') }),
+    JSON.stringify({
+      ...eod,
+      complete: generated,
+      ts: generated ? Date.now() : 0,
+      _instr: instrSince(mark, generated ? 'complete' : 'placeholder'),
+    }),
     { expirationTtl: 86400 },
   );
-  console.log('[cron] eod summary saved');
+  console.log(generated
+    ? '[cron] eod summary saved'
+    : '[cron] eod generation FAILED — wrote placeholder with ts:0 so the next firing retries');
 }
 
 /* ── Cron: midday market pulse (11:30am PT) ──

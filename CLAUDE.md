@@ -460,53 +460,86 @@ empty on a run that did nothing. The grep is a positive signal, never a negative
 one: a silent grep plus a stamped key is *not* proof of success, and the five jobs
 in the table below can produce exactly that.
 
-##### KNOWN DEFECT, NOT FIXED — five jobs stamp their dedup key on a failed run
+##### EVERY DEDUP STAMP IS GUARDED ON THE RUN HAVING ACCOMPLISHED SOMETHING
 
-Measured 2026-08-12 by forcing each failure locally and reading KV through the
-Worker's own binding (logs are unusable here — wrangler dev surfaces only
-`warn`/`error` from `waitUntil`). This interacts badly with the trade above: such
-a run is a clean 200, prints no `JOB-FAILED`, **and** dedups itself out of the
-day's remaining firings.
+Five of the eight used to stamp after a run that did nothing. Fixed 2026-08-12;
+before and after both measured by forcing each failure locally and reading KV
+through the Worker's own binding (logs are unusable here — wrangler dev surfaces
+only `warn`/`error` from `waitUntil`). It interacted badly with the trade above:
+such a run was a clean 200, printed no `JOB-FAILED`, **and** dedupped itself out
+of the day's remaining firings.
 
-| job | key | on a failed run |
-|---|---|---|
-| `morning-briefing` | `daily:snapshot` | **safe** — writes the placeholder with `ts: 0`, and the dedup demands `isComplete && age<2h`. Measured: two firings, bytes changed, it retried |
-| `midday-pulse` | `daily:midday` | **safe** — returns before the put. Measured: absent after both firings |
-| `macro-state` | `macrosweep:last` | **safe** — refuses before stamping |
-| `eod-summary` | `daily:eod` | **STAMPS.** The Claude `catch` assigns a fallback and falls through to a put with `ts: Date.now()`; the dedup has no content check. Measured: fire 2 skipped, identical hash |
-| `iv-sweep` | `ivsweep:last` | **STAMPS.** `allSettled` turns every rejection into a fulfilled result, so `ok` reaches 0 and the stamp still runs. Measured: 0 `iv:{T}:{DATE}` keys written, key stamped. **Worst consequence** — `ivRank` needs an unbroken daily series and a gap does not backfill |
-| `forward-returns` | `recfwd:last` | **STAMPS.** Per-ticker chart failures `continue` |
-| `move-series` | `movesweep:last` | **STAMPS.** Same `allSettled` shape as the IV sweep |
-| `13f-slice` | `13f:cursor`, `13f:index.lastFullPass` | **STAMPS, for 7 days.** `lastFullPass` is set on wrap unconditionally. Measured: 5 slices with all 20 managers failing left `managersOk: 0` and a set `lastFullPass`; slices 6 and 7 were byte-identical no-ops |
+| job | key | guard | before → after |
+|---|---|---|---|
+| `morning-briefing` | `daily:snapshot` | `ts: 0` + `isComplete` in the dedup | was already safe; **the pattern the other four copied** |
+| `midday-pulse` | `daily:midday` | returns before the put | was already safe |
+| `macro-state` | `macrosweep:last` | four refusal paths, all returning before the stamp | was already safe |
+| `eod-summary` | `daily:eod` | `ts: 0` + `complete` term in the dedup | stamped `ts: Date.now()` on a Claude failure → **placeholder `ts: 0`, `complete: false`, retries** |
+| `iv-sweep` | `ivsweep:last` | `ok === tickers.length` | 0 samples written, key stamped → **key ABSENT** |
+| `forward-returns` | `recfwd:last` | `chartFailures === 0` | per-ticker chart failures `continue`d and it stamped → **key ABSENT** |
+| `move-series` | `movesweep:last` | `written + skipped === tickers.length` | same `allSettled` shape → **key ABSENT** |
+| `13f-slice` | `13f:cursor`, `lastFullPass` | cursor holds on a wholly-failed batch; `lastFullPass` needs `managersOk > 0` | advanced 4→8→12→16→0, set `lastFullPass`, then idled 7 days → **cursor held at 0 across 5 slices, `lastFullPass: null`** |
 
-A throw placed immediately *before* each stamp leaves every key absent, on all
-three branches tested — so no stamp sits in a `finally` and none is duplicated.
-The exposure is entirely from failures the jobs swallow themselves.
+**The thresholds, and why each is what it is:**
+
+- **`ok === N`, not `ok > 0`, for the IV sweep.** Per-ticker writes are idempotent
+  (one key per ticker per PT day), so a retry fills the gaps rather than
+  duplicating work. `ok > 0` would have accepted 2026-08-06's 7-of-N.
+- **`written + skipped === N` for move-series.** `skipped` means "already current",
+  which is a complete outcome; `absent` (spark did not return the name) is not.
+- **NOT `filled > 0` for forward-returns.** Most days nothing is pending and 0
+  filled is correct and complete. The incomplete signal is a ticker whose chart
+  could not be read at all.
+
+**Cost, bounded and stated:** the 1:15pm window admits exactly two firings, so a
+persistently failing name costs one extra pass per day and no more.
+
+**Verified both directions.** Forced failures leave every key absent; clean runs
+still stamp — 13F cursor advanced 0→4 with the index at 16,237 B against 4,829 B
+when every manager failed, forward-returns and move-series both stamped, and the
+IV sweep stamped on a real 14-name local run, so `ok === N` does not block a
+genuinely complete pass.
+
+**A note on the instrument, because it changed under the fix.** The old test
+compared stored bytes across two firings: the pre-fix EOD placeholder carried
+`ts: Date.now()`, so identical bytes proved a skip. The fix makes the payload
+deterministic (`ts: 0`), so identical bytes prove nothing. The working
+discriminator is the **KV expiration**, which moves on every write: 1786666522 →
+1786666570 across the second firing, i.e. rewritten, i.e. retried. **When a fix
+makes an instrument degenerate, replace the instrument.**
 
 **Blind spot:** `morning-briefing` and `midday-pulse` cannot have their
 post-Claude paths exercised locally — with no `ANTHROPIC_API_KEY` in `.dev.vars`
 neither is reached. Those two rows are measured on the *failure* path only.
 
-**Five, not four.** An earlier revision of this section said "four" while the table
-listed five. The count is **five stamping, three safe**, across eight jobs.
+**Not changed, and worth knowing:** `handleDailyGet` triggers request-path
+regeneration on `!eod`, not on `!eod.complete`, so a page visit will not
+regenerate a placeholder. The impact is bounded because the next cron firing now
+does retry.
 
 ##### `iv:` SAMPLE COUNT DOES NOT MEASURE SWEEP SUCCESS — and never has
 
-**Four writers share `iv:{TICKER}:{DATE}`, and the stored record only tells two of
-them apart.** `recordIvSample` puts provenance in the body via `...(src ? { src } : {})`:
+**Four writers share `iv:{TICKER}:{DATE}`. Until 2026-08-12 the stored record only
+told two of them apart.** `recordIvSample` puts provenance in the body via
+`...(src ? { src } : {})`:
 
 | caller | `src` |
 |---|---|
 | `longRow` live path | `'long-live'` |
 | `longRow` warm path | `'long-warm'` (+ `skipIfPresent`) |
-| `/api/iv/:ticker` handler | **none** |
-| `recordWatchlistIv` (the cron) | **none** |
+| `/api/iv/:ticker` handler | `'api'` — **added 2026-08-12** |
+| `recordWatchlistIv` (the cron) | `'sweep'` — **added 2026-08-12** |
 
-So a sample with no `src` is the cron **or** an ordinary page view, and nothing
-stored separates them. The only remaining separator is behavioural — the sweep
-writes the whole watchlist within seconds of 1:15pm PT, a page view writes one at
-an arbitrary time. **That is an inference from clustering, not a field**, and it
-misclassifies any page view landing inside the window.
+**AN ABSENT `src` MEANS PRE-2026-08-12, NOT `'api'`.** Historical keys are
+deliberately not backfilled — the gaps and their provenance are the evidence for
+how biased the series is. Anything reading `src` must treat absent as UNKNOWN.
+
+For everything written before that, a sample with no `src` is the cron **or** an
+ordinary page view, and nothing stored separates them. The only separator for the
+historical record is behavioural — the sweep writes the whole watchlist within
+seconds of 1:15pm PT, a page view writes one at an arbitrary time. **That is an
+inference from clustering, not a field**, and it misclassifies any page view
+landing inside the window.
 
 **Consequence: sweep completeness cannot be measured retroactively, and a raw
 `iv:` count is actively misleading.** Measured 2026-08-12 over the whole 123-key
@@ -515,23 +548,35 @@ dates, and in one case by 35:
 
 | PT date | dow | `iv:` keys | writes in the 1:15pm window | what it actually was |
 |---|---|---|---|---|
-| 2026-08-04 | Tue | 1 | 0 | no sweep |
-| 2026-08-05 | Wed | 20 | 15 (13:15:17–19) | 3 batches of 5, then nothing |
-| 2026-08-06 | Thu | 16 | 7 (13:15:25–27) | 2 batches with misses, then nothing |
-| 2026-08-07 | Fri | 5 | 0 | no sweep — the Sun–Thu cron bug |
-| 2026-08-08 | Sat | 5 | 0 | market closed, correct |
-| 2026-08-09 | Sun | 6 | 0 | market closed, correct |
-| 2026-08-10 | Mon | **35** | **0** | **no sweep** — all 35 were `long-live` + traffic |
-| 2026-08-11 | Tue | 3 | 0 | **no sweep** |
-| 2026-08-12 | Wed | 32 | 32 (13:15:07–18) | full sweep, 32/33 |
+| PT date | dow | `iv:` keys | 1:15pm-window writes | cron fired? (analytics) | verdict |
+|---|---|---|---|---|---|
+| 2026-08-04 | Tue | 1 | 0 | **yes** 20:15:55, 13 sub | job-level failure |
+| 2026-08-05 | Wed | 20 | 15 (13:15:17–19) | series at :14, **no 20:15 row** | anomalous, see below |
+| 2026-08-06 | Thu | 16 | 7 (13:15:25–27) | **yes** 20:15:23, 50 sub | job-level, partial |
+| 2026-08-07 | Fri | 5 | 0 | **yes** 20:15:42, 11 sub | job-level failure |
+| 2026-08-08 | Sat | 5 | 0 | yes, 0 sub | market closed, correct |
+| 2026-08-09 | Sun | 6 | 0 | yes, 0 sub | market closed, correct |
+| 2026-08-10 | Mon | **35** | **0** | **yes** 20:15:35, **105 sub** | job-level failure |
+| 2026-08-11 | Tue | 3 | 0 | **yes** 20:15:31, 41 sub | job-level failure |
+| 2026-08-12 | Wed | 32 | 32 (13:15:07–18) | **yes** 20:15:05, 113 sub | full sweep, 32/33 |
 
-**One full sweep in seven trading days.** `2026-08-10` is the trap: 35 samples
+**One full sweep in seven trading days**, and `2026-08-10` is the trap: 35 samples
 against a 33-name watchlist reads as a complete sweep and is a sweep that never
-ran.
+ran — every one of the 35 was `long-live` or traffic.
 
-**If you add a fifth writer, or need this measurable, give the cron its own `src`.**
-It is a one-word change at the call site and it is the difference between a
-measurement and a guess.
+**THE CRON FIRED ON EVERY TRADING DAY.** Established from Workers Analytics
+(`workersInvocationsAdaptive`, which needs no observability token) by matching the
+cron's stable per-day second-offset at quarter-hour minutes. So **these are
+job-level failures, not schedule failures** — which is what makes the stamp guards
+above the right fix rather than a schedule change.
+
+**2026-08-07 was NOT a Sun–Thu casualty** — an earlier revision of this table said
+it was and that was wrong. The expression fix (`f313c04`, 2026-08-07 11:23 PT)
+predates that day's 1:15pm branch, and the cron did fire at 20:15:42.
+
+**2026-08-05 is the one loose end:** 15 samples were written at 13:15:17–19 PT and
+analytics shows **no invocation at all** at that minute, though the cron series is
+present at :14 seconds on either side of it. Unexplained.
 
 #### None of that logging exists unless observability is on
 

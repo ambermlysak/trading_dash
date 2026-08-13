@@ -1018,8 +1018,11 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    hostile sessions come from the index-trend clause with the VIX term structure in
    contango; those are unlikely to behave like backwardation episodes.
 
-15. **FIVE CRON JOBS STAMP THEIR DEDUP KEY ON A FAILED RUN — measured, awaiting a
-   decision on the fix.** `eod-summary`, `iv-sweep`, `forward-returns`,
+15. ~~**FIVE CRON JOBS STAMP THEIR DEDUP KEY ON A FAILED RUN**~~ — **FIXED
+   2026-08-12.** Each of the five now guards its stamp on the run having
+   accomplished something, with the threshold and the before/after measurement in
+   CLAUDE.md rule #7. Item 16 below is the part that remains. Original text:
+   `eod-summary`, `iv-sweep`, `forward-returns`,
    `move-series` and `13f-slice` all stamp after a run that accomplished nothing,
    because each swallows its own per-item failures. The full measured table, the
    forcing method and the per-job verdicts are in **CLAUDE.md rule #7**, under
@@ -1054,12 +1057,23 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    COUNT DOES NOT MEASURE SWEEP SUCCESS"*. Three distinct problems, none of which
    #15's stamp fix would touch:
 
-   - **Four dates recorded no sweep at all** (08-04, 08-07, 08-10, 08-11). 08-07 is
-     explained by the known Sun–Thu cron bug. **08-10 and 08-11 are consecutive
-     trading days with no known cause**, and 08-11 is the one that matters: if the
-     sweep ran, failed and stamped, that is #15 firing in production on the path
-     where the data does not backfill. **Undeterminable retroactively** —
-     `ivsweep:last` has been overwritten and the logs are unreachable (see #17).
+   - **Four dates recorded no sweep at all** (08-04, 08-07, 08-10, 08-11) — and
+     **the cron fired on every one of them.** Established from Workers Analytics:
+     08-04 at 20:15:55 (13 sub), 08-07 at 20:15:42 (11 sub), 08-10 at 20:15:35
+     (**105 sub**), 08-11 at 20:15:31 (41 sub). So these are **job-level failures,
+     not schedule failures**. My earlier attribution of 08-07 to the Sun–Thu cron
+     bug was **wrong**: the fix (`f313c04`) landed 2026-08-07 11:23 PT, hours
+     before that day's branch.
+
+     **Two candidate causes for 08-10/08-11 and the evidence cannot separate
+     them.** Both fit a `20:30` firing that consumed 0 subrequests: (a) the sweep
+     ran, every ticker failed, and it stamped — #15 in production; or (b)
+     `sweepUniverse` refused an empty universe, which returns *before* the stamp
+     and would refuse again at :30. KV reads are invisible to the analytics
+     subrequest metric (see #18), so both look identical from outside. The line
+     that would settle it — `[cron] iv samples recorded for X/Y` — is unreachable
+     (#17). **The 2026-08-12 stamp guards make (a) impossible going forward
+     regardless of which it was.**
    - **Two dates truncated mid-loop** (08-05 at 15, 08-06 at 7). `recordWatchlistIv`
      runs `Promise.allSettled` over batches of 5, awaited sequentially, so a
      per-ticker failure is absorbed and the loop continues — **per-ticker failures
@@ -1075,9 +1089,49 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
      sweep that ever reached KTOS's position in the list, so n=1 and it reads as
      transient.
 
-   **The prerequisite for any of this becoming measurable is one word:** give the
-   cron its own `src` in `recordIvSample`. Until then the count conflates four
-   writers and `ok/N` lives only in a log line nobody can read.
+   **The provenance half is DONE (2026-08-12):** the cron writes `src: 'sweep'` and
+   `/api/iv/:ticker` writes `src: 'api'`, so from here the split is a field rather
+   than an inference. Historical keys stay unprovenanced on purpose — absent `src`
+   means pre-2026-08-12 and must never be read as `'api'`.
+
+   **THE REMAINING PROBLEM IS BIAS, NOT SPARSITY, AND IT HAS A DEADLINE.**
+   `ivRankFrom` counts `history.length` and nothing else; `ivHistory` rebuilds the
+   series from key metadata (`atmIv`, `spot`, `dte`) which carries **no
+   provenance**. So nothing anywhere gates on where a sample came from — confirmed
+   by reading both functions. Measured 2026-08-12:
+
+   - **44% of all 123 samples are sweep-origin** (54/123). The rest exist only for
+     names someone looked at, at times someone looked.
+   - Highest sweep fraction is 75% (GOOGL, MU, NOW — each 3/4). Lowest are 0%:
+     JPM, MRK, SNDK (off-watchlist) and **KTOS, which is on the watchlist**.
+   - **The leader is AAPL at 8 samples — 52 short of `IV_RANK_MIN_DAYS` (60).**
+
+   At roughly one sample per trading day that is about ten weeks of runway before
+   `ivRankFrom` starts returning a number computed as `(cur − min) / (max − min)`
+   over a viewing-biased sample, with `historyDays` unable to tell the difference.
+   **The fix must land before the floor is crossed**, and the shape of it is a
+   provenance term in the rank — not a change to `IV_RANK_MIN_DAYS`.
+
+   **What the floor is currently hiding, printed rather than asserted.** Today
+   neither AAPL nor NVDA diverges — both give 0 with and without the floor, because
+   current IV is the series minimum either way:
+
+   ```
+   AAPL  all n=8  [29.36 28.38 26.01 23.79 23.28 24.84 23.6 20.85]  cur 20.85 -> 0
+         sweep-only n=1  [20.85]                                     cur 20.85 -> 0
+         ^ that 0 is the `max === min` degenerate branch at n=1, NOT a percentile
+   NVDA  all n=7  [35.96 33.88 34.28 32.94 35.05 33.86 30.61]        cur 30.61 -> 0
+         sweep-only n=3 [35.96 33.88 30.61]                          cur 30.61 -> 0
+   ```
+
+   The divergence is latent, not visible today. **But `max === min → 0` means a
+   degenerate series and a genuine bottom-of-range reading render identically**,
+   which is the same class as the `hitRate` null that printed as a measured 0%.
+
+   **`buyableFrom` is not currently ungated** — with `ivRank` null it falls to the
+   `basis: 'proxy'` branch on IV/HV30, which labels itself *"A proxy, not a
+   percentile."* The floor demoted the gate to a labelled proxy rather than
+   disabling it.
 
    `ivRank` needs `IV_RANK_MIN_DAYS`-worth of unbroken daily history and none of
    these gaps backfill, so every day of delay is permanent.
@@ -1108,8 +1162,18 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    completion and is therefore clean, disagrees the same way: `capCost` 254
    (ext 139 / bind 115) against Cloudflare's 153.
 
-   **Hypothesis, not conclusion: Cloudflare's metric excludes KV binding
-   operations.** Not verified — a deliberate experiment would be needed.
+   **Cloudflare's metric excludes KV binding operations — upgraded from hypothesis
+   to strongly supported, 2026-08-12, by a natural experiment rather than a
+   contrived one.** The second firing of the 1:15pm window (20:30:05Z) dispatches
+   all three jobs, every one of which performs at least one KV `get` for its dedup
+   check before returning. Analytics reports **0 subrequests** for that invocation
+   against **3,437 µs CPU** — non-zero work, zero counted subrequests. The same
+   shape appears on 08-11 (20:30:31Z, 0 sub / 3,257 µs). KV reads demonstrably
+   happened and were demonstrably not counted.
+
+   Still short of proof: this infers the KV reads from the dispatch path rather
+   than observing them, and it does not establish which *other* binding types
+   behave the same way.
 
    If true, the consequence is two-sided. `capCost` would be *conservative*
    relative to the platform's own accounting, which is the safe direction, and at
