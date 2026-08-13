@@ -1204,17 +1204,37 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
      in precisely the series `ivRank` will percentile at day 60, which is the one
      place a silent redefinition costs the most.
 
-   ### CAPTURE, on the first day the sweep runs twice
+   ### CAPTURE — `iv-capture.mjs`, fire once and walk away
 
    The two passes are 15 minutes apart and the second overwrites the first, so the
-   only chance to measure the shift is **between them**:
+   only chance to measure the shift is **between them**. That window is too narrow
+   and too real-time to work by hand, so it is scripted:
 
-   1. Between roughly **13:17 and 13:29 PT**, read every `iv:{TICKER}:{DATE}` value
-      for the watchlist and save it — `atmIv` and `ts` per name. Read-only, via
-      `npx wrangler kv key get --remote --binding REC_LOG`. **Never** through
-      `/api/iv/:ticker`, which would write a sample and corrupt the measurement.
-   2. After **13:32 PT**, read the same keys again.
-   3. Print the per-ticker `atmIv` delta and the `ts` gap.
+   ```bash
+   node iv-capture.mjs        # run between 1:16pm and 1:28pm PT; 1:17pm is the mark
+   ```
+
+   It takes pass 1 immediately, re-reads after 45s to confirm the first sweep has
+   stopped writing (using the later read if it had not), waits past 1:33pm PT,
+   takes pass 2, and prints the per-ticker `atmIv` delta, the `ts` gap, and which
+   names appear in one pass only. Both raw snapshots are written to
+   `iv-capture-out/` (gitignored) so the comparison can be redone offline with
+   `node iv-capture.mjs --compare <pass1> <pass2>`.
+
+   **It refuses outside the window rather than producing a meaningless pass 1** —
+   too early captures a half-written set, too late may already contain the second
+   pass. `--force` overrides, loudly.
+
+   **Read-only, and the two ways to ruin the measurement are both refusals of
+   discipline rather than of code:** never call `/api/iv/:ticker` (its "record
+   before ranking" call site WRITES a sample), and do not expand a Long-tab row
+   while it runs (`/api/long/:ticker` writes `src: 'long-live'`). Loading the Long
+   tab itself is safe — `/api/long/batch` is a KV read with no outbound fetch.
+
+   It reads through the Cloudflare REST API with wrangler's own credential rather
+   than 33 serial `wrangler kv key get` calls, because npx startup cost alone could
+   push pass 1 past the 1:30pm boundary and blend the two sweeps. One wrangler call
+   is still made first, purely to refresh the OAuth token.
 
    If the `:15` and `:30` readings differ materially, the non-incremental retry is a
    **data-integrity** problem rather than wasted subrequests — and that changes what

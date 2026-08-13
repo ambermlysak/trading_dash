@@ -8,3 +8,8 @@ node_modules/
 .claude/settings.local.json
 
 long-tab-prompt.md
+
+# Raw KV snapshots written by iv-capture.mjs. Kept on disk deliberately so a
+# comparison can be redone offline, but they are per-day measurement data, not
+# source — and they carry the whole watchlist's IV readings.
+iv-capture-out/
