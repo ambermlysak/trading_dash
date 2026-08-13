@@ -428,12 +428,12 @@ distinguish one failed job from a failed branch.
 
 1. the job's own **per-job KV stamp** — `daily:snapshot`, `daily:midday`,
    `daily:eod`, `ivsweep:last`, `macrosweep:last`, `recfwd:last`,
-   `movesweep:last`, `13f:cursor`
+   `movesweep:last`, `moodsweep:last`, `13f:cursor`
 2. a grep for **`!! JOB-FAILED !!`**, which names the job
 
-This now covers all eight dispatch sites in `scheduled()`: `morning-briefing`,
+This now covers all nine dispatch sites in `scheduled()`: `morning-briefing`,
 `midday-pulse`, `eod-summary`, `iv-sweep`, `macro-state`, `forward-returns`,
-`move-series`, `13f-slice`.
+`move-series`, `market-mood`, `13f-slice`.
 
 > ##### THE GREP HALF OF THIS STANDARD HAS NEVER BEEN RUNNABLE — 2026-08-12
 >
@@ -478,6 +478,7 @@ of the day's remaining firings.
 | `iv-sweep` | `ivsweep:last` | `ok === tickers.length` | 0 samples written, key stamped → **key ABSENT** |
 | `forward-returns` | `recfwd:last` | `chartFailures === 0` | per-ticker chart failures `continue`d and it stamped → **key ABSENT** |
 | `move-series` | `movesweep:last` | `written + skipped === tickers.length` | same `allSettled` shape → **key ABSENT** |
+| `market-mood` | `moodsweep:last` | `fetched === MOOD_SYMBOLS.length` | built to the pattern above, never had the defect |
 | `13f-slice` | `13f:cursor`, `lastFullPass` | cursor holds on a wholly-failed batch; `lastFullPass` needs `managersOk > 0` | advanced 4→8→12→16→0, set `lastFullPass`, then idled 7 days → **cursor held at 0 across 5 slices, `lastFullPass: null`** |
 
 **The thresholds, and why each is what it is:**
@@ -490,6 +491,12 @@ of the day's remaining firings.
 - **NOT `filled > 0` for forward-returns.** Most days nothing is pending and 0
   filled is correct and complete. The incomplete signal is a ticker whose chart
   could not be read at all.
+- **`fetched === 15` for market-mood, and a partial run still WRITES.** The two
+  are separate decisions and both are deliberate: a readable sector board with an
+  unavailable verdict is a finding worth rendering, so the payload is stored; but
+  the run is not done, so it does not stamp. The write is one key rewritten
+  whole, so a retry replaces rather than duplicates. A run where **every** fetch
+  failed writes nothing at all — a board of 15 unavailable rows is not a finding.
 
 **Cost, bounded and stated:** the 1:15pm window admits exactly two firings, so a
 persistently failing name costs one extra pass per day and no more.
@@ -718,6 +725,11 @@ locally — a local run with no `.dev.vars` shows:
 - **econ calendar degraded to FOMC-only**, reporting `dataReleases.ok: false`
 - **short interest falling back to the labelled Yahoo estimate** instead of FINRA
 - **every Claude-backed card empty**, since `/api/claude` 500s with no key
+- **Market Mood renders its house TEMPLATE sentence, not an empty card** — the
+  whole verdict is rules-decided, so only the phrasing degrades. `sentenceSource`
+  reads `template` and the note names `ANTHROPIC_API_KEY not set`. That is the
+  fallback working, not a failure, and it is why the Claude half of that job
+  cannot be exercised locally without a key
 
 To test those paths locally, create `.dev.vars` with the same keys:
 
@@ -739,7 +751,7 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Ten checks exist, all of which print computed vs
+There is no build step. Eleven checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
 (Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
@@ -766,14 +778,27 @@ term-structure SIGN convention, both classification boundaries as strict
 inequalities, `hostileVia`, date alignment against a brute-force intersection,
 `unavailable` with each of the four inputs missing in turn, the trailing mean, the
 two trend derivations agreeing, and `collectMacroState`'s exact cost and every
-refusal path driven with stub bindings). All of them extract functions from
+refusal path driven with stub bindings), and `node mood.check.mjs` (Market Mood:
+every candlestick predicate firing **and** at a non-firing boundary value, the
+trend-context reclassification — one geometry reading `hammer` / `hanging-man` /
+direction-neutral — both sides of every emotion cut, the macro classifier across
+all seven states with stub reads, the stance table, the template for every
+(macroState, breadth qualifier) pair, the sentence guard that stops a rephrase
+becoming a reclassification, and `collectMarketMood`'s exact cost and every
+refusal path with stub bindings). All of them extract functions from
 `worker.js` by source, not by import, because every named export in `worker.js`
 must be a function or `workerd` refuses to boot.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144** for moves / long-fixtures /
-cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f / sweep-universe /
-macro — **592 comparisons** across the suite.
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 273** for moves /
+long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
+sweep-universe / macro / mood — **865 comparisons** across the suite.
+
+**`mood.check.mjs` uses a brace-matching `grabConst`, not the scan-to-semicolon
+one the other scripts share.** `MOOD_STANCE`'s sentences contain semicolons, and
+a `[^;]+` grab truncates the table mid-string — the generated module then fails
+to parse, which reads as a missing constant rather than as a harness bug. Copy
+that version, not the older one, for any table holding prose.
 
 **`node iv-capture.fixture.mjs` is an eleventh script and is deliberately NOT in
 that total**, because it tests `iv-capture.mjs` — an operational capture tool —
@@ -830,6 +855,8 @@ without ever opening that file.
 - Do not declare a local `const TTL` — `TTL` is a module-level table
 - `premium:{TICKER}` freshness and retention must not be equal
 - `moves:{TICKER}` schema check stays strict equality
+- `mood:state` schema check stays strict equality; Market Mood's states are
+  decided by rules and Claude may only rephrase the verdict, never change it
 - `calib:pooled` lives in the cron and must never move
 - `scheduled()` gates on the Pacific trading day before dispatching
 
@@ -853,7 +880,7 @@ data is still empty — `primeTabs()` has usually painted it already.
 
 | Tab | `#hash` | What it is |
 |---|---|---|
-| **Market** | `#market` | Default. Index/futures/commodities strip, the 6am Claude briefing headline, EOD card, Friday week-ahead, news cards, pre/post-market movers (≥ ±10%), IPO calendar, watchlist signals. |
+| **Market** | `#market` | Default. Index/futures/commodities strip, the 6am Claude briefing headline, **Market Mood** (candlestick emotion read, directly under the brief), EOD card, Friday week-ahead, news cards, pre/post-market movers (≥ ±10%), IPO calendar, watchlist signals. |
 | **Midday** | `#midday` | The 11:30am PT midday pulse — session narrative, topics, next-day events, short-term trade ideas, big movers. |
 | **Scanner** | `#scanner` | Four presets. Three (Momentum / HOD, Pre-Market Gappers, All Movers) hit `/api/market/scanner` and share `renderScanner()`; **Golden Cross Setup** hits `/api/market/golden-cross` and uses `renderGoldenCross()`. `loadScanner()` branches on the preset for endpoint, renderer, header copy and legend. |
 | **Watchlist** | `#watchlist` | The 14-column table, sortable, with expandable rows and the consolidated Recommendation column. |

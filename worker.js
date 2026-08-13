@@ -1075,6 +1075,12 @@ const TTL = {
   ipos:     12 * 3600,
   earnings: 12 * 3600,
   track:    3600,
+  /* One write a trading day (2:00pm PT), so the badge should only go amber once
+     a whole daily cadence has been missed. `MOOD_FRESH_MS` is derived from this
+     rather than declared beside the job, so the badge and the reader cannot
+     disagree about what "fresh" means. A weekend or holiday legitimately ages
+     the record past it — the section renders its own as-of date. */
+  mood:     26 * 3600,
 };
 
 /* ── Yahoo Finance (no-auth) ── */
@@ -1432,7 +1438,11 @@ async function yahooSparkCloses(symbols, range = '3y', concurrency = 4, { withTi
    Retries transient failures (429 rate limit, 5xx overload) with backoff.
    A single un-retried hiccup during the 6am cron used to wipe out the daily
    briefing, sector intelligence, and watchlist signals for the whole day. */
-async function workerClaude(prompt, env, maxTokens = 400, schema = null) {
+/* `raw` opts into `{ text, stopReason }` instead of the bare string.
+ * `claudeText()` cannot tell a complete answer from one the token cap cut off —
+ * both arrive as text, and the truncated one parses or renders as though it were
+ * whole. Every existing caller keeps the string return by omitting the flag. */
+async function workerClaude(prompt, env, maxTokens = 400, schema = null, { raw = false } = {}) {
   if (!env?.ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY not set');
 
   const MAX_ATTEMPTS = 4;
@@ -1471,7 +1481,10 @@ async function workerClaude(prompt, env, maxTokens = 400, schema = null) {
     }
 
     if (r.ok) {
-      return claudeText(await r.json());
+      const data = await r.json();
+      return raw
+        ? { text: claudeText(data), stopReason: data?.stop_reason ?? null }
+        : claudeText(data);
     }
 
     // Retry only transient statuses; fail fast on 4xx client errors (bad key, bad request)
@@ -6725,6 +6738,906 @@ async function collectMoveSeries(env) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   MARKET MOOD — a candlestick emotion read across 4 index ETFs and the 11 SPDR
+   sector ETFs, collapsed into ONE macro emotion and ONE stance line.
+
+   ── HYBRID, AND THE SPLIT IS THE WHOLE DESIGN ───────────────────────────────
+   Every state here — each symbol's emotion, the macro emotion, the stance
+   category — is decided by the rules in this section and by nothing else.
+   Claude is handed the FINISHED verdict and asked for one readable sentence.
+   It cannot change a state: the prompt says the verdict is decided, the schema
+   returns a sentence and nothing else, and `moodSentenceUsable()` rejects an
+   answer that names a different state. A fixed template per (macroState,
+   breadth qualifier) pair is what renders when the call fails or comes back
+   unusable, and `sentenceSource` on the payload says which one is on screen.
+
+   Why that split rather than asking the model for the read: the `analysis:`
+   rating was wired into sort order before anyone measured it and came back with
+   a NEGATIVE edge, and the macro chip ships display-only for the same reason.
+   A model's read is allowed to write here. It is never allowed to decide.
+
+   ── THIS IS PATTERN RECOGNITION, NOT A MEASURED EDGE ────────────────────────
+   Nothing in this section has been scored against forward returns. The
+   emotion, the macro state and the stance are a rules-based reading of price
+   shape, and the payload carries `usedForRanking: false` so no reader has to
+   infer that. It sorts, gates and filters nothing.
+
+   ── SETTLED BARS ────────────────────────────────────────────────────────────
+   Runs on the 2:00pm PT branch for the same reason `collectMoveSeries` does:
+   the NYSE closes at 1:00pm PT, so by 2:00pm the day's daily bar is final and
+   is the most informative bar in the series. `moodSettledBars()` still drops a
+   final bar dated today when the job runs BEFORE the bell (PT hour <
+   MOOD_PRECLOSE_PT_HOUR) — that covers a manual or admin-triggered run, which
+   is the only way a forming bar can reach this code. An unconditional drop
+   would discard a settled bar every single day and make the 2:00pm placement
+   buy nothing.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const MOOD_KEY       = 'mood:state';
+/* OUTSIDE the `mood:` prefix, the same rule as `ivsweep:last` / `movesweep:last`
+   / `macrosweep:last`: nothing scanning that prefix may read the dedup stamp as
+   a record. Stamped LAST, after the payload write, so any failure leaves the
+   next firing to retry. */
+const MOOD_SWEEP_KEY = 'moodsweep:last';
+const MOOD_SCHEMA    = 1;
+const MOOD_TTL       = 7 * 24 * 3600;          // 7d retention
+/* Freshness ≠ retention, the same split as `long:` / `macro:` / `econ:dgs3mo`.
+   Past 26h the section still renders, badged stale and carrying its as-of date;
+   a labelled old read beats a blank one. Derived from the global TTL table so
+   the badge's threshold and the reader's cannot drift. */
+const MOOD_FRESH_MS  = TTL.mood * 1000;
+const MOOD_RANGE     = '3mo';                  // ~63 sessions: SMA20 + context + slack
+const MOOD_MIN_BARS  = 30;                     // below this the trend context cannot be formed
+const MOOD_PRECLOSE_PT_HOUR = 13;              // PT hour the 1:00pm bell has rung by
+
+/* ── THE UNIVERSE ────────────────────────────────────────────────────────────
+   Candlestick patterns need OHLC, and `yahooSparkCloses` is close-only — so
+   this is one /v8 chart fetch per symbol, 15 of them, and there is no batched
+   substitute. That is the cost of the feature, stated rather than discovered.
+
+   The sector half REUSES `SECTOR_ETFS` rather than restating the 11 names.
+   Both tables are symbol -> label; an inverted twin of an existing table is the
+   "looks like a copy, means the opposite" hazard this codebase has already been
+   caught by once, so the direction matches deliberately. */
+const MOOD_INDEX_ETFS = {
+  'SPY': 'S&P 500',
+  'QQQ': 'Nasdaq 100',
+  'DIA': 'Dow 30',
+  'IWM': 'Russell 2000',
+};
+const MOOD_SYMBOLS = [
+  ...Object.entries(MOOD_INDEX_ETFS).map(([symbol, label]) => ({ symbol, label, group: 'index' })),
+  ...Object.entries(SECTOR_ETFS).map(([symbol, label]) => ({ symbol, label, group: 'sector' })),
+];
+
+/* ── CANDLE GEOMETRY THRESHOLDS ──────────────────────────────────────────────
+   Every predicate below is an exact OHLC test against one of these. They are
+   ratios of the bar's own range or its own body, never absolute prices: a 0.40
+   body on SPY and on XLU mean the same thing, a $2 body does not. */
+const MOOD_DOJI_BODY_MAX     = 0.10;   // |c-o| <= 10% of the high-low range
+const MOOD_SPIN_BODY_MAX     = 0.30;   // spinning top: small body...
+const MOOD_SPIN_SHADOW_MIN   = 0.25;   //   ...with BOTH shadows >= 25% of range
+const MOOD_HAMMER_SHADOW_MIN = 2.00;   // hammer family: long shadow >= 2x the body
+const MOOD_HAMMER_OPP_MAX    = 0.25;   //   ...and the opposite shadow <= 25% of range
+const MOOD_HAMMER_BODY_MAX   = 0.35;   //   ...and the body itself <= 35% of range
+const MOOD_MARUBOZU_BODY_MIN = 0.90;   // body >= 90% of range: no meaningful shadows
+const MOOD_LONG_BODY_MIN     = 0.60;   // "long" body, for engulfing / star / soldier quality
+const MOOD_STAR_BODY_MAX     = 0.35;   // the star's own (middle) body
+const MOOD_TREND_LOOKBACK    = 5;      // sessions in the prior-return half of the trend read
+const MOOD_TREND_SMA         = 20;     // SMA of closes the current close is placed against
+
+/* ── PATTERN SCORES ──────────────────────────────────────────────────────────
+   Sign is direction, magnitude is conviction. Three-candle confirmations and
+   engulfings carry the most because they encode a completed reversal rather
+   than a single indecisive bar; doji and spinning top carry ZERO because
+   indecision is not a direction, and giving them a sign would manufacture one.
+
+   THESE ARE NOT CALIBRATED WEIGHTS. They are a stated ordering, and the payload
+   ships them so nothing downstream re-invents a different one. */
+const MOOD_PATTERN_SCORE = {
+  'doji':                  0,
+  'spinning-top':          0,
+  'long-lower-shadow':     0,
+  'long-upper-shadow':     0,
+  'hammer':               +2,
+  'inverted-hammer':      +1,
+  'hanging-man':          -2,
+  'shooting-star':        -2,
+  'bullish-marubozu':     +2,
+  'bearish-marubozu':     -2,
+  'bullish-engulfing':    +3,
+  'bearish-engulfing':    -3,
+  'piercing-line':        +2,
+  'dark-cloud-cover':     -2,
+  'morning-star':         +3,
+  'evening-star':         -3,
+  'three-white-soldiers': +3,
+  'three-black-crows':    -3,
+};
+
+/* Context adds at most ±2: one for which side of the SMA20 the close sits on,
+   one for the sign of the prior 5-session return. Deliberately smaller than any
+   confirmed reversal pattern — context should colour a read, not carry it. */
+const MOOD_CTX_SMA   = 1;
+const MOOD_CTX_TREND = 1;
+
+/* ── EMOTION THRESHOLDS ──────────────────────────────────────────────────────
+   Symmetric by construction: a score and its negation land the same distance
+   from neutral. Positive cuts are `>=`, negative cuts are `<=`, and score 0 is
+   the only value that reaches `neutral`. */
+const MOOD_T_EUPHORIA     =  5;
+const MOOD_T_GREED        =  3;
+const MOOD_T_OPTIMISM     =  1;
+const MOOD_T_CAUTION      = -1;
+const MOOD_T_FEAR         = -3;
+const MOOD_T_CAPITULATION = -5;
+
+const MOOD_BULLISH_EMOTIONS = ['optimism', 'greed', 'euphoria'];
+const MOOD_BEARISH_EMOTIONS = ['caution', 'fear', 'capitulation'];
+
+/* ── MACRO CLASSIFIER ────────────────────────────────────────────────────────
+   The indexes are what the phrase "the market" means, so they carry double the
+   weight of one sector. Eleven sectors at weight 1 against four indexes at
+   weight 2 gives the sector half 11/19 of the blend — enough that a broad
+   sector move can outvote the indexes, which is the point of looking at both. */
+const MOOD_INDEX_WEIGHT  = 2;
+const MOOD_SECTOR_WEIGHT = 1;
+
+const MOOD_M_EUPHORIA     =  4.0;
+const MOOD_M_GREED        =  2.5;
+const MOOD_M_RISK_ON      =  0.75;
+const MOOD_M_RISK_OFF     = -0.75;
+const MOOD_M_FEAR         = -2.5;
+const MOOD_M_CAPITULATION = -4.0;
+
+/* Breadth qualifier cutoffs, over the sectors that returned a reading. */
+const MOOD_BREADTH_STRONG = 7;   // >= 7 of 11 leaning one way is broad
+const MOOD_BREADTH_SPLIT  = 1;   // |bullish - bearish| <= 1 is split
+
+/* ── STANCE ──────────────────────────────────────────────────────────────────
+   Written for a trader whose primary structure is BOUGHT premium on
+   high-conviction directional setups (long calls/puts, debit verticals), with
+   short structures secondary and defined-risk only. That is why greed reads as
+   a warning rather than a green light: for a buyer of options, a crowded tape
+   is where the debit is most expensive and the edge is worst.
+
+   EVERY macroState resolves here, `unavailable` included — a missing read gets
+   an explicit no-stance rather than falling through to the neutral one, because
+   "we could not compute this" and "the market is balanced" are different facts
+   and must not produce the same line. */
+const MOOD_STANCE = {
+  'euphoria': {
+    category: 'stand-down',
+    sentence: 'Stand down on new longs — the tape is crowded and long premium is at its most expensive, '
+            + 'so wait for the pullback rather than paying up for continuation.',
+  },
+  'greed': {
+    category: 'wait-for-pullback',
+    sentence: 'Do not chase — wait for pullback entries, because long premium is expensive here and every '
+            + 'strike is already priced for the move to continue.',
+  },
+  'risk-on': {
+    category: 'press-longs',
+    sentence: 'Constructive for bought calls and call debit verticals — take the higher-conviction setups '
+            + 'at normal size and let the trend do the work.',
+  },
+  'mixed': {
+    category: 'setup-only',
+    sentence: 'No macro edge either way — trade only names with their own catalyst, keep debits small, '
+            + 'and skip anything that needs the whole tape to cooperate.',
+  },
+  'risk-off': {
+    category: 'defensive',
+    sentence: 'Defensive — no new swing longs into strength, bought puts and put debit verticals are the '
+            + 'cleaner side, and any short structure stays defined-risk.',
+  },
+  'fear': {
+    category: 'defined-risk-only',
+    sentence: 'No new swing longs — defined-risk only, and watch for a reversal pattern to print before '
+            + 'catching anything falling.',
+  },
+  'capitulation': {
+    category: 'wait-for-reversal',
+    sentence: 'Do not knife-catch — wait for a confirmed reversal candle, because premium is at its most '
+            + 'expensive exactly where the urge to buy it is strongest.',
+  },
+  'unavailable': {
+    category: 'no-read',
+    sentence: 'No stance — the mood read could not be computed, and an absent reading is not a calm one.',
+  },
+};
+
+/* Appended to the template sentence. A breadth qualifier changes how firmly the
+   state is held, never which state it is — so it is a clause on the sentence
+   rather than a second key into the stance table. */
+const MOOD_BREADTH_CLAUSE = {
+  'broad':  ' Breadth is broad, so the index read is confirmed across sectors.',
+  'narrow': ' Breadth is narrow, so this rests on a few sectors rather than the whole tape.',
+  'split':  ' Breadth is split, so treat the index read as weakly held.',
+};
+
+const MOOD_ANSWER_TOKENS   = 200;
+const MOOD_SENTENCE_MAX    = 260;   // chars; longer is not one sentence
+const MOOD_SENTENCE_MIN    = 30;    // chars; shorter is not a usable rewrite
+
+const MOOD_SENTENCE_SCHEMA = {
+  type: 'object',
+  properties: {
+    sentence: {
+      type: 'string',
+      description: 'One sentence of plain prose, 15-40 words, no markdown, no bullet points.',
+    },
+  },
+  required: ['sentence'],
+  additionalProperties: false,
+};
+
+/** OHLC bars from a Yahoo /v8 chart response. Every predicate below needs all
+ *  four values, so a bar missing any one of them is dropped rather than carried
+ *  with a null that would silently make a comparison false. */
+function moodBars(chart) {
+  const res = chart?.chart?.result?.[0];
+  const ts  = res?.timestamp || [];
+  const q   = res?.indicators?.quote?.[0] || {};
+  const out = [];
+  for (let i = 0; i < ts.length; i++) {
+    const o = q.open?.[i], h = q.high?.[i], l = q.low?.[i], c = q.close?.[i];
+    if (o == null || h == null || l == null || c == null) continue;
+    if (!Number.isFinite(o) || !Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c)) continue;
+    out.push({ iso: new Date(ts[i] * 1000).toISOString().slice(0, 10), o, h, l, c });
+  }
+  return out;
+}
+
+/** Drop a final bar dated today ONLY when the bell has not rung yet.
+ *  See the settled-bars note above: at 2:00pm PT today's bar is final and is
+ *  the bar this whole feature exists to read. */
+function moodSettledBars(bars, today = ptDate(), ptHour = null) {
+  const hour = ptHour == null
+    ? Number(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles', hour: '2-digit', hour12: false }))
+    : ptHour;
+  const last = bars.length ? bars[bars.length - 1] : null;
+  if (last && last.iso === today && Number.isFinite(hour) && hour < MOOD_PRECLOSE_PT_HOUR) {
+    return { bars: bars.slice(0, -1), droppedForming: true };
+  }
+  return { bars, droppedForming: false };
+}
+
+/** One bar's geometry. A zero-range bar (no trade, or a halt printing one price)
+ *  yields null ratios, and every predicate then answers false rather than
+ *  dividing by zero into a pattern that did not happen. */
+function moodCandle(b) {
+  const range = b.h - b.l;
+  const body  = Math.abs(b.c - b.o);
+  const upper = b.h - Math.max(b.o, b.c);
+  const lower = Math.min(b.o, b.c) - b.l;
+  const ok    = range > 0;
+  return {
+    ...b, range, body, upper, lower,
+    bull: b.c > b.o, bear: b.c < b.o,
+    bodyPct:  ok ? body / range  : null,
+    upperPct: ok ? upper / range : null,
+    lowerPct: ok ? lower / range : null,
+  };
+}
+
+/* ── SINGLE-CANDLE PREDICATES ───────────────────────────────────────────────
+   The hammer and inverted-hammer SHAPES are direction-neutral. Which name they
+   take is decided by trend context in `moodPatternsAt` — a hammer in an uptrend
+   is a hanging man, and calling both "hammer" would put a bullish reversal
+   label on a bearish one. */
+function moodIsDoji(k) {
+  return k.bodyPct != null && k.bodyPct <= MOOD_DOJI_BODY_MAX;
+}
+function moodIsSpinningTop(k) {
+  return k.bodyPct != null
+      && k.bodyPct > MOOD_DOJI_BODY_MAX && k.bodyPct <= MOOD_SPIN_BODY_MAX
+      && k.upperPct >= MOOD_SPIN_SHADOW_MIN && k.lowerPct >= MOOD_SPIN_SHADOW_MIN;
+}
+/** Long lower shadow, small body near the high. `body > 0` keeps a true doji out
+ *  of this family: with a zero body, `lower >= 2 * body` is trivially true and
+ *  every dragonfly doji would also report as a hammer. */
+function moodIsHammerShape(k) {
+  return k.bodyPct != null && k.body > 0
+      && k.bodyPct <= MOOD_HAMMER_BODY_MAX
+      && k.lower >= MOOD_HAMMER_SHADOW_MIN * k.body
+      && k.upperPct <= MOOD_HAMMER_OPP_MAX;
+}
+/** Mirror image: long upper shadow, small body near the low. */
+function moodIsInvertedShape(k) {
+  return k.bodyPct != null && k.body > 0
+      && k.bodyPct <= MOOD_HAMMER_BODY_MAX
+      && k.upper >= MOOD_HAMMER_SHADOW_MIN * k.body
+      && k.lowerPct <= MOOD_HAMMER_OPP_MAX;
+}
+function moodIsBullMarubozu(k) {
+  return k.bodyPct != null && k.bull && k.bodyPct >= MOOD_MARUBOZU_BODY_MIN;
+}
+function moodIsBearMarubozu(k) {
+  return k.bodyPct != null && k.bear && k.bodyPct >= MOOD_MARUBOZU_BODY_MIN;
+}
+
+/* ── TWO-CANDLE PREDICATES ──────────────────────────────────────────────────
+   `p` is the prior bar, `k` the current one. Engulfing compares BODIES, not
+   ranges — the classical definition, and the one that survives a long shadow.
+
+   Piercing and dark cloud test the open against the prior CLOSE rather than the
+   prior low/high. The stricter variant requires a gap past the extreme, which
+   on index and sector ETFs is close to unreachable — a predicate that cannot
+   fire is worse than no predicate, which this repo has already shipped once. */
+function moodIsBullEngulfing(p, k) {
+  return p.bear && k.bull && p.body > 0 && k.body > 0 && k.c > p.o && k.o < p.c;
+}
+function moodIsBearEngulfing(p, k) {
+  return p.bull && k.bear && p.body > 0 && k.body > 0 && k.c < p.o && k.o > p.c;
+}
+function moodIsPiercingLine(p, k) {
+  if (!(p.bear && k.bull) || p.bodyPct == null || p.bodyPct < MOOD_LONG_BODY_MIN) return false;
+  const mid = (p.o + p.c) / 2;
+  // Closes back INTO the prior body past its midpoint, but not through it —
+  // through it is an engulfing, and the two must stay mutually exclusive.
+  return k.o < p.c && k.c > mid && k.c < p.o;
+}
+function moodIsDarkCloudCover(p, k) {
+  if (!(p.bull && k.bear) || p.bodyPct == null || p.bodyPct < MOOD_LONG_BODY_MIN) return false;
+  const mid = (p.o + p.c) / 2;
+  return k.o > p.c && k.c < mid && k.c > p.o;
+}
+
+/* ── THREE-CANDLE PREDICATES ────────────────────────────────────────────────
+   `a` is the oldest of the three, `k` the current bar. */
+function moodIsMorningStar(a, b, k) {
+  return a.bear && a.bodyPct != null && a.bodyPct >= MOOD_LONG_BODY_MIN
+      && b.bodyPct != null && b.bodyPct <= MOOD_STAR_BODY_MAX
+      && Math.max(b.o, b.c) < a.c                 // the star gaps below the first body
+      && k.bull && k.c > (a.o + a.c) / 2;         // and the third closes back into it
+}
+function moodIsEveningStar(a, b, k) {
+  return a.bull && a.bodyPct != null && a.bodyPct >= MOOD_LONG_BODY_MIN
+      && b.bodyPct != null && b.bodyPct <= MOOD_STAR_BODY_MAX
+      && Math.min(b.o, b.c) > a.c
+      && k.bear && k.c < (a.o + a.c) / 2;
+}
+function moodIsThreeWhiteSoldiers(a, b, k) {
+  return a.bull && b.bull && k.bull
+      && a.bodyPct != null && b.bodyPct != null && k.bodyPct != null
+      && a.bodyPct >= MOOD_LONG_BODY_MIN && b.bodyPct >= MOOD_LONG_BODY_MIN && k.bodyPct >= MOOD_LONG_BODY_MIN
+      && b.c > a.c && k.c > b.c                    // each closes higher
+      && b.o > a.o && b.o < a.c                    // and opens inside the prior body
+      && k.o > b.o && k.o < b.c;
+}
+function moodIsThreeBlackCrows(a, b, k) {
+  return a.bear && b.bear && k.bear
+      && a.bodyPct != null && b.bodyPct != null && k.bodyPct != null
+      && a.bodyPct >= MOOD_LONG_BODY_MIN && b.bodyPct >= MOOD_LONG_BODY_MIN && k.bodyPct >= MOOD_LONG_BODY_MIN
+      && b.c < a.c && k.c < b.c
+      && b.o < a.o && b.o > a.c
+      && k.o < b.o && k.o > b.c;
+}
+
+/**
+ * Trend context at bar `i`: which side of the SMA20 the close sits on, and the
+ * sign of the prior `MOOD_TREND_LOOKBACK`-session return ENDING AT `i-1` — the
+ * move that led into this bar, not one that includes it.
+ *
+ * Returns null when the history is too short. Null is not "flat": a caller must
+ * not read "we could not form a trend" as "there is no trend", so the reversal
+ * names fall back to their direction-neutral form rather than to a bullish one.
+ */
+function moodTrendAt(closes, i) {
+  const need = Math.max(MOOD_TREND_SMA - 1, MOOD_TREND_LOOKBACK + 1);
+  if (!Array.isArray(closes) || i < need || i >= closes.length) return null;
+  let sum = 0;
+  for (let j = i - MOOD_TREND_SMA + 1; j <= i; j++) sum += closes[j];
+  const sma  = sum / MOOD_TREND_SMA;
+  const from = closes[i - 1 - MOOD_TREND_LOOKBACK];
+  const to   = closes[i - 1];
+  if (!(from > 0)) return null;
+  const priorRet = (to - from) / from * 100;
+  const smaVote   = closes[i] > sma ? 1 : closes[i] < sma ? -1 : 0;
+  const trendVote = priorRet > 0 ? 1 : priorRet < 0 ? -1 : 0;
+  const votes = smaVote + trendVote;
+  return {
+    sma, priorRet, smaVote, trendVote, votes,
+    aboveSma: smaVote > 0, belowSma: smaVote < 0,
+    // BOTH signals must agree before a direction is claimed. One-of-two is
+    // `flat`, which is a real answer here rather than a missing one.
+    dir: votes >= 2 ? 'up' : votes <= -2 ? 'down' : 'flat',
+  };
+}
+
+/**
+ * Every pattern present on bar `i`, with the reversal shapes named by trend.
+ *
+ * The `flat` names — `long-lower-shadow` / `long-upper-shadow` — exist because
+ * a hammer shape with no trend behind it has nothing to reverse. Calling it a
+ * hammer would assert a bullish reversal from a bar that is only a bar; both
+ * carry score 0, so the shape is reported without a direction being invented.
+ */
+function moodPatternsAt(bars, closes, i) {
+  const k = moodCandle(bars[i]);
+  const p = i >= 1 ? moodCandle(bars[i - 1]) : null;
+  const a = i >= 2 ? moodCandle(bars[i - 2]) : null;
+  const trend = moodTrendAt(closes, i);
+  const dir   = trend ? trend.dir : 'flat';
+  const names = [];
+
+  if (moodIsDoji(k)) names.push('doji');
+  else if (moodIsSpinningTop(k)) names.push('spinning-top');
+
+  if (moodIsBullMarubozu(k)) names.push('bullish-marubozu');
+  if (moodIsBearMarubozu(k)) names.push('bearish-marubozu');
+
+  if (moodIsHammerShape(k)) {
+    names.push(dir === 'up' ? 'hanging-man' : dir === 'down' ? 'hammer' : 'long-lower-shadow');
+  }
+  if (moodIsInvertedShape(k)) {
+    names.push(dir === 'up' ? 'shooting-star' : dir === 'down' ? 'inverted-hammer' : 'long-upper-shadow');
+  }
+
+  if (p) {
+    if (moodIsBullEngulfing(p, k))  names.push('bullish-engulfing');
+    if (moodIsBearEngulfing(p, k))  names.push('bearish-engulfing');
+    if (moodIsPiercingLine(p, k))   names.push('piercing-line');
+    if (moodIsDarkCloudCover(p, k)) names.push('dark-cloud-cover');
+  }
+  if (a && p) {
+    if (moodIsMorningStar(a, p, k))         names.push('morning-star');
+    if (moodIsEveningStar(a, p, k))         names.push('evening-star');
+    if (moodIsThreeWhiteSoldiers(a, p, k))  names.push('three-white-soldiers');
+    if (moodIsThreeBlackCrows(a, p, k))     names.push('three-black-crows');
+  }
+  return { names, trend, candle: k };
+}
+
+/** Pattern scores plus at most ±2 of context. Returns null when there is no
+ *  trend read at all, because a score built from patterns alone is not the same
+ *  quantity as one built from patterns and context. */
+function moodScoreOf(names, trend) {
+  let score = 0;
+  for (const n of names) score += MOOD_PATTERN_SCORE[n] ?? 0;
+  if (trend) {
+    score += trend.smaVote * MOOD_CTX_SMA;
+    score += trend.trendVote * MOOD_CTX_TREND;
+  }
+  return score;
+}
+
+/** Score -> emotion. Negative cuts are tested BEFORE the neutral fallthrough,
+ *  so only an exact 0 reaches `neutral`. */
+function moodEmotionOf(score) {
+  if (score == null || !Number.isFinite(score)) return null;
+  if (score >= MOOD_T_EUPHORIA)     return 'euphoria';
+  if (score >= MOOD_T_GREED)        return 'greed';
+  if (score >= MOOD_T_OPTIMISM)     return 'optimism';
+  if (score <= MOOD_T_CAPITULATION) return 'capitulation';
+  if (score <= MOOD_T_FEAR)         return 'fear';
+  if (score <= MOOD_T_CAUTION)      return 'caution';
+  return 'neutral';
+}
+
+/** One symbol's read from its settled bars. Returns an `unavailable` row with a
+ *  reason rather than a neutral emotion whenever it cannot compute one — a
+ *  missing read must never be indistinguishable from a calm market. */
+function moodReadFor(entry, bars) {
+  const base = { symbol: entry.symbol, label: entry.label, group: entry.group };
+  if (!Array.isArray(bars) || bars.length < MOOD_MIN_BARS) {
+    return {
+      ...base, status: 'unavailable', emotion: null, score: null, patterns: [],
+      changePct: null, asOfClose: bars?.length ? bars[bars.length - 1].iso : null,
+      reason: `only ${bars?.length || 0} settled daily bars returned, and ${MOOD_MIN_BARS} are needed `
+            + `before the ${MOOD_TREND_SMA}-session trend context can be formed`,
+    };
+  }
+  const i      = bars.length - 1;
+  const closes = bars.map(b => b.c);
+  const { names, trend } = moodPatternsAt(bars, closes, i);
+  const score   = moodScoreOf(names, trend);
+  const prev    = closes[i - 1];
+  // `x == null` and `x === 0` must not render the same way, so a change that
+  // cannot be computed is null and never 0.
+  const changePct = prev > 0 ? (closes[i] - prev) / prev * 100 : null;
+  return {
+    ...base,
+    status: 'ok',
+    emotion:   moodEmotionOf(score),
+    score,
+    patterns:  names,
+    changePct: changePct == null ? null : Math.round(changePct * 100) / 100,
+    asOfClose: bars[i].iso,
+    trend: trend ? {
+      dir: trend.dir,
+      aboveSma: trend.aboveSma,
+      priorReturnPct: Math.round(trend.priorRet * 100) / 100,
+    } : null,
+    reason: null,
+  };
+}
+
+/** Bullish / bearish / neutral counts over the sector rows that produced a read.
+ *  `absent` is counted separately and is NOT folded into neutral — a sector we
+ *  could not read is not a sector sitting still. */
+function moodBreadthOf(sectorReads) {
+  const counts = { bullish: 0, bearish: 0, neutral: 0, counted: 0, absent: 0 };
+  for (const r of sectorReads) {
+    if (r.status !== 'ok' || r.emotion == null) { counts.absent++; continue; }
+    counts.counted++;
+    if (MOOD_BULLISH_EMOTIONS.includes(r.emotion)) counts.bullish++;
+    else if (MOOD_BEARISH_EMOTIONS.includes(r.emotion)) counts.bearish++;
+    else counts.neutral++;
+  }
+  return counts;
+}
+
+/** How firmly the state is held across sectors. Checked split-first: a 5/5/1
+ *  board is split even though neither side reaches the `broad` cutoff. */
+function moodBreadthQualifier(counts, macroScore) {
+  if (!counts || !counts.counted) return null;
+  if (Math.abs(counts.bullish - counts.bearish) <= MOOD_BREADTH_SPLIT) return 'split';
+  const lead = (macroScore != null && macroScore < 0) ? counts.bearish : counts.bullish;
+  return lead >= MOOD_BREADTH_STRONG ? 'broad' : 'narrow';
+}
+
+/**
+ * The macro verdict: deterministic, from the four index reads at double weight
+ * and the sector reads at single weight.
+ *
+ * ANY unreadable INDEX makes the whole verdict unavailable and names which.
+ * The four index ETFs are what the macro claim is about; computing one from
+ * sectors alone and calling it "the market" would be a different measurement
+ * wearing the same label. Sector rows that failed simply drop out of the blend
+ * and are reported in `breadth.absent`.
+ */
+function moodMacroFrom(reads) {
+  const idx = reads.filter(r => r.group === 'index');
+  const sec = reads.filter(r => r.group === 'sector');
+  const idxBad = idx.filter(r => r.status !== 'ok' || r.emotion == null);
+  const breadth = moodBreadthOf(sec);
+
+  if (idxBad.length || !idx.length) {
+    const named = idxBad.map(r => r.symbol).join(', ') || 'all four';
+    return {
+      state: 'unavailable', score: null, breadth, breadthQualifier: null,
+      unavailableCause: 'index-missing',
+      missingIndexes: idxBad.map(r => r.symbol),
+      reason: `no readable daily bars for ${named}, and the macro verdict is a claim about the index `
+            + 'ETFs. Sector detail below is whatever did return — the verdict itself is withheld rather '
+            + 'than rebuilt from a different set of symbols under the same name.',
+    };
+  }
+
+  let num = 0, den = 0;
+  for (const r of idx) { num += r.score * MOOD_INDEX_WEIGHT;  den += MOOD_INDEX_WEIGHT; }
+  for (const r of sec) {
+    if (r.status !== 'ok' || r.score == null) continue;
+    num += r.score * MOOD_SECTOR_WEIGHT; den += MOOD_SECTOR_WEIGHT;
+  }
+  const score = den > 0 ? num / den : null;
+  const state = score == null ? 'unavailable'
+    : score >= MOOD_M_EUPHORIA     ? 'euphoria'
+    : score >= MOOD_M_GREED        ? 'greed'
+    : score >= MOOD_M_RISK_ON      ? 'risk-on'
+    : score <= MOOD_M_CAPITULATION ? 'capitulation'
+    : score <= MOOD_M_FEAR         ? 'fear'
+    : score <= MOOD_M_RISK_OFF     ? 'risk-off'
+    : 'mixed';
+
+  return {
+    state,
+    score: score == null ? null : Math.round(score * 100) / 100,
+    weightDenominator: den,
+    breadth,
+    breadthQualifier: moodBreadthQualifier(breadth, score),
+    unavailableCause: null, missingIndexes: [], reason: null,
+  };
+}
+
+/** The stance for a macro state, and the template sentence that renders when
+ *  Claude is not used or is not usable. Every state resolves. */
+function moodStanceFor(state, qualifier = null) {
+  const st = MOOD_STANCE[state] || MOOD_STANCE.unavailable;
+  const clause = (state === 'unavailable' || !qualifier) ? '' : (MOOD_BREADTH_CLAUSE[qualifier] || '');
+  return { category: st.category, template: st.sentence + clause };
+}
+
+/**
+ * Is a model-written sentence usable as a rewrite of a verdict already decided?
+ *
+ * The last check is the one that matters: the answer may not name a macro state
+ * other than the decided one. That is what stops a rephrase from becoming a
+ * reclassification, and it is why the model can only ever change the words. A
+ * legitimate sentence that happens to use another state's word in passing is
+ * rejected too — falling back to the template loses phrasing and nothing else,
+ * which is the cheap side of that trade.
+ */
+function moodSentenceUsable(text, state) {
+  if (typeof text !== 'string') return { ok: false, reason: 'no text returned' };
+  const s = text.trim();
+  if (s.length < MOOD_SENTENCE_MIN) return { ok: false, reason: `sentence is ${s.length} chars, under the ${MOOD_SENTENCE_MIN}-char floor` };
+  if (s.length > MOOD_SENTENCE_MAX) return { ok: false, reason: `sentence is ${s.length} chars, over the ${MOOD_SENTENCE_MAX}-char ceiling` };
+  if (/\n/.test(s)) return { ok: false, reason: 'answer spans multiple lines, so it is not one sentence' };
+  const others = Object.keys(MOOD_STANCE).filter(k => k !== state && k !== 'unavailable');
+  for (const other of others) {
+    const re = new RegExp(`(^|[^a-z-])${other.replace('-', '[- ]')}([^a-z-]|$)`, 'i');
+    if (re.test(s)) return { ok: false, reason: `names the state "${other}" while the decided state is "${state}"` };
+  }
+  return { ok: true, reason: null, sentence: s };
+}
+
+/** The prompt. It states the verdict is decided and that the answer is a
+ *  rewrite — the schema then makes anything but a sentence ungenerable. */
+function moodPrompt(macro, stance, reads) {
+  const line = r => `${r.symbol} (${r.label}): ` + (r.status === 'ok'
+    ? `${r.emotion}, score ${r.score}, ${r.patterns.length ? r.patterns.join(' + ') : 'no named pattern'}, `
+      + `${r.changePct == null ? 'change unavailable' : (r.changePct >= 0 ? '+' : '') + r.changePct + '% on the session'}`
+    : `no reading (${r.reason})`);
+
+  return `You are writing ONE sentence for a market dashboard.
+
+THE VERDICT IS ALREADY DECIDED by a rules-based candlestick engine. You may not change it, argue with it, hedge it, or add a different conclusion. Your only job is to say the same thing in one readable sentence a trader can absorb at a glance.
+
+DECIDED MACRO EMOTION: ${macro.state}
+DECIDED STANCE CATEGORY: ${stance.category}
+THE STANCE, IN THE HOUSE TEMPLATE: ${stance.template}
+
+SECTOR BREADTH: ${macro.breadth.bullish} bullish, ${macro.breadth.bearish} bearish, ${macro.breadth.neutral} neutral of ${macro.breadth.counted} sectors read${macro.breadth.absent ? ` (${macro.breadth.absent} could not be read)` : ''} — qualifier: ${macro.breadthQualifier || 'none'}
+BLENDED SCORE: ${macro.score}
+
+PER-SYMBOL READ (indexes first):
+${reads.map(line).join('\n')}
+
+Write one sentence that states the macro emotion "${macro.state}" and the stance above. The reader buys options on directional setups — long calls, long puts and debit verticals — so what matters is whether to press, wait, or stand aside. Do not name a different emotion. Do not invent a price level, a ticker recommendation or a date. Do not use markdown.`;
+}
+
+/**
+ * 2:00pm PT — bank one market-mood record.
+ *
+ * COST, STATED STRUCTURALLY rather than read off `_instr`. This branch now
+ * dispatches THREE jobs through `ctx.waitUntil`, and `instrSince()` subtracts
+ * invocation-wide counters over a span of time, so a per-job figure from this
+ * branch is an upper bound on the job and a lower bound on the invocation —
+ * never a measurement of either (rule #1). The structure is:
+ *
+ *   extFetches  15 chart calls (one per symbol, no batched OHLC substitute)
+ *               + 1 Anthropic call            = 16
+ *   bindingOps  1 dedup get + 1 mood:state put + 1 dedup put = 3
+ *   capCost     19
+ *
+ * Against a 10,000 per-invocation ceiling, and alongside the forward-return
+ * fill (~45 charts) and the move sweep (~5), the branch stays around 0.7% of it.
+ *
+ * REFUSES BEFORE STAMPING when every fetch failed, the same contract
+ * `recordWatchlistIv` / `collectMoveSeries` / `collectMacroState` follow. A
+ * partial run DOES store — a readable sector board with an unavailable verdict
+ * is a finding — but it does not stamp, so the next firing retries the gaps.
+ */
+async function collectMarketMood(env) {
+  if (!env?.REC_LOG) return;
+  const mark = instrMark();
+
+  try {
+    const last = await env.REC_LOG.get(MOOD_SWEEP_KEY);
+    if (last === ptDate()) { console.log('[cron] market mood already collected today, skipping'); return; }
+  } catch (_) {}
+
+  const today = ptDate();
+  const results = await allSettledCounted(
+    MOOD_SYMBOLS.map(async (entry) => {
+      const chart = await yahoo(`/v8/finance/chart/${encodeURIComponent(entry.symbol)}`,
+                                `?range=${MOOD_RANGE}&interval=1d`);
+      const raw = moodBars(chart);
+      const { bars, droppedForming } = moodSettledBars(raw, today);
+      return { entry, bars, droppedForming };
+    }),
+    'market-mood chart fan-out',
+  );
+
+  let fetched = 0, droppedAny = 0;
+  const reads = results.map((res, i) => {
+    const entry = MOOD_SYMBOLS[i];
+    if (res.status !== 'fulfilled') {
+      /* A failed fetch is stored as `unavailable` WITH ITS REASON, never as a
+         neutral emotion. Honesty rule 11: "we have not looked" and "there is
+         nothing there" are different facts, and on a mood board a neutral row
+         reads as a calm market. */
+      return {
+        symbol: entry.symbol, label: entry.label, group: entry.group,
+        status: 'unavailable', emotion: null, score: null, patterns: [],
+        changePct: null, asOfClose: null,
+        reason: `chart fetch failed — ${res.reason?.message || res.reason}`,
+      };
+    }
+    fetched++;
+    if (res.value.droppedForming) droppedAny++;
+    return moodReadFor(entry, res.value.bars);
+  });
+
+  if (fetched === 0) {
+    console.error(`[cron] !! MOOD-COLLECT !! all ${MOOD_SYMBOLS.length} chart fetches failed. REFUSING to `
+      + `write rather than storing a board of unavailable rows; no dedup key stamped, so the next firing `
+      + `retries · ${JSON.stringify(instrSince(mark, 'refused'))}`);
+    return;
+  }
+
+  const macro  = moodMacroFrom(reads);
+  const stance = moodStanceFor(macro.state, macro.breadthQualifier);
+
+  /* ONE Claude call, and only when there is a verdict to phrase. An unavailable
+     verdict has nothing to rewrite, so it takes the template and spends nothing. */
+  let sentence = stance.template;
+  let sentenceSource = 'template';
+  let sentenceNote = macro.state === 'unavailable'
+    ? 'the verdict is unavailable, so no rewrite was requested and no Anthropic call was made'
+    : null;
+
+  if (macro.state !== 'unavailable') {
+    try {
+      const { text, stopReason } = await workerClaude(
+        moodPrompt(macro, stance, reads), env, MOOD_ANSWER_TOKENS, MOOD_SENTENCE_SCHEMA, { raw: true },
+      );
+      if (stopReason === 'max_tokens') {
+        sentenceNote = 'the model hit the token cap mid-answer, so the template stands rather than a '
+                     + 'sentence that stops mid-clause';
+      } else {
+        const parsed = JSON.parse(text);
+        const verdict = moodSentenceUsable(parsed?.sentence, macro.state);
+        if (verdict.ok) { sentence = verdict.sentence; sentenceSource = 'claude'; sentenceNote = null; }
+        else sentenceNote = `model sentence rejected — ${verdict.reason}`;
+      }
+    } catch (e) {
+      sentenceNote = `rewrite failed — ${e.message}`;
+    }
+    if (sentenceSource === 'template') {
+      console.warn(`[cron] market mood: using the template sentence · ${sentenceNote}`);
+    }
+  }
+
+  const asOfClose = reads.filter(r => r.asOfClose).map(r => r.asOfClose).sort().pop() || null;
+
+  const record = {
+    schema: MOOD_SCHEMA,
+    ts: Date.now(),
+    asOfClose,
+    state: macro.state,
+    stance: stance.category,
+    sentence,
+    sentenceSource,
+    sentenceNote,
+    template: stance.template,
+    score: macro.score,
+    breadth: macro.breadth,
+    breadthQualifier: macro.breadthQualifier,
+    unavailableCause: macro.unavailableCause,
+    missingIndexes: macro.missingIndexes,
+    reason: macro.reason,
+    symbols: reads,
+    coverage: { fetched, total: MOOD_SYMBOLS.length, droppedFormingBars: droppedAny },
+    /* Thresholds ship with the payload for the same reason every other gate in
+       this Worker does: neither frontend may hardcode a number the Worker owns. */
+    gates: {
+      emotion: {
+        euphoria: MOOD_T_EUPHORIA, greed: MOOD_T_GREED, optimism: MOOD_T_OPTIMISM,
+        caution: MOOD_T_CAUTION, fear: MOOD_T_FEAR, capitulation: MOOD_T_CAPITULATION,
+      },
+      macro: {
+        euphoria: MOOD_M_EUPHORIA, greed: MOOD_M_GREED, riskOn: MOOD_M_RISK_ON,
+        riskOff: MOOD_M_RISK_OFF, fear: MOOD_M_FEAR, capitulation: MOOD_M_CAPITULATION,
+      },
+      breadth: { strong: MOOD_BREADTH_STRONG, split: MOOD_BREADTH_SPLIT },
+      weights: { index: MOOD_INDEX_WEIGHT, sector: MOOD_SECTOR_WEIGHT },
+      patternScores: MOOD_PATTERN_SCORE,
+    },
+    usedForRanking: false,
+    notUsedNote: 'A rules-based reading of candlestick shape. It has not been scored against forward '
+               + 'returns, and it sorts, gates and filters nothing on this dashboard.',
+    _instr: instrSince(mark, fetched === MOOD_SYMBOLS.length ? 'complete' : 'partial'),
+  };
+
+  try {
+    await env.REC_LOG.put(MOOD_KEY, JSON.stringify(record), { expirationTtl: MOOD_TTL });
+  } catch (e) {
+    console.error(`[cron] !! MOOD-COLLECT !! KV write failed — ${e.message}. No dedup key stamped, `
+      + 'so the next firing retries.');
+    return;
+  }
+
+  /* STAMP ONLY A COMPLETE RUN. A partial board is worth storing and is NOT
+     worth calling done: the write is idempotent (one key, rewritten whole), so
+     a retry fills the gaps rather than duplicating work. The 2:00pm window
+     admits two firings, so a persistently failing symbol costs one extra pass a
+     day and no more. */
+  if (fetched === MOOD_SYMBOLS.length) {
+    try { await env.REC_LOG.put(MOOD_SWEEP_KEY, ptDate(), { expirationTtl: 172800 }); } catch (_) {}
+    console.log(
+      `[cron] market mood: ${macro.state}${macro.breadthQualifier ? ` (${macro.breadthQualifier})` : ''} · `
+      + `stance ${stance.category} · score ${macro.score} · breadth ${macro.breadth.bullish}B/`
+      + `${macro.breadth.bearish}S/${macro.breadth.neutral}N of ${macro.breadth.counted} · `
+      + `asOf ${asOfClose} · sentence from ${sentenceSource} · ${JSON.stringify(instrSince(mark, 'complete'))}`,
+    );
+  } else {
+    console.error(`[cron] !! MOOD-SWEEP-INCOMPLETE !! ${fetched}/${MOOD_SYMBOLS.length} symbols fetched `
+      + `(state ${macro.state}). Payload STORED so the readable rows render, but NOT stamping `
+      + `${MOOD_SWEEP_KEY}, so the next firing retries · ${JSON.stringify(instrSince(mark, 'partial'))}`);
+  }
+}
+
+/** ONE KV read of `mood:state`. A schema mismatch reads as ABSENT so an old
+ *  shape retires rather than rendering under field meanings it was not written
+ *  for — the same strict equality `readMoveSeries` and `readMacroState` use. */
+async function readMarketMood(env) {
+  let rec = null;
+  try { rec = await env?.REC_LOG?.get(MOOD_KEY, 'json'); } catch (_) { rec = null; }
+
+  if (!rec || rec.schema !== MOOD_SCHEMA) {
+    /* The same three missing-record situations `readMacroState` separates, and
+       for the same reason: a cold start on a freshly deployed Worker and a
+       sweep that has been refusing for days are different facts with different
+       fixes, and one message for both is the collapsed state honesty rule 11
+       exists to prevent. */
+    let sweptOn = null;
+    if (!rec) { try { sweptOn = await env?.REC_LOG?.get(MOOD_SWEEP_KEY); } catch (_) {} }
+    const today = ptDate();
+    const cause = rec ? 'schema'
+                : !sweptOn ? 'never-collected'
+                : sweptOn === today ? 'record-missing'
+                : 'stale-sweep';
+    const reason = {
+      schema: `the stored record is schema ${rec?.schema}, not ${MOOD_SCHEMA} — it retires rather than `
+            + 'rendering under field meanings it was not written for. The next 2:00pm PT firing rewrites it.',
+      'never-collected': 'the mood collection has never completed, so there is nothing to show yet. This is '
+            + 'the expected state of a newly deployed Worker until the first 2:00pm PT firing — it is NOT a '
+            + 'data failure and says nothing about the market.',
+      'record-missing': `the collection completed today (${today}) but the record is not in KV. That is a `
+            + 'storage fault rather than an upstream one, and it clears on the next firing.',
+      'stale-sweep': `the collection last completed on ${sweptOn} and has not completed since — it has been `
+            + 'REFUSING, which means an upstream failure. Grep the Worker logs for "!! MOOD-COLLECT !!" and '
+            + '"!! MOOD-SWEEP-INCOMPLETE !!". This one is worth acting on.',
+    }[cause];
+
+    const stance = moodStanceFor('unavailable');
+    return {
+      schema: MOOD_SCHEMA, state: 'unavailable', unavailableCause: cause,
+      lastSweptOn: sweptOn || null,
+      stance: stance.category, sentence: stance.template, sentenceSource: 'template',
+      sentenceNote: null, template: stance.template,
+      score: null, breadth: null, breadthQualifier: null,
+      missingIndexes: [], reason,
+      symbols: [], coverage: null, asOfClose: null,
+      ts: null, ageMs: null, stale: true, freshMs: MOOD_FRESH_MS,
+      usedForRanking: false,
+      notUsedNote: 'A rules-based reading of candlestick shape. It has not been scored against forward '
+                 + 'returns, and it sorts, gates and filters nothing on this dashboard.',
+    };
+  }
+
+  const ageMs = Number.isFinite(rec.ts) ? Date.now() - rec.ts : null;
+  return { ...rec, ageMs, stale: ageMs == null ? true : ageMs >= MOOD_FRESH_MS, freshMs: MOOD_FRESH_MS };
+}
+
+/** GET /api/market/mood — ONE KV read, zero outbound fetches, no Claude call.
+ *  Origin-gated like every other market read; deliberately NOT behind `aiGuard`,
+ *  because nothing on this path can spend. */
+async function handleMarketMood(origin, env) {
+  const mark = instrMark();
+  const rec  = await readMarketMood(env);
+  const note = rec.state === 'unavailable'
+    ? `no verdict — ${rec.unavailableCause}`
+    : `${rec.coverage?.fetched ?? '?'}/${rec.coverage?.total ?? MOOD_SYMBOLS.length} symbols read · `
+      + `sentence from ${rec.sentenceSource}`;
+  return json({
+    ...rec,
+    _instr: instrSince(mark, 'mood'),
+    _meta: srcMeta('Yahoo daily bars · candlestick rules', {
+      ok: rec.state !== 'unavailable',
+      delayed: true,
+      ttlSeconds: TTL.mood,
+      asOf: rec.asOfClose,
+      note,
+    }),
+  }, 200, origin);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    MACRO REGIME — phase 1, DISPLAY ONLY
 
    PHASE 1 DOES NOT AFFECT RANKING, GATING, OR ANY EXISTING FIGURE. That is a
@@ -9901,6 +10814,10 @@ export default {
             }
             return await handleMarketSectors(origin, env, ctx, url.searchParams);
           }
+          // KV read only — zero outbound fetches and no Claude call, so it is
+          // origin-gated like the other market reads and NOT behind aiGuard.
+          // The request path for Market Mood cannot spend.
+          if (sub === 'mood')       return await handleMarketMood(origin, env);
           if (sub === 'scanner')    return await handleScanner(url.searchParams, origin, env, ctx, request);
           if (sub === 'golden-cross') return await handleGoldenCross(origin, env, url.searchParams);
           if (sub === 'econ-calendar') return await handleEconCalendar(url.searchParams, origin, env);
@@ -10049,13 +10966,20 @@ export default {
          does not get its own. */
       dispatchJob(ctx, 'macro-state', () => collectMacroState(env));            // 1:15pm PT one macro state record
     } else if (h === 14 && m < 30) {
-      branch = 'forward-returns+moves';
+      branch = 'forward-returns+moves+mood';
       dispatchJob(ctx, 'forward-returns', () => fillForwardReturns(env));       // 2:00pm PT resolve 5/20-session forward returns
       // 2:00pm PT bank the historical move distribution. Placed on THIS branch and
       // not the 1:15pm EOD one because the daily bar is settled by now — see the
       // note on collectMoveSeries(). Both jobs share this invocation's subrequest
       // budget: ctx.waitUntil does not get its own.
       dispatchJob(ctx, 'move-series', () => collectMoveSeries(env));
+      /* 2:00pm PT bank the candlestick mood board. On THIS branch for the same
+         settlement reason as the move sweep: the bell rang at 1:00pm PT, so the
+         bar this reads is final. Costs 15 chart fetches + 1 Anthropic call + 3
+         binding ops; the branch now runs THREE jobs sharing one subrequest
+         budget, so no per-job `_instr` from here is a measurement — see the cost
+         note on collectMarketMood. */
+      dispatchJob(ctx, 'market-mood', () => collectMarketMood(env));
     } else if (h === 10) {
       // Fires on all four firings of the hour: a slice is only 4 managers, so
       // four slices a day completes a 20-manager pass in ~1.3 days. 13F-HR lands

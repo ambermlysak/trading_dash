@@ -96,6 +96,23 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #                         it as a record — same rule as ivsweep/movesweep.
 #                         Stamped LAST, after both writes, so any failure leaves
 #                         the next firing to retry.
+#   mood:state          — Market Mood board: macro emotion, stance category, the
+#                         one-sentence verdict + sentenceSource, breadth counts,
+#                         and all 15 per-symbol reads (emotion, score, detected
+#                         patterns, 1-session change, or an unavailable row with
+#                         its reason). ~5.2 KB, MOOD_SCHEMA 1, strict equality.
+#                         7d retained / 26h fresh (TTL.mood) — one write a
+#                         trading day by the 2:00pm PT collectMarketMood, so the
+#                         badge only ages once a whole cadence is missed. ONE key:
+#                         the payload is small enough to read on the request path,
+#                         unlike macro's state/series split.
+#   moodsweep:last      — PT date of the last mood collection (dedup). Outside
+#                         the `mood:` prefix, same rule as ivsweep/movesweep/
+#                         macrosweep. Stamped LAST and only when all 15 symbols
+#                         returned bars; a partial run still writes mood:state
+#                         (a readable sector board with an unavailable verdict is
+#                         a finding) but does not stamp, so the next firing
+#                         retries. A run where EVERY fetch failed writes nothing.
 #   13f:cursor          — which manager the 13F pass is up to (outside 13f:index)
 #   econ:dgs3mo         — FRED 3-month T-bill, risk-free rate for Black-Scholes
 #                         (12h fresh, 90d kept — the long retention is the outage
@@ -139,6 +156,12 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   EOD summary      — 1:15pm PT   (20:15 UTC PDT / 21:15 UTC PST)
 #   IV history sweep — 1:15pm PT   (runs alongside the EOD job; own daily dedup key)
 #   Forward-ret fill — 2:00pm PT   (21:00 UTC PDT / 22:00 UTC PST; own daily dedup key)
+#   Move-series sweep— 2:00pm PT   (settled daily bar; own daily dedup key)
+#   Market Mood      — 2:00pm PT   (same settled bar; 15 chart fetches + 1 Claude
+#                      call; own daily dedup key. Three jobs share this
+#                      invocation's subrequest budget — waitUntil gets no budget
+#                      of its own — so no per-job _instr from this branch is a
+#                      measurement. Derivation: capCost 19.)
 #   13F index slice  — 10:00am PT  (4 managers per firing, ~13 external fetches)
 #                      NOT 3:00pm PT: that is 23:00 UTC under PST, outside this
 #                      window, so the job never ran for half the year.

@@ -290,6 +290,55 @@ body::after { content: ''; position: fixed; inset: 0; background: radial-gradien
 .eod-body { font-size: 13px; color: var(--ink-2); line-height: 1.6; }
 .eod-ts { font-size: 10px; color: var(--ink-3); font-family: var(--mono); margin-top: 8px; }
 
+/* Market Mood — one verdict line always visible, the per-symbol board on expand.
+   Colour is by TONE, never by direction alone: green is constructive, amber is
+   caution in EITHER direction (greed is a warning for a buyer of premium, not a
+   green light), red is fear. The label text carries the state; the colour only
+   carries how to hold it. */
+.mood-card {
+  background: var(--bg-1); border: 1px solid var(--line); border-radius: 10px;
+  padding: 16px 28px; margin-bottom: 24px;
+}
+.mood-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.mood-chip {
+  font-size: 10px; font-family: var(--mono); font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.06em; padding: 4px 9px; border-radius: 3px; white-space: nowrap;
+  background: var(--bg-3); color: var(--ink-2); border: 1px solid var(--line);
+}
+.mood-chip.tone-bull  { background: var(--bull-soft);  color: var(--bull);  border-color: rgba(35,209,139,0.25); }
+.mood-chip.tone-amber { background: var(--amber-soft); color: var(--amber); border-color: rgba(244,183,64,0.25); }
+.mood-chip.tone-bear  { background: var(--bear-soft);  color: var(--bear);  border-color: rgba(242,95,92,0.25); }
+.mood-chip.tone-cyan  { background: var(--cyan-soft);  color: var(--cyan);  border-color: rgba(94,197,234,0.25); }
+.mood-stance { font-size: 9px; font-family: var(--mono); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; }
+.mood-sentence { flex: 1 1 340px; font-size: 13px; color: var(--ink-1); line-height: 1.55; }
+.mood-toggle {
+  background: none; border: 1px solid var(--line); color: var(--ink-3); cursor: pointer;
+  font-family: var(--mono); font-size: 10px; padding: 4px 9px; border-radius: 3px;
+}
+.mood-toggle:hover { border-color: var(--cyan); color: var(--ink-1); }
+.mood-note { flex-basis: 100%; font-size: 10px; font-family: var(--mono); color: var(--ink-3); line-height: 1.5; }
+.mood-detail { display: none; margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
+.mood-detail.open { display: block; }
+.mood-group-label { font-size: 10px; font-family: var(--mono); color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; margin: 4px 0 8px; }
+.mood-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; margin-bottom: 16px; }
+.mood-cell { background: var(--bg-2); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+.mood-cell.unavailable { opacity: 0.75; border-style: dashed; }
+.mood-cell-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.mood-cell-sym { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--ink-0); }
+.mood-cell-chg { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+.mood-cell-chg.up { color: var(--bull); }
+.mood-cell-chg.dn { color: var(--bear); }
+.mood-cell-label { font-size: 10px; color: var(--ink-3); margin-top: 1px; }
+.mood-cell-emo { font-family: var(--mono); font-size: 10px; font-weight: 600; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+.mood-cell-emo.tone-bull  { color: var(--bull);  }
+.mood-cell-emo.tone-amber { color: var(--amber); }
+.mood-cell-emo.tone-bear  { color: var(--bear);  }
+.mood-cell-emo.tone-cyan  { color: var(--cyan);  }
+.mood-cell-emo.tone-none  { color: var(--ink-3); }
+.mood-cell-pat { font-size: 10px; color: var(--ink-2); margin-top: 4px; line-height: 1.45; }
+.mood-cell-reason { font-size: 10px; color: var(--ink-3); margin-top: 4px; line-height: 1.45; font-style: italic; }
+.mood-legend { font-size: 10px; font-family: var(--mono); color: var(--ink-3); line-height: 1.6; border-top: 1px solid var(--line); padding-top: 10px; }
+
 /* Midday Pulse card */
 .midday-card {
   background: var(--bg-1); border: 1px solid var(--line); border-radius: 10px;
@@ -765,6 +814,19 @@ th.lane-f-maxloss { color: var(--bear) !important; }
       <div class="headline-ts" id="headline-ts"></div>
     </div>
 
+    <!-- Market Mood: verdict line always visible, per-symbol board on expand -->
+    <div class="mood-card" id="mood-card">
+      <div class="mood-head">
+        <span class="mood-chip" id="mood-chip">…</span>
+        <span class="mood-stance" id="mood-stance"></span>
+        <div class="mood-sentence" id="mood-sentence">Loading market mood…</div>
+        <span class="src-tag" id="mood-badge"></span>
+        <button class="mood-toggle" id="mood-toggle" aria-expanded="false" aria-controls="mood-detail">detail ▾</button>
+        <div class="mood-note" id="mood-note"></div>
+      </div>
+      <div class="mood-detail" id="mood-detail"></div>
+    </div>
+
     <div class="eod-card" id="eod-card">
       <div class="eod-header">
         <span class="eod-badge" id="eod-badge">Pre-Market</span>
@@ -1137,12 +1199,18 @@ async function apiFetch(path, opts = {}) {
   if (!r.ok) {
     // Distinguish the gate from an outage, so a blank card does not read as
     // "the upstream data source is down".
-    if (r.status === 401) throw new Error('API key rejected — DASH_KEY does not match the Worker’s AI_GATE_SECRET');
+    //
+    // `.status` rides along on every one of these. A caller that must tell
+    // "this Worker does not have that route yet" (404, the routine state while
+    // the page is newer than the Worker) from "the route broke" cannot get that
+    // from the message text without parsing prose.
+    const fail = (msg) => { const e = new Error(msg); e.status = r.status; return e; };
+    if (r.status === 401) throw fail('API key rejected — DASH_KEY does not match the Worker’s AI_GATE_SECRET');
     if (r.status === 429) {
       const body = await r.json().catch(() => ({}));
-      throw new Error(body.error || 'Rate limit reached — try again later');
+      throw fail(body.error || 'Rate limit reached — try again later');
     }
-    throw new Error(`API ${r.status}: ${path}`);
+    throw fail(`API ${r.status}: ${path}`);
   }
   return r.json();
 }
@@ -1232,6 +1300,165 @@ async function loadMarketStrip() {
   } catch (e) {
     console.error('[strip]', e.message);
   }
+}
+
+/* ─── Market Mood ─────────────────────────────────────────────────────────────
+ * A candlestick emotion read over 4 index ETFs and the 11 SPDR sectors, banked
+ * once a trading day by the 2:00pm PT cron. Every state on screen was decided
+ * by rules in the Worker; Claude only rewrote the verdict as one sentence, and
+ * `sentenceSource` says whether the reader is looking at that rewrite or at the
+ * house template.
+ *
+ * COLOUR IS TONE, NOT DIRECTION. Amber is caution in EITHER direction, because
+ * for someone buying premium a greedy tape is a warning rather than a green
+ * light. The label always carries the state; colour only carries how to hold it.
+ */
+const MOOD_TONE = {
+  euphoria: 'amber', greed: 'amber', 'risk-on': 'bull', optimism: 'bull',
+  mixed: 'cyan', neutral: 'cyan',
+  'risk-off': 'amber', caution: 'amber',
+  fear: 'bear', capitulation: 'bear',
+};
+const moodTone = state => MOOD_TONE[state] || 'none';
+
+let moodOpen = false;
+
+async function loadMarketMood() {
+  try {
+    const data = await apiFetch('/market/mood');
+    renderMarketMood(data);
+  } catch (e) {
+    /* ── THE ABSENT FIELD IS ITS OWN STATE, and it is a ROUTINE one ───────────
+       `dashboard.html` goes live on GitHub Pages the moment a commit is pushed;
+       `wrangler deploy` is manual. So every frontend-first feature passes
+       through a window where the page is newer than the Worker, and in that
+       window `/api/market/mood` is an unknown route and answers 404. This is
+       also exactly where a Worker rollback lands.
+
+       A silent blank here would be indistinguishable from the feature not
+       existing (honesty rule 11), which is the failure `macroChip` shipped. So
+       the 404 gets its own named cause, separate from a real outage. */
+    const notDeployed = e.status === 404;
+    renderMarketMood({
+      state: 'unavailable',
+      unavailableCause: notDeployed ? 'endpoint-absent' : 'request-failed',
+      stance: 'no-read',
+      sentence: notDeployed
+        ? 'Market mood is not collected yet — the deployed Worker has no /api/market/mood route.'
+        : 'Market mood could not be loaded.',
+      reason: notDeployed
+        ? 'the deployed Worker does not serve this endpoint, so it predates this feature or has been '
+          + 'rolled back. The page and the Worker deploy separately — GitHub Pages updates on push, '
+          + 'wrangler deploy is manual — so this is the expected reading in between, and it is a fact '
+          + 'about the deployment rather than about the market.'
+        : `the request failed: ${e.message}. Nothing is substituted — an unread board and a calm market `
+          + 'must not look the same.',
+      symbols: [], score: null, breadth: null, ts: null,
+    });
+  }
+}
+
+/** One symbol cell. Every number is null-guarded BEFORE any arithmetic: a null
+ *  score and a score of 0 are different findings and must not render alike. */
+function moodCell(s) {
+  if (!s || s.status !== 'ok') {
+    return `<div class="mood-cell unavailable">
+      <div class="mood-cell-top">
+        <span class="mood-cell-sym">${esc(s?.symbol || '—')}</span>
+        <span class="mood-cell-chg">—</span>
+      </div>
+      <div class="mood-cell-label">${esc(s?.label || '')}</div>
+      <div class="mood-cell-emo tone-none">no reading</div>
+      <div class="mood-cell-reason">${esc(s?.reason || 'no reason recorded')}</div>
+    </div>`;
+  }
+  // `chg == null` renders an em dash and takes no class; only a real number is
+  // signed and coloured. `0` is a real number and reads flat, not missing.
+  const chg = s.changePct;
+  const chgTxt = chg == null ? '—' : `${chg > 0 ? '+' : ''}${chg.toFixed(2)}%`;
+  const chgCls = chg == null ? '' : chg > 0 ? 'up' : chg < 0 ? 'dn' : '';
+  const scoreTxt = s.score == null ? 'score —' : `score ${s.score > 0 ? '+' : ''}${s.score}`;
+  const pats = Array.isArray(s.patterns) && s.patterns.length
+    ? s.patterns.join(' · ')
+    : 'no named pattern on the last bar';
+  return `<div class="mood-cell">
+    <div class="mood-cell-top">
+      <span class="mood-cell-sym">${esc(s.symbol)}</span>
+      <span class="mood-cell-chg ${chgCls}">${chgTxt}</span>
+    </div>
+    <div class="mood-cell-label">${esc(s.label || '')}</div>
+    <div class="mood-cell-emo tone-${moodTone(s.emotion)}">${esc(s.emotion || 'no reading')} <span style="color:var(--ink-3);font-weight:400">${esc(scoreTxt)}</span></div>
+    <div class="mood-cell-pat">${esc(pats)}</div>
+  </div>`;
+}
+
+function renderMarketMood(data) {
+  const state = String(data?.state || 'unavailable');
+  const chip  = document.getElementById('mood-chip');
+  chip.textContent = state === 'unavailable'
+    ? ({
+        'endpoint-absent': 'mood not collected yet',
+        'never-collected': 'mood not collected yet',
+        'stale-sweep':     'mood collection failing',
+        'record-missing':  'mood record missing',
+        'schema':          'mood record retired',
+        'request-failed':  'mood unavailable',
+      }[data?.unavailableCause] || 'mood unavailable')
+    : state;
+  /* Amber only where something is actually wrong. A cold start, or a Worker that
+     simply has not shipped the route yet, is not a fault and must not wear the
+     colour of one. */
+  const badCause = ['stale-sweep', 'record-missing', 'request-failed'].includes(data?.unavailableCause);
+  chip.className = 'mood-chip tone-' + (state === 'unavailable' ? (badCause ? 'amber' : 'none') : moodTone(state));
+
+  document.getElementById('mood-stance').textContent = data?.stance ? `stance · ${data.stance}` : '';
+  document.getElementById('mood-sentence').textContent = data?.sentence || 'No verdict.';
+
+  /* The note carries what the reader cannot see from the sentence: whether the
+     wording is Claude's or the template's, and the reason when there is no
+     verdict. `sentenceSource === 'template'` is not a failure by itself — an
+     unavailable verdict deliberately spends no Claude call. */
+  const bits = [];
+  if (state === 'unavailable' && data?.reason) bits.push(data.reason);
+  if (data?.sentenceSource) {
+    bits.push(data.sentenceSource === 'claude'
+      ? 'Wording by Claude from a verdict the rules had already decided — the model cannot change a state, only phrase it.'
+      : 'Wording is the fixed house template' + (data.sentenceNote ? ` (${data.sentenceNote})` : '') + '.');
+  }
+  if (data?.asOfClose) bits.push(`Reads the ${data.asOfClose} close.`);
+  if (data?.coverage && data.coverage.fetched !== data.coverage.total) {
+    bits.push(`${data.coverage.fetched} of ${data.coverage.total} symbols returned bars — the rest render their reason below.`);
+  }
+  document.getElementById('mood-note').textContent = bits.join(' ');
+
+  setBadge('mood-badge', data?._meta);
+
+  // Detail board
+  const rows = Array.isArray(data?.symbols) ? data.symbols : [];
+  const idx  = rows.filter(r => r.group === 'index');
+  const sec  = rows.filter(r => r.group === 'sector');
+  const b    = data?.breadth;
+  const breadthLine = b && b.counted
+    ? `Sector breadth: ${b.bullish} bullish · ${b.bearish} bearish · ${b.neutral} neutral of ${b.counted} read`
+      + (b.absent ? ` · ${b.absent} could not be read` : '')
+      + (data.breadthQualifier ? ` — ${data.breadthQualifier}` : '')
+    : 'Sector breadth: no sectors returned a reading.';
+  const scoreLine = data?.score == null
+    ? 'Blended score: unavailable.'
+    : `Blended score: ${data.score > 0 ? '+' : ''}${data.score} (indexes weighted ${data.gates?.weights?.index ?? '?'}×, sectors ${data.gates?.weights?.sector ?? '?'}×).`;
+
+  document.getElementById('mood-detail').innerHTML = rows.length
+    ? `<div class="mood-group-label">Indexes</div>
+       <div class="mood-grid">${idx.map(moodCell).join('')}</div>
+       <div class="mood-group-label">Sectors</div>
+       <div class="mood-grid">${sec.map(moodCell).join('')}</div>
+       <div class="mood-legend">
+         ${esc(breadthLine)}<br>${esc(scoreLine)}<br>
+         Emotion per symbol is a rules-based reading of the last settled daily candles — pattern shape plus
+         trend context, mapped through fixed thresholds. A hammer in an uptrend is scored as a hanging man,
+         so the same shape reads differently by context. ${esc(data?.notUsedNote || '')}
+       </div>`
+    : `<div class="mood-legend">${esc(data?.reason || 'No per-symbol board to show.')}</div>`;
 }
 
 /* ─── Daily snapshot ─── */
@@ -1954,6 +2181,15 @@ document.getElementById('wl-add-input').addEventListener('keydown', e => {
 });
 
 document.getElementById('wl-refresh-btn').addEventListener('click', () => loadWatchlistBatch());
+
+document.getElementById('mood-toggle').addEventListener('click', () => {
+  moodOpen = !moodOpen;
+  const panel = document.getElementById('mood-detail');
+  const btn   = document.getElementById('mood-toggle');
+  panel.classList.toggle('open', moodOpen);
+  btn.setAttribute('aria-expanded', String(moodOpen));
+  btn.textContent = moodOpen ? 'detail ▴' : 'detail ▾';
+});
 
 document.getElementById('wl-tbody').addEventListener('click', e => {
   const removeBtn = e.target.closest('[data-remove]');
@@ -3795,6 +4031,9 @@ async function init() {
   await Promise.allSettled([
     loadMarketStrip(),
     loadDailySnapshot(),
+    // One KV read, no outbound fetch, no Claude call — cheap enough to sit on
+    // the load path beside the briefing it renders under.
+    loadMarketMood(),
     loadMovers(),
     loadIPOs(),
     loadWeekAhead(),
@@ -3814,6 +4053,10 @@ async function init() {
     loadMarketStrip();
   }, 300_000);
   setInterval(loadDailySnapshot, 600_000);
+  // Written once a trading day, so a 10-minute poll is plenty and costs one KV
+  // read. It is here at all so an afternoon page left open picks up the 2:00pm
+  // PT write without a reload.
+  setInterval(loadMarketMood, 600_000);
 
   // Fire a targeted refresh 30 min after market close (4:30pm ET) on weekdays
   schedulePostMarketRefresh();

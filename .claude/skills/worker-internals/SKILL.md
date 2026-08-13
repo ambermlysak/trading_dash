@@ -40,6 +40,7 @@ GET  /api/market/ipos             Upcoming IPO calendar (12h KV cache)
 GET  /api/watchlist               The saved list (read path for the adopt-on-empty bootstrap)
 GET  /api/watchlist/batch         Bulk fundamentals + RSI + SMA/EMA cross + Claude analysis
 GET  /api/daily                   Daily Claude synthesis (served from KV)
+GET  /api/market/mood             Market Mood — candlestick emotion board (KV read only, capCost 1)
 GET  /api/market/sectors          Sector summaries + top opportunity/avoid per sector (4h KV cache)
 GET  /api/market/scanner?preset=  Day-trading momentum scanner (5 Pillars, 90s KV cache)
 GET  /api/market/golden-cross     Names set up for a golden cross, EMA + SMA gaps (1h KV cache)
@@ -427,6 +428,8 @@ differs from its retention, both are given and the reason is in the notes.
 | `macro:state` | **90d retention / 26h freshness** (`MACRO_FRESH_MS`) | The classified macro regime — state, `hostileVia`, the four raw inputs, both term spreads, the gates. **~640–730 bytes.** Written by the 1:15pm PT `collectMacroState`; read once per request by `/api/long/batch` and `/api/long/:ticker`. Freshness ≠ retention for the same reason as `econ:dgs3mo`: a labelled old macro read beats a blank one, and the chip renders its own age. A weekend or holiday legitimately ages it past 26h. |
 | `macro:series` | **90d** | The 756-session (~3y) slice of **derived per-session inputs** — dates, SPY/QQQ spreads, VIX level, raw and smoothed term spread — computed over the full 10y pull then sliced, so the SMA200 is valid from the slice's first session. **~31 KB. Read by NOTHING in phase 1**; it exists so phase 2 needs no second collection pass. **THE SPLIT FROM `macro:state` IS A REQUEST-PATH COST DECISION**: one key would mean every `/api/long/*` request pulls 31 KB out of KV to render a 640-byte chip, and stripping the slice on read hides that rather than avoiding it. Both keys carry `MACRO_SCHEMA` and **are bumped together**. |
 | `macrosweep:last` | 2d | PT date of the last macro collection, for dedup. **Outside the `macro:` prefix**, so nothing scanning that prefix can read it as a record — the same rule as `ivsweep:last` and `movesweep:last`. Stamped **last**, after both writes, so any failure leaves the next firing to retry. |
+| `mood:state` | **7d retention / 26h freshness** (`MOOD_FRESH_MS`, derived from `TTL.mood`) | The Market Mood board: macro state, stance category, the one-sentence verdict and its `sentenceSource`, the breadth counts, and all 15 per-symbol reads (emotion, score, detected patterns, 1-session change, or a `status: 'unavailable'` row with its reason). **~5.2 KB measured** on a full 15-symbol run — one key, no state/series split, because the whole payload is small enough to read on the request path. `MOOD_SCHEMA` 1, checked by **strict equality**; any other value reads as ABSENT and the next 2:00pm firing rewrites it. Written by the 2:00pm PT `collectMarketMood`; read by `/api/market/mood` and nothing else. |
+| `moodsweep:last` | 2d | PT date of the last mood collection, for dedup. **Outside the `mood:` prefix**, the same rule as `ivsweep:last` / `movesweep:last` / `macrosweep:last`. Stamped **last**, and only when all 15 symbols returned bars — a partial run still writes `mood:state` (a readable sector board with an unavailable verdict is a finding) but does not stamp, so the next firing retries. |
 | `premium:{TICKER}` | **24h retention / 4h freshness** | One premium-screen row. The two differ on purpose — see below. |
 | `long:{TICKER}` | **24h retention / 4h freshness** (`LONG_FRESH_MS`) | One long-screen row: **six lanes** (A–F), both timestamps, the buy gate and the directional read. Same freshness/retention split as `premium:` and for the same reason — past 4h the row still renders, badged stale. |
 | `cik:map` | 30d | SEC ticker→CIK map from `company_tickers.json` |
@@ -521,7 +524,38 @@ their own `const TTL = <number>`, which shadowed it silently and turned
 the badge. They are now **`CRUMB_TTL`, `SCAN_TTL`, `GOLDEN_TTL`, `IPO_TTL`**. Any
 new local cache window needs its own name.
 
-**Cron trigger:** a single `*/15 13-22 * * *` UTC cron — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), the **`eod+iv-sweep+macro`** branch (1:15pm PT — EOD summary, IV sample sweep, and the macro-regime collection), the **`forward-returns+moves`** branch (2pm PT — the forward-return fill *and* the move-series sweep), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
+**Cron trigger:** a single `*/15 13-22 * * *` UTC cron — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), the **`eod+iv-sweep+macro`** branch (1:15pm PT — EOD summary, IV sample sweep, and the macro-regime collection), the **`forward-returns+moves+mood`** branch (2pm PT — the forward-return fill, the move-series sweep, *and* the Market Mood collection), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
+
+**`collectMarketMood` runs at 2:00pm PT for the same bar-settlement reason as
+`collectMoveSeries`**, and it is the third job on that branch. Cost, stated
+structurally because three concurrent jobs make any per-job `_instr` from this
+branch an upper bound rather than a measurement (rule #1): **15 external chart
+fetches + 1 Anthropic call = 16 ext; 1 dedup get + 1 `mood:state` put + 1 dedup
+put = 3 bindings; capCost 19.** Measured in a local run with no
+`ANTHROPIC_API_KEY` (so no Claude call): `extFetches 15, bindingOps 3, capCost
+18`, with `invocationCapCost 20` on the same firing — exactly the documented
+contamination.
+
+**There is no batched substitute for those 15 fetches.** Candlestick patterns
+need OHLC and `yahooSparkCloses` is close-only, so this is one `/v8` chart call
+per symbol. That is the cost of the feature.
+
+**`moodSettledBars()` drops a final bar dated today ONLY when the run is
+pre-close** (PT hour < `MOOD_PRECLOSE_PT_HOUR`, 13). At 2:00pm PT the bell has
+rung and today's daily bar is final — it is the most informative bar in the
+series and the one the whole feature exists to read. An unconditional
+"drop if `iso === ptDate()`" would discard a settled bar every day and make the
+2:00pm placement buy nothing over 1:15pm. The guard exists for a manual or
+admin-triggered run, which is the only way a forming bar can reach this code.
+
+**The mood job's Claude call is the only one in this Worker that cannot change
+what it is called about.** The verdict is computed first; the model is handed it
+and asked for a sentence; `moodSentenceUsable()` rejects an answer that names a
+different state, is multi-line, or falls outside `MOOD_SENTENCE_MIN`/`_MAX`. It
+also passes `{ raw: true }` to `workerClaude` so it can check
+`stopReason === 'max_tokens'` — `claudeText()` alone cannot tell a complete
+answer from a truncated one. Every rejection falls back to the house template
+and records why in `sentenceNote`.
 
 **`collectMoveSeries` runs at 2:00pm PT, not on the 1:15pm EOD branch, and the
 reason is bar settlement rather than load balance.** The NYSE closes at 1:00pm PT,

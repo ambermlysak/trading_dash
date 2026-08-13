@@ -24,6 +24,10 @@ trading_dash/
 │                        #   both DST regimes; prints computed vs expected. Also the
 │                        #   cheapest real ES-MODULE parse of worker.js — `node --check`
 │                        #   parses it as CommonJS and misses duplicate declarations
+├── mood.check.mjs       # Market Mood — every candlestick predicate firing AND at
+│                        #   a non-firing boundary, trend-context reclassification,
+│                        #   the emotion cuts, the macro classifier, the stance
+│                        #   table, the sentence guard, and every refusal path
 macro.check.mjs       # macroRegime phase 1 — sign convention, both thresholds,
 │                        #   hostileVia, date alignment vs brute force, all four
 │                        #   states, and collectMacroState's cost with stub bindings
@@ -45,7 +49,7 @@ moved into the Worker and shipped in the payload (`volRegime`, gate thresholds).
 
 | Tab | Contents | Data path |
 |---|---|---|
-| Market | Index/futures/commodities strip, 6am Claude briefing, EOD card, Friday week-ahead, news cards, pre/post-market movers (≥ ±10%), IPO calendar, watchlist signals | loads on page load |
+| Market | Index/futures/commodities strip, 6am Claude briefing, **Market Mood** (candlestick emotion read over 4 index ETFs + 11 SPDR sectors, one verdict line with the per-symbol board on expand — sits directly under the brief), EOD card, Friday week-ahead, news cards, pre/post-market movers (≥ ±10%), IPO calendar, watchlist signals | loads on page load; mood is `mood:state` via `/api/market/mood`, one KV read |
 | Midday | 11:30am PT pulse: session narrative, topics, next-day events, short-term ideas, big movers | `daily:midday` via `/api/daily` |
 | Scanner | Momentum / HOD · Pre-Market Gappers · All Movers · **Golden Cross Setup** | first three `/api/market/scanner`; golden cross has its own endpoint and renderer |
 | Watchlist | 14 columns, sortable, expandable rows, one consolidated Recommendation | `/api/watchlist/batch` |
@@ -612,6 +616,7 @@ Where a paid feed would still add something real, it is named in the notes.
 | 16 | News flow | Alpaca news when keyed, Yahoo `search` otherwise | **real** | Benzinga ($177) |
 | — | ~~Premium screen (dashboard)~~ | **DELETED 2026-08-10.** Became Lane F of the Long screen. See the aROC note below | — | — |
 | — | Long screen (dashboard) | Yahoo chain via `/api/long/:ticker`, one ticker per request: six lanes, ask-based debit (bid-based credit on F), breakeven, BE/EM, extrinsic %, leverage, annualised carry, theta, vega, `P(BE)@exp` from N(d2). Reuses `premium:{TICKER}`'s slower-moving fields when fresh (4 external fetches) and refetches them when not (8) | **real** — Lane D's breakeven/BE/EM/P(BE)/carry are **suppressed**, not estimated | ORATS for a historical IV surface; a term-structure model would unlock Lane D |
+| — | **Market Mood (Market tab)** | **Yahoo `/v8` daily OHLC** — 4 index ETFs (SPY/QQQ/DIA/IWM) + the 11 SPDR sectors, one chart fetch each, banked by the 2:00pm PT cron into `mood:state`. Candlestick patterns are exact OHLC predicates against named ratio thresholds; single-candle reversals are direction-classified by trend context (SMA20 position + prior 5-session return), so the same geometry reads `hammer` in a downtrend and `hanging-man` in an uptrend. Per-symbol score → emotion enum; a weighted blend (indexes ×2, sectors ×1) → macro state; a fixed table → stance | **real, and HYBRID** — every *state* is rules-decided. **One Claude call a day rewrites the already-decided verdict as one sentence and can never change it**: the prompt says so, the schema returns only a sentence, and `moodSentenceUsable()` rejects an answer naming a different state. A fixed template per (state, breadth) pair is the fallback, and `sentenceSource` says which is on screen. **Scored against nothing** — `usedForRanking: false`, it sorts and gates nothing | — |
 | — | Macro regime chip (Long tab header) | **Yahoo spark** — SPY, QQQ, `^VIX`, `^VIX3M`, 10y, one request/day banked by the 1:15pm PT cron into `macro:state`. SPY/QQQ trend from `smaCrossState(50,200)`; term structure = `^VIX` − `^VIX3M`, 5-session trailing mean | **real** — thresholds derived from 2,293 historical sessions; **phase 1 is display only and ranks nothing** | — |
 | — | Long screen · `cov` / `gap` / `E[R]` / `E[$]` | **Measured** from `moves:{TICKER}` — 3y of Yahoo daily closes banked by the 2pm PT sweep (2 external fetches for the whole watchlist), then overlapping N-session windows. `cov` is an empirical frequency, `p(be)` beside it is modelled; `E[R]` is mean P/L over those windows ÷ capital risked | **real** — 1y/3y never averaged; horizons the history cannot support return null naming the numbers; `gapBaseline` null this release | ORATS for a historical IV surface would let `pBe` be checked against a *measured* IV rather than only against realized moves |
 
@@ -755,6 +760,7 @@ GET  /api/daily                    Morning briefing + EOD + midday, from KV
 GET  /api/market/snapshot          Index / futures / commodities strip
 GET  /api/market/movers            Pre-market and day movers (≥ ±10%)
 GET  /api/market/ipos              Upcoming IPO calendar
+GET  /api/market/mood              Market Mood — KV read only, 0 fetches, no Claude
 GET  /api/market/sectors           11 SPDR sectors + Claude picks   (?cached=1)
 GET  /api/market/scanner?preset=   Momentum scanner, 5 Pillars      (?cached=1)
 GET  /api/market/golden-cross      Golden-cross setups, EMA + SMA   (?cached=1)
