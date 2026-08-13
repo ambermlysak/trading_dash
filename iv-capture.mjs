@@ -154,6 +154,21 @@ function compare(p1, p2) {
       console.log(`  ${c.t.padEnd(8)} ${String(c.ivA).padStart(9)} ${String(c.ivB).padStart(11)} `
         + `${String(c.dIv).padStart(9)} ${String(c.gap).padStart(11)}   ${c.srcA}→${c.srcB}`);
     }
+    /* THE ZERO-DELTA SUBSET IS THE DECISION, so it gets its own line rather than
+       sitting as a `0` in the table. A rewrite that lands the SAME atmIv means the
+       second pass cost subrequests and changed no measurement — which is the
+       outcome under which `skipIfPresent` on the cron path is unnecessary. A
+       rewrite that moves the number is the opposite finding. */
+    const noChange = changed.filter(c => c.dIv === 0).length;
+    console.log(`\n  OF THE ${changed.length} REWRITTEN, ${noChange} carried an IDENTICAL atmIv`
+      + ` and ${changed.length - noChange} moved the measurement.`);
+    console.log(noChange === changed.length
+      ? '  -> every rewrite was a no-op on the measurement. The second pass costs subrequests\n'
+        + '     and changes nothing, so skipIfPresent would be an optimisation, not a correction.'
+      : `  -> ${changed.length - noChange} sample(s) mean the stored series DEPENDS on which pass wrote it.\n`
+        + '     That is a data-integrity finding, not wasted budget: skipIfPresent (or writing the\n'
+        + '     :15 reading and refusing to overwrite it) would be protecting the measurement.');
+
     const ds = changed.map(c => c.dIv).filter(Number.isFinite);
     if (ds.length) {
       const abs = ds.map(Math.abs).sort((a, b) => a - b);

@@ -771,9 +771,19 @@ refusal path driven with stub bindings). All of them extract functions from
 must be a function or `workerd` refuses to boot.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 119** for moves / long-fixtures /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144** for moves / long-fixtures /
 cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f / sweep-universe /
-macro — **567 comparisons** across the suite.
+macro — **592 comparisons** across the suite.
+
+**`node iv-capture.fixture.mjs` is an eleventh script and is deliberately NOT in
+that total**, because it tests `iv-capture.mjs` — an operational capture tool —
+rather than anything in `worker.js`, and the 592 has always meant "comparisons
+against the Worker". It contributes **15** of its own. It exists because
+`iv-capture.mjs`'s first live run exercised only the no-change branch
+(`rewritten: 0`), and **an empty comparison is not a pass**: the rewrite detection,
+the per-ticker delta arithmetic, the `ts` gap and the only-in-pass-1 /
+only-in-pass-2 buckets had never executed against changed data. It synthesises that
+data from a real snapshot and checks the arithmetic against hand-computed values.
 
 **`node --check` IS NOT A SUFFICIENT PRE-DEPLOY PARSE, and it gave a false pass on
 this commit.** `worker.js` is an ES module; `node --check` parses it as a CommonJS

@@ -1236,6 +1236,28 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    push pass 1 past the 1:30pm boundary and blend the two sweeps. One wrangler call
    is still made first, purely to refresh the OAuth token.
 
+   **`node iv-capture.fixture.mjs` covers the branch the live dry run could not.**
+   That run returned `rewritten: 0` — the no-change path — so the logic that matters
+   on a day the guard misfires had never executed. The fixture synthesises a second
+   pass from a real snapshot with six cases: `atmIv` up, `atmIv` down, a large move,
+   a tiny move, **`atmIv` identical with a changed `ts`**, an untouched name, a name
+   present in pass 1 and gone in pass 2, one recovered by the second pass, and one
+   absent from both. 15 comparisons, all printed computed-vs-expected, with four
+   per-ticker deltas and the aggregate statistics hand-checked.
+
+   **Two behaviours it pins down, so they are defined rather than discovered:**
+
+   - **A key present in pass 1 and absent in pass 2 reports distinctly from
+     absent-in-both.** A disappearing key is a different fact from one that never
+     existed, and with a 400-day TTL it should be impossible — the report says so.
+   - **An identical `atmIv` with a changed `ts` reports as REWRITTEN, not
+     untouched.** The bucket keys on `ts`, never on the value. Classifying it as
+     untouched would hide exactly the case being tested for. The report then splits
+     the rewritten set: how many carried an identical `atmIv` versus how many moved
+     the measurement, because that split *is* the decision — all-identical means
+     `skipIfPresent` would be an optimisation, any movement means the stored series
+     depends on which pass wrote it and `skipIfPresent` protects the measurement.
+
    If the `:15` and `:30` readings differ materially, the non-incremental retry is a
    **data-integrity** problem rather than wasted subrequests — and that changes what
    the right fix to the guard is, because `skipIfPresent` on the cron path would then
