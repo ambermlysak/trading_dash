@@ -1257,22 +1257,41 @@ async function loadDailySnapshot() {
 
     // EOD / Market Open card
     if (data.eod) {
-      document.getElementById('eod-badge').textContent    = 'Market Close';
-      document.getElementById('eod-headline').textContent = data.eod.headline || '';
-      document.getElementById('eod-body').textContent     = data.eod.body || '';
-      if (data.eod.ts) {
-        const d = new Date(data.eod.ts);
-        document.getElementById('eod-ts').textContent = 'As of ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
-      }
+      /* THREE states, not two. Since 2026-08-12 the cron writes a PLACEHOLDER
+         (`complete: false`, `ts: 0`) when Claude generation fails, so the record
+         does not dedup itself out and the next firing retries.
+
+         THE TEST IS `=== false`, NEVER `!data.eod.complete`. A record with no
+         `complete` field at all came from a Worker predating that change and is a
+         REAL summary — the frontend ships ahead of the Worker routinely, and
+         treating absent as false would relabel every genuine record as failed. */
+      const failed = data.eod.complete === false;
+      document.getElementById('eod-badge').textContent    = failed ? 'Market Close · unavailable' : 'Market Close';
+      document.getElementById('eod-headline').textContent = failed
+        ? 'End-of-day summary could not be generated'
+        : (data.eod.headline || '');
+      document.getElementById('eod-body').textContent     = failed
+        ? 'The 1:15pm PT job did not get a usable summary back. It retries on the next cron firing. '
+          + 'Nothing here is a reading of today’s session.'
+        : (data.eod.body || '');
+      /* ASSIGN UNCONDITIONALLY. This used to be `if (data.eod.ts) { … }`, which on a
+         record with no timestamp left the PREVIOUS render's line in place — measured
+         before this fix: a `ts: 0` placeholder rendered under "As of 01:15 PM PDT",
+         i.e. a failed generation shown as a timestamped report. A stale value is a
+         worse lie than a blank one. */
+      document.getElementById('eod-ts').textContent = data.eod.ts
+        ? 'As of ' + new Date(data.eod.ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })
+        : (failed ? 'no summary for today yet — retrying' : '');
       document.getElementById('eod-card').classList.add('visible');
     } else if (data.open) {
       document.getElementById('eod-badge').textContent    = 'Pre-Market';
       document.getElementById('eod-headline').textContent = data.open.headline || '';
       document.getElementById('eod-body').textContent     = data.open.body || '';
-      if (data.ts) {
-        const d = new Date(data.ts);
-        document.getElementById('eod-ts').textContent = 'As of ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
-      }
+      // Unconditional for the same reason as the branch above: `eod-ts` is shared
+      // between the two, so a skipped assignment inherits the other one's line.
+      document.getElementById('eod-ts').textContent = data.ts
+        ? 'As of ' + new Date(data.ts).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })
+        : '';
       document.getElementById('eod-card').classList.add('visible');
     } else if (data.eodLoading) {
       document.getElementById('eod-badge').textContent    = 'Market Close';

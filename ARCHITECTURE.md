@@ -1136,6 +1136,53 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    `ivRank` needs `IV_RANK_MIN_DAYS`-worth of unbroken daily history and none of
    these gaps backfill, so every day of delay is permanent.
 
+   ### PRE-REGISTERED, written 2026-08-12 before the 2026-08-13 firing
+
+   **The `ok === tickers.length` guard collides with today's 32-of-33 result.** Under
+   it, today's sweep would not have stamped. That is correct for a transient miss —
+   it retries at :30, per-ticker writes are idempotent, the gap fills. It is *wrong*
+   for a name whose chain is chronically absent: `ivSnapshot` returning null counts
+   as `!ok`, so one such name blocks the stamp **permanently**, `ivsweep:last` reads
+   "never succeeded" every day while 32 of 33 samples land fine, and the sweep runs
+   twice daily forever. That would turn a signal just made trustworthy into a
+   constant. KTOS is the live candidate at n=1; CRCL, QUBT and similar names share
+   the shape.
+
+   **The two outcomes, fixed in advance:**
+
+   - **KTOS records and `ok === 33`** → the stamp lands, the guard is correct as
+     written, nothing to do.
+   - **KTOS misses again** → the sweep runs at :15 and :30, `ivsweep:last` is absent
+     all day, and 32–33 samples are present anyway. **Report and STOP.** Do not
+     adjust the guard in the same breath. The open question is then whether
+     `snap == null` ("no chain") should be distinguished from a thrown error ("the
+     call failed") — the loop currently collapses them into `!ok` — and that is a
+     decision to take with the data in hand, not while the surprise is fresh.
+
+   **Cost of the sweep running twice, stated rather than assumed.** Derived by
+   subtraction from measured branch totals, NOT directly measured — the sweep has no
+   `_instr` of its own:
+
+   | quantity | figure |
+   |---|---|
+   | 08-12 branch, Cloudflare counter (eod + sweep 32 names + macro) | **113** |
+   | 08-11 branch (eod + sweep that produced nothing, no macro job yet) | **41** |
+   | macro, measured in isolation | 1 ext |
+   | ⇒ sweep of 32 names, by subtraction | **≈ 71 external**, ≈ 2.2/ticker |
+   | branch with the sweep running twice | **≈ 184** by that counter |
+   | additional KV ops for the second pass (1 read + ~32 puts) | ≈ 34 |
+   | ⇒ additional `capCost` | **≈ 105** |
+
+   Against the 10,000 ceiling that is **under 3%**, so cost is not the argument
+   against the guard. Two things about the retry are worth knowing anyway:
+
+   - **It is NOT incremental.** The cron path passes no `skipIfPresent`, and there is
+     no per-ticker "already have today" check, so the second pass re-fetches all 33
+     chains to recover one name.
+   - **It overwrites the 32 good samples** with slightly later post-close readings.
+     Harmless — both are valid same-day post-close values, and the precedence note in
+     `recordIvSample` wants the cron to win — but it is 32 extra writes, not zero.
+
 17. **BLOCKED ON THE ACCOUNT OWNER — two capabilities the verification standard
    already assumes.** Neither is work to schedule; both are credentials to provide,
    and until they exist the corresponding checks must be reported as unrun rather

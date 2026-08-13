@@ -515,7 +515,43 @@ neither is reached. Those two rows are measured on the *failure* path only.
 **Not changed, and worth knowing:** `handleDailyGet` triggers request-path
 regeneration on `!eod`, not on `!eod.complete`, so a page visit will not
 regenerate a placeholder. The impact is bounded because the next cron firing now
-does retry.
+does retry. Changing it would add a Claude-spend path to ordinary page loads, which
+is its own decision.
+
+##### THE PLACEHOLDER IS A THIRD RENDER STATE — and it rendered as a real report
+
+`daily:eod` can now hold `complete: false, ts: 0`, which is a state the EOD card
+had never seen. Rendered before the fix, with a stale timestamp seeded as a
+re-render would leave it:
+
+```
+─── PLACEHOLDER (complete:false, ts:0)      BEFORE
+   badge     : "Market Close"
+   headline  : "Market closed Wednesday, August 12, 2026"
+   body      : "Market data unavailable."
+   timestamp : "As of 01:15 PM PDT"          <- the PREVIOUS render's line
+```
+
+`if (data.eod.ts) { … }` skipped the assignment rather than clearing it, so a
+failed generation appeared as a **timestamped market-close report**. That branch
+was unreachable until the guard started writing `ts: 0`. After:
+
+```
+─── PLACEHOLDER                              AFTER
+   badge     : "Market Close · unavailable"
+   headline  : "End-of-day summary could not be generated"
+   body      : "The 1:15pm PT job did not get a usable summary back. It retries…"
+   timestamp : "no summary for today yet — retrying"
+```
+
+**The test is `data.eod.complete === false`, never `!data.eod.complete`.** A record
+with no `complete` field came from a Worker predating 2026-08-12 and is a REAL
+summary — the frontend ships ahead of the Worker routinely, and treating absent as
+false would relabel every genuine record as failed. Verified against all three
+states; the old-Worker record still renders normally.
+
+**A stale value is a worse lie than a blank one.** Both `eod-ts` assignments are
+now unconditional, including the `data.open` branch, which shares the element.
 
 ##### `iv:` SAMPLE COUNT DOES NOT MEASURE SWEEP SUCCESS — and never has
 
@@ -574,9 +610,29 @@ above the right fix rather than a schedule change.
 it was and that was wrong. The expression fix (`f313c04`, 2026-08-07 11:23 PT)
 predates that day's 1:15pm branch, and the cron did fire at 20:15:42.
 
-**2026-08-05 is the one loose end:** 15 samples were written at 13:15:17–19 PT and
-analytics shows **no invocation at all** at that minute, though the cron series is
-present at :14 seconds on either side of it. Unexplained.
+##### TWO BOUNDS ON THAT METHOD, both found chasing the 2026-08-05 loose end
+
+15 samples were written at 13:15:17–19 PT on 08-05 with **no invocation recorded**
+at that minute, though the cron series is plainly present at `:14` seconds on
+either side (20:00:14, 20:30:14, 20:45:14). The explanation is the second bound
+below, and it is the more consequential one.
+
+1. **Minute-bucket attribution misclassifies under firing drift.** The cron's
+   second-offset ranges from `:05` to `:55` across days, so a firing at `20:14:5x`
+   lands in the `:14` bucket and reads as "not at a quarter hour". Any reading
+   built on quarter-hour minutes inherits this.
+2. **`workersInvocationsAdaptive` IS SAMPLED, so an absent row is not evidence of
+   an absent invocation.** Measured: `sampleInterval` takes values **1, 1.6, 2.5,
+   2.8 and 10** in the same two-hour window. Every quarter-hour row this analysis
+   relied on carried `sampleInterval = 1`, so the rows that *were* read are sound —
+   but 08-05's missing 20:15:14 is a dropped row, not a missing firing, and the
+   corroboration is that 20:30:14 shows **0 subrequests**, which under the pre-fix
+   code means all three jobs dedupped, which requires the 20:15 firing to have run
+   and stamped.
+
+**So "FIRED" conclusions from this dataset are safe and "NEVER FIRED" ones are
+not.** The claim above — the cron fired on every trading day — rests only on rows
+that are present, which is the safe direction. Do not invert it.
 
 #### None of that logging exists unless observability is on
 
