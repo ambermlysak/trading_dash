@@ -3,6 +3,12 @@ node_modules/
 .dev.vars
 *.log
 
+# Every .env file. `alpaca-paper.env` reached a PUBLIC commit (3d18cae) because
+# it was untracked, unignored, and swept up by a `git add -A` — the ID inside it
+# is in the history permanently. Secrets belong in `.dev.vars` (already ignored)
+# or in `wrangler secret put`; this pattern is the backstop for when they do not.
+*.env
+
 # Local Claude Code permission grants — machine-specific, and publishing them
 # is free reconnaissance on a public repo. .claude/skills/ IS tracked.
 .claude/settings.local.json
