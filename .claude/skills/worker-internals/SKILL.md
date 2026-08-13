@@ -556,6 +556,23 @@ series and the one the whole feature exists to read. An unconditional
 2:00pm placement buy nothing over 1:15pm. The guard exists for a manual or
 admin-triggered run, which is the only way a forming bar can reach this code.
 
+**`unavailable` IS NOT ONE CONDITION, AND `_meta.ok` MUST NOT TREAT IT AS ONE.**
+`MOOD_FAULT_CAUSES` (`stale-sweep`, `record-missing`) names the two causes that
+are genuine faults; `moodMetaOk()` derives `_meta.ok` from it. `never-collected`
+(nothing has run yet) and `schema` (an old record retiring after a deploy) are
+expected transitional states and report `ok: true`.
+
+**This was a live defect, caught on the deployed build 2026-08-13.** `ok` was
+`state !== 'unavailable'`, so a cold start rendered `.src-tag.bad` — a **red**
+provenance badge — right beside a chip that was deliberately neutral for the same
+state under a comment saying a cold start is not a fault. One fact, two elements,
+opposite tones, and the red one carried more weight. The list therefore ships on
+the payload as `faultCauses`, and `dashboard.html` tones its chip from that plus
+its own `CLIENT_FAULT_CAUSES` (`request-failed`) — causes the Worker can never
+send because they describe the request rather than the record. The page keeps a
+literal copy as its deploy-window fallback; **keep the two in sync**, and
+`mood.check.mjs` §10 asserts against both files for exactly that reason.
+
 **KNOWN WATCH ITEM — the two loosened predicates have never fired on live data.**
 `moodIsPiercingLine` and `moodIsDarkCloudCover` test the open against the prior
 **close** rather than the prior low/high. The strict form needs a gap past the

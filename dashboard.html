@@ -1407,8 +1407,18 @@ function renderMarketMood(data) {
     : state;
   /* Amber only where something is actually wrong. A cold start, or a Worker that
      simply has not shipped the route yet, is not a fault and must not wear the
-     colour of one. */
-  const badCause = ['stale-sweep', 'record-missing', 'request-failed'].includes(data?.unavailableCause);
+     colour of one.
+
+     THE WORKER OWNS ITS HALF OF THIS LIST and ships it as `faultCauses`; the two
+     client-only causes are added here because the Worker can never send them —
+     they describe the request, not the record. The literal is the fallback for
+     the deploy window where this page is newer than the Worker, which is a
+     routine state here, not an edge case. Keep it in sync with the Worker's
+     MOOD_FAULT_CAUSES: it is what renders until the Worker catches up. */
+  const CLIENT_FAULT_CAUSES = ['request-failed'];
+  const faultCauses = (Array.isArray(data?.faultCauses) ? data.faultCauses : ['stale-sweep', 'record-missing'])
+    .concat(CLIENT_FAULT_CAUSES);
+  const badCause = faultCauses.includes(data?.unavailableCause);
   chip.className = 'mood-chip tone-' + (state === 'unavailable' ? (badCause ? 'amber' : 'none') : moodTone(state));
 
   document.getElementById('mood-stance').textContent = data?.stance ? `stance · ${data.stance}` : '';
@@ -1458,7 +1468,11 @@ function renderMarketMood(data) {
          trend context, mapped through fixed thresholds. A hammer in an uptrend is scored as a hanging man,
          so the same shape reads differently by context. ${esc(data?.notUsedNote || '')}
        </div>`
-    : `<div class="mood-legend">${esc(data?.reason || 'No per-symbol board to show.')}</div>`;
+    /* The note above already carries `reason` on every unavailable state, so
+       repeating it here printed the same paragraph twice on expand. */
+    : `<div class="mood-legend">${esc(state === 'unavailable'
+        ? 'No per-symbol board — the reason is stated above the fold.'
+        : (data?.reason || 'No per-symbol board to show.'))}</div>`;
 }
 
 /* ─── Daily snapshot ─── */

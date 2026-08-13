@@ -803,15 +803,18 @@ trend-context reclassification — one geometry reading `hammer` / `hanging-man`
 direction-neutral — both sides of every emotion cut, the macro classifier across
 all seven states with stub reads, the stance table, the template for every
 (macroState, breadth qualifier) pair, the sentence guard that stops a rephrase
-becoming a reclassification, and `collectMarketMood`'s exact cost and every
-refusal path with stub bindings). All of them extract functions from
+becoming a reclassification, `collectMarketMood`'s exact cost and every
+refusal path with stub bindings, and `moodMetaOk` — which of the five
+missing-record causes are actual faults, asserted against **both** the Worker and
+the page so the badge and the chip cannot tone the same state differently again).
+All of them extract functions from
 `worker.js` by source, not by import, because every named export in `worker.js`
 must be a function or `workerd` refuses to boot.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 273** for moves /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287** for moves /
 long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
-sweep-universe / macro / mood — **865 comparisons** across the suite.
+sweep-universe / macro / mood — **879 comparisons** across the suite.
 
 **`mood.check.mjs` uses a brace-matching `grabConst`, not the scan-to-semicolon
 one the other scripts share.** `MOOD_STANCE`'s sentences contain semicolons, and

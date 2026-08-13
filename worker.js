@@ -6956,6 +6956,32 @@ const MOOD_BREADTH_CLAUSE = {
   'split':  ' Breadth is split, so treat the index read as weakly held.',
 };
 
+/* ── WHICH MISSING-RECORD CAUSES ARE ACTUALLY FAULTS ─────────────────────────
+   `unavailable` is not one condition. A cold start and a sweep that has been
+   refusing for days are both "no record", and only the second is wrong.
+
+   THIS EXISTS BECAUSE THE BADGE AND THE CHIP DISAGREED. `_meta.ok` was
+   `state !== 'unavailable'`, which painted the provenance badge RED on
+   `never-collected` — while the chip beside it deliberately stayed neutral,
+   under a comment saying a cold start is not a fault. One fact, two elements,
+   opposite tones, and the red one was the more eye-catching of the two.
+
+   So the split is named once, here, and SHIPS ON THE PAYLOAD as `faultCauses`.
+   The frontend needs its own list anyway — it adds `endpoint-absent` and
+   `request-failed`, which the Worker can never send because they describe the
+   request rather than the record — and a hardcoded copy of the Worker's half is
+   exactly how the two drift apart again. */
+const MOOD_FAULT_CAUSES = ['stale-sweep', 'record-missing'];
+
+/** `_meta.ok` for a mood payload: false ONLY where something is genuinely
+ *  broken. `never-collected` (nothing has run yet) and `schema` (an old record
+ *  retiring after a deploy) are both expected transitional states — neither says
+ *  anything about the market and neither is a source failure. */
+function moodMetaOk(rec) {
+  if (!rec || rec.state !== 'unavailable') return true;
+  return !MOOD_FAULT_CAUSES.includes(rec.unavailableCause);
+}
+
 const MOOD_ANSWER_TOKENS   = 200;
 const MOOD_SENTENCE_MAX    = 260;   // chars; longer is not one sentence
 const MOOD_SENTENCE_MIN    = 30;    // chars; shorter is not a usable rewrite
@@ -7620,6 +7646,10 @@ async function readMarketMood(env) {
     return {
       schema: MOOD_SCHEMA, state: 'unavailable', unavailableCause: cause,
       lastSweptOn: sweptOn || null,
+      /* Shipped so the frontend tones this state from the Worker's own split
+         rather than from a hardcoded copy of it. */
+      faultCauses: MOOD_FAULT_CAUSES,
+      isFault: MOOD_FAULT_CAUSES.includes(cause),
       stance: stance.category, sentence: stance.template, sentenceSource: 'template',
       sentenceNote: null, template: stance.template,
       score: null, breadth: null, breadthQualifier: null,
@@ -7650,7 +7680,9 @@ async function handleMarketMood(origin, env) {
     ...rec,
     _instr: instrSince(mark, 'mood'),
     _meta: srcMeta('Yahoo daily bars · candlestick rules', {
-      ok: rec.state !== 'unavailable',
+      // NOT `state !== 'unavailable'` — that reddened the badge on a cold start,
+      // contradicting the neutral chip beside it. See MOOD_FAULT_CAUSES.
+      ok: moodMetaOk(rec),
       delayed: true,
       ttlSeconds: TTL.mood,
       asOf: rec.asOfClose,

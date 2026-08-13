@@ -84,6 +84,7 @@ const CONSTS = [
   'MOOD_M_EUPHORIA', 'MOOD_M_GREED', 'MOOD_M_RISK_ON',
   'MOOD_M_RISK_OFF', 'MOOD_M_FEAR', 'MOOD_M_CAPITULATION',
   'MOOD_BREADTH_STRONG', 'MOOD_BREADTH_SPLIT', 'MOOD_STANCE', 'MOOD_BREADTH_CLAUSE',
+  'MOOD_FAULT_CAUSES',
   'MOOD_ANSWER_TOKENS', 'MOOD_SENTENCE_MAX', 'MOOD_SENTENCE_MIN', 'MOOD_SENTENCE_SCHEMA',
 ];
 const FNS = [
@@ -94,7 +95,7 @@ const FNS = [
   'moodIsMorningStar', 'moodIsEveningStar', 'moodIsThreeWhiteSoldiers', 'moodIsThreeBlackCrows',
   'moodTrendAt', 'moodPatternsAt', 'moodScoreOf', 'moodEmotionOf', 'moodReadFor',
   'moodBreadthOf', 'moodBreadthQualifier', 'moodMacroFrom', 'moodStanceFor',
-  'moodSentenceUsable', 'moodPrompt',
+  'moodSentenceUsable', 'moodPrompt', 'moodMetaOk',
 ];
 
 const M = new Function([
@@ -776,6 +777,44 @@ console.log('\n§9  collectMarketMood — cost counted directly, and the stamp c
   }
 }
 
+/* ── 10. _meta.ok — WHICH CAUSES ARE FAULTS ───────────────────────────────── */
+console.log('\n§10 _meta.ok — a cold start is not a fault, and the badge must not say it is');
+{
+  /* THE BUG THIS PINS: `ok` was `state !== 'unavailable'`, so `never-collected`
+     rendered `.src-tag.bad` — a RED provenance badge — beside a chip that was
+     deliberately neutral for the same state. One fact, two elements, opposite
+     tones. Verified against the live deployed Worker on 2026-08-13 before the
+     fix: badgeClass "src-tag bad delayed" on a cold start. */
+  const rec = (state, cause) => ({ state, unavailableCause: cause });
+  row('a populated state is ok', M.moodMetaOk(rec('mixed', null)), true);
+  row('every non-unavailable state is ok',
+      ['euphoria', 'greed', 'risk-on', 'mixed', 'risk-off', 'fear', 'capitulation']
+        .every(s => M.moodMetaOk(rec(s, null))), true);
+  row('never-collected is NOT a fault (cold start)', M.moodMetaOk(rec('unavailable', 'never-collected')), true);
+  row('schema is NOT a fault (an old record retiring after a deploy)',
+      M.moodMetaOk(rec('unavailable', 'schema')), true);
+  row('stale-sweep IS a fault', M.moodMetaOk(rec('unavailable', 'stale-sweep')), false);
+  row('record-missing IS a fault', M.moodMetaOk(rec('unavailable', 'record-missing')), false);
+  row('an unknown cause defaults to NOT a fault (never invent a failure)',
+      M.moodMetaOk(rec('unavailable', 'something-new')), true);
+  row('null record is ok rather than throwing', M.moodMetaOk(null), true);
+  row('fault list is exactly the two', M.MOOD_FAULT_CAUSES.join(','), 'stale-sweep,record-missing');
+
+  /* The frontend tones its chip from `faultCauses` on the payload plus its own
+     two client-only causes. These must agree, or the badge and the chip diverge
+     again — which is the whole defect this section exists for. */
+  const page = fs.readFileSync('dashboard.html', 'utf8');
+  row('the page reads faultCauses off the payload', /data\?\.faultCauses/.test(page), true);
+  row('  ...with the Worker list as its deploy-window fallback',
+      /\['stale-sweep', 'record-missing'\]/.test(page), true);
+  row('  ...and adds only the client-only causes the Worker cannot send',
+      /CLIENT_FAULT_CAUSES = \['request-failed'\]/.test(page), true);
+  row('endpoint-absent is NOT toned as a fault (it is a deploy window)',
+      /CLIENT_FAULT_CAUSES = \[[^\]]*endpoint-absent/.test(page), false);
+  row('the unavailable detail panel does not repeat the reason',
+      /the reason is stated above the fold/.test(page), true);
+}
+
 const populationOk = populated('mood engine', M.MOOD_SYMBOLS.length, ALL_STATES.length);
 if (!populationOk) t.failures++;
 
@@ -783,5 +822,5 @@ process.exit(reportVerdict({
   label: 'Market Mood',
   comparisons: t.comparisons,
   failures: t.failures,
-  minComparisons: 273,
+  minComparisons: 287,
 }));
