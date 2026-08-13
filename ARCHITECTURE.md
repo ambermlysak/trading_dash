@@ -1147,6 +1147,55 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    fix is done. Historical keys stay unprovenanced on purpose — absent `src` means
    pre-2026-08-12 and must never be read as `'api'`.
 
+   ### THE OVERWRITE IS THE SAMPLING DESIGN — decided 2026-08-13, retroactively
+
+   **This was never chosen. It is being written down as a decision because the
+   behaviour is load-bearing, undocumented and invisible, and the next person to
+   look at it will see an obvious optimisation rather than a design.**
+
+   **The decision: `iv:{TICKER}:{DATE}` holds one sample per name per day, taken at
+   a fixed time — 13:15 PT — and the sweep's unconditional overwrite is the
+   mechanism that enforces it.**
+
+   **The reasoning.** `ivRank` percentiles a series across days. A percentile is
+   only meaningful if every point in the series is the *same measurement*, and IV
+   moves intraday — so a series mixing a 07:08 reading with a 13:15 reading is
+   comparing two different quantities and calling the difference a percentile
+   move. Uniform 13:15 sampling across all 33 names is exactly the shape that makes
+   the comparison valid. **Morning page views are the contamination, and the
+   overwrite is what removes it.**
+
+   That the sweep runs *after* the 1:00pm PT close is part of it: every stored
+   sample is a settled-session reading.
+
+   **The cost, stated plainly: intraday readings are destroyed and unrecoverable.**
+   Any name opened on the Long tab in the morning has its reading silently replaced.
+   Measured 2026-08-13 — four names carried pre-sweep readings and all four were
+   overwritten, with real movement in between:
+
+   ```
+   AMD   54.47 -> 51.22   (-6.0%)      TSM   28.96 -> 33.85   (+16.9%)
+   TWLO  50.10 -> 53.69   (+7.2%)      PLTR  43.13 -> 44.56   (+3.3%)
+   ```
+
+   Those four morning readings exist nowhere now; the only record they were ever
+   taken is an out-of-band baseline captured at 08:53 that day. **If intraday IV is
+   ever wanted, it needs its own key — it cannot be recovered from this one.**
+
+   > **THEREFORE: DO NOT ADD `skipIfPresent` TO THE CRON PATH.** It reads as a pure
+   > optimisation — the second pass re-fetches 33 chains to recover one name — and
+   > it is not. On the cron it would mean *"keep whichever reading happened to be
+   > written first today"*, which on any morning-viewed name is a page view at an
+   > arbitrary time. **That silently converts a fixed-time series into a
+   > first-writer-wins one, biased toward exactly the names someone looked at** —
+   > the bias this whole item exists to remove. The fetches saved are real; the
+   > sampling design is worth more.
+   >
+   > The `:15` vs `:30` case pre-registered above is the *same* concern by a
+   > different route. It did not fire on 2026-08-13 because the guard held, but the
+   > mechanism — a later pass redefining what the stored sample measures — is
+   > identical, and the morning-view route fires every day the Long tab is used.
+
    **THE REMAINING PROBLEM IS BIAS, NOT SPARSITY, AND IT HAS A DEADLINE.**
    `ivRankFrom` counts `history.length` and nothing else; `ivHistory` rebuilds the
    series from key metadata (`atmIv`, `spot`, `dte`) which carries **no
@@ -1415,6 +1464,42 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    than observing them, and it does not establish which *other* binding types
    behave the same way.
 
+   **THIRD DATA POINT — 2026-08-13, and it does NOT show disagreement in both
+   directions.** The `daily:eod` record generated on the request path at 13:06:22 PT
+   stamped `invocationFetches 50 / invocationCapCost 55`, against the analytics row
+   at 20:06:14Z reading **54**. It is a clean comparison: one job, run to
+   completion, `scope: "none"`.
+
+   **The two units must not be mixed, and mixing them is what makes the direction
+   look inconsistent.** `capCost` includes binding ops; the analytics figure (on the
+   hypothesis above) does not. Compared like for like, every case points the same
+   way:
+
+   | invocation | `capCost` | `extFetches` | analytics | capCost − analytics | ext − analytics |
+   |---|---|---|---|---|---|
+   | 08-12 6am (clean, one job) | 254 | 139 | 153 | **+101** | **−14** |
+   | 08-13 1:06pm request (clean, one job) | 55 | 50 | 54 | **+1** | **−4** |
+   | 08-12 1:15pm (mid-flight, not comparable) | 122 | 89 | 113 | +9 | −24 |
+
+   So `capCost ≥ analytics` in every case and `extFetches ≤ analytics` in every
+   case. **Both directions are consistent, and both support the KV-exclusion
+   hypothesis** rather than complicating it — the first column is the KV ops
+   analytics omits.
+
+   **What is NOT explained is the second column: analytics exceeds instrumented
+   `fetch()` calls by 14 and by 4 — roughly 8–10% both times.** `INSTR` wraps
+   `globalThis.fetch` and counts one call per invocation of it. **Untested
+   hypothesis: Cloudflare counts each redirect hop as its own subrequest, while
+   `INSTR` counts the originating call once.** Several upstreams here redirect
+   (Yahoo crumb, SEC EDGAR). That would make `extFetches` a count of *intended*
+   requests and the analytics figure a count of *HTTP round trips* — different
+   quantities, both correct.
+
+   **Testable and not tested:** issue a known number of fetches to a
+   known-redirecting URL and to a known-direct one, and compare the delta. Until
+   someone does, the residual is unexplained and `extFetches` should not be treated
+   as a round-trip count.
+
    If true, the consequence is two-sided. `capCost` would be *conservative*
    relative to the platform's own accounting, which is the safe direction, and at
    113–190 against a 10,000 ceiling nothing is at risk either way. **But the unit
@@ -1423,6 +1508,40 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    the measured 125–143% understatement behind it, was derived assuming the two
    agree. **That assumption is now open.** Do not restate the understatement figure
    as settled until this is resolved.
+
+19. **`mood:`'s WRITE PATH — AUDITED 2026-08-13, NOT EXPOSED. Queued as a check,
+   closed on the same day, because the answer was already in the code.**
+
+   Raised on the suspicion that `market-mood` post-dates the #15 stamp-guard audit
+   and might therefore stamp unconditionally, inheriting the silent-failure mode
+   closed everywhere else. **It does not.** Read directly from `worker.js`:
+
+   | question | answer | evidence |
+   |---|---|---|
+   | runs on a cron branch? | **yes** — 2:00pm PT, `forward-returns+moves+mood` | `worker.js:11036` |
+   | dispatched through `dispatchJob`? | **yes** | `dispatchJob(ctx, 'market-mood', …)` |
+   | stamps a dedup key? | **yes** — `moodsweep:last` | `worker.js:7598` |
+   | is the stamp guarded? | **yes** — `fetched === MOOD_SYMBOLS.length` | `worker.js:7597` |
+   | stamped last, after the payload write? | **yes** | so a failed write leaves it unstamped |
+   | dedup key outside the `mood:` prefix? | **yes** | nothing scanning `mood:` reads the stamp as a record |
+
+   A partial run **stores but does not stamp** (a readable sector board with an
+   unavailable verdict is a finding); a run where every fetch failed writes nothing
+   at all. The incomplete path logs `!! MOOD-SWEEP-INCOMPLETE !!` with `fetched/N`.
+
+   **Its coverage is stronger than the five jobs #15 fixed, not weaker.** Those were
+   verified by forcing failures locally once; this one has standing assertions in
+   `mood.check.mjs` §9 — four separate no-stamp paths (dedup skip, one index down,
+   one sector down, and a failed payload write), plus *"dedup stamped LAST"* and
+   *"dedup key is OUTSIDE the mood: prefix"*. A regression would fail the check
+   suite rather than needing to be rediscovered in production.
+
+   **The premise that it skipped the audit was wrong** — CLAUDE.md rule #7's stamp
+   table already carries a `market-mood` row reading *"built to the pattern above,
+   never had the defect"*. Recorded here anyway, because "we checked and it is fine"
+   is worth more written down than an open question that keeps getting re-raised.
+
+   **Nothing was changed.** No fix was needed and none was made.
 
 9. **Chart pattern recognition.** Head-and-shoulders, cup-and-handle etc.
    Lightweight Charts supports custom drawings; recognition would be rules-based

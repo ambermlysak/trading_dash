@@ -915,6 +915,11 @@ without ever opening that file.
 - Provenance badges are derived by `setBadge()`, never authored
 - Do not declare a local `const TTL` — `TTL` is a module-level table
 - `premium:{TICKER}` freshness and retention must not be equal
+- The IV sweep's unconditional overwrite **is the sampling design**, not a missing
+  optimisation: one sample per name per day at a fixed 13:15 PT. **Never add
+  `skipIfPresent` to the cron path** — it would make the series first-writer-wins
+  and biased toward morning-viewed names (ARCHITECTURE #16, *"THE OVERWRITE IS THE
+  SAMPLING DESIGN"*)
 - `moves:{TICKER}` schema check stays strict equality
 - `mood:state` schema check stays strict equality; its freshness (26h, from
   `TTL.mood`) and retention (7d) must not be equal, same reason as `premium:`
