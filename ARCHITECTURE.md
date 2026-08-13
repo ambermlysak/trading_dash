@@ -1157,7 +1157,9 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
      adjust the guard in the same breath. The open question is then whether
      `snap == null` ("no chain") should be distinguished from a thrown error ("the
      call failed") — the loop currently collapses them into `!ok` — and that is a
-     decision to take with the data in hand, not while the surprise is fresh.
+     decision to take with the data in hand, not while the surprise is fresh. **Run
+     the capture below in that case**, because a daily double sweep is exactly the
+     condition under which the series silently becomes the `:30` reading.
 
    **Cost of the sweep running twice, stated rather than assumed.** Derived by
    subtraction from measured branch totals, NOT directly measured — the sweep has no
@@ -1168,20 +1170,60 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    | 08-12 branch, Cloudflare counter (eod + sweep 32 names + macro) | **113** |
    | 08-11 branch (eod + sweep that produced nothing, no macro job yet) | **41** |
    | macro, measured in isolation | 1 ext |
-   | ⇒ sweep of 32 names, by subtraction | **≈ 71 external**, ≈ 2.2/ticker |
+   | ⇒ sweep of 32 names, by subtraction | **≥ 71 external**, **≥ 2.2/ticker** |
    | branch with the sweep running twice | **≈ 184** by that counter |
    | additional KV ops for the second pass (1 read + ~32 puts) | ≈ 34 |
    | ⇒ additional `capCost` | **≈ 105** |
 
-   Against the 10,000 ceiling that is **under 3%**, so cost is not the argument
-   against the guard. Two things about the retry are worth knowing anyway:
+   **THE ≈71 IS A LOWER BOUND, NOT A POINT ESTIMATE, AND THE ERROR RUNS ONE WAY.**
+   The subtraction treats 08-11's 41 as "EOD alone", which holds only if that day's
+   sweep failed *early*. If it failed late — chains fetched, nothing written — then
+   41 already contains sweep work, so `EOD_alone = 41 − w` for some `w > 0`, and
+   `sweep_0812 = 113 − 1 − EOD_alone = 71 + w`. Either way **≥ 71**. My own analysis
+   left the failure point open, so this cannot be narrowed from here.
+
+   A second, unquantified error source runs in both directions: the subtraction
+   assumes EOD costs the same on both days, and it does not — its cost varies with
+   news volume and index-chart failures.
+
+   **Replace this with a measured figure at the first opportunity.** A stamping
+   sweep gives one clean pass to measure; a double sweep gives two.
+
+   Against the 10,000 ceiling this is **under 3%**, so cost is not the argument
+   against the guard. The retry's real cost is elsewhere:
 
    - **It is NOT incremental.** The cron path passes no `skipIfPresent`, and there is
      no per-ticker "already have today" check, so the second pass re-fetches all 33
      chains to recover one name.
-   - **It overwrites the 32 good samples** with slightly later post-close readings.
-     Harmless — both are valid same-day post-close values, and the precedence note in
-     `recordIvSample` wants the cron to win — but it is 32 extra writes, not zero.
+   - **IT REWRITES THE SERIES, AND THAT IS NOT HARMLESS.** An earlier revision of
+     this section called it harmless; that was wrong, and only right about cost. A
+     13:30 post-close ATM IV is a **different measurement** from a 13:15 one. If the
+     guard misfires daily, every stored sample silently becomes the `:30` reading
+     rather than the `:15` reading — identical keys, identical shape, identical
+     `src: 'sweep'`, and a **systematic shift in what the series measures**. It lands
+     in precisely the series `ivRank` will percentile at day 60, which is the one
+     place a silent redefinition costs the most.
+
+   ### CAPTURE, on the first day the sweep runs twice
+
+   The two passes are 15 minutes apart and the second overwrites the first, so the
+   only chance to measure the shift is **between them**:
+
+   1. Between roughly **13:17 and 13:29 PT**, read every `iv:{TICKER}:{DATE}` value
+      for the watchlist and save it — `atmIv` and `ts` per name. Read-only, via
+      `npx wrangler kv key get --remote --binding REC_LOG`. **Never** through
+      `/api/iv/:ticker`, which would write a sample and corrupt the measurement.
+   2. After **13:32 PT**, read the same keys again.
+   3. Print the per-ticker `atmIv` delta and the `ts` gap.
+
+   If the `:15` and `:30` readings differ materially, the non-incremental retry is a
+   **data-integrity** problem rather than wasted subrequests — and that changes what
+   the right fix to the guard is, because `skipIfPresent` on the cron path would then
+   be protecting the measurement rather than merely saving fetches.
+
+   **Capture only. Do not add `skipIfPresent` and do not change the loop.** The
+   window admits exactly two firings (`m >= 15 && m < 45` with `*/15`), so there is
+   no third pass to worry about.
 
 17. **BLOCKED ON THE ACCOUNT OWNER — two capabilities the verification standard
    already assumes.** Neither is work to schedule; both are credentials to provide,
@@ -1195,10 +1237,37 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
      unreadable. Workers **Analytics** (GraphQL `workersInvocationsAdaptive`) does
      work under the current token and gives invocation times, status and
      subrequests; it gives no log text.
-   - **The Chrome extension reconnected.** The in-page chip assertion — cache-busted
-     load, identifier asserted in the running page, hard throw on stale code —
-     cannot run without it, and CLAUDE.md's own rule says a byte count is not a
-     substitute.
+   - **The Chrome extension reconnected. IT NOW BLOCKS THREE THINGS, listed here so
+     the cost of the missing tooling is visible in one place instead of accumulating
+     as separate caveats in three commits:**
+
+     1. **The macro chip in-page assertion** — cache-busted load, identifier
+        asserted in the running page, hard throw on stale code. §4(c) has been
+        outstanding since 2026-08-12. Byte counts on the served source are not a
+        substitute, by this repo's own rule.
+     2. **The EOD placeholder styling.** `95934cc` verified what the card *says*
+        via a text-level DOM shim, not how it looks. `· unavailable` still carries
+        the cyan `.eod-badge` styling, which reads as an ordinary informational
+        badge — a failure state wearing a neutral colour is the same
+        absent-versus-empty family the text fix just closed.
+     3. **Every future render check.** `alignChip`'s `no tag` / `no read`,
+        `candDetail`'s refusal row, and the Long tab's lane statuses have all been
+        verified by source or by shim, never in a browser.
+
+     **What to run once it is available** (planned in advance so the checks are not
+     improvised around whatever the page happens to show):
+
+     - Load the deployed Pages `dashboard.html#long` with a cache-buster; assert an
+       identifier from the current build inside the page and **throw** if absent, so
+       a stale cached script cannot be reported as a pass — that exact failure
+       already happened once, with byte counts matching at 210,796.
+     - Read the macro chip's rendered state, both term values, `hostileVia` and the
+       age treatment from the live DOM.
+     - If `daily:eod` is a placeholder that day, read the **computed style** of
+       `.eod-badge` — not just its text — and judge whether the failure state is
+       distinguishable at a glance from a normal close summary.
+     - Screenshot both, since neither the shim nor the accessibility tree settles a
+       colour question.
 
 18. **THE TWO SUBREQUEST COUNTERS DISAGREE — recorded, not resolved.** On the
    2026-08-12 1:15pm invocation, Cloudflare's `workersInvocationsAdaptive` reports

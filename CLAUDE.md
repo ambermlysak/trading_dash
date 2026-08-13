@@ -610,29 +610,16 @@ above the right fix rather than a schedule change.
 it was and that was wrong. The expression fix (`f313c04`, 2026-08-07 11:23 PT)
 predates that day's 1:15pm branch, and the cron did fire at 20:15:42.
 
-##### TWO BOUNDS ON THAT METHOD, both found chasing the 2026-08-05 loose end
+**2026-08-05, where the sampling rule above was found.** 15 samples were written at
+13:15:17–19 PT with **no invocation recorded** at that minute, though the cron
+series is plainly present at `:14` seconds on either side (20:00:14, 20:30:14,
+20:45:14). It is a dropped row, not a missing firing: `20:30:14` shows **0
+subrequests**, which under the pre-fix code means all three jobs dedupped, which
+requires the 20:15 firing to have run and stamped.
 
-15 samples were written at 13:15:17–19 PT on 08-05 with **no invocation recorded**
-at that minute, though the cron series is plainly present at `:14` seconds on
-either side (20:00:14, 20:30:14, 20:45:14). The explanation is the second bound
-below, and it is the more consequential one.
-
-1. **Minute-bucket attribution misclassifies under firing drift.** The cron's
-   second-offset ranges from `:05` to `:55` across days, so a firing at `20:14:5x`
-   lands in the `:14` bucket and reads as "not at a quarter hour". Any reading
-   built on quarter-hour minutes inherits this.
-2. **`workersInvocationsAdaptive` IS SAMPLED, so an absent row is not evidence of
-   an absent invocation.** Measured: `sampleInterval` takes values **1, 1.6, 2.5,
-   2.8 and 10** in the same two-hour window. Every quarter-hour row this analysis
-   relied on carried `sampleInterval = 1`, so the rows that *were* read are sound —
-   but 08-05's missing 20:15:14 is a dropped row, not a missing firing, and the
-   corroboration is that 20:30:14 shows **0 subrequests**, which under the pre-fix
-   code means all three jobs dedupped, which requires the 20:15 firing to have run
-   and stamped.
-
-**So "FIRED" conclusions from this dataset are safe and "NEVER FIRED" ones are
-not.** The claim above — the cron fired on every trading day — rests only on rows
-that are present, which is the safe direction. Do not invert it.
+**Every quarter-hour row the table above rests on carried `sampleInterval = 1`, and
+the claim is "the cron fired", never "the cron did not."** That is the safe
+direction of the asymmetry. Do not invert it.
 
 #### None of that logging exists unless observability is on
 
@@ -650,6 +637,32 @@ independent and only one of them needs observability:
 |---|---|---|
 | **Workers Logs** (`wrangler tail`, dashboard log search) | **yes** — for anything retained | your own `console.log` lines, e.g. `branch=morning-briefing` |
 | **Workers Analytics** (GraphQL `workersInvocationsAdaptive`) | **no** | invocation counts, errors, subrequest totals, timestamps |
+
+> ##### `workersInvocationsAdaptive` IS SAMPLED — NEVER ARGUE FROM ABSENCE
+>
+> The **Adaptive** in the name is load-bearing. Measured 2026-08-12 across three
+> single-day queries, `sampleInterval` took the values **1, 1.6, 1.588…, 1.667, 2,
+> 2.5, 2.8 and 10** — within a single two-hour window. Rows are dropped.
+>
+> **The asymmetry is the whole rule:**
+>
+> | reading | valid? |
+> |---|---|
+> | a row is present (check `sampleInterval` is 1) → that invocation happened | **YES** |
+> | no row at that time → the invocation did not happen | **NO. Never.** |
+>
+> This applies to every question asked of this dataset — "did the cron fire", "was
+> there traffic", "did anything run at all" — not just the one it was found on.
+> **Always select `avg { sampleInterval }` alongside whatever you are counting**,
+> and say which rows carried 1. A count taken without it is a lower bound wearing
+> the costume of a measurement.
+>
+> `subrequests` from this dataset also **excludes KV binding operations** — see
+> ARCHITECTURE #18 — so it is not `capCost` and must never be quoted as one.
+>
+> Second, smaller bound on the same method: the cron's second-offset drifts across
+> days (**`:05` to `:55` observed**), so attributing firings by quarter-hour minute
+> misclassifies whenever drift crosses a minute boundary.
 
 **Observability set in the dashboard does not survive a deploy.** `wrangler
 deploy` sends the whole config and overwrites dashboard-set values — the same
