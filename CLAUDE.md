@@ -596,6 +596,38 @@ told two of them apart.** `recordIvSample` puts provenance in the body via
 deliberately not backfilled — the gaps and their provenance are the evidence for
 how biased the series is. Anything reading `src` must treat absent as UNKNOWN.
 
+###### `src` IS LAST-WRITER-WINS — it proves who wrote LAST, never who wrote
+
+**The general form, recorded once and applying to every provenance scalar in this
+codebase: a single last-writer-wins field cannot represent a key with more than one
+writer.** `src` lives in the key body and `recordIvSample` rewrites the record
+whole, so each write erases the previous writer's mark. Four writers share
+`iv:{TICKER}:{DATE}` and the field has room for one.
+
+Two readings that look safe and are not:
+
+| reading | why it fails |
+|---|---|
+| count keys with `src: 'sweep'` → sweep coverage | earlier same-day writes the sweep overwrote are counted as sweep; later non-sweep writes hide a sweep that did run |
+| a key reading `'api'` → the sweep missed that name | **indistinguishable** from a name the sweep wrote and a page view then overwrote |
+
+Measured 2026-08-13. Four keys existed before that day's sweep — AMD `api` 07:08
+PT, TWLO `api` 08:09, TSM `api` 08:18, PLTR `long-live` 08:40 — and **all four read
+`src: 'sweep'` at 13:15:16–17 afterwards**, with the values genuinely moved (AMD
+54.47 → 51.22, TWLO 50.10 → 53.69, TSM 28.96 → 33.85, PLTR 43.13 → 44.56). Nothing
+in the stored record survives to say those writes happened. **The `ts` is
+overwritten too, so the behavioural timing discriminator loses exactly the same
+information** — this is a property of the record, not of the field, and no reader
+can recover it after the fact.
+
+**The honest measures of sweep coverage are the per-ticker write count inside the
+13:15 PT window and the sweep's own `ok/N`.** Neither depends on `src`.
+
+The two fixes are **recording all writers** (an append-only list on the key) or **a
+distinct key for sweep samples**. Both are schema changes; neither is done. Until
+one lands, `src` is corroboration and never evidence — relevant to the provenance
+term ARCHITECTURE #16 wants in `ivRank` before the 60-day floor is crossed.
+
 For everything written before that, a sample with no `src` is the cron **or** an
 ordinary page view, and nothing stored separates them. The only separator for the
 historical record is behavioural — the sweep writes the whole watchlist within

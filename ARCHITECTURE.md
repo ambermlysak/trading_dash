@@ -1130,10 +1130,22 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
      sweep that ever reached KTOS's position in the list, so n=1 and it reads as
      transient.
 
-   **The provenance half is DONE (2026-08-12):** the cron writes `src: 'sweep'` and
-   `/api/iv/:ticker` writes `src: 'api'`, so from here the split is a field rather
-   than an inference. Historical keys stay unprovenanced on purpose — absent `src`
-   means pre-2026-08-12 and must never be read as `'api'`.
+   ~~**The provenance half is DONE (2026-08-12):** … from here the split is a field
+   rather than an inference.~~ **CORRECTED 2026-08-13 — the field was added, but it
+   does not replace the inference and on the sweep's own names it is weaker than
+   one.** `src` is **last-writer-wins**: it proves the sweep wrote *last*, never
+   that it wrote at all, and a key still reading `'api'` is indistinguishable from
+   a name the sweep never reached. Measured the same day: four keys written
+   `api`/`long-live` between 07:08 and 08:40 PT all read `src: 'sweep'` after the
+   13:15 sweep overwrote them. The `ts` is overwritten with it, so the behavioural
+   discriminator loses the same information — nothing stored survives to say those
+   four writes happened.
+
+   **The general form, the two candidate fixes and the readings they invalidate are
+   in CLAUDE.md rule #7, *"`src` IS LAST-WRITER-WINS"*.** Recorded there rather than
+   here because it applies to every provenance scalar, not just this key. Neither
+   fix is done. Historical keys stay unprovenanced on purpose — absent `src` means
+   pre-2026-08-12 and must never be read as `'api'`.
 
    **THE REMAINING PROBLEM IS BIAS, NOT SPARSITY, AND IT HAS A DEADLINE.**
    `ivRankFrom` counts `history.length` and nothing else; `ivHistory` rebuilds the
@@ -1291,6 +1303,35 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    - **A key present in pass 1 and absent in pass 2 reports distinctly from
      absent-in-both.** A disappearing key is a different fact from one that never
      existed, and with a 400-day TTL it should be impossible — the report says so.
+
+   > **INSTRUMENT BOUND, FOUND ON THE FIRST REAL RUN — 2026-08-13. "ABSENT IN PASS
+   > 1" IS NOT EVIDENCE OF ABSENCE.** The run reported `only in pass 2: PANW`
+   > against `rewritten: 0`, which is self-contradictory: no second sweep ran, so
+   > nothing could have written PANW between the passes. The stored key settles it —
+   > **`ts 13:15:20 PT, src 'sweep'`**, written **1m45s before** pass 1 read at
+   > 13:17:05 and missed by it. **KV reads are eventually consistent and
+   > `iv-capture.mjs` reads through the REST API, which is subject to the same edge
+   > propagation as the binding.**
+   >
+   > **It is not a write-ordering effect and that is the important part.** PANW was
+   > written mid-pack; DELL, MDB and SHOP were written *later* (13:15:25) and were
+   > all visible in pass 1. Propagation varies per key, so any single key can read
+   > absent for minutes after its write.
+   >
+   > **This invalidates the `only in pass 1` and `absent in both` buckets** for any
+   > read taken close to a write — both are built on absence. `rewritten`,
+   > `untouched` and the per-ticker deltas are unaffected: they compare `ts` values
+   > of keys that were actually returned, and a stale read returns an older `ts`,
+   > never a wrong one.
+   >
+   > **Scope, stated precisely so it is not over-applied:** the bound bites on reads
+   > taken *minutes* after a write. It does **not** retroactively invalidate the
+   > 2026-08-12 KTOS-absent finding — that was re-confirmed by an independent
+   > key-list count 19 hours later, long past any propagation window, and KTOS was
+   > genuinely missing. **A settled read is still trustworthy; a fresh one is not.**
+   >
+   > The fix, if this instrument is used again, is to re-read the absent names once
+   > more after a delay before reporting them absent. Not done.
    - **An identical `atmIv` with a changed `ts` reports as REWRITTEN, not
      untouched.** The bucket keys on `ts`, never on the value. Classifying it as
      untouched would hide exactly the case being tested for. The report then splits
