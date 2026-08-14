@@ -1390,6 +1390,116 @@ function smaCrossState(closes, fast = 50, slow = 200) {
   return { sma50: f, sma200: s, ...rest };
 }
 
+/* ── Linear-regression channel (the Watchlist "Swing" column) ────────────────
+ * Mirrors thinkorswim's regression channel: an OLS fit through the last
+ * SWING_REG_BARS *completed* daily closes, and a channel width measured as the
+ * standard error of that REGRESSION — the spread of the closes about the fitted
+ * line, NOT the standard deviation of the closes themselves. Those are different
+ * quantities and on a trending name they differ by a lot: a stock marching
+ * steadily higher has a large close-to-close stdev and a tiny residual stdev,
+ * and using the former would report a name pinned to its own trend as sitting
+ * quietly inside the channel while a genuine break barely registered.
+ *
+ * THE THRESHOLD LIVES HERE, NOT IN THE FRONTEND. `swingSignal` is decided in
+ * this function and shipped decided; `swingThreshold` rides on the response
+ * envelope purely so the column's tooltip can name the number it was gated on.
+ * Same rule as every other gate in this codebase — a page must never re-derive a
+ * decision the Worker already made, because the two then drift silently.
+ * ─────────────────────────────────────────────────────────────────────────── */
+const SWING_REG_BARS      = 30;   // completed daily bars in the fit
+const SWING_Z_THRESHOLD   = 1.5;  // residual σ from the line at which BUY/SELL fires
+const SWING_SETTLE_ET_HOUR = 16;  // 4:00pm ET — the bell today's daily bar settles at
+
+/** Current hour in US Eastern (market) time, 0–23. `hourCycle: 'h23'` rather
+ *  than `hour12: false`, which prints "24" for midnight under some ICU builds. */
+const etHourNow = () => Number(new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', hour: '2-digit', hourCycle: 'h23',
+}).format(new Date()));
+
+/**
+ * Fit the channel and place the live quote in it.
+ *
+ * `pairs` is date-aligned `{ iso, close }`, oldest first. All four outputs are
+ * null together when the window cannot be built — a missing measurement, never
+ * a zero (honesty rule 22: `0σ` means "sitting exactly on the line", which is a
+ * finding, and it must not be what an absent fit renders as).
+ */
+function swingChannel(pairs, livePrice, today = etToday(), etHour = null) {
+  const empty = { swingZ: null, swingSignal: null, swingFit: null, swingSigma: null,
+                  swingEvalX: null, swingAsOf: null };
+  if (!Array.isArray(pairs) || !pairs.length) return empty;
+  if (livePrice == null || !Number.isFinite(livePrice)) return empty;
+
+  /* Drop today's FORMING bar. Yahoo returns the in-progress session as an
+     ordinary daily bar whose close is just the last print, so fitting it would
+     mix a partial session into a series of completed ones and then compare the
+     live price against a line that already contains it. Only dropped before the
+     bell: after 4:00pm ET today's bar is final and is the most informative bar
+     in the window — an unconditional drop would throw away a settled session
+     every evening. Same shape as `moodSettledBars()`. */
+  const hour = etHour == null ? etHourNow() : etHour;
+  const lastPair = pairs[pairs.length - 1];
+  const forming = !!lastPair && lastPair.iso === today
+                  && Number.isFinite(hour) && hour < SWING_SETTLE_ET_HOUR;
+  const bars = forming ? pairs.slice(0, -1) : pairs;
+
+  if (bars.length < SWING_REG_BARS) return empty;
+  const win = bars.slice(-SWING_REG_BARS);
+  const n = SWING_REG_BARS;
+
+  // OLS on x = 0 … n-1 against the closes.
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (let i = 0; i < n; i++) {
+    const y = win[i].close;
+    if (!Number.isFinite(y)) return empty;
+    sx += i; sy += y; sxx += i * i; sxy += i * y;
+  }
+  const denom = n * sxx - sx * sx;
+  if (!(denom > 0)) return empty;
+  const slope     = (n * sxy - sx * sy) / denom;
+  const intercept = (sy - slope * sx) / n;
+
+  let ssr = 0;
+  for (let i = 0; i < n; i++) {
+    const resid = win[i].close - (intercept + slope * i);
+    ssr += resid * resid;
+  }
+  /* n − 2, not n and not n − 1: the slope and the intercept were both estimated
+     from this same window, so two degrees of freedom are already spent and
+     dividing by n would understate the spread — which on this column means
+     firing BUY/SELL slightly too often. This is the standard error of the
+     regression, the same quantity a charting package's regression channel
+     widths are quoted in. */
+  const sigma = Math.sqrt(ssr / (n - 2));
+  if (!Number.isFinite(sigma) || sigma <= 0) return empty;
+
+  /* Evaluate the line at the session the LIVE quote belongs to, which is not
+     always the last fitted bar. If the window ends yesterday, `regularMarketPrice`
+     is today's print and the fair comparison is the line EXTRAPOLATED one bar to
+     x = n. If the window already ends today (post-settlement), the quote and the
+     last bar are the same session and the line is read at x = n − 1. Getting this
+     wrong misstates the distance by exactly one bar of slope in whichever
+     direction the name is trending — small, systematic, and invisible. */
+  const lastIso = win[n - 1].iso;
+  const evalX   = lastIso < today ? n : n - 1;
+  const fit     = intercept + slope * evalX;
+  const z       = (livePrice - fit) / sigma;
+  if (!Number.isFinite(z)) return empty;
+
+  const r2 = v => Math.round(v * 100) / 100;
+  const zR = r2(z);
+  // Gate on the ROUNDED z, so the signal and the number printed beside it can
+  // never disagree about which side of the threshold the name is on.
+  return {
+    swingZ:      zR,
+    swingSignal: zR <= -SWING_Z_THRESHOLD ? 'BUY' : zR >= SWING_Z_THRESHOLD ? 'SELL' : null,
+    swingFit:    r2(fit),
+    swingSigma:  r2(sigma),
+    swingEvalX:  evalX,
+    swingAsOf:   lastIso,
+  };
+}
+
 /* Yahoo v7 spark: close-only series for many symbols per request (max 20).
  * Far cheaper than one v8 chart call per symbol. Returns Map<symbol, closes[]>.
  * Unknown/delisted symbols are simply absent from the response. */
@@ -9047,6 +9157,7 @@ async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
         let price = null, changePct = null, volume = null;
         let w52High = null, w52Low = null;
         let rsi = null, support = null, resist = null;
+        let swingPairs = [];
 
         if (chartRes.status === 'fulfilled') {
           const result = chartRes.value?.chart?.result?.[0];
@@ -9064,6 +9175,25 @@ async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
 
           if (closes.length >= 15) rsi = computeRSI(closes);
           if (highs.length  >= 5)  ({ support, resist } = computeSR(highs, lows));
+
+          /* Date-aligned pairs for the regression channel. ZERO ADDED SUBREQUEST
+             COST — this is the `?range=3mo&interval=1d` response already fetched
+             above, read a second way. Deliberately NOT built from `closes`: that
+             array is filtered bare and carries no dates, so a dropped null bar is
+             indistinguishable from a session that never existed and the forming-bar
+             test would have nothing to test against. Timestamps are filtered on the
+             SAME predicate as the closes so the two stay aligned — the pattern
+             `yahooSparkCloses`' `withTimestamps` path already uses — and a length
+             mismatch yields no pairs rather than a silently mispaired series. */
+          const stamps = result?.timestamp;
+          const rawCloses = q.close;
+          if (Array.isArray(stamps) && Array.isArray(rawCloses) && stamps.length === rawCloses.length) {
+            for (let i = 0; i < rawCloses.length; i++) {
+              const c = rawCloses[i];
+              if (c == null || !Number.isFinite(c) || !Number.isFinite(stamps[i])) continue;
+              swingPairs.push({ iso: new Date(stamps[i] * 1000).toISOString().slice(0, 10), close: c });
+            }
+          }
         }
 
         let pe = null, forwardPE = null, targetLow = null, targetMean = null, targetHigh = null;
@@ -9115,6 +9245,14 @@ async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
           analysisTs = cached.ts;
         }
 
+        /* Regression channel, evaluated HERE rather than in the chart block above
+           so it uses the same `price` the row renders — the quoteSummary price
+           module overwrites the chart meta's quote a few lines up, and a σ
+           distance measured against a price the column does not show would be an
+           inconsistency nobody could see. Same reason `levelPct` below is
+           computed at this point. */
+        const swing = swingChannel(swingPairs, price);
+
         // Nearest decision level: whichever of support/resistance the price sits
         // closest to in percentage terms. The watchlist shows one, not both.
         let levelPct = null, levelKind = null, levelAbove = null, levelPrice = null;
@@ -9159,6 +9297,9 @@ async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
           levelKind,
           levelAbove,
           levelPrice,
+          // Regression channel. `swingSignal` is decided in the Worker against
+          // SWING_Z_THRESHOLD; the page renders it, it never re-derives it.
+          ...swing,
           recommendation,
           drivers,
           summary,
@@ -9228,6 +9369,12 @@ async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
   // Recommendation column is whatever the nightly Claude pass last wrote.
   return json({
     stocks, analysisLoading: needsAnalysis.length > 0, ts: Date.now(),
+    // The Swing column's gate, shipped so the header tooltip can name the number
+    // the signal was decided against instead of hardcoding a copy that drifts.
+    // A payload without these two came from an older Worker — the page must say
+    // "not shipped", never assume 1.5 (the frontend runs ahead of the Worker).
+    swingThreshold: SWING_Z_THRESHOLD,
+    swingBars:      SWING_REG_BARS,
     _meta: srcMeta('Yahoo Finance + Claude', {
       delayed: true, ttlSeconds: TTL.quote,
       note: `price ${YAHOO_DELAY_NOTE} · fundamentals cached 6h · recommendation refreshed daily`,

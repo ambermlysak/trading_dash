@@ -802,7 +802,7 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Eleven checks exist, all of which print computed vs
+There is no build step. Twelve checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
 (Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
@@ -838,15 +838,32 @@ all seven states with stub reads, the stance table, the template for every
 becoming a reclassification, `collectMarketMood`'s exact cost and every
 refusal path with stub bindings, and `moodMetaOk` — which of the five
 missing-record causes are actual faults, asserted against **both** the Worker and
-the page so the badge and the chip cannot tone the same state differently again).
+the page so the badge and the chip cannot tone the same state differently again),
+and `node swing.check.mjs` (the Watchlist Swing column: the regression against two
+independent fits — the centered normal equations *and* a numerical SSR minimiser
+seeded away from the answer, which is what proves the line is the least-squares
+one rather than the same algebra written twice — the residual σ against the σ of
+the closes on three live names, the forming-bar drop with the clock that decided
+it, the x=29/x=30 rule in both settlement regimes, the sub-30-bar null path, both
+sides of the threshold at ±0.01σ, and the 15-wide colgroup / header / row
+alignment).
 All of them extract functions from
 `worker.js` by source, not by import, because every named export in `worker.js`
 must be a function or `workerd` refuses to boot.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287** for moves /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 88** for moves /
 long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
-sweep-universe / macro / mood — **879 comparisons** across the suite.
+sweep-universe / macro / mood / swing — **967 comparisons** across the suite.
+
+**`swing.check.mjs` is the one script whose count is TAPE-DEPENDENT**, and the 88
+above is its *fixed* count, not its observed total. §7a asserts once per watchlist
+name that actually breached ±1.5σ, so a run costs 88 + however many fired: two
+runs an hour apart on 2026-08-14 reported **95** (7 names) and **96** (8). The
+floor is the fixed count minus slack (84), never the observed total — a quiet day
+with zero breaches must report a verdict rather than a false NO VERDICT. It is
+also the only script that reads **live** data, through the deployed Worker's
+`/api/chart/:ticker` proxy, because Yahoo 429s a direct request from a laptop.
 
 **`mood.check.mjs` uses a brace-matching `grabConst`, not the scan-to-semicolon
 one the other scripts share.** `MOOD_STANCE`'s sentences contain semicolons, and
@@ -951,7 +968,22 @@ data is still empty — `primeTabs()` has usually painted it already.
 | **Market** | `#market` | Default. Index/futures/commodities strip, the 6am Claude briefing headline, **Market Mood** (candlestick emotion read, directly under the brief), EOD card, Friday week-ahead, news cards, pre/post-market movers (≥ ±10%), IPO calendar, watchlist signals. |
 | **Midday** | `#midday` | The 11:30am PT midday pulse — session narrative, topics, next-day events, short-term trade ideas, big movers. |
 | **Scanner** | `#scanner` | Four presets. Three (Momentum / HOD, Pre-Market Gappers, All Movers) hit `/api/market/scanner` and share `renderScanner()`; **Golden Cross Setup** hits `/api/market/golden-cross` and uses `renderGoldenCross()`. `loadScanner()` branches on the preset for endpoint, renderer, header copy and legend. |
-| **Watchlist** | `#watchlist` | The 14-column table, sortable, with expandable rows and the consolidated Recommendation column. |
+| **Watchlist** | `#watchlist` | The 15-column table, sortable, with expandable rows and the consolidated Recommendation column. |
+
+**The Swing column** is an informational linear-regression channel read, mirroring
+thinkorswim's: an OLS fit over the last `SWING_REG_BARS` (30) **completed** daily
+closes, with σ the **standard error of the regression** — the spread of the closes
+about the fitted line, not the stdev of the closes. `Buy` at `SWING_Z_THRESHOLD`
+(1.5) residual σ or more below the line, `Sell` at 1.5σ or more above, otherwise
+the signed σ distance as an informational value. **The Worker decides the signal**
+and ships `swingThreshold` / `swingBars` on the `/api/watchlist/batch` envelope so
+the header tooltip can name the gate; the page never compares `swingZ` to a number
+of its own. Today's **forming bar is excluded** until the 4:00pm ET close
+(`SWING_SETTLE_ET_HOUR`), and the line is then read at x = 30 (extrapolated one bar,
+because the live quote belongs to today) rather than x = 29. Computed inside the
+`?range=3mo&interval=1d` chart fetch `handleWatchlistBatch` already makes — **zero
+added subrequest cost**. Fewer than 30 completed bars leaves all four fields null,
+which renders `—`. Checked by `node swing.check.mjs`.
 | **Sectors** | `#sectors` | All 11 SPDR sectors, ETF % change plus a Claude-picked opportunity and avoid per sector. |
 | **Long** | `#long` | The only options screen. **Six lanes** (LEAPS / swing / debit verticals / calendars / straddle+strangle / defined-risk credit spreads). The standalone Premium tab was merged in as Lane F on 2026-08-10 — short premium is secondary and now sits as one lane among six, ranked by the same expectancy as everything else. |
 

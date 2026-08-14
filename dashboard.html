@@ -956,7 +956,7 @@ th.lane-f-maxloss { color: var(--bear) !important; }
     <div class="wl-table-wrap">
       <table class="wl-table">
         <colgroup>
-          <col><col><col><col><col><col><col>
+          <col><col><col><col><col><col><col><col>
           <col><col><col><col><col><col><col>
         </colgroup>
         <thead>
@@ -968,6 +968,7 @@ th.lane-f-maxloss { color: var(--bear) !important; }
             <th data-sort="recRank" title="One consolidated call, weighing technicals, momentum, price action, fundamentals, positioning and sentiment, and the macro / geopolitical backdrop against each other. Confidence reflects how strongly those factors agree — conflicting evidence lowers it rather than hedging the call. Hover a row for the drivers that decided it; click to expand the full rationale. Sorts strongest BUY to strongest SELL.">Recommendation</th>
             <th data-sort="crossSpread" title="SMA cross in effect: Golden = 50-day SMA above the 200-day, Death = below, with the gap between them. Arrow = which way that gap is moving over 5 sessions — ▲ the 50D is pulling up on the 200D, ▼ pulling down. So Golden ▼ is a golden cross decaying. ◆ marks a setup within 5% and trending into a flip.">SMA X</th>
             <th data-sort="rsi">RSI</th>
+            <th data-sort="swingZ" id="wl-th-swing">Swing</th>
             <th data-sort="forwardPE">Fwd P/E</th>
             <th data-sort="shortPct">Short %</th>
             <th data-sort="levelPct" title="Distance to the nearest decision level — support or resistance, whichever the price is closer to, never both. ▲ means price is above that level, ▼ below. Sorts nearest level first.">Key Level</th>
@@ -978,7 +979,7 @@ th.lane-f-maxloss { color: var(--bear) !important; }
           </tr>
         </thead>
         <tbody id="wl-tbody">
-          <tr><td colspan="14" class="loading" style="padding:24px">Loading watchlist…</td></tr>
+          <tr><td colspan="15" class="loading" style="padding:24px">Loading watchlist…</td></tr>
         </tbody>
       </table>
     </div>
@@ -1081,6 +1082,12 @@ const WL_KEY = 'trading_dash_watchlist';
 let sortCol = 'symbol', sortAsc = true;
 let expandedTicker = null;
 let wlData = {};
+/* The Swing column's gate, as SHIPPED by the Worker. Nulls until a payload
+ * arrives, and they stay null against an older Worker that does not ship them —
+ * the frontend is routinely newer than the Worker, and a missing threshold is
+ * "this build does not send one", not 1.5. The page never compares z to a
+ * threshold itself; this is for the header tooltip only. */
+let wlSwing = { threshold: null, bars: null };
 let auctionData = {};
 let wlLoading = false;
 let analysisRefreshTimer = null;
@@ -1136,6 +1143,57 @@ function levelCell(s) {
             + `${s.levelKind} $${fmt(s.levelPrice)} — the nearer of the two levels.${other}`;
   return `<td class="mono ${cls}" title="${esc(tip)}">${arrow} ${fmt(s.levelPct, 1)}% `
        + `<span class="lvl-tag">${isSup ? 'Sup' : 'Res'}</span></td>`;
+}
+
+/* Swing cell — where the live price sits inside the linear-regression channel.
+ * The Worker fits the line, measures the residual σ and DECIDES the signal; this
+ * renders what it decided. Three states, deliberately distinct:
+ *   BUY / SELL  — the Worker's call, price past the threshold below / above
+ *   ±0.8σ       — informational distance, inside the channel, muted
+ *   —           — no fit: fewer than the shipped bar count of completed bars */
+function swingCell(s) {
+  if (s.swingZ == null) {
+    return '<td class="mono" style="color:var(--ink-3)" title="No regression channel — '
+         + 'fewer completed daily bars than the fit needs.">—</td>';
+  }
+  /* One decimal, but the SIGN comes off the rounded value: z = −0.03 rounds to
+   * −0 and "−0.0σ" reads as a rendering fault rather than as "on the line".
+   * The `|| 0` is what collapses JS's negative zero — `toLocaleString(-0)` is
+   * "-0.0", so dropping the '+' alone does not fix it. */
+  const z1   = (Math.round(s.swingZ * 10) / 10) || 0;
+  const z    = (z1 > 0 ? '+' : '') + fmt(z1, 1) + 'σ';
+  const side = s.swingZ >= 0 ? 'above' : 'below';
+  const tip  = `Price $${fmt(s.price)} is ${fmt(Math.abs(s.swingZ), 2)}σ ${side} the regression line`
+             + ` ($${fmt(s.swingFit)}) · residual σ $${fmt(s.swingSigma)}`
+             + (s.swingAsOf ? ` · fit through ${s.swingAsOf}` : '')
+             + (s.swingEvalX != null ? `, line read at bar x=${s.swingEvalX}` : '')
+             + (s.swingSignal ? ` · ${s.swingSignal}` : ' · inside the channel');
+
+  if (s.swingSignal === 'BUY') {
+    return `<td class="mono" style="color:var(--bull)" title="${esc(tip)}">Buy <span style="opacity:.75">${z}</span></td>`;
+  }
+  if (s.swingSignal === 'SELL') {
+    return `<td class="mono" style="color:var(--bear)" title="${esc(tip)}">Sell <span style="opacity:.75">${z}</span></td>`;
+  }
+  return `<td class="mono" style="color:var(--ink-2)" title="${esc(tip)}">${z}</td>`;
+}
+
+/* The header tooltip names the threshold the Worker gated on — interpolated from
+ * the payload, never a hardcoded 1.5. With nothing shipped it says so. */
+function updateSwingHeader() {
+  const th = document.getElementById('wl-th-swing');
+  if (!th) return;
+  const bars = wlSwing.bars != null ? wlSwing.bars : '—';
+  const gate = wlSwing.threshold != null
+    ? `Buy at ${wlSwing.threshold}σ or more below the line, Sell at ${wlSwing.threshold}σ or more above; `
+      + 'otherwise the signed σ distance, which is informational only.'
+    : 'Threshold not shipped by this Worker build — the signal below is still the '
+      + 'Worker’s, but the number it was gated on is unavailable here.';
+  th.title = `Linear-regression channel over the last ${bars} COMPLETED daily bars `
+           + '(today’s forming bar excluded until the 4:00pm ET close). OLS fit on the '
+           + 'closes; σ is the standard error of the regression — the spread of the closes '
+           + 'about the fitted line, not the stdev of the closes. Distance is measured from '
+           + `the live price to the line. ${gate}`;
 }
 
 /* SMA cross cell — one column covering both formations.
@@ -1904,7 +1962,7 @@ async function loadWatchlistBatch() {
   btn.disabled = true;
   btn.textContent = '↺ Loading…';
   document.getElementById('wl-tbody').innerHTML =
-    '<tr><td colspan="14" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
+    '<tr><td colspan="15" style="padding:20px;color:var(--ink-3);font-family:var(--mono);font-size:11px">Fetching data…</td></tr>';
   document.getElementById('wl-status').textContent = 'Fetching…';
 
   try {
@@ -1924,6 +1982,9 @@ async function loadWatchlistBatch() {
       if (data.analysisLoading) anyAnalysisLoading = true;
       // Every chunk carries the same provenance; the last one wins the badge.
       setBadge('wl-badge', data._meta);
+      // Same for the Swing gate — every chunk ships the same two constants.
+      if (data.swingThreshold != null) wlSwing.threshold = data.swingThreshold;
+      if (data.swingBars      != null) wlSwing.bars      = data.swingBars;
     }
     wlData = allStocks;
 
@@ -1944,7 +2005,7 @@ async function loadWatchlistBatch() {
     console.error('[watchlist]', e.message);
     document.getElementById('wl-status').textContent = 'Error — ' + e.message;
     document.getElementById('wl-tbody').innerHTML =
-      '<tr><td colspan="14" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
+      '<tr><td colspan="15" style="padding:20px;color:var(--bear);font-family:var(--mono);font-size:11px">Failed to load data. Check console for details.</td></tr>';
   } finally {
     wlLoading = false;
     btn.disabled = false;
@@ -1954,6 +2015,7 @@ async function loadWatchlistBatch() {
 
 /* ─── Watchlist render ─── */
 function renderWatchlist() {
+  updateSwingHeader();
   const tickers = getWatchlist();
   const rows = tickers
     .map(t => {
@@ -2001,6 +2063,7 @@ function renderWatchlist() {
       ${recCell(s)}
       ${crossCell(s)}
       <td class="${clsRsi(s.rsi)}">${s.rsi != null ? s.rsi : '—'}</td>
+      ${swingCell(s)}
       <td class="mono">${s.forwardPE != null ? fmt(s.forwardPE, 1) : '—'}</td>
       <td class="mono">${s.shortPct != null ? fmt(s.shortPct, 1) + '%' : '—'}</td>
       ${levelCell(s)}
@@ -2034,7 +2097,7 @@ function renderWatchlist() {
       }
 
       html += `<tr class="expand-row">
-        <td colspan="14">
+        <td colspan="15">
           <div class="expand-content">
             ${s.summary ? `<div class="expand-summary">${esc(s.summary)}</div>` : ''}
             <div class="expand-meta">
@@ -2049,7 +2112,7 @@ function renderWatchlist() {
       </tr>`;
     }
   }
-  tbody.innerHTML = html || '<tr><td colspan="14" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
+  tbody.innerHTML = html || '<tr><td colspan="15" style="padding:20px;color:var(--ink-3)">Watchlist is empty.</td></tr>';
 }
 
 /* ─── Closing auction block trades ───
