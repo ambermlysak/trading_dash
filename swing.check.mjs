@@ -68,6 +68,10 @@ const W = new Function([
 const N     = W.SWING_REG_BARS;
 const THR   = W.SWING_Z_THRESHOLD;
 const SETTLE = W.SWING_SETTLE_ET_HOUR;
+/* The two clocks §5 drives, declared once. A fixture that reconstructs a call's
+   input must reconstruct the CLOCK it was called with as well as the bars — see
+   the note in §5, which is where these being one value each stops a bug. */
+const PRE_HOUR = 10, POST_HOUR = 17;
 const t = tally();
 
 const near = (a, b, tol) => a != null && b != null && Math.abs(a - b) <= tol;
@@ -257,28 +261,56 @@ console.log(`          lastCompletedBar.iso === etToday() ->  x = ${N - 1} (same
 for (const sym of SYMS) {
   const { pairs, price } = live[sym];
   // Pre-close: hour 10 ET. Today's bar forms, is dropped, window ends yesterday.
-  const pre  = W.swingChannel(pairs, price, today, 10);
+  const pre  = W.swingChannel(pairs, price, today, PRE_HOUR);
   // Post-close: hour 17 ET. Today's bar is settled and kept, window ends today.
-  const post = W.swingChannel(pairs, price, today, 17);
+  const post = W.swingChannel(pairs, price, today, POST_HOUR);
   const lastIso = pairs[pairs.length - 1].iso;
-  console.log(`    ${sym.padEnd(5)} pre-close(10 ET)  asOf ${pre.swingAsOf}  x=${pre.swingEvalX}   `
-    + `post-close(17 ET) asOf ${post.swingAsOf}  x=${post.swingEvalX}`);
+  console.log(`    ${sym.padEnd(5)} pre-close(${PRE_HOUR} ET)  asOf ${pre.swingAsOf}  x=${pre.swingEvalX}   `
+    + `post-close(${POST_HOUR} ET) asOf ${post.swingAsOf}  x=${post.swingEvalX}`);
   row(`${sym}: pre-close reads x = ${N} (window ends before today)`,  pre.swingEvalX,  N);
   row(`${sym}: post-close reads x = ${N - 1} when the last bar IS today`,
       post.swingEvalX, lastIso === today ? N - 1 : N);
+
+  /* A FIXTURE MUST REBUILD THE CALL'S CLOCK, NOT JUST ITS BARS.
+     ─────────────────────────────────────────────────────────────────────────
+     This block used to reconstruct the comparison window as
+     `windowOf(pairs, today, hour)` — the LIVE hour — and then compare the
+     resulting line against `pre`, which was called at hour ${PRE_HOUR}. Run
+     before 4pm ET the two clocks agree and it passed; run after the close, the
+     live window keeps today's settled bar while `pre`'s drops it, so the two
+     were different windows and all three tickers failed by up to 3.50.
+
+     The tell was already written down four lines further up: the note below
+     warns that pre and post use different windows and that differencing them
+     measures the window shift. The code then took the window from a third
+     clock again. So: the hour is an INPUT, and every reconstruction of a call
+     takes it from the same constant the call did. */
+  const preW  = windowOf(pairs, today, PRE_HOUR);
+  const postW = windowOf(pairs, today, POST_HOUR);
+
   /* What x=29 vs x=30 costs, ON ONE WINDOW. The two calls above use DIFFERENT
      windows (one ends yesterday, one ends today), so differencing their fits
      measures the window shift as well — the isolated quantity is the same
      window's line read at both x, which is exactly one bar of slope. */
-  const w  = windowOf(pairs, today, hour);
-  const bf = bruteFit(w.win.map(p => p.close));
+  const bf = bruteFit(preW.win.map(p => p.close));
   const at = (x) => bf.intercept + bf.slope * x;
   console.log(`          one window, line at x=${N - 1} ${at(N - 1).toFixed(4)} vs x=${N} ${at(N).toFixed(4)}`
     + `  ->  difference ${(at(N) - at(N - 1)).toFixed(6)} = slope ${bf.slope.toFixed(6)}`);
   row(`${sym}: x=${N} minus x=${N - 1} is exactly one bar of slope`,
       at(N) - at(N - 1), bf.slope, 1e-9);
-  row(`${sym}: pre-close fit IS that window read at x=${N}`,
+  row(`${sym}: pre-close fit IS the ${PRE_HOUR} ET window read at x=${N}`,
       pre.swingFit, Math.round(at(N) * 100) / 100, 0);
+
+  /* The post-close half, which was never checked — the section is titled "in
+     BOTH settlement regimes" and only ever asserted one of them. This is the
+     x=${N - 1} branch's fit, on its OWN window, and it is the assertion that
+     would have made the clock bug obvious instead of clock-dependent. */
+  const bfPost = bruteFit(postW.win.map(p => p.close));
+  const atPost = (x) => bfPost.intercept + bfPost.slope * x;
+  console.log(`          post-close window ends ${postW.win[postW.win.length - 1]?.iso}`
+    + `, line at x=${post.swingEvalX} = ${atPost(post.swingEvalX).toFixed(4)}`);
+  row(`${sym}: post-close fit IS the ${POST_HOUR} ET window read at x=${post.swingEvalX}`,
+      post.swingFit, Math.round(atPost(post.swingEvalX) * 100) / 100, 0);
 }
 
 /* ── §6  THE NULL PATH ────────────────────────────────────────────────────── */
@@ -430,13 +462,17 @@ console.log('\n§8  ENVELOPE + FRONTEND — the threshold is shipped, and the pa
 process.exit(reportVerdict({
   label: 'swing regression channel',
   comparisons: t.comparisons, failures: t.failures,
-  /* Floor. The fixed count is 88; exactly ONE block is tape-dependent — §7a
-     asserts once per name that actually breached the threshold. Two runs an hour
-     apart on 2026-08-14 reported 95 (7 names) and 96 (8). On a quiet day it is 0,
-     so the floor must sit at the FIXED count, never at an observed total, or a
-     run with no live breach reports NO VERDICT for the wrong reason. 84 leaves
-     slack for a name the chart proxy drops. */
-  minComparisons: 84,
+  /* Floor. The fixed count is 91 — 88 until 2026-08-19, when §5 gained the
+     post-close fit assertion it had always been missing (one per ticker).
+     Exactly ONE block is tape-dependent: §7a asserts once per name that actually
+     breached the threshold. Against the old fixed 88, two runs an hour apart on
+     2026-08-14 reported 95 (7 names) and 96 (8); on 2026-08-19 nothing reached
+     ±1.5σ and the run reported exactly 91, i.e. the fixed count with zero
+     breaches. That is the case the floor exists for — a quiet day must report a
+     verdict, not a false NO VERDICT — so the floor sits at the FIXED count and
+     never at an observed total. 87 leaves the same slack for a name the chart
+     proxy drops. */
+  minComparisons: 87,
 }));
 };
 

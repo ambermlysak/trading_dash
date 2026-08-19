@@ -860,9 +860,9 @@ All of them extract functions from
 must be a function or `workerd` refuses to boot.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 88 / 113** for moves /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113** for moves /
 long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
-sweep-universe / macro / mood / swing / earnings-timing — **1,080 comparisons**
+sweep-universe / macro / mood / swing / earnings-timing — **1,083 comparisons**
 across the suite.
 
 **TWO scripts now read live data, and both floors are the FIXED count rather than
@@ -874,14 +874,40 @@ contingent on the network and on a watchlist whose length changes. The floor is
 that does not depend on the tape while §7 announces its own emptiness through
 `populated()`. Never raise either floor to an observed total.
 
-**`swing.check.mjs` is the one script whose count is TAPE-DEPENDENT**, and the 88
-above is its *fixed* count, not its observed total. §7a asserts once per watchlist
-name that actually breached ±1.5σ, so a run costs 88 + however many fired: two
-runs an hour apart on 2026-08-14 reported **95** (7 names) and **96** (8). The
-floor is the fixed count minus slack (84), never the observed total — a quiet day
-with zero breaches must report a verdict rather than a false NO VERDICT. It is
-also the only script that reads **live** data, through the deployed Worker's
+**`swing.check.mjs`'s count is TAPE-DEPENDENT**, and the 91 above is its *fixed*
+count, not its observed total. §7a asserts once per watchlist name that actually
+breached ±1.5σ, so a run costs 91 + however many fired. Against the old fixed
+count of 88, two runs an hour apart on 2026-08-14 reported **95** (7 names) and
+**96** (8); on 2026-08-19 nothing reached ±1.5σ (max |z| 1.16, TSLA) and the run
+reported exactly **91** — the fixed count with zero breaches, which is precisely
+the case the floor exists for. The floor is the fixed count minus slack (**87**),
+never the observed total — a quiet day must report a verdict rather than a false
+NO VERDICT. It reads **live** data through the deployed Worker's
 `/api/chart/:ticker` proxy, because Yahoo 429s a direct request from a laptop.
+
+##### A FIXTURE MUST REBUILD THE CALL'S CLOCK, NOT JUST ITS BARS — 2026-08-19
+
+**§5 of `swing.check.mjs` failed on all three tickers for five days and only
+after 4:00pm ET**, which is why it shipped green. The section drives
+`swingChannel` at a pre-close hour (10 ET) and a post-close hour (17 ET), then
+rebuilds the window independently to check the returned fit. It rebuilt that
+window with the **live** `etHourNow()` instead of the hour it had passed in. Run
+before the close the two clocks agree and it passes; run after, the live window
+keeps today's settled bar while the hour-10 call drops it, so the comparison was
+against a **different window** — NVDA off by 0.43, AMD by 1.84, SPCX by 3.50.
+
+**The tell was already written in the file.** The comment immediately above warns
+that the pre and post calls use different windows and that differencing their
+fits measures the window shift as well. The code then took the window from a
+third clock again. **The hour is an INPUT**: `PRE_HOUR` / `POST_HOUR` are now
+declared once and every reconstruction reads the same constant the call did.
+
+Fixing it exposed that the section titled *"in BOTH settlement regimes"* only
+ever asserted **one** of them — the x=30 pre-close fit. The x=29 post-close fit,
+on its own window, is now checked too (+3 comparisons, hence 88 → 91), and it is
+the assertion that would have made this a permanent failure instead of a
+clock-dependent one. **When a check's heading claims a symmetry, count the
+assertions on each side before believing it.**
 
 **`mood.check.mjs` uses a brace-matching `grabConst`, not the scan-to-semicolon
 one the other scripts share.** `MOOD_STANCE`'s sentences contain semicolons, and
