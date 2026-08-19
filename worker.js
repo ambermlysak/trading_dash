@@ -9773,18 +9773,77 @@ const incNum = v => {
   return typeof v === 'number' ? v : null;
 };
 
+/* THE SLEEVE ENTRY IS AN ALLOWLIST, AND EVERY DEPARTURE FROM IT IS REPORTED.
+ *
+ * `income:tickers` is written by a caller and read back to render, so the stored
+ * shape is FIXED rather than whatever JSON arrived — reflecting arbitrary caller
+ * fields into a value that later renders is the shape of the unauthenticated
+ * `/api/analysis/:ticker` write CLAUDE.md rule #5 exists to close. That decision
+ * stands; what changed is that the allowlist no longer applies itself in silence.
+ *
+ * `category` is on the allowlist as an ENUM: it is the Diversify tab's storage —
+ * a user-assigned classification the consumer renders groups from — and the
+ * design for it lives in decision_dash's DESIGN.md. Constraining it to four
+ * values keeps the reflection concern satisfied: still an allowlist, now with one
+ * enum-constrained field rather than free text.
+ *
+ * THE SILENCE WAS THE DEFECT, NOT THE STRIPPING. A client that sent `category`
+ * before this got a clean 200 and found out on the next read, because `rejected`
+ * counts only entries whose TICKER failed and says nothing about fields. Both
+ * failure kinds are now collected into `report` and surfaced by the caller:
+ *
+ *   report.unknown  a field name not on the allowlist — STRIPPED
+ *   report.invalid  an allowlisted field whose value failed — COERCED TO NULL
+ *
+ * Neither ever rejects the entry. A bad `category` must not cost you the ticker.
+ */
+const INCOME_CATEGORIES   = ['income', 'cyclical', 'value', 'defensive'];
+const INCOME_ENTRY_FIELDS = ['ticker', 'addBelow', 'category'];
+
 /**
  * Normalise one saved sleeve entry. Objects are the shape; a bare string is
  * tolerated and coerced, because an older client sending strings should degrade
  * to "no add-below set" rather than dropping the name out of the sleeve.
+ *
+ * `report` is optional: pass `{ unknown: Set, invalid: [] }` to collect what was
+ * stripped or coerced. Omit it where the caller only wants the entry.
  */
-function incomeEntry(raw) {
+function incomeEntry(raw, report = null) {
   const t = typeof raw === 'string' ? raw : raw?.ticker;
   const ticker = String(t ?? '').toUpperCase().trim();
   if (!REC_SYMBOL_RE.test(ticker)) return null;
-  const ab = typeof raw === 'object' && raw ? Number(raw.addBelow) : NaN;
-  return { ticker, addBelow: Number.isFinite(ab) && ab > 0 ? Math.round(ab * 100) / 100 : null };
+  const obj = typeof raw === 'object' && raw ? raw : null;
+
+  const abRaw = obj ? obj.addBelow : undefined;
+  const ab = obj ? Number(abRaw) : NaN;
+  const addBelow = Number.isFinite(ab) && ab > 0 ? Math.round(ab * 100) / 100 : null;
+  if (report && abRaw != null && addBelow === null) {
+    report.invalid.push({
+      ticker, field: 'addBelow', value: abRaw,
+      reason: 'not a finite number greater than 0 — coerced to null',
+    });
+  }
+
+  let category = null;
+  const catRaw = obj ? obj.category : undefined;
+  if (catRaw != null) {
+    const c = String(catRaw).toLowerCase().trim();
+    if (INCOME_CATEGORIES.includes(c)) category = c;
+    else if (report) {
+      report.invalid.push({
+        ticker, field: 'category', value: catRaw,
+        reason: `not one of ${INCOME_CATEGORIES.join(' | ')} — coerced to null`,
+      });
+    }
+  }
+
+  if (report && obj) {
+    for (const k of Object.keys(obj)) if (!INCOME_ENTRY_FIELDS.includes(k)) report.unknown.add(k);
+  }
+  return { ticker, addBelow, category };
 }
+
+const incomeReport = () => ({ unknown: new Set(), invalid: [] });
 
 /**
  * Read the saved sleeve. Returns `{ entries, byTicker, reason }` with entries
@@ -9807,13 +9866,33 @@ async function readIncomeSleeve(env) {
     else if (!raw.length)         why = 'key holds an empty array';
   }
   if (!why) {
-    const entries = raw.map(incomeEntry).filter(Boolean);
+    /* The READ normalises through the same allowlist, so `category` round-trips
+       and nothing outside it can arrive from a hand-written KV value. It reports
+       too: a stored record carrying an unknown field or an out-of-enum category
+       did not come from `handleIncomeSave`, and that is worth seeing rather than
+       quietly flattening. Normally both are empty. */
+    const report = incomeReport();
+    const entries = raw.map(r => incomeEntry(r, report)).filter(Boolean);
     const seen = new Map();
     for (const e of entries) if (!seen.has(e.ticker)) seen.set(e.ticker, e);
     if (!seen.size) why = `all ${raw.length} entries failed the symbol-shape test`;
-    else return { entries: [...seen.values()], byTicker: seen, reason: null, dropped: raw.length - seen.size };
+    else {
+      if (report.unknown.size || report.invalid.length) {
+        console.warn(`[income] stored sleeve carried fields the allowlist does not: `
+          + `unknown [${[...report.unknown].join(', ')}] · invalid ${JSON.stringify(report.invalid)}`);
+      }
+      return {
+        entries: [...seen.values()], byTicker: seen, reason: null,
+        dropped: raw.length - seen.size,
+        storedDroppedFields: [...report.unknown],
+        storedInvalidValues: report.invalid,
+      };
+    }
   }
-  return { entries: null, byTicker: new Map(), reason: `income:tickers ${why}`, dropped: 0 };
+  return {
+    entries: null, byTicker: new Map(), reason: `income:tickers ${why}`, dropped: 0,
+    storedDroppedFields: [], storedInvalidValues: [],
+  };
 }
 
 /** GET /api/income/list — origin-gated. An absent sleeve is a NAMED state. */
@@ -9823,6 +9902,12 @@ async function handleIncomeList(origin, env) {
   return json({
     entries: s.entries, count: s.entries?.length ?? null, reason: s.reason,
     ...(s.dropped ? { droppedEntries: s.dropped } : {}),
+    /* Normally absent. Present only when the STORED value carried something the
+       allowlist does not — which means it did not come from this Worker's save
+       path, and is worth seeing rather than being flattened in silence. */
+    ...(s.storedDroppedFields?.length ? { storedDroppedFields: s.storedDroppedFields } : {}),
+    ...(s.storedInvalidValues?.length ? { storedInvalidValues: s.storedInvalidValues } : {}),
+    categories: INCOME_CATEGORIES,
     _instr: instrSince(mark, 'income-list'),
     _meta: srcMeta('Cloudflare KV', { ok: !!s.entries, ttlSeconds: null, note: s.reason || `${s.entries.length} names` }),
   }, 200, origin);
@@ -9837,16 +9922,24 @@ async function handleIncomeList(origin, env) {
  * names. It does NOT block — deleting names is something the user is allowed to
  * do, and a screen that refuses to save is worse than a log line. The snapshot
  * is what makes a clobber recoverable.
+ *
+ * THE ALLOWLIST REPORTS ITSELF. `rejected` counts entries whose TICKER failed and
+ * says nothing about fields, so a client that sent an unknown field used to get a
+ * clean 200 and discover the loss on the next read. `droppedFields` names every
+ * field stripped and `invalidValues` every allowlisted field coerced to null;
+ * both also log at WARN. Neither ever rejects the entry — a bad `category` must
+ * not cost you the ticker.
  */
 async function handleIncomeSave(request, origin, env) {
   const body = await request.json().catch(() => null);
   const list = Array.isArray(body?.tickers) ? body.tickers : null;
-  if (!list) return err('tickers required — an array of { ticker, addBelow }', 400, origin);
+  if (!list) return err('tickers required — an array of { ticker, addBelow, category }', 400, origin);
 
+  const report = incomeReport();
   const seen = new Map();
   let rejected = 0;
   for (const raw of list) {
-    const e = incomeEntry(raw);
+    const e = incomeEntry(raw, report);
     if (!e) { rejected++; continue; }
     if (!seen.has(e.ticker)) seen.set(e.ticker, e);
   }
@@ -9869,8 +9962,28 @@ async function handleIncomeSave(request, origin, env) {
       + `income:prev. Dropped: ${gone.join(', ')}`);
   }
 
+  const droppedFields = [...report.unknown];
+  if (droppedFields.length) {
+    console.warn(`[income] save STRIPPED ${droppedFields.length} field name(s) not on the allowlist `
+      + `(${INCOME_ENTRY_FIELDS.join(', ')}): ${droppedFields.join(', ')}. The entries were saved without them.`);
+  }
+  if (report.invalid.length) {
+    console.warn(`[income] save COERCED ${report.invalid.length} value(s) to null: `
+      + report.invalid.map(i => `${i.ticker}.${i.field}=${JSON.stringify(i.value)}`).join(', ')
+      + '. The entries themselves were kept.');
+  }
+
   await env?.REC_LOG?.put('income:tickers', JSON.stringify(entries));
-  return json({ ok: true, count: entries.length, previousCount: prevCount, rejected }, 200, origin);
+  return json({
+    ok: true, count: entries.length, previousCount: prevCount, rejected,
+    /* Always present, empty arrays included: a consumer checking `.length` must
+       not have to distinguish "nothing was dropped" from "this Worker predates
+       the reporting". Compare the frontend-newer-than-Worker failure mode. */
+    droppedFields,
+    invalidValues: report.invalid,
+    allowedFields: INCOME_ENTRY_FIELDS,
+    categories: INCOME_CATEGORIES,
+  }, 200, origin);
 }
 
 /* ── The dividend history read ──────────────────────────────────────────────
@@ -10234,7 +10347,13 @@ async function handleIncomeBatch(symbols, origin, env, params) {
       trendReason = `${settled.length} completed daily closes available, 200 needed for a 200-day average`;
     }
 
-    const addBelow = sleeve.byTicker.get(t)?.addBelow ?? null;
+    const saved = sleeve.byTicker.get(t) || null;
+    const addBelow = saved?.addBelow ?? null;
+    /* Rides along with `addBelow` for the same reason it does: both are user
+       data from the sleeve, and the Diversify tab groups rows by `category`.
+       Shipping one and not the other would leave the consumer fetching the
+       sleeve separately to render a grouping it already has the rows for. */
+    const category = saved?.category ?? null;
     const inAddZone = addBelow != null && price != null ? price <= addBelow : null;
 
     const exDivDaysAway = row.exDivDate ? daysBetweenIso(etToday, row.exDivDate) : null;
@@ -10256,7 +10375,9 @@ async function handleIncomeBatch(symbols, origin, env, params) {
       sma200, aboveSma200, trendReason,
       exDivIsPast, exDivDaysAway,
       addBelow,
+      category,
       addBelowSource: sleeve.entries ? 'income:tickers' : 'unavailable',
+      categorySource: sleeve.entries ? 'income:tickers' : 'unavailable',
       inAddZone,
       events,
       /* Two ages, never one: the dividend half is cached and the price half is
@@ -10275,6 +10396,7 @@ async function handleIncomeBatch(symbols, origin, env, params) {
        `inAddZone` event — is silently absent when the sleeve is unreadable, and
        a silently absent event is indistinguishable from one that did not fire. */
     sleeve: { ok: !!sleeve.entries, count: sleeve.entries?.length ?? null, reason: sleeve.reason },
+    categories: INCOME_CATEGORIES,
     gates: {
       exDivUpcomingDays: INCOME_EXDIV_UPCOMING_DAYS,
       payoutHighPct: INCOME_PAYOUT_HIGH_PCT,

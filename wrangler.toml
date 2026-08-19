@@ -149,8 +149,15 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   income:tickers      — THE INCOME SLEEVE. A SEPARATE LIST from
 #                         watchlist:tickers and it must stay one: sweepUniverse()
 #                         reads only the watchlist, so nothing here ever enters a
-#                         cron sweep. Entries are OBJECTS, { ticker, addBelow },
-#                         addBelow being an optional user-set price. No TTL, no
+#                         cron sweep. Entries are OBJECTS on a THREE-FIELD
+#                         ALLOWLIST: { ticker, addBelow, category }. addBelow is
+#                         an optional user-set price; category is an enum —
+#                         income | cyclical | value | defensive | null — backing
+#                         the Diversify tab. Anything else is STRIPPED and named
+#                         in droppedFields; a bad enum value coerces to null and
+#                         is named in invalidValues. Neither ever rejects the
+#                         entry, and the read normalises through the same
+#                         allowlist so category round-trips. No TTL, no
 #                         server-side default seeding — an absent key means the
 #                         user has not built a sleeve and the endpoints say so
 #                         (entries: null, never []).

@@ -1020,15 +1020,45 @@ GET  /api/income/batch?symbols=  one mechanical row per name
 | `INCOME_GROWTH_YEARS` / `INCOME_GROWTH_MATCH_DAYS` | 5 / 45 | the 5y growth anchor and how near a payment must sit to it |
 | `INCOME_EXDIV_UPCOMING_DAYS` / `INCOME_PAYOUT_HIGH_PCT` | 7 / **90** | the `exDivUpcoming` and `payoutHigh` events |
 | `INCOME_SHRINK_WARN_PCT` | 0.30 | WARN on save, **never blocks** — same guard as the watchlist |
+| `INCOME_ENTRY_FIELDS` | `ticker`, `addBelow`, `category` | the saved-entry **allowlist**; anything else is stripped and named |
+| `INCOME_CATEGORIES` | `income` \| `cyclical` \| `value` \| `defensive` | the `category` enum, default `null`, matched case-insensitively |
 
 **`income:tickers` is a SEPARATE list from `watchlist:tickers`.** Different purpose,
 different cadence, and — the load-bearing part — `sweepUniverse()` reads the watchlist
 and nothing else, so folding the sleeve in would silently enlarge the IV sweep, the
-move-series sweep and the analysis refresh. Entries are **objects**,
-`{ ticker, addBelow }`. There is **no server-side default seeding**: an absent key
-means the user has not built a sleeve, and the reader returns **`entries: null`, never
-`[]`** with one of four distinguishable reasons — `[]` would mean "a sleeve exists and
-is empty", a different state. `POST` snapshots `income:prev` before every overwrite.
+move-series sweep and the analysis refresh. There is **no server-side default
+seeding**: an absent key means the user has not built a sleeve, and the reader returns
+**`entries: null`, never `[]`** with one of four distinguishable reasons — `[]` would
+mean "a sleeve exists and is empty", a different state. `POST` snapshots `income:prev`
+before every overwrite.
+
+**THE ENTRY IS A THREE-FIELD ALLOWLIST AND IT REPORTS ITSELF.** Entries are objects,
+`{ ticker, addBelow, category }`. The stored shape is fixed rather than whatever JSON
+arrived, because reflecting arbitrary caller fields into a value that later renders is
+the shape of the unauthenticated `/api/analysis/:ticker` write rule #5 closes. That
+decision stands; what does not is applying it in silence:
+
+| kind | what happens | reported as |
+|---|---|---|
+| a field not on `INCOME_ENTRY_FIELDS` | **stripped** | `droppedFields: ['notes','sector']` + WARN |
+| an allowlisted field whose value fails | **coerced to `null`** | `invalidValues: [{ticker, field, value, reason}]` + WARN |
+
+**Neither ever rejects the entry** — a bad `category` must not cost you the ticker —
+and **both arrays are always present on the save response, empty included**, so a
+consumer checking `.length` need not distinguish "nothing was dropped" from "this
+Worker predates the reporting". `rejected` still counts only entries whose *ticker*
+failed, which is what made the old silence possible.
+
+**`category` is the Diversify tab's storage**: a user-assigned classification the
+consumer renders groups from, designed in decision_dash's DESIGN.md. It is
+`INCOME_CATEGORIES` (`income` / `cyclical` / `value` / `defensive`) or `null`, matched
+case-insensitively. An **enum rather than free text** is what keeps the reflection
+concern satisfied — still an allowlist, now with one constrained field. **The READ
+normalises through the same allowlist**, so `category` round-trips and a hand-written
+KV value carrying junk surfaces as `storedDroppedFields` / `storedInvalidValues` on
+`/api/income/list` instead of being flattened. `category` also rides every
+`/api/income/batch` row beside `addBelow`, with `categorySource` distinguishing "the
+sleeve was read and this name is not in it" from "the sleeve is unreadable".
 
 **THE FIXED-RATE vs VARIABLE CLASSIFIER IS MEASURED, AND TWO OBVIOUS ALTERNATIVES
 WERE FALSIFIED.** A declared-dividend equity holds the same amount for several
