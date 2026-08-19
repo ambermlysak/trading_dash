@@ -984,6 +984,55 @@ because the live quote belongs to today) rather than x = 29. Computed inside the
 `?range=3mo&interval=1d` chart fetch `handleWatchlistBatch` already makes — **zero
 added subrequest cost**. Fewer than 30 completed bars leaves all four fields null,
 which renders `—`. Checked by `node swing.check.mjs`.
+
+**Earnings session timing** ships on every `/api/watchlist/batch` row as three
+fields, added 2026-08-18 for the decision_dash rebuild's deadline logic and
+partially closing ARCHITECTURE "Not yet done" #2:
+
+| field | value |
+|---|---|
+| `earningsTs` | the next-earnings instant as **ISO 8601 UTC**, or `null` |
+| `earningsSession` | `'bmo'` \| `'amc'` \| `'unknown'` — **never null** |
+| `earningsIsEstimate` | Yahoo's flag as a boolean, or `null` when Yahoo omits it |
+
+Source is `calendarEvents.earnings`, already in the batch's quoteSummary module
+list — **zero added subrequest cost**, same pattern as the Swing column.
+
+**This decides a DEADLINE, not a label.** BMO means the hold/exit decision was
+the *prior* session's close and the report day is reaction-only; AMC means the
+deadline is that day's own close. A wrong answer moves a deadline by a whole
+session, so the classification is deliberately conservative:
+
+- **`bmo`** — 04:00 ≤ ET < 09:30 · **`amc`** — ET ≥ 16:00 · **`unknown`** — everything else
+- **`unknown` with a real date is a valid and common answer**, not a failure.
+- **A date-only placeholder is rejected on the UTC instant, before any ET
+  reading.** Midnight UTC read as ET is 19:00/20:00 the *previous* day — past the
+  16:00 cut — so a naive ET conversion would stamp a confident AMC on the wrong
+  day for every date-only row. Guarded by `ts % 86400 === 0`.
+- A second `earningsDate` entry (Yahoo's start/end pair) means "sometime that
+  day" and is `unknown` regardless of the first entry's clock.
+- `etMinutesOfDay` uses `hourCycle: 'h23'`, not `hour12: false`: the latter
+  renders midnight as `"24"` under some ICU builds, putting a midnight ET value
+  at 1440 and past every cut.
+
+**THE YAHOO FIELD IS `isEarningsDateEstimate`.** ARCHITECTURE #2 calls it
+`earningsDateIsEstimate`; that name is not in the live payload and reading it
+returns undefined for every ticker — which ships a permanently-null flag looking
+exactly like "Yahoo never sends it". Verified against the live response, whose
+`calendarEvents.earnings` keys are `earningsDate`, `earningsCallDate`,
+`isEarningsDateEstimate`, `earningsAverage/Low/High`, `revenueAverage/Low/High`.
+The documented name is still read as a fallback. **This is the FINRA field-name
+lesson again: check the live response, not the doc.**
+
+**KNOWN CONSERVATIVE MISS — post-DST AMC reads as `unknown`.** Yahoo appears to
+encode after-close prints at a fixed `20:00Z`, which is 16:00 ET under EDT but
+**15:00 ET under EST** — mid-session, so it fails the ≥16:00 cut. Measured
+2026-08-18: NVDA 2026-08-26 (EDT) → `amc`; PLTR 2026-11-02 and QUBT 2026-11-09
+(both EST, both AMC reporters) → `unknown`. BMO is unaffected, because 12:30Z is
+08:30 ET under EDT and 07:30 ET under EST — inside the window either way.
+Widening the AMC cut to 15:00 would be guessing at Yahoo's intent and would
+misclassify a genuine mid-session print, so it stays. Expect roughly half the
+year's AMC names to read `unknown`; that is the honest answer, not a bug.
 | **Sectors** | `#sectors` | All 11 SPDR sectors, ETF % change plus a Claude-picked opportunity and avoid per sector. |
 | **Long** | `#long` | The only options screen. **Six lanes** (LEAPS / swing / debit verticals / calendars / straddle+strangle / defined-risk credit spreads). The standalone Premium tab was merged in as Lane F on 2026-08-10 — short premium is secondary and now sits as one lane among six, ranked by the same expectancy as everything else. |
 

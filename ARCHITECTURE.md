@@ -885,15 +885,30 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    section below for what those layers do *not* cover, which is the part worth
    reading.
 
-2. **Confirmed-vs-estimated earnings dates.** Yahoo returns
-   `earningsDateIsEstimate` and nothing in the codebase reads it. Every earnings
-   date on the catalyst card, the watchlist column and the Long screen is presented
-   with equal confidence whether the company confirmed it or Yahoo guessed it from
-   last year's pattern. **This got MORE load-bearing, not less, when the premium
-   screen was deleted**: Lane E gates on whether a catalyst falls inside the expiry
-   (`no-catalyst-inside`), so an estimated date off by a week can flip a gate on
-   the lane whose whole value is refusing 91% of candidates. Surface the flag and
-   let the gate say when it is working from an estimate.
+2. **Confirmed-vs-estimated earnings dates — PARTIALLY DONE 2026-08-18.**
+
+   **The field is `isEarningsDateEstimate`, not `earningsDateIsEstimate`.** This
+   item named the wrong key for months. The wrong name is not in the live payload
+   at all, so reading it returns undefined for every ticker — a permanently-null
+   flag indistinguishable from "Yahoo never sends it". Verified against the live
+   `calendarEvents.earnings`, whose keys are `earningsDate`, `earningsCallDate`,
+   `isEarningsDateEstimate`, `earningsAverage/Low/High`, `revenueAverage/Low/High`.
+
+   **Done:** `/api/watchlist/batch` now ships `earningsIsEstimate` (boolean, or
+   null when Yahoo omits it) alongside `earningsTs` and `earningsSession`
+   (`bmo`/`amc`/`unknown`), at zero added subrequest cost — `calendarEvents` was
+   already in that handler's module list. See CLAUDE.md's *Earnings session
+   timing* block for the classification rule and its known conservative miss.
+   Measured on live data: AAPL, PLTR and VST all return `earningsIsEstimate:
+   true`; HD, NVDA, TSM and UNH return `false`; SPY returns `null`.
+
+   **Still outstanding:** nothing *consumes* the flag yet. The catalyst card, the
+   watchlist Earnings column and the Long screen still present every date with
+   equal confidence. **This stays load-bearing for Lane E**, which gates on
+   whether a catalyst falls inside the expiry (`no-catalyst-inside`) — an
+   estimated date off by a week can flip a gate on the lane whose whole value is
+   refusing 91% of candidates. `nextEarningsIso()`, which Lane E reads, still
+   returns a bare ISO string carrying no estimate flag and no session.
 
 3. **Position awareness.** The app knows nothing about what is actually held, so
    every recommendation is written as if from flat. Missing: cost basis, days to

@@ -1860,6 +1860,97 @@ function nextEarningsIso(qsResult) {
   return iso >= etToday() ? iso : null;
 }
 
+/* ── Earnings session timing: BMO / AMC / unknown ─────────────────────────────
+
+   THIS DECIDES A DEADLINE, NOT A LABEL. A before-open print means the hold/exit
+   decision was the PRIOR session's close and the report day is reaction-only; an
+   after-close print means the deadline is that day's own close. A wrong answer
+   moves a deadline by a full session, so every ambiguous input resolves to
+   'unknown' and the consumer assumes the earlier deadline and says it assumed.
+
+   `unknown` WITH A REAL DATE IS A VALID AND COMMON ANSWER, not a failure — the
+   source simply does not publish a time for most names.
+
+   The input is `calendarEvents.earnings.earningsDate`, which the batch already
+   fetches (`?modules=...,calendarEvents,...`), so this costs ZERO subrequests.
+   Entries are epoch seconds. Two shapes arrive and only one carries a time:
+
+     - a real scheduled instant, e.g. an after-close call
+     - a DATE-ONLY placeholder at exactly midnight UTC
+
+   The placeholder is the trap. Midnight UTC read as ET is 19:00 (EDT) or 20:00
+   (EST) on the PREVIOUS day — past the 16:00 cut, so a naive ET reading
+   classifies every date-only row as a confident AMC on the wrong day. It is
+   therefore rejected on the UTC instant, BEFORE any ET conversion happens.
+
+   A second-entry range (Yahoo's start/end pair) means "sometime that day" and is
+   also unknown, regardless of what the first entry's clock says. */
+const EARN_BMO_START_MIN = 4 * 60;        // 04:00 ET
+const EARN_BMO_END_MIN   = 9 * 60 + 30;   // 09:30 ET — the opening bell
+const EARN_AMC_START_MIN = 16 * 60;       // 16:00 ET — the closing bell
+
+/** Minutes past ET midnight for an instant, or null. `hourCycle: 'h23'` because
+ *  `hour12: false` renders midnight as "24" under some ICU builds, which would
+ *  put a midnight ET value at 1440 and past every cut. */
+function etMinutesOfDay(ms) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hourCycle: 'h23',
+    hour: '2-digit', minute: '2-digit',
+  }).formatToParts(new Date(ms));
+  const h = Number(parts.find(p => p.type === 'hour')?.value);
+  const m = Number(parts.find(p => p.type === 'minute')?.value);
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+  return h * 60 + m;
+}
+
+/** `{ earningsTs, earningsSession }` from a `calendarEvents.earnings` object.
+ *  `earningsTs` is the raw first entry as ISO 8601 UTC — the same entry
+ *  `earningsDate` and `daysToEarnings` already use, so the three cannot describe
+ *  different reports. */
+function earningsTimingFrom(cal) {
+  const raws = (cal?.earningsDate || [])
+    .map(e => Number.isFinite(e?.raw) ? e.raw : (Number.isFinite(e) ? e : null))
+    .filter(v => v != null);
+  if (!raws.length) return { earningsTs: null, earningsSession: 'unknown' };
+
+  const ts  = raws[0];
+  const iso = new Date(ts * 1000).toISOString();
+  const out = s => ({ earningsTs: iso, earningsSession: s });
+
+  // Start/end pair spanning the session — Yahoo saying "sometime that day".
+  if (new Set(raws).size > 1) return out('unknown');
+
+  // Date-only placeholder. Checked on the UTC instant: see the dateline note.
+  if (ts % 86400 === 0) return out('unknown');
+
+  const mins = etMinutesOfDay(ts * 1000);
+  if (mins == null) return out('unknown');
+  if (mins >= EARN_BMO_START_MIN && mins < EARN_BMO_END_MIN) return out('bmo');
+  if (mins >= EARN_AMC_START_MIN) return out('amc');
+  return out('unknown');
+}
+
+/** Yahoo's estimate flag as a boolean, or null when Yahoo omits it.
+ *
+ *  THE FIELD IS `isEarningsDateEstimate`. ARCHITECTURE.md's "Not yet done" item 2
+ *  calls it `earningsDateIsEstimate` and that name does not exist in the live
+ *  payload — reading it returns undefined for every ticker, which would have
+ *  shipped a permanently-null flag that looked like "Yahoo never sends it".
+ *  Verified 2026-08-18 against the live response: `calendarEvents.earnings` keys
+ *  are earningsDate, earningsCallDate, `isEarningsDateEstimate`, earningsAverage,
+ *  earningsLow, earningsHigh, revenueAverage, revenueLow, revenueHigh. The
+ *  documented name is checked as a fallback in case Yahoo carries both.
+ *
+ *  Null is NOT false: "Yahoo did not say" and "the company confirmed it" are
+ *  different claims, and a gate working from an estimate has to say which it has. */
+function earningsIsEstimateFrom(cal) {
+  for (const v of [cal?.isEarningsDateEstimate, cal?.earningsDateIsEstimate]) {
+    if (typeof v === 'boolean') return v;
+    if (typeof v?.raw === 'boolean') return v.raw;
+  }
+  return null;
+}
+
 /**
  * IV rank from a stored history. Factored out so `/api/iv` and `/api/premium`
  * cannot drift into two different definitions of the same number.
@@ -9199,6 +9290,9 @@ async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
         let pe = null, forwardPE = null, targetLow = null, targetMean = null, targetHigh = null;
         let shortPct = null, earningsDate = null, daysToEarnings = null, sector = null;
         let sma50 = null, sma200 = null;
+        // Session timing. Defaults are the no-data answer, not a guess: an absent
+        // calendarEvents block leaves ts null and the session 'unknown'.
+        let earningsTs = null, earningsSession = 'unknown', earningsIsEstimate = null;
 
         if (fundRes.status === 'fulfilled') {
           const r = fundRes.value?.quoteSummary?.result?.[0] || {};
@@ -9226,12 +9320,17 @@ async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
             changePct = Math.round((qPrice - qPrev) / qPrev * 10000) / 100;
           }
 
-          const epoch = r.calendarEvents?.earnings?.earningsDate?.[0]?.raw;
+          const cal = r.calendarEvents?.earnings;
+          const epoch = cal?.earningsDate?.[0]?.raw;
           if (epoch) {
             const d = new Date(epoch * 1000);
             earningsDate   = `${d.toLocaleString('en-US', { month: 'short' })} ${d.getDate()}, '${String(d.getFullYear()).slice(2)}`;
             daysToEarnings = Math.ceil((d.getTime() - Date.now()) / 86_400_000);
           }
+          // Read off the SAME `cal` object, so the timestamp, the formatted date
+          // and the countdown all describe one report.
+          ({ earningsTs, earningsSession } = earningsTimingFrom(cal));
+          earningsIsEstimate = earningsIsEstimateFrom(cal);
         }
 
         // Claude analysis from KV (written by cron or previous on-demand run)
@@ -9285,6 +9384,12 @@ async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
           shortPct:   shortPct   != null ? Math.round(shortPct   * 10000) / 100 : null,
           earningsDate,
           daysToEarnings,
+          // Session timing. `earningsSession` is always one of 'bmo'|'amc'|
+          // 'unknown' — never null — so a consumer cannot confuse "no field"
+          // (an older Worker) with "we could not tell" (this one, saying so).
+          earningsTs,
+          earningsSession,
+          earningsIsEstimate,
           sma50:    sma50  != null ? Math.round(sma50  * 100) / 100 : null,
           sma200:   sma200 != null ? Math.round(sma200 * 100) / 100 : null,
           pctVs50:  price != null && sma50  ? Math.round((price - sma50)  / sma50  * 10000) / 100 : null,
