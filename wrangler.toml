@@ -58,7 +58,16 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   finra:token         — FINRA OAuth2 bearer token
 #   econ:fred           — FRED release dates (12h TTL)
 #   ivsweep:last        — PT date of last cron IV sweep (dedup)
-#   fund:{TICKER}       — per-ticker Yahoo fundamentals cache (6h TTL)
+#   (NO fund:{TICKER} KEY EXISTS. This line used to claim a "per-ticker Yahoo
+#    fundamentals cache (6h TTL)" and there is no such key — verified 2026-08-19
+#    by grepping worker.js for the literal: zero readers, zero writers, and the
+#    string `fund:` appears exactly once, as the TTL table entry below. The
+#    fundamentals a ticker page reads come straight from /api/quote's Yahoo
+#    quoteSummary call and are not banked in KV at all. `TTL.fund` (6h) survives
+#    as a LABEL ONLY: handlePeers() stamps it as `ttlSeconds` on the _meta of an
+#    UNCACHED response, so it tells the badge how stale to consider a figure
+#    rather than how long anything is kept. A key listed here that does not exist
+#    is worse than an omission — it reads as a cache someone can go and inspect.)
 #   premium:{TICKER}    — premium-screen row, cached on demand (4h fresh, 24h retained)
 #   long:{TICKER}       — long-screen row, cached on demand (4h fresh, 24h retained)
 #   moves:{TICKER}      — historical N-session return distribution behind the Long

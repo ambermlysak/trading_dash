@@ -31,6 +31,11 @@ trading_dash/
 │                        #   a non-firing boundary, trend-context reclassification,
 │                        #   the emotion cuts, the macro classifier, the stance
 │                        #   table, the sentence guard, and every refusal path
+├── earnings-timing.check.mjs # BMO/AMC/unknown — both fixed UTC anchors under
+│                        #   both DST regimes, the ET wall-clock boundaries with
+│                        #   the branch that decided each, the midnight-UTC guard
+│                        #   and its ordering, the range branch, and a live
+│                        #   re-probe of the watchlist's anchor distribution
 macro.check.mjs       # macroRegime phase 1 — sign convention, both thresholds,
 │                        #   hostileVia, date alignment vs brute force, all four
 │                        #   states, and collectMacroState's cost with stub bindings
@@ -898,9 +903,22 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    null when Yahoo omits it) alongside `earningsTs` and `earningsSession`
    (`bmo`/`amc`/`unknown`), at zero added subrequest cost — `calendarEvents` was
    already in that handler's module list. See CLAUDE.md's *Earnings session
-   timing* block for the classification rule and its known conservative miss.
-   Measured on live data: AAPL, PLTR and VST all return `earningsIsEstimate:
-   true`; HD, NVDA, TSM and UNH return `false`; SPY returns `null`.
+   timing* block for the classification rule. Measured on live data: AAPL, PLTR
+   and VST all return `earningsIsEstimate: true`; HD, NVDA, TSM and UNH return
+   `false`; SPY returns `null`.
+
+   **The DST ambiguity is CLOSED, 2026-08-19.** The classifier's original
+   wall-clock rule read `20:00Z` as 15:00 ET under EST — mid-session — and
+   returned `unknown` for every after-close name dated between November and
+   March. Probing all 39 watchlist names showed Yahoo takes **exactly two**
+   distinct UTC times of day, `20:00:00Z` (n=28) and `12:30:00Z` (n=11), both
+   DST-invariant: it encodes a **session flag as a fixed anchor**, not a time.
+   Those anchors are now decoded before the wall-clock windows, which remain as
+   the fallback. Ten names moved `unknown` → `amc` (PLTR AMD QUBT APP CRWV CAVA
+   HOOD ARM SMR KTOS), and the watchlist reads **bmo 11 · amc 28 · unknown 0**
+   against 11 / 18 / 10 before. Pinned by `node earnings-timing.check.mjs`; the
+   measured distribution and the residual (an anchor is a convention, not an
+   observation) are in CLAUDE.md.
 
    **Still outstanding:** nothing *consumes* the flag yet. The catalyst card, the
    watchlist Earnings column and the Long screen still present every date with

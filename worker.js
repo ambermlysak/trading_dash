@@ -1884,10 +1884,50 @@ function nextEarningsIso(qsResult) {
    therefore rejected on the UTC instant, BEFORE any ET conversion happens.
 
    A second-entry range (Yahoo's start/end pair) means "sometime that day" and is
-   also unknown, regardless of what the first entry's clock says. */
+   also unknown, regardless of what the first entry's clock says.
+
+   ── YAHOO ENCODES SESSIONS AS FIXED UTC ANCHORS, NOT AS ET WALL CLOCK ────────
+
+   MEASURED 2026-08-19 over all 39 watchlist names, one probe per name through
+   the Worker's own /api/quote proxy. EVERY name resolved, and the whole
+   population took exactly TWO distinct UTC times of day:
+
+       20:00:00Z   n=28      12:30:00Z   n=11
+       0 names with no entry · 0 with a second distinct entry · 0 at midnight UTC
+
+   Both are DST-invariant, which is the finding. 20:00Z is 16:00 ET under EDT and
+   15:00 ET under EST; 12:30Z is 08:30 ET under EDT and 07:30 ET under EST. So
+   the ET wall clock is the FICTION here and the anchor is the datum — Yahoo is
+   not publishing a time, it is publishing a session flag encoded as a constant.
+
+   The original wall-clock-only rule therefore misread every after-close name
+   whose date falls under EST: 20:00Z → 15:00 ET is mid-session, so it failed the
+   ≥16:00 cut and came back `unknown`. That was 10 of the 28 AMC names in this
+   measurement (PLTR AMD QUBT APP CRWV CAVA HOOD ARM SMR KTOS) — all genuine AMC
+   reporters, all dated in November. BMO was never affected: 12:30Z lands inside
+   04:00–09:30 ET in both regimes.
+
+   So the anchors are decoded FIRST and the wall-clock windows stay as the
+   fallback for any non-anchor time. That ordering is what keeps this honest if
+   Yahoo ever starts publishing real times — a real time is not exactly 12:30:00Z
+   or 20:00:00Z, so it falls straight through to the windows. If Yahoo instead
+   re-anchors to some third constant, the windows decide it and an out-of-window
+   constant degrades to `unknown`, which is the safe direction.
+
+   RESIDUAL, stated rather than discovered later: an anchor is a CONVENTION, not
+   an observation, so a genuine report scheduled at exactly 20:00:00Z that really
+   was mid-session under EST would be read as AMC. Nothing in the payload could
+   distinguish the two, and the convention is overwhelmingly the more likely
+   reading at n=39/39. Re-run `node earnings-timing.check.mjs` §7 — which probes
+   the live watchlist — if the distribution is ever suspected of having moved. */
 const EARN_BMO_START_MIN = 4 * 60;        // 04:00 ET
 const EARN_BMO_END_MIN   = 9 * 60 + 30;   // 09:30 ET — the opening bell
 const EARN_AMC_START_MIN = 16 * 60;       // 16:00 ET — the closing bell
+
+/* Yahoo's fixed UTC session anchors, as seconds past UTC midnight. Compared for
+   EXACT equality: an anchor is a flag, and "near 20:00Z" is not the same claim. */
+const EARN_ANCHOR_BMO_UTC_SEC = 12 * 3600 + 30 * 60;   // 12:30:00Z — before open
+const EARN_ANCHOR_AMC_UTC_SEC = 20 * 3600;             // 20:00:00Z — after close
 
 /** Minutes past ET midnight for an instant, or null. `hourCycle: 'h23'` because
  *  `hour12: false` renders midnight as "24" under some ICU builds, which would
@@ -1920,9 +1960,21 @@ function earningsTimingFrom(cal) {
   // Start/end pair spanning the session — Yahoo saying "sometime that day".
   if (new Set(raws).size > 1) return out('unknown');
 
-  // Date-only placeholder. Checked on the UTC instant: see the dateline note.
-  if (ts % 86400 === 0) return out('unknown');
+  // Seconds past UTC midnight, normalised so a pre-epoch value cannot go negative
+  // and slip past an anchor comparison as some other constant.
+  const utcSec = ((ts % 86400) + 86400) % 86400;
 
+  // Date-only placeholder. Checked on the UTC instant: see the dateline note.
+  // Stays FIRST of the three UTC tests — 00:00:00Z is not an anchor, and it must
+  // be rejected before anything tries to read a session out of it.
+  if (utcSec === 0) return out('unknown');
+
+  // The fixed UTC anchors, exact equality. See the measurement above.
+  if (utcSec === EARN_ANCHOR_BMO_UTC_SEC) return out('bmo');
+  if (utcSec === EARN_ANCHOR_AMC_UTC_SEC) return out('amc');
+
+  // Not an anchor: fall through to the ET wall-clock windows, which is the right
+  // reading of a genuinely published time.
   const mins = etMinutesOfDay(ts * 1000);
   if (mins == null) return out('unknown');
   if (mins >= EARN_BMO_START_MIN && mins < EARN_BMO_END_MIN) return out('bmo');

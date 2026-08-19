@@ -802,7 +802,7 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Twelve checks exist, all of which print computed vs
+There is no build step. Thirteen checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
 (Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
@@ -846,15 +846,33 @@ one rather than the same algebra written twice — the residual σ against the �
 the closes on three live names, the forming-bar drop with the clock that decided
 it, the x=29/x=30 rule in both settlement regimes, the sub-30-bar null path, both
 sides of the threshold at ±0.01σ, and the 15-wide colgroup / header / row
-alignment).
+alignment), and `node earnings-timing.check.mjs` (the BMO/AMC/unknown classifier:
+both fixed UTC anchors under **both** DST regimes and one second either side of
+each, all six ET wall-clock boundaries in both regimes — **each printed with the
+branch that decided it**, because two of those boundaries *are* anchors and a
+test that does not say which branch answered proves nothing about either — the
+midnight-UTC placeholder guard *and its ordering ahead of the anchors*, the
+multi-entry range branch and its inverse, every absent-date shape, the
+`isEarningsDateEstimate` field name, and a live re-probe of the watchlist's
+anchor distribution).
 All of them extract functions from
 `worker.js` by source, not by import, because every named export in `worker.js`
 must be a function or `workerd` refuses to boot.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 88** for moves /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 88 / 113** for moves /
 long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
-sweep-universe / macro / mood / swing — **967 comparisons** across the suite.
+sweep-universe / macro / mood / swing / earnings-timing — **1,080 comparisons**
+across the suite.
+
+**TWO scripts now read live data, and both floors are the FIXED count rather than
+the observed total.** `swing.check.mjs` (below) and `earnings-timing.check.mjs`,
+whose §7 re-probes the watchlist: that section contributed **44** of a 157-run on
+2026-08-19 — 5 aggregate rows plus one per name probed (39) — all of it
+contingent on the network and on a watchlist whose length changes. The floor is
+**113**, the deterministic half, so an offline run still has to clear everything
+that does not depend on the tape while §7 announces its own emptiness through
+`populated()`. Never raise either floor to an observed total.
 
 **`swing.check.mjs` is the one script whose count is TAPE-DEPENDENT**, and the 88
 above is its *fixed* count, not its observed total. §7a asserts once per watchlist
@@ -1003,17 +1021,34 @@ the *prior* session's close and the report day is reaction-only; AMC means the
 deadline is that day's own close. A wrong answer moves a deadline by a whole
 session, so the classification is deliberately conservative:
 
-- **`bmo`** — 04:00 ≤ ET < 09:30 · **`amc`** — ET ≥ 16:00 · **`unknown`** — everything else
-- **`unknown` with a real date is a valid and common answer**, not a failure.
+The decision order in `earningsTimingFrom` is **range → midnight guard → anchors
+→ wall clock**, and every step of it is load-bearing:
+
+- A second, **distinct** `earningsDate` entry (Yahoo's start/end pair) means
+  "sometime that day" and is `unknown` regardless of the first entry's clock. A
+  *duplicated* entry is one instant, not a range, and must not trip it —
+  the test is `new Set(raws).size > 1`.
 - **A date-only placeholder is rejected on the UTC instant, before any ET
   reading.** Midnight UTC read as ET is 19:00/20:00 the *previous* day — past the
   16:00 cut — so a naive ET conversion would stamp a confident AMC on the wrong
-  day for every date-only row. Guarded by `ts % 86400 === 0`.
-- A second `earningsDate` entry (Yahoo's start/end pair) means "sometime that
-  day" and is `unknown` regardless of the first entry's clock.
+  day for every date-only row. Guarded by `utcSec === 0`, which must stay
+  **ahead of the anchor tests**: `00:00:00Z` is not an anchor and nothing may try
+  to read a session out of it.
+- **The fixed UTC anchors, by exact equality** — see the measurement below.
+  `12:30:00Z` → `bmo`, `20:00:00Z` → `amc`.
+- **The ET wall-clock windows, as the fallback** for any non-anchor time:
+  **`bmo`** — 04:00 ≤ ET < 09:30 · **`amc`** — ET ≥ 16:00 · **`unknown`** —
+  everything else.
+- **`unknown` with a real date is a valid answer**, not a failure — though on the
+  current watchlist it is now a rare one (0 of 39).
 - `etMinutesOfDay` uses `hourCycle: 'h23'`, not `hour12: false`: the latter
   renders midnight as `"24"` under some ICU builds, putting a midnight ET value
   at 1440 and past every cut.
+
+Pinned by `node earnings-timing.check.mjs` — both anchors under both DST regimes,
+all six wall-clock boundaries in both regimes each printed with the branch that
+decided it, the placeholder guard and its ordering, the range branch and its
+inverse, every absent-date shape, and a live re-probe of the watchlist.
 
 **THE YAHOO FIELD IS `isEarningsDateEstimate`.** ARCHITECTURE #2 calls it
 `earningsDateIsEstimate`; that name is not in the live payload and reading it
@@ -1024,15 +1059,54 @@ exactly like "Yahoo never sends it". Verified against the live response, whose
 The documented name is still read as a fallback. **This is the FINRA field-name
 lesson again: check the live response, not the doc.**
 
-**KNOWN CONSERVATIVE MISS — post-DST AMC reads as `unknown`.** Yahoo appears to
-encode after-close prints at a fixed `20:00Z`, which is 16:00 ET under EDT but
-**15:00 ET under EST** — mid-session, so it fails the ≥16:00 cut. Measured
-2026-08-18: NVDA 2026-08-26 (EDT) → `amc`; PLTR 2026-11-02 and QUBT 2026-11-09
-(both EST, both AMC reporters) → `unknown`. BMO is unaffected, because 12:30Z is
-08:30 ET under EDT and 07:30 ET under EST — inside the window either way.
-Widening the AMC cut to 15:00 would be guessing at Yahoo's intent and would
-misclassify a genuine mid-session print, so it stays. Expect roughly half the
-year's AMC names to read `unknown`; that is the honest answer, not a bug.
+##### YAHOO ENCODES THE SESSION AS A FIXED UTC ANCHOR — the ET wall clock is the fiction
+
+**Measured 2026-08-19, all 39 watchlist names, one probe each through
+`/api/quote`.** Every name resolved, and the whole population took **exactly two
+distinct UTC times of day**:
+
+| UTC time-of-day | n | ET under EDT | ET under EST |
+|---|---|---|---|
+| `20:00:00Z` | **28** | 16:00 — on the bell | **15:00 — mid-session** |
+| `12:30:00Z` | **11** | 08:30 | 07:30 |
+
+**0 names with no entry · 0 with a second distinct entry · 0 at midnight UTC.**
+
+Both values are **DST-invariant**, and that is the finding: Yahoo is not
+publishing a *time*, it is publishing a **session flag encoded as a constant**.
+So the anchor is the datum and the ET reading is a derived fiction.
+
+This supersedes the *"KNOWN CONSERVATIVE MISS — post-DST AMC reads as
+`unknown`"* note that stood here, which recorded the symptom (`20:00Z` is 15:00
+ET under EST, mid-session, so it failed the ≥16:00 cut) and declined to fix it on
+the grounds that widening the cut to 15:00 would be guessing at Yahoo's intent.
+**That reasoning was right and the conclusion was wrong**: the fix is not to
+widen a wall-clock cut, it is to stop reading a wall clock off a constant.
+Decoding the anchor makes no claim about 15:00 ET at all.
+
+**What changed, measured before → after over the same 39 names:** ten names moved
+`unknown` → `amc` — **PLTR, AMD, QUBT, APP, CRWV, CAVA, HOOD, ARM, SMR, KTOS** —
+all genuine AMC reporters, all dated in November, i.e. all under EST. The
+watchlist now classifies **bmo 11 · amc 28 · unknown 0**, against 11 / 18 / 10
+before. BMO was never affected, because `12:30Z` sits inside 04:00–09:30 ET in
+both regimes.
+
+**Anchors are decoded first and the wall-clock windows stay as the fallback.**
+That ordering is what keeps this honest if Yahoo changes: a genuinely published
+time is not *exactly* `12:30:00Z` or `20:00:00Z`, so it falls straight through to
+the windows; a re-anchoring to some third constant is decided by the windows and
+degrades to `unknown` if it lands outside them, which is the safe direction.
+Equality is **exact** — `19:59:59Z` and `20:00:01Z` are not the flag, and
+`earnings-timing.check.mjs` §2 drives both.
+
+**RESIDUAL, and it cannot be closed from the payload:** an anchor is a
+*convention*, so a report genuinely scheduled at exactly `20:00:00Z` that really
+was mid-session under EST would read `amc`. Nothing in `calendarEvents`
+distinguishes the two. At 39/39 on two values the convention is overwhelmingly
+the better reading, but it is an inference about an encoding, not an observation
+of a time — the same class as the `iv:` timing-clustering inference above.
+**`earnings-timing.check.mjs` §7 re-probes the live watchlist and prints the
+distribution; run it if the encoding is ever suspected of having moved.**
 | **Sectors** | `#sectors` | All 11 SPDR sectors, ETF % change plus a Claude-picked opportunity and avoid per sector. |
 | **Long** | `#long` | The only options screen. **Six lanes** (LEAPS / swing / debit verticals / calendars / straddle+strangle / defined-risk credit spreads). The standalone Premium tab was merged in as Lane F on 2026-08-10 — short premium is secondary and now sits as one lane among six, ranked by the same expectancy as everything else. |
 
