@@ -990,6 +990,96 @@ without ever opening that file.
 - `scheduled()` gates on the Pacific trading day before dispatching
 - `radar:{PT-DATE}` schema check stays strict equality; a radar **refusal is never
   cached** and returns `candidates: null`, never `[]`
+- `income:tickers` is **NOT** a sweep universe — `sweepUniverse()` reads
+  `watchlist:tickers` and nothing else, and folding the sleeve in would silently
+  enlarge three cron sweeps
+- income rows live under **`incomerow:`**, never `income:` — `TICKERS` and `PREV`
+  both pass `REC_SYMBOL_RE`, so sharing the prefix would let a row scan read the
+  sleeve list as a ticker
+- `incomerow:{TICKER}` schema check stays strict equality, and its freshness (6h)
+  and retention (36h) must not be equal
+
+### `GET /api/income/*` — the income sleeve
+
+The dividend half of decision_dash: three endpoints, one saved list, **no Claude
+call anywhere in the feature and no cron change**. Added 2026-08-19.
+
+```
+GET  /api/income/list            origin-gated read of income:tickers
+POST /api/income/save            requireSecret — it is a KV write
+GET  /api/income/batch?symbols=  one mechanical row per name
+```
+
+| constant | value | what it gates |
+|---|---|---|
+| `INCOME_SCHEMA` | 1 | row shape, checked by **strict equality** |
+| `INCOME_FRESH_MS` / `INCOME_ROW_TTL` | **6h / 36h** | the row's slow half — freshness ≠ retention, same reason as `premium:` |
+| `INCOME_MAX_SYMBOLS` / `INCOME_MAX_SLEEVE` | 30 / 60 | per batch request / per saved list; over-cap names are reported as `dropped`, never silently |
+| `INCOME_DIV_RANGE` / `INCOME_DIV_INTERVAL` | `6y` / `1mo` | the dividend-history pull. `1mo` carries the **identical** event set at 10,255 bytes against 164,899 for `1d` |
+| `INCOME_DIST_WINDOW` / `INCOME_FIXED_RATE_MIN_REPEAT` / `INCOME_DIST_MIN_CHANGES` | 12 / **0.5** / 4 | the fixed-rate vs variable classifier |
+| `INCOME_GROWTH_YEARS` / `INCOME_GROWTH_MATCH_DAYS` | 5 / 45 | the 5y growth anchor and how near a payment must sit to it |
+| `INCOME_EXDIV_UPCOMING_DAYS` / `INCOME_PAYOUT_HIGH_PCT` | 7 / **90** | the `exDivUpcoming` and `payoutHigh` events |
+| `INCOME_SHRINK_WARN_PCT` | 0.30 | WARN on save, **never blocks** — same guard as the watchlist |
+
+**`income:tickers` is a SEPARATE list from `watchlist:tickers`.** Different purpose,
+different cadence, and — the load-bearing part — `sweepUniverse()` reads the watchlist
+and nothing else, so folding the sleeve in would silently enlarge the IV sweep, the
+move-series sweep and the analysis refresh. Entries are **objects**,
+`{ ticker, addBelow }`. There is **no server-side default seeding**: an absent key
+means the user has not built a sleeve, and the reader returns **`entries: null`, never
+`[]`** with one of four distinguishable reasons — `[]` would mean "a sleeve exists and
+is empty", a different state. `POST` snapshots `income:prev` before every overwrite.
+
+**THE FIXED-RATE vs VARIABLE CLASSIFIER IS MEASURED, AND TWO OBVIOUS ALTERNATIVES
+WERE FALSIFIED.** A declared-dividend equity holds the same amount for several
+periods then raises; a fund passes through what it collected. So the discriminator is
+`zeroFrac` — the fraction of consecutive payments that are **exactly equal** — not how
+much the amount varies. Measured over 30 names, 2026-08-19:
+
+| discriminator | variable funds | steady quarterly ETFs | equities | verdict |
+|---|---|---|---|---|
+| coefficient of variation | 1.3–85.4% | 7.2–22.1% | 3.2–5.6% | **overlaps** — QYLD/RYLD/SPYI are *steadier* than SCHD/VYM/DGRO |
+| down-moves ÷ periods | 0.18–0.55 | 0.45–0.55 | 0.00 | **overlaps** |
+| **`zeroFrac`** | **0–18%** | **0–9%** | **73–100%** | **separates, with a 55-point gap** |
+
+It also gets **`O` right**: Realty Income pays *monthly* and scores 82%, so its growth
+rate and cut flag stay meaningful where a "monthly ⇒ variable" rule would have
+suppressed both. **Consequence the caller must know: SCHD, VYM, DGRO, VIG, SPYD, HDV
+and DVY all classify VARIABLE**, and suppressing `cut` for them is the point rather
+than a side effect — SCHD's latest distribution is −1.56% on the prior, which is a
+fluctuation and not a dividend cut.
+
+**`ttmRate` takes one year's worth of payments at the observed cadence, NEVER a
+365-day date window.** Four quarterly gaps span ~364 days, so a date window counts
+five quarters: before the fix JNJ read 6.54 against Yahoo's own 5.24 and O read 3.513
+against 3.235, both exactly one payment too many.
+
+**The ex-dividend gotcha, quantified.** `summaryDetail.exDividendDate` is routinely
+the most recent **past** date — the catalyst-card defect again. Measured over 15
+payers: **9 published a past date** (XOM PG MO ABBV HD T VZ IBM O), 6 a future one,
+and all 3 ETFs published nothing at all. The date ships as published with
+`exDivIsPast` against **ET today**, and **the next one is never estimated from
+cadence** — a projected date renders identically to a declared one.
+
+**Tax character (qualified vs ordinary) is OMITTED, not nulled.** Nothing in any
+Yahoo module carries it and it is not derivable: it depends on the issuer's 1099-DIV
+allocation and on the holder's own holding period. Only `taxCharacterNote` ships, so
+a consumer reaching for the value finds the reason rather than a field to fill.
+
+**Cost, measured** (`wrangler dev --remote` against production KV, N=10, crumb warm):
+**cold capCost 42** (21 ext + 21 bindings) · **warm 12** (1 ext + 11 bindings). The
+model is `4N + ceil(N/20) + 1` cold and `N + ceil(N/20) + 1` warm, plus 4 for a cold
+crumb. **The price half is live on every request** — one spark per 20 names — because
+a 6-hour-old price would make `inAddZone` a fiction, and that event is the whole
+reason `addBelow` exists.
+
+**KNOWN CAVEAT — `payoutHigh` fires on REITs and it is not a false reading.** `O`
+reports a published payout ratio of **236%** and ABBV **190%**, both genuine >90%
+values on Yahoo's GAAP-earnings denominator. A REIT pays out of FFO, so a GAAP payout
+ratio over 100% is ordinary for the structure rather than distress. The event is left
+firing as specified and the ratio itself ships on the row, so a consumer can render
+the number rather than only the flag; suppressing it would need an industry read this
+endpoint does not fetch.
 
 ### `GET /api/radar` — off-watchlist discovery
 

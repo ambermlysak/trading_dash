@@ -146,6 +146,32 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   scanner:{preset}    — day-trading scanner results (90s TTL)
 #   auction:{DATE}:{SYMBOLS} — closing-auction block trades, keyed by ET date (20h TTL)
 #   watchlist:tickers   — saved watchlist; also seeds scan universes
+#   income:tickers      — THE INCOME SLEEVE. A SEPARATE LIST from
+#                         watchlist:tickers and it must stay one: sweepUniverse()
+#                         reads only the watchlist, so nothing here ever enters a
+#                         cron sweep. Entries are OBJECTS, { ticker, addBelow },
+#                         addBelow being an optional user-set price. No TTL, no
+#                         server-side default seeding — an absent key means the
+#                         user has not built a sleeve and the endpoints say so
+#                         (entries: null, never []).
+#   income:prev         — previous sleeve, snapshotted before every overwrite;
+#                         the one-step undo, same as watchlist:prev.
+#   incomerow:{TICKER}  — one income row's SLOW half (yield + the field that
+#                         carried it, payout ratio, the whole dividend-history
+#                         read, the published ex-div date). 36h retained /
+#                         6h fresh (INCOME_ROW_TTL / INCOME_FRESH_MS — they
+#                         differ so a stale row still RENDERS, same reason as
+#                         premium:). INCOME_SCHEMA 1, strict equality. The price
+#                         half is NEVER cached: it comes live from one spark per
+#                         20 names, because a 6h-old price would make the
+#                         inAddZone event a fiction.
+#                         THE PREFIX IS `incomerow:`, NOT `income:`, AND THAT IS
+#                         LOAD-BEARING: `TICKERS` and `PREV` both pass
+#                         REC_SYMBOL_RE, so a row key of income:{TICKER} would
+#                         put the sleeve list inside the rows' own prefix and any
+#                         future list({prefix:'income:'}) would read the sleeve
+#                         as a ticker called TICKERS. Same rule as ivsweep:last
+#                         sitting outside the iv: prefix.
 #   rec:{TICKER}        — recommendation history, one entry per PT trading day
 #   recfwd:last         — PT date of last forward-return fill (dedup)
 #   admin:token         — bearer token gating the /api/admin/* routes

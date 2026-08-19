@@ -9599,6 +9599,705 @@ async function handleRadar(origin, env, params) {
   return json(radarResponse(built, { cached: false, wantTrail, mark }), 200, origin);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   INCOME SLEEVE  (/api/income) — the dividend half of decision_dash
+
+   THREE ENDPOINTS, ONE SAVED LIST, NO CLAUDE CALL ANYWHERE, NO CRON CHANGE.
+
+     GET  /api/income/list            origin-gated read of `income:tickers`
+     POST /api/income/save            requireSecret — it is a KV write
+     GET  /api/income/batch?symbols=  one mechanical row per name
+
+   `income:tickers` IS A DIFFERENT LIST FROM `watchlist:tickers` AND MUST STAY
+   ONE. Different purpose (hold-for-yield vs trade), different cadence, and —
+   the load-bearing part — `sweepUniverse()` reads `watchlist:tickers` and
+   nothing else, so folding the sleeve into it would silently enlarge the IV
+   sweep, the move-series sweep and the analysis refresh. Nothing here is ever
+   read by a cron.
+
+   Entries are OBJECTS, not bare strings: `{ ticker, addBelow }`, where
+   `addBelow` is an optional user-set price. `addBelow` is USER DATA, which is
+   why `inAddZone` is an honest event — it compares a live price to a number the
+   user typed, not to one this Worker invented.
+
+   ── WHAT YAHOO ACTUALLY RETURNS, probed live 2026-08-19 rather than recalled.
+      This is the FINRA field-name lesson; every one of these was wrong-by-
+      documentation and right-by-probe:
+
+     • `summaryDetail.dividendYield` is populated for EQUITY and **EMPTY `{}` for
+       every ETF**. ETFs carry it as `summaryDetail.yield` (and
+       `defaultKeyStatistics.yield`). Measured: KO `dividendYield` 0.0239; SCHD /
+       JEPQ / VYM `dividendYield` `{}` with `yield` 0.0313 / 0.1076 / 0.0224.
+       Reading only `dividendYield` ships a permanently-null yield on every fund
+       in an income sleeve — i.e. on most of it.
+     • Both are **decimals**. They are normalised to PERCENT here, and the field
+       that decided each row rides along as `dividendYieldSource`.
+     • **`trailingAnnualDividendRate` IS A FABRICATED ZERO ON ETFs.** SCHD and
+       JEPQ both report `0` while paying quarterly and monthly respectively; VYM
+       reports `{}`. A vendor 0 against a paying history is not a fact, so it is
+       **nulled** with `trailingRateNote` saying why, and `ttmRate` — summed from
+       the dividend history this handler already fetches — is shipped beside it.
+     • `payoutRatio` is `{}` for every ETF and `0` for a non-payer. Null payout
+       produces NO `payoutHigh` event, which is not the same as a passing one.
+     • `defaultKeyStatistics.lastDividendValue` / `lastDividendDate` are populated
+       for EQUITY (KO 0.53 / 2026-06-15, matching the chart history exactly) and
+       **empty for every ETF**, so the dividend history is the primary source for
+       the last payment and Yahoo's pair is only a cross-check.
+
+   ── THE EX-DIVIDEND GOTCHA, quantified. `summaryDetail.exDividendDate` is
+      routinely the most recent PAST date rather than the next one — the same
+      defect the catalyst card was fixed for. Measured over 15 payers on
+      2026-08-19: **9 published a PAST date** (XOM PG MO ABBV HD T VZ IBM O),
+      6 a future one, and all 3 ETFs published NOTHING. So the date ships as
+      published with `exDivIsPast` computed against ET today, and
+      **the next one is never estimated from cadence** — a projected date is
+      indistinguishable on screen from a declared one.
+
+   ── DIVIDEND HISTORY comes from `/v8/finance/chart?events=div`, no crumb.
+      `events.dividends[].date` is the **EX-DIVIDEND date**, not the pay date —
+      verified against KO, whose chart event 2026-06-15 equals
+      `defaultKeyStatistics.lastDividendDate` while `calendarEvents.dividendDate`
+      (the pay date) is 2026-10-01. The field is therefore named `lastDivExDate`.
+      `interval=1mo` carries the identical event set at **10,255 bytes against
+      164,899** for `interval=1d` (KO, range=6y, 24 events either way).
+
+   ── TAX CHARACTER (qualified vs ordinary) IS OMITTED ENTIRELY, not nulled.
+      Nothing in any Yahoo module carries it, and it is not derivable: it depends
+      on the issuer's own 1099-DIV box allocation and on the holder's own holding
+      period, neither of which this Worker can see. A field that could only ever
+      be a guess is worse than an absent one, because a guess renders.
+
+   ── COST, per rule #1, capCost = extFetches + bindingOps. Per NAME:
+        1 quoteSummary (crumbed) + 1 dividend chart          = 2 external
+        1 KV get + 1 KV put on a cold row                    = 2 bindings
+        1 KV get only, on a warm row                         = 1 binding
+      Plus, ONCE per batch: ceil(N/20) spark fetches and 1 KV get for the sleeve
+      (+1 get and +2 fetches and +1 put when the Yahoo crumb is also cold).
+
+        cold batch  = 4N + ceil(N/20) + 1   (+4 for a cold crumb)
+        warm batch  =  N + ceil(N/20) + 1   (+4 for a cold crumb)
+
+      MEASURED on `wrangler dev --remote` against production KV, 2026-08-19,
+      N=10 (PG MO ABBV MCD HD T VZ IBM LMT PEP), crumb warm:
+
+        cold  extFetches 21 · bindingOps 21 · **capCost 42**   (model: 41 + crumb)
+        warm  extFetches  1 · bindingOps 11 · **capCost 12**   (model: 12)
+
+      The one spark fetch is what makes the warm read cheap: the price half is
+      live for every name at ceil(N/20) fetches total, so nothing has to refetch
+      a quoteSummary just to keep `inAddZone` honest.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const INCOME_SCHEMA      = 1;
+const INCOME_FRESH_MS    = 6 * 3600_000;   // freshness horizon — drives the stale badge
+const INCOME_ROW_TTL     = 36 * 3600;      // retention OUTLIVES freshness so stale can render
+const INCOME_MAX_SYMBOLS = 30;             // per batch request
+const INCOME_MAX_SLEEVE  = 60;             // per saved list
+
+/* Dividend history pull. `1mo` bars because only the EVENTS are wanted — see
+   the payload measurement above. 6y so a 5-year growth rate has a margin. */
+const INCOME_DIV_RANGE    = '6y';
+const INCOME_DIV_INTERVAL = '1mo';
+
+/* THE FIXED-RATE vs VARIABLE CLASSIFIER, and it is measured rather than guessed.
+   A declared-dividend equity holds the SAME amount for several periods and then
+   raises; a fund distributes whatever it collected, so the amount moves nearly
+   every period. So the discriminator is "does the amount repeat", not "how much
+   does it vary" — `zeroFrac`, the fraction of consecutive payments that are
+   EXACTLY equal over the last `INCOME_DIST_WINDOW`.
+
+   MEASURED 2026-08-19 over 30 names, and this falsified two obvious alternatives:
+
+     coefficient of variation   variable 1.3-85.4%  vs  steady ETF 7.2-22.1%
+                                -> OVERLAPS COMPLETELY. QYLD/RYLD/SPYI/NUSI are
+                                   all STEADIER than SCHD/VYM/DGRO. Unusable.
+     down-moves / n             variable 0.18-0.55  vs  steady ETF 0.45-0.55
+                                -> overlaps. Unusable.
+     zeroFrac                   14 equities  73%, 82%, 100%   (min 73%)
+                                16 funds     0-18%            (max 18%)
+                                -> separates cleanly, threshold in a 55-pt gap.
+
+   AND IT GETS `O` RIGHT: Realty Income pays MONTHLY and scores 82%, because it
+   declares a monthly rate and holds it. A "monthly implies variable" rule would
+   have suppressed its growth and its cut flag, both of which are meaningful.
+
+   CONSEQUENCE THE CALLER MUST KNOW: SCHD, VYM, DGRO, VIG, SPYD, HDV and DVY all
+   classify VARIABLE (zeroFrac 0-9%, median period change 6.9-19.7%). Their
+   quarterly amount genuinely moves — SCHD's latest is -1.56% on the prior — so
+   suppressing `cut` for them is the point rather than a side effect: that -1.56%
+   is a distribution fluctuation and rendering it as a dividend cut is exactly
+   the false positive this classifier exists to prevent. */
+const INCOME_DIST_WINDOW           = 12;   // payments in the classifier window
+const INCOME_FIXED_RATE_MIN_REPEAT = 0.5;  // zeroFrac at or above this = fixed-rate
+const INCOME_DIST_MIN_CHANGES      = 4;    // below this the kind is `unknown`, never guessed
+
+const INCOME_GROWTH_YEARS      = 5;
+const INCOME_GROWTH_MATCH_DAYS = 45;  // how near the 5y-ago anchor a payment must sit
+const INCOME_EXDIV_UPCOMING_DAYS = 7;
+const INCOME_PAYOUT_HIGH_PCT     = 90;
+const INCOME_SHRINK_WARN_PCT     = 0.30;
+
+/* THE PER-NAME ROW LIVES UNDER `incomerow:`, NOT UNDER `income:`, AND THAT IS
+   NOT COSMETIC. The saved list is `income:tickers` (named by the spec) and its
+   snapshot is `income:prev`. Both `TICKERS` and `PREV` pass `REC_SYMBOL_RE`, so
+   a row key of `income:{TICKER}` would put the sleeve list inside the same
+   prefix as the rows — and any future `list({ prefix: 'income:' })` over the
+   rows would read the sleeve itself as a ticker called TICKERS. That is exactly
+   why `ivsweep:last`, `movesweep:last`, `macrosweep:last` and `moodsweep:last`
+   all sit OUTSIDE the prefixes they belong to. Nothing scans either prefix
+   today; this keeps it impossible rather than merely unused. */
+const incomeKey = sym => `incomerow:${sym.toUpperCase()}`;
+
+const INCOME_CADENCE = [
+  [35,  'monthly'], [115, 'quarterly'], [220, 'semi-annual'], [400, 'annual'],
+];
+function incomeCadenceLabel(days) {
+  if (days == null) return null;
+  for (const [max, label] of INCOME_CADENCE) if (days <= max) return label;
+  return 'irregular';
+}
+
+/** Today in US Eastern time as `YYYY-MM-DD` — the reference `exDivIsPast` is
+ *  computed against, because an ex-dividend date is an exchange-calendar date. */
+const etDateToday = () =>
+  new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date());
+
+const isoOfUnix = sec => (sec == null ? null : new Date(sec * 1000).toISOString().slice(0, 10));
+const daysBetweenIso = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86_400_000);
+
+/** Yahoo wraps scalars as `{raw, fmt}` and uses `{}` for absent. Both collapse
+ *  to null here — `{}` is NOT zero, and that distinction is the whole ETF bug. */
+const incNum = v => {
+  if (v == null) return null;
+  if (typeof v === 'object') return typeof v.raw === 'number' ? v.raw : null;
+  return typeof v === 'number' ? v : null;
+};
+
+/**
+ * Normalise one saved sleeve entry. Objects are the shape; a bare string is
+ * tolerated and coerced, because an older client sending strings should degrade
+ * to "no add-below set" rather than dropping the name out of the sleeve.
+ */
+function incomeEntry(raw) {
+  const t = typeof raw === 'string' ? raw : raw?.ticker;
+  const ticker = String(t ?? '').toUpperCase().trim();
+  if (!REC_SYMBOL_RE.test(ticker)) return null;
+  const ab = typeof raw === 'object' && raw ? Number(raw.addBelow) : NaN;
+  return { ticker, addBelow: Number.isFinite(ab) && ab > 0 ? Math.round(ab * 100) / 100 : null };
+}
+
+/**
+ * Read the saved sleeve. Returns `{ entries, byTicker, reason }` with entries
+ * NULL — never `[]` — on every unusable shape, each with its own message. `[]`
+ * would mean "the user has a sleeve and it is empty"; null means there is no
+ * sleeve, which is a different thing and the one an empty key actually is.
+ * NO SERVER-SIDE DEFAULT SEEDING: an absent key means the user has not built a
+ * sleeve, and every endpoint says exactly that.
+ */
+async function readIncomeSleeve(env) {
+  let raw = null, why = null;
+  try {
+    raw = await env?.REC_LOG?.get('income:tickers', 'json');
+  } catch (e) {
+    why = `KV read failed — ${e.message}`;
+  }
+  if (!why) {
+    if (raw == null)              why = 'key is absent — no income sleeve has been saved yet';
+    else if (!Array.isArray(raw)) why = `key holds ${typeof raw}, not an array`;
+    else if (!raw.length)         why = 'key holds an empty array';
+  }
+  if (!why) {
+    const entries = raw.map(incomeEntry).filter(Boolean);
+    const seen = new Map();
+    for (const e of entries) if (!seen.has(e.ticker)) seen.set(e.ticker, e);
+    if (!seen.size) why = `all ${raw.length} entries failed the symbol-shape test`;
+    else return { entries: [...seen.values()], byTicker: seen, reason: null, dropped: raw.length - seen.size };
+  }
+  return { entries: null, byTicker: new Map(), reason: `income:tickers ${why}`, dropped: 0 };
+}
+
+/** GET /api/income/list — origin-gated. An absent sleeve is a NAMED state. */
+async function handleIncomeList(origin, env) {
+  const mark = instrMark();
+  const s = await readIncomeSleeve(env);
+  return json({
+    entries: s.entries, count: s.entries?.length ?? null, reason: s.reason,
+    ...(s.dropped ? { droppedEntries: s.dropped } : {}),
+    _instr: instrSince(mark, 'income-list'),
+    _meta: srcMeta('Cloudflare KV', { ok: !!s.entries, ttlSeconds: null, note: s.reason || `${s.entries.length} names` }),
+  }, 200, origin);
+}
+
+/**
+ * POST /api/income/save — `requireSecret`, because it is a KV write.
+ *
+ * Same guard pattern as the watchlist and for the same reason: the previous
+ * value goes to `income:prev` before every overwrite, and a shrink past
+ * `INCOME_SHRINK_WARN_PCT` logs at WARN naming both counts and the dropped
+ * names. It does NOT block — deleting names is something the user is allowed to
+ * do, and a screen that refuses to save is worse than a log line. The snapshot
+ * is what makes a clobber recoverable.
+ */
+async function handleIncomeSave(request, origin, env) {
+  const body = await request.json().catch(() => null);
+  const list = Array.isArray(body?.tickers) ? body.tickers : null;
+  if (!list) return err('tickers required — an array of { ticker, addBelow }', 400, origin);
+
+  const seen = new Map();
+  let rejected = 0;
+  for (const raw of list) {
+    const e = incomeEntry(raw);
+    if (!e) { rejected++; continue; }
+    if (!seen.has(e.ticker)) seen.set(e.ticker, e);
+  }
+  const entries = [...seen.values()].slice(0, INCOME_MAX_SLEEVE);
+  if (!entries.length) return err('no usable entries — each needs a { ticker } of valid symbol shape', 400, origin);
+
+  let prev = null;
+  try { prev = await env?.REC_LOG?.get('income:tickers', 'json'); } catch (_) {}
+  const prevCount = Array.isArray(prev) ? prev.length : 0;
+
+  if (prevCount) {
+    try {
+      await env?.REC_LOG?.put('income:prev', JSON.stringify({ tickers: prev, replacedAt: Date.now() }));
+    } catch (e) { console.warn('[income] prev snapshot failed:', e.message); }
+  }
+  if (prevCount && entries.length < prevCount * (1 - INCOME_SHRINK_WARN_PCT)) {
+    const kept = new Set(entries.map(e => e.ticker));
+    const gone = prev.map(p => incomeEntry(p)?.ticker).filter(t => t && !kept.has(t));
+    console.warn(`[income] SHRINK: ${prevCount} -> ${entries.length} names. The previous value is in `
+      + `income:prev. Dropped: ${gone.join(', ')}`);
+  }
+
+  await env?.REC_LOG?.put('income:tickers', JSON.stringify(entries));
+  return json({ ok: true, count: entries.length, previousCount: prevCount, rejected }, 200, origin);
+}
+
+/* ── The dividend history read ──────────────────────────────────────────────
+   ONE chart fetch per name. Returns the sorted payment list plus everything
+   derived from it. Every refusal carries its own reason string; nothing here
+   returns a zero standing in for an absence. */
+async function incomeDividendHistory(sym) {
+  const d = await yahoo(
+    `/v8/finance/chart/${encodeURIComponent(sym)}`,
+    `?range=${INCOME_DIV_RANGE}&interval=${INCOME_DIV_INTERVAL}&events=div`,
+  );
+  const res = d?.chart?.result?.[0];
+  const ev  = res?.events?.dividends;
+  const list = ev
+    ? Object.values(ev)
+        .filter(x => x && typeof x.amount === 'number' && typeof x.date === 'number')
+        .sort((a, b) => a.date - b.date)
+    : [];
+  return list;
+}
+
+/**
+ * Everything the payment list supports, and nothing it does not.
+ *
+ * The ordering matters: the KIND is decided first, and `growth5y` / `cut` are
+ * then either computed or refused on it. A variable distribution's
+ * period-over-period move is not a cut and its point-to-point 5y ratio is two
+ * noisy draws, so both refuse WITH THE REASON rather than rendering a number.
+ */
+function incomeDividendFacts(list) {
+  const out = {
+    paysDividend: false, distributionKind: 'none', distributionKindBasis: null,
+    cadenceDays: null, cadence: null, paymentsPerYear: null,
+    lastDivAmount: null, lastDivExDate: null, priorDivAmount: null, lastVsPriorPct: null,
+    divHistoryCount: 0, divHistorySpanYears: null,
+    ttmRate: null, ttmSum5yAgo: null,
+    growth5y: null, growth5yReason: 'no dividend history',
+    cut: null, cutPct: null, cutReason: 'no dividend history',
+  };
+  if (!list.length) {
+    out.growth5yReason = 'no dividend has ever been paid in the window read';
+    out.cutReason      = out.growth5yReason;
+    return out;
+  }
+
+  out.paysDividend    = true;
+  out.divHistoryCount = list.length;
+  const last  = list[list.length - 1];
+  const prior = list.length >= 2 ? list[list.length - 2] : null;
+  out.lastDivAmount  = last.amount;
+  out.lastDivExDate  = isoOfUnix(last.date);      // EX-DIV date, not the pay date
+  out.priorDivAmount = prior?.amount ?? null;
+  if (prior && prior.amount > 0) {
+    out.lastVsPriorPct = Math.round((last.amount - prior.amount) / prior.amount * 10000) / 100;
+  }
+  out.divHistorySpanYears =
+    Math.round((last.date - list[0].date) / 86400 / 365.25 * 100) / 100;
+
+  // Cadence, from the median gap over the recent window.
+  const gaps = [];
+  for (let i = Math.max(1, list.length - INCOME_DIST_WINDOW); i < list.length; i++) {
+    gaps.push((list[i].date - list[i - 1].date) / 86400);
+  }
+  if (gaps.length) {
+    const g = [...gaps].sort((a, b) => a - b);
+    out.cadenceDays = Math.round(g.length % 2 ? g[(g.length - 1) / 2] : (g[g.length / 2 - 1] + g[g.length / 2]) / 2);
+    out.cadence = incomeCadenceLabel(out.cadenceDays);
+  }
+
+  /* Trailing 12 months of distributions — the honest annual rate for a fund
+     whose vendor `trailingAnnualDividendRate` is a fabricated 0, and the raw
+     input for a TTM-sum growth rate later.
+
+     TAKE ONE YEAR'S WORTH OF PAYMENTS AT THE OBSERVED CADENCE, NOT A 365-DAY
+     DATE WINDOW. A 365-day window is off by one whenever the cadence divides it
+     unevenly: four quarterly gaps span ~364 days, so the fifth payment back
+     falls INSIDE the window and the sum reads five quarters. Measured before the
+     fix — JNJ 6.54 against Yahoo's 5.24, and O 3.513 against 3.235, both exactly
+     one payment too many. After: JNJ 5.24 and KO 2.08, matching Yahoo's own
+     field to the cent on every name where Yahoo publishes one. */
+  const perYear = out.cadenceDays ? Math.max(1, Math.round(365 / out.cadenceDays)) : null;
+  const sumLastN = (endIdx, n) => {
+    if (!n || endIdx + 1 < n) return null;
+    let t = 0;
+    for (let i = endIdx; i > endIdx - n; i--) t += list[i].amount;
+    return Math.round(t * 1e6) / 1e6;
+  };
+  out.paymentsPerYear = perYear;
+  out.ttmRate = sumLastN(list.length - 1, perYear);
+  // The same construction anchored five years back, so a TTM-sum growth rate can
+  // be computed later without a second fetch. Null unless a real anchor exists.
+  const fiveBackS = last.date - INCOME_GROWTH_YEARS * 365.25 * 86400;
+  let fiveIdx = -1, fiveGap = Infinity;
+  for (let i = 0; i < list.length; i++) {
+    const g = Math.abs((list[i].date - fiveBackS) / 86400);
+    if (g < fiveGap) { fiveGap = g; fiveIdx = i; }
+  }
+  out.ttmSum5yAgo = (fiveIdx >= 0 && fiveGap <= INCOME_GROWTH_MATCH_DAYS)
+    ? sumLastN(fiveIdx, perYear) : null;
+
+  // ── Kind. Measured on repeats, not on variance. See the constant's block. ──
+  const win = list.slice(-(INCOME_DIST_WINDOW + 1));
+  const chg = [];
+  for (let i = 1; i < win.length; i++) {
+    if (win[i - 1].amount > 0) chg.push((win[i].amount - win[i - 1].amount) / win[i - 1].amount);
+  }
+  if (chg.length < INCOME_DIST_MIN_CHANGES) {
+    out.distributionKind = 'unknown';
+    out.distributionKindBasis = { changes: chg.length, needed: INCOME_DIST_MIN_CHANGES, zeroFrac: null };
+    const r = `only ${chg.length} payment-to-payment change${chg.length === 1 ? '' : 's'} available, `
+            + `${INCOME_DIST_MIN_CHANGES} needed to tell a declared fixed rate from a variable distribution`;
+    out.growth5yReason = r;
+    out.cutReason      = r;
+    return out;
+  }
+  const zeroFrac = chg.filter(c => Math.abs(c) < 1e-9).length / chg.length;
+  out.distributionKind = zeroFrac >= INCOME_FIXED_RATE_MIN_REPEAT ? 'fixed-rate' : 'variable';
+  out.distributionKindBasis = {
+    zeroFrac: Math.round(zeroFrac * 1000) / 1000, changes: chg.length,
+    threshold: INCOME_FIXED_RATE_MIN_REPEAT,
+  };
+
+  if (out.distributionKind === 'variable') {
+    const r = 'variable distribution — this fund passes through what it collects, so the amount moves '
+      + `almost every period (${Math.round(zeroFrac * 100)}% of consecutive payments repeat, against the `
+      + `${Math.round(INCOME_FIXED_RATE_MIN_REPEAT * 100)}% a declared fixed rate clears). A period-over-period `
+      + 'decline is a distribution fluctuation, not a cut, and a point-to-point 5y ratio is two noisy draws. '
+      + '`ttmRate` and `ttmSum5yAgo` are shipped as the raw inputs.';
+    out.growth5yReason = r;
+    out.cutReason      = r;
+    return out;
+  }
+
+  // ── Fixed rate: a decline IS a cut, because the amount otherwise repeats. ──
+  if (prior == null) {
+    out.cutReason = 'only one payment on record — nothing to compare it against';
+  } else {
+    out.cut = last.amount < prior.amount;
+    /* ONLY populated when `cut` is true. It read `lastVsPriorPct` unconditionally,
+       so JNJ — which RAISED — shipped `cut: false, cutPct: 3.08`: a positive
+       number under a field named for a cut. The signed change is already
+       `lastVsPriorPct` and is shipped either way. */
+    out.cutPct = out.cut ? out.lastVsPriorPct : null;
+    out.cutReason = null;
+  }
+
+  // ── Fixed rate: 5y growth, point to point, only on a real 5y anchor. ──
+  const target = last.date - INCOME_GROWTH_YEARS * 365.25 * 86400;
+  let anchor = null, best = Infinity;
+  for (const p of list) {
+    const gap = Math.abs((p.date - target) / 86400);
+    if (gap < best) { best = gap; anchor = p; }
+  }
+  if (!anchor || best > INCOME_GROWTH_MATCH_DAYS) {
+    out.growth5yReason = `history spans ${out.divHistorySpanYears}y and the nearest payment to the `
+      + `${INCOME_GROWTH_YEARS}-year anchor is ${Math.round(best)} days away (tolerance `
+      + `${INCOME_GROWTH_MATCH_DAYS}d) — not enough to state a ${INCOME_GROWTH_YEARS}-year growth rate`;
+  } else if (!(anchor.amount > 0)) {
+    out.growth5yReason = `the payment ${INCOME_GROWTH_YEARS} years ago was ${anchor.amount}, so a growth rate is undefined`;
+  } else {
+    const cagr = Math.pow(last.amount / anchor.amount, 1 / INCOME_GROWTH_YEARS) - 1;
+    out.growth5y = Math.round(cagr * 10000) / 100;   // percent
+    out.growth5yFrom = { amount: anchor.amount, exDate: isoOfUnix(anchor.date) };
+    out.growth5yReason = null;
+  }
+  return out;
+}
+
+/** Build one cold row: 1 crumbed quoteSummary + 1 dividend chart. */
+async function incomeRow(sym, env) {
+  const [qsRes, divRes] = await Promise.allSettled([
+    yahooAuth(
+      `/v10/finance/quoteSummary/${encodeURIComponent(sym)}`,
+      '?modules=price,summaryDetail,defaultKeyStatistics,calendarEvents',
+      env,
+    ),
+    incomeDividendHistory(sym),
+  ]);
+
+  const res = qsRes.status === 'fulfilled' ? (qsRes.value?.quoteSummary?.result?.[0] || {}) : null;
+  const divList = divRes.status === 'fulfilled' ? divRes.value : null;
+
+  if (!res && divList == null) {
+    return {
+      symbol: sym.toUpperCase(), schema: INCOME_SCHEMA, ts: Date.now(), ok: false,
+      status: 'no-data',
+      reason: `both upstream reads failed — quoteSummary: ${qsRes.reason?.message || 'n/a'}; `
+            + `dividend history: ${divRes.reason?.message || 'n/a'}`,
+    };
+  }
+
+  const sd = res?.summaryDetail || {};
+  const ks = res?.defaultKeyStatistics || {};
+  const ce = res?.calendarEvents || {};
+  const pr = res?.price || {};
+
+  /* YIELD — the field that carries it depends on the instrument, so the field
+     that decided the number ships with it rather than being assumed. */
+  let dividendYield = incNum(sd.dividendYield), dividendYieldSource = 'summaryDetail.dividendYield';
+  if (dividendYield == null) { dividendYield = incNum(sd.yield); dividendYieldSource = 'summaryDetail.yield'; }
+  if (dividendYield == null) { dividendYield = incNum(ks.yield); dividendYieldSource = 'defaultKeyStatistics.yield'; }
+  if (dividendYield == null) dividendYieldSource = null;
+  else dividendYield = Math.round(dividendYield * 10000) / 100;   // decimal -> percent
+
+  let payoutRatioRaw = incNum(sd.payoutRatio);
+  const facts = incomeDividendFacts(divList || []);
+
+  /* Yahoo's trailing rate, and the ETF zero it fabricates. A 0 against a history
+     that plainly shows payments is a vendor artifact, not a fact about the fund. */
+  let trailingAnnualDividendRate = incNum(sd.trailingAnnualDividendRate);
+  let trailingRateNote = null;
+  if (trailingAnnualDividendRate === 0 && facts.ttmRate) {
+    trailingRateNote = `Yahoo reports trailingAnnualDividendRate 0 while the dividend history shows `
+      + `${facts.ttmRate} paid over the trailing 12 months — a known vendor artifact on funds. `
+      + 'Suppressed rather than shipped as a fact; read `ttmRate`, which is summed from the history.';
+    trailingAnnualDividendRate = null;
+  }
+
+  /* A NON-PAYER RENDERS "no dividend", NEVER ZEROS. Yahoo hands back
+     `trailingAnnualDividendRate: 0` and `payoutRatio: 0` for TSLA — arithmetically
+     defensible and, on screen, a measured 0% payout sitting next to a measured
+     $0.00 rate. There is nothing to measure: the company pays nothing. Both are
+     suppressed and `noDividendNote` says which state this is. */
+  let noDividendNote = null;
+  if (!facts.paysDividend) {
+    noDividendNote = `No dividend. ${divList == null ? 'The dividend history could not be read' : `Yahoo's dividend history carries no payment in the ${INCOME_DIV_RANGE} window read`}`
+      + `, so the yield, trailing rate and payout ratio are suppressed rather than shipped as zeros`
+      + `${trailingAnnualDividendRate === 0 || payoutRatioRaw === 0 ? ' (Yahoo returns 0 for both)' : ''}.`;
+    trailingAnnualDividendRate = null;
+    payoutRatioRaw = null;
+    trailingRateNote = null;
+    dividendYield = null;
+    dividendYieldSource = null;
+  }
+
+  const exDivUnix = incNum(sd.exDividendDate) ?? incNum(ce.exDividendDate);
+  const exDivDate = isoOfUnix(exDivUnix);
+  /* THE REASON MUST NAME ITS OWN CAUSE (honesty rule 17). This said "Yahoo
+     publishes none for any ETF" on TSLA — an EQUITY that simply pays no
+     dividend. Three different states, three different sentences. */
+  const exDivReason = exDivDate ? null
+    : !facts.paysDividend
+      ? 'no dividend is paid, so there is no ex-dividend date to publish'
+      : (pr.quoteType === 'ETF' || pr.quoteType === 'MUTUALFUND')
+        ? `Yahoo publishes no exDividendDate for funds — it returned none for any of SCHD, JEPQ or VYM. `
+          + `The last ex-div this fund actually went through is \`lastDivExDate\` (${facts.lastDivExDate}); `
+          + 'the NEXT one is deliberately NOT estimated from the payment cadence, because a projected '
+          + 'date renders identically to a declared one.'
+        : 'Yahoo published no exDividendDate for this symbol. The next one is deliberately NOT estimated '
+          + 'from the payment cadence, because a projected date renders identically to a declared one.';
+
+  return {
+    symbol: sym.toUpperCase(), schema: INCOME_SCHEMA, ts: Date.now(), ok: true, status: 'ok',
+    name: pr.longName || pr.shortName || null,
+    quoteType: pr.quoteType || null,
+    quotePrice: incNum(pr.regularMarketPrice),      // as of THIS build; the batch overlays live
+    dividendYield, dividendYieldSource,
+    trailingAnnualDividendRate, trailingRateNote,
+    payoutRatio: payoutRatioRaw == null ? null : Math.round(payoutRatioRaw * 10000) / 100,   // percent
+    exDivDate, exDivReason,
+    noDividendNote,
+    yahooLastDividendValue: incNum(ks.lastDividendValue),
+    yahooLastDividendDate:  isoOfUnix(incNum(ks.lastDividendDate)),
+    ...facts,
+    partial: !res || divList == null,
+    partialReason: !res ? `quoteSummary failed — ${qsRes.reason?.message}`
+      : divList == null ? `dividend history failed — ${divRes.reason?.message}` : null,
+  };
+}
+
+async function readIncomeRow(sym, env) {
+  try {
+    const row = await env?.REC_LOG?.get(incomeKey(sym), 'json');
+    return row && row.schema === INCOME_SCHEMA ? row : null;   // strict equality
+  } catch (_) { return null; }
+}
+
+/**
+ * GET /api/income/batch?symbols=
+ *
+ * The row's SLOW half (yield, payout, dividend history, published ex-div) is
+ * cached `INCOME_FRESH_MS` and retained `INCOME_ROW_TTL` — the two differ on
+ * purpose, same as `premium:` and `long:`: evicting at the freshness horizon
+ * leaves nothing to render AS stale, and a 7-hour-old payout ratio badged stale
+ * beats a blank row.
+ *
+ * The FAST half (price, change, trend, and therefore `inAddZone`) is taken LIVE
+ * from the spark on every request — one fetch per 20 names — and carries its own
+ * `priceAsOf`. A 6-hour-old price would make `inAddZone` a fiction, and that
+ * event is the whole reason `addBelow` exists.
+ */
+async function handleIncomeBatch(symbols, origin, env, params) {
+  const mark = instrMark();
+  const requested = symbols.split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  const tickers = [...new Set(requested)].filter(t => REC_SYMBOL_RE.test(t)).slice(0, INCOME_MAX_SYMBOLS);
+  if (!tickers.length) return err('symbols required', 400, origin);
+  const force = params?.get('refresh') === '1';
+
+  // `addBelow` is user data and comes from the saved sleeve — one KV read.
+  const sleeve = await readIncomeSleeve(env);
+
+  await getYahooCrumb(env).catch(() => {});
+  const sparkPromise = yahooSparkCloses(tickers, '1y', 4, { withTimestamps: true }).catch(() => new Map());
+
+  const rows = {};
+  const CHUNK = 4;   // same reason as the watchlist batch: do not fan out at Yahoo
+  for (let i = 0; i < tickers.length; i += CHUNK) {
+    const batch = tickers.slice(i, i + CHUNK);
+    await allSettledCounted(batch.map(async (t) => {
+      let row = force ? null : await readIncomeRow(t, env);
+      let cachedAge = row ? Date.now() - (row.ts || 0) : null;
+      if (!row || cachedAge >= INCOME_FRESH_MS) {
+        const fresh = await incomeRow(t, env).catch(e => ({
+          symbol: t, schema: INCOME_SCHEMA, ts: Date.now(), ok: false, status: 'no-data',
+          reason: `row build failed — ${e.message}`,
+        }));
+        /* A failed build must not evict a good stale row: a labelled 7-hour-old
+           yield beats a blank cell (honesty rule 24). Only a successful build
+           is written. */
+        if (fresh.ok) {
+          try { await env?.REC_LOG?.put(incomeKey(t), JSON.stringify(fresh), { expirationTtl: INCOME_ROW_TTL }); }
+          catch (e) { console.warn(`[income] cache write failed for ${t}:`, e.message); }
+          row = fresh;
+        } else if (!row) {
+          row = fresh;
+        }
+      }
+      rows[t] = row;
+    }), 'income:rows');
+  }
+
+  const spark = await sparkPromise;
+  const etToday = etDateToday();
+  const out = [];
+  for (const t of tickers) {
+    const row = rows[t] || { symbol: t, schema: INCOME_SCHEMA, ok: false, status: 'not-loaded', ts: null,
+      reason: 'the row was neither cached nor built on this request' };
+
+    // ── Live half, from the spark. ──
+    const s = spark.get(t);
+    const closes = Array.isArray(s?.closes) ? s.closes : [];
+    const stamps = Array.isArray(s?.timestamps) ? s.timestamps : null;
+    let price = null, prevClose = null, chgPct = null, priceAsOf = null;
+    if (closes.length) {
+      price = closes[closes.length - 1];
+      priceAsOf = stamps ? isoOfUnix(stamps[stamps.length - 1]) : null;
+      if (closes.length >= 2) {
+        prevClose = closes[closes.length - 2];
+        if (prevClose > 0) chgPct = Math.round((price - prevClose) / prevClose * 10000) / 100;
+      }
+    }
+    /* SMA200 over COMPLETED closes: the final bar is dropped only when the spark's
+       OWN timestamps say it is today's forming one. The window is decided by the
+       same call's data, never by a second clock read. */
+    let sma200 = null, aboveSma200 = null, trendReason = null;
+    const settled = (stamps && priceAsOf === etToday) ? closes.slice(0, -1) : closes;
+    if (settled.length >= 200) {
+      sma200 = Math.round(settled.slice(-200).reduce((a, b) => a + b, 0) / 200 * 10000) / 10000;
+      if (price != null) aboveSma200 = price > sma200;
+    } else {
+      trendReason = `${settled.length} completed daily closes available, 200 needed for a 200-day average`;
+    }
+
+    const addBelow = sleeve.byTicker.get(t)?.addBelow ?? null;
+    const inAddZone = addBelow != null && price != null ? price <= addBelow : null;
+
+    const exDivDaysAway = row.exDivDate ? daysBetweenIso(etToday, row.exDivDate) : null;
+    const exDivIsPast   = row.exDivDate ? exDivDaysAway < 0 : null;
+
+    // ── Events. A null input produces NO event — never a firing one. ──
+    const events = [];
+    if (exDivIsPast === false && exDivDaysAway <= INCOME_EXDIV_UPCOMING_DAYS) events.push('exDivUpcoming');
+    if (row.cut === true) events.push('cut');
+    if (row.payoutRatio != null && row.payoutRatio > INCOME_PAYOUT_HIGH_PCT) events.push('payoutHigh');
+    if (inAddZone === true) events.push('inAddZone');
+
+    const age = row.ts ? Date.now() - row.ts : null;
+    out.push({
+      ...row,
+      ticker: t,
+      price, prevClose, chgPct, priceAsOf,
+      priceReason: closes.length ? null : 'the spark returned no closes for this symbol',
+      sma200, aboveSma200, trendReason,
+      exDivIsPast, exDivDaysAway,
+      addBelow,
+      addBelowSource: sleeve.entries ? 'income:tickers' : 'unavailable',
+      inAddZone,
+      events,
+      /* Two ages, never one: the dividend half is cached and the price half is
+         live, so one as-of for both would be a lie about whichever is older. */
+      divAgeMs: age, stale: age == null ? true : age >= INCOME_FRESH_MS, freshMs: INCOME_FRESH_MS,
+    });
+  }
+
+  const loaded = out.filter(r => r.ok).length;
+  return json({
+    schema: INCOME_SCHEMA,
+    count: out.length, loaded,
+    rows: out,
+    dropped: requested.length - tickers.length,
+    /* The sleeve's own state rides along, because `addBelow` — and therefore the
+       `inAddZone` event — is silently absent when the sleeve is unreadable, and
+       a silently absent event is indistinguishable from one that did not fire. */
+    sleeve: { ok: !!sleeve.entries, count: sleeve.entries?.length ?? null, reason: sleeve.reason },
+    gates: {
+      exDivUpcomingDays: INCOME_EXDIV_UPCOMING_DAYS,
+      payoutHighPct: INCOME_PAYOUT_HIGH_PCT,
+      fixedRateMinRepeat: INCOME_FIXED_RATE_MIN_REPEAT,
+      growthYears: INCOME_GROWTH_YEARS,
+      freshMs: INCOME_FRESH_MS,
+    },
+    /* THE FIELD ITSELF IS OMITTED, not shipped as null — a null invites a column
+       that renders "—" as though the value were merely pending. Only the note
+       exists, so a consumer reaching for the value finds the reason instead. */
+    taxCharacterNote: 'Qualified vs ordinary is NOT shipped and is not derivable here. No Yahoo module '
+      + 'carries it, and it depends on the issuer\'s own 1099-DIV allocation and on the holder\'s holding '
+      + 'period — neither of which this Worker can see. Omitted rather than estimated.',
+    etToday,
+    _instr: instrSince(mark, 'income-batch'),
+    _meta: srcMeta('Yahoo quoteSummary + dividend history', {
+      ok: loaded > 0, delayed: true, ttlSeconds: Math.round(INCOME_FRESH_MS / 1000), asOf: etToday,
+      note: `${loaded}/${out.length} rows · dividends cached ${Math.round(INCOME_FRESH_MS / 3600000)}h · `
+          + `price live · ${YAHOO_DELAY_NOTE}`,
+    }),
+  }, 200, origin);
+}
+
 async function handleMarketIPOs(origin, env) {
   const KV_KEY = 'market:ipos';
   const IPO_TTL = 43_200_000; // 12 hours
@@ -11665,6 +12364,24 @@ export default {
            on the path, so there is nothing for `aiGuard` to protect, and the
            only write is its own `radar:{PT-date}` day cache. */
         case 'radar':    return await handleRadar(origin, env, url.searchParams);
+        /* The income sleeve. No Claude call anywhere in this feature, so the
+           two reads are origin-gated only; `save` writes `income:tickers` and
+           therefore takes `requireSecret`, the same rule as every other KV
+           write. Nothing here is read by a cron — `income:tickers` is a
+           SEPARATE list from `watchlist:tickers`, which is the only sweep
+           universe. */
+        case 'income':
+          if (sub === 'batch') return await handleIncomeBatch(
+            url.searchParams.get('symbols') || '', origin, env, url.searchParams,
+          );
+          if (sub === 'save') {
+            if (request.method !== 'POST') return err('method not allowed', 405, origin);
+            const g = requireSecret(request, env, origin);
+            if (g) return g;
+            return await handleIncomeSave(request, origin, env);
+          }
+          if (!sub || sub === 'list') return await handleIncomeList(origin, env);
+          return err('unknown income route', 404, origin);
         case 'market':
           if (sub === 'snapshot')    return await handleMarketSnapshot(origin, env);
           if (sub === 'movers')      return await handleMarketMovers(origin, env);

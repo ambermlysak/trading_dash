@@ -47,7 +47,82 @@ GET  /api/market/golden-cross     Names set up for a golden cross, EMA + SMA gap
 GET  /api/market/econ-calendar    Next FOMC / CPI events from the official schedule
 GET  /api/earnings/:ticker        Last report: numbers, price reaction, call coverage (12h KV)
 GET  /api/radar                   Off-watchlist discovery, <=5 quality names (radar:{PT-date})
+GET  /api/income/list             The saved income sleeve (income:tickers), origin-gated
+POST /api/income/save             Persist the sleeve — requireSecret, snapshots income:prev
+GET  /api/income/batch?symbols=   One mechanical dividend row per name (incomerow:{TICKER})
 ```
+
+**The income sleeve (`/api/income/*`) — the dividend half of decision_dash.** Three
+endpoints, one saved list, **no Claude call anywhere in the feature** and **no cron
+touches any of it**. The two reads are origin-gated; `save` writes KV and therefore
+takes `requireSecret`.
+
+**`income:tickers` IS A DIFFERENT LIST FROM `watchlist:tickers` AND MUST STAY ONE.**
+`sweepUniverse()` reads `watchlist:tickers` and nothing else, so folding the sleeve
+into it would silently enlarge the IV sweep, the move-series sweep and the analysis
+refresh. Entries are **objects** — `{ ticker, addBelow }` — where `addBelow` is an
+optional user-set price. There is **no server-side default seeding**: an absent key
+means the user has not built a sleeve, and `readIncomeSleeve()` returns
+**`entries: null`, never `[]`**, with one of four distinguishable reasons. `[]` would
+mean "a sleeve exists and is empty", which is a different state. `POST` snapshots to
+`income:prev` before every overwrite and WARNs past `INCOME_SHRINK_WARN_PCT` (30%)
+without blocking — the same guard, and the same reasoning, as the watchlist.
+
+**What Yahoo actually returns, probed live 2026-08-19 — every one of these was
+wrong-by-documentation and right-by-probe:**
+
+| what | where it really is |
+|---|---|
+| yield, EQUITY | `summaryDetail.dividendYield` (KO 0.0239) |
+| yield, ETF | **`summaryDetail.yield`** — `dividendYield` is `{}` for every fund (SCHD 0.0313, JEPQ 0.1076, VYM 0.0224). Reading only `dividendYield` ships a permanently-null yield on most of an income sleeve |
+| units | **decimals**, normalised to percent here; the field that decided each row ships as `dividendYieldSource` |
+| `trailingAnnualDividendRate` | **a fabricated `0` on ETFs** — SCHD and JEPQ both report 0 while paying. Nulled with `trailingRateNote`; `ttmRate` (summed from the history) ships beside it |
+| `payoutRatio` | `{}` for every ETF, `0` for a non-payer. A null payout produces **no** `payoutHigh` event |
+| last payment | `defaultKeyStatistics.lastDividendValue`/`lastDividendDate` are populated for EQUITY and **empty for every ETF**, so the chart history is primary and Yahoo's pair is only a cross-check |
+
+**The ex-dividend gotcha, quantified.** `summaryDetail.exDividendDate` is routinely the
+most recent **past** date — the same defect the catalyst card was fixed for. Measured
+over 15 payers: **9 published a past date** (XOM PG MO ABBV HD T VZ IBM O), 6 a future
+one, and all 3 ETFs published nothing. So the date ships as published with
+`exDivIsPast` computed against **ET today**, and **the next one is never estimated from
+cadence** — a projected date renders identically to a declared one.
+
+**Dividend history** comes from `/v8/finance/chart?events=div` (no crumb).
+`events.dividends[].date` is the **EX-DIVIDEND date, not the pay date** — verified on
+KO, whose chart event `2026-06-15` equals `defaultKeyStatistics.lastDividendDate` while
+`calendarEvents.dividendDate` (the pay date) is `2026-10-01`. Hence the field name
+`lastDivExDate`. `interval=1mo` carries the identical event set at **10,255 bytes
+against 164,899** for `interval=1d`.
+
+**The fixed-rate vs variable classifier is measured, and two obvious alternatives were
+falsified.** A declared-dividend equity holds the same amount for several periods then
+raises; a fund distributes what it collected. So the discriminator is `zeroFrac` — the
+fraction of consecutive payments that are **exactly equal** — not how much the amount
+varies. Over 30 names: coefficient of variation gave variable 1.3–85.4% against steady
+ETF 7.2–22.1% (**overlapping**, QYLD/RYLD/SPYI are steadier than SCHD/VYM); down-moves
+per period also overlapped; `zeroFrac` gave **14 equities at 73–100% against 16 funds at
+0–18%**, a 55-point gap. It also gets **`O` right** — Realty Income pays monthly and
+scores 82%, so its growth and cut flag stay meaningful where a "monthly ⇒ variable"
+rule would have suppressed them. **Consequence: SCHD, VYM, DGRO, VIG, SPYD, HDV and DVY
+all classify VARIABLE**, and suppressing `cut` for them is the point — SCHD's latest is
+−1.56% on the prior, which is a distribution fluctuation, not a cut.
+
+`ttmRate` takes **one year's worth of payments at the observed cadence, not a 365-day
+date window** — four quarterly gaps span ~364 days, so a date window counts five
+quarters. Before the fix JNJ read 6.54 against Yahoo's 5.24 and O read 3.513 against
+3.235; after, both match Yahoo to the cent.
+
+**Tax character (qualified vs ordinary) is OMITTED, not nulled.** No Yahoo module
+carries it and it is not derivable — it depends on the issuer's 1099-DIV allocation and
+on the holder's holding period. Only `taxCharacterNote` exists, so a consumer reaching
+for the value finds the reason instead of a field to fill with a guess.
+
+Cost, **measured** (`wrangler dev --remote` against production KV, N=10, crumb warm):
+**cold capCost 42** (21 ext + 21 bindings) · **warm 12** (1 ext + 11 bindings). The row's
+slow half is cached `INCOME_FRESH_MS` (6h) and retained `INCOME_ROW_TTL` (36h) — they
+differ for the same reason as `premium:`; the **price half is live on every request**
+from one spark per 20 names, because a 6-hour-old price would make `inAddZone` a
+fiction and that event is the whole reason `addBelow` exists.
 
 **`GET /api/radar` — off-watchlist discovery.** Answers one question: which quality
 names *not* on `watchlist:tickers` deserve attention today. **No Claude call anywhere
@@ -509,6 +584,9 @@ differs from its retention, both are given and the reason is in the notes.
 | `market:goldencross` | 2h | Golden-cross setups (served fresh for 1h via `GOLDEN_TTL`) |
 | `scanner:{preset}` | 5min | Day-trading scanner results (served fresh for 90s via `SCAN_TTL`) |
 | `auction:{DATE}:{SYMBOLS}` | 20h | Closing-auction block trades, keyed by ET date |
+| `income:tickers` | none | **The income sleeve — a DIFFERENT list from `watchlist:tickers` and it must stay one.** `sweepUniverse()` reads only the watchlist, so nothing here ever enters a cron sweep. Entries are **objects**, `{ ticker, addBelow }`, `addBelow` being an optional user-set price. Written only by `POST /api/income/save` (`requireSecret`). **No server-side default seeding** — absent means the user has not built a sleeve, and every endpoint returns `entries: null` with a named reason rather than `[]`. |
+| `income:prev` | none | Previous sleeve, snapshotted before every overwrite — the one-step undo, exactly as `watchlist:prev` is for the watchlist. Verified by readback 2026-08-19. |
+| `incomerow:{TICKER}` | **36h retention / 6h freshness** (`INCOME_ROW_TTL` / `INCOME_FRESH_MS`) | One income row's SLOW half: yield and its source field, payout ratio, the whole dividend history read (kind, cadence, last/prior payment, `ttmRate`, 5y growth, cut) and the published ex-div date. `INCOME_SCHEMA` 1, **strict equality** — any other value reads as absent and the row rebuilds. Freshness ≠ retention for the same reason as `premium:`: evicting at the freshness horizon leaves nothing to render *as* stale. **The prefix is `incomerow:`, NOT `income:`, and that is load-bearing** — `TICKERS` and `PREV` both pass `REC_SYMBOL_RE`, so a row key of `income:{TICKER}` would put the sleeve list inside the rows' own prefix and any future `list({prefix:'income:'})` would read the sleeve as a ticker called TICKERS. Same rule as `ivsweep:last` sitting outside `iv:`. The price half is never cached — see the endpoint notes. |
 | `watchlist:prev` | none | Previous watchlist, snapshotted before every overwrite — a one-step undo for a clobbered list |
 | `watchlist:tickers` | none | **The ONLY sweep universe.** Written by the dashboard on an EDIT, or on load only when this key is empty (read-then-adopt — see the bootstrap rule; an unconditional on-load push clobbered it once). `DEFAULT_WATCHLIST` is deleted, so an absent or unusable value makes `sweepUniverse()` refuse loudly rather than sweep zero names. Also seeds scan universes |
 | `rec:{TICKER}` | none | Recommendation history, one entry per PT trading day (up to 500) |
