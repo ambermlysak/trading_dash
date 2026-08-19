@@ -46,7 +46,60 @@ GET  /api/market/scanner?preset=  Day-trading momentum scanner (5 Pillars, 90s K
 GET  /api/market/golden-cross     Names set up for a golden cross, EMA + SMA gaps (1h KV cache)
 GET  /api/market/econ-calendar    Next FOMC / CPI events from the official schedule
 GET  /api/earnings/:ticker        Last report: numbers, price reaction, call coverage (12h KV)
+GET  /api/radar                   Off-watchlist discovery, <=5 quality names (radar:{PT-date})
 ```
+
+**`GET /api/radar` — off-watchlist discovery.** Answers one question: which quality
+names *not* on `watchlist:tickers` deserve attention today. **No Claude call anywhere
+on the path**, so it is origin-gated only and takes no `x-dash-key`; the only write is
+its own day cache.
+
+| gate | constant | value |
+|---|---|---|
+| market cap > | `RADAR_MIN_MARKET_CAP` | $10B |
+| price > | `RADAR_MIN_PRICE` | $20 |
+| avg daily $-volume ≥ | `RADAR_MIN_DOLLAR_VOL` | $50M (`price × averageDailyVolume3Month`) |
+| front-chain open interest ≥ | `RADAR_MIN_CHAIN_OI` | 1,000 (calls + puts, nearest listed expiry) |
+| max returned | `RADAR_MAX` / `RADAR_MOVER_SLOTS` / `RADAR_SECTOR_SLOTS` | 5 / 3 / 2 |
+
+Two sources, both filtered through the same gates: the Yahoo predefined screeners in
+`RADAR_SCREENERS` (`day_gainers`, `most_actives` — their rows already carry
+`marketCap`, `regularMarketPrice`, `regularMarketVolume` and
+`averageDailyVolume3Month`, so **zero extra fetches**), and the `opportunity` picks
+banked in `market:sectors`, priced by **one batched** `/v7/finance/quote` call rather
+than one per name. **An S&P 500 golden-cross sweep is deliberately out of v1** — no
+verified constituent source is wired, and a hand-typed 500-name list is the
+unverifiable constant honesty rule 18 exists to kill.
+
+Four contracts, each of which the endpoint would be dishonest without:
+
+- **`watchlist:tickers` unreadable REFUSES.** Radar is defined as *not on the
+  watchlist*; with no exclusion set it answers a different question under the first
+  one's label. All four unusable shapes refuse with their own message (same
+  discipline as `sweepUniverse()`, separate function because that one caps at 60 and
+  is worded for a cron). A refusal returns **`candidates: null`, never `[]`** — `[]`
+  means the gates ran and nothing survived — and **is never cached**.
+- **A failing source is NAMED.** `sources: [{name, ok, reason, rows}]` carries one
+  entry per source and `complete` is true only when every one reported `ok`. A thin
+  day and a broken source must not look the same.
+- **Ranking is `rvol` (today's volume ÷ 3-month average), tie-broken on `|chgPct|`,
+  with RESERVED SLOTS per lane.** In one pool the sector picks would never surface (a
+  large cap sits at ~1.0× while a gainer sits at 3–15×), which would make that source
+  a branch that cannot fire. Unused slots spill to the other lane, and spilling only
+  ever promotes a name that already cleared every gate — nothing is padded to reach 5.
+- **Optionability is checked ONLY on the final ≤5, and there is no backfill.** A name
+  that fails it reduces the count rather than promoting the next one behind an
+  unchecked chain. `listed: false` (no chain) and `listed: null` (the fetch failed)
+  are different facts and both are recorded.
+
+`?trail=1` emits the full elimination trail — every row considered, the gate that
+removed it, and its numbers. The trail is **stored either way** so a cached record can
+still answer for it; `funnel` (counts per gate) ships unconditionally. `?refresh=1`
+forces a rebuild.
+
+Cost, **measured** on `wrangler dev --remote` against production KV 2026-08-19:
+**warm 1** · **cold 13** with a warm crumb (8 ext + 5 bindings) · **cold 16** with a
+cold crumb (10 ext + 6 bindings) · **refusal 2**, writing nothing.
 
 **Earnings analysis (`/api/earnings/:ticker`):** powers the "Analyze Earnings" button under Catalysts
 on `index.html`. Gathers EPS history, quarterly revenue, forward estimates and revisions, a price
@@ -451,7 +504,8 @@ differs from its retention, both are given and the reason is in the notes.
 | `earnings:{TICKER}` | 2d | Earnings analysis for the last report |
 | `fund:{TICKER}` | 6h | Yahoo fundamentals cache |
 | `market:ipos` | 12h | IPO calendar |
-| `market:sectors` | 4h | Sector summaries + opportunity/avoid picks |
+| `market:sectors` | 4h | Sector summaries + opportunity/avoid picks. **Also source (b) of `/api/radar`** — its `opportunity` tickers are gate-filtered as radar candidates |
+| `radar:{PT-DATE}` | **36h** (`RADAR_TTL`) | One PT day's off-watchlist radar: the ≤5 candidates, the `sources` verdicts, the `funnel` counts and the full elimination `trail`. Keyed on the PT date, so there is no freshness question — retention outlives the day it names so a late-evening read still finds the answer instead of paying for a rebuild after the close. `RADAR_SCHEMA` 1, checked by **strict equality**; any other value reads as ABSENT and the next request rebuilds. An **incomplete** build (a source was down) is cached like any other so cost stays bounded, but is re-built rather than re-served once `RADAR_RETRY_MS` (10 min) has passed — a source that was down at 6am must not define discovery for the whole day. A **refusal is never written**, because it is a fact about our own config rather than about the day. |
 | `market:goldencross` | 2h | Golden-cross setups (served fresh for 1h via `GOLDEN_TTL`) |
 | `scanner:{preset}` | 5min | Day-trading scanner results (served fresh for 90s via `SCAN_TTL`) |
 | `auction:{DATE}:{SYMBOLS}` | 20h | Closing-auction block trades, keyed by ET date |

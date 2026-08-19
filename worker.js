@@ -9092,6 +9092,513 @@ async function handleGoldenCross(origin, env, params) {
   return json(payload, 200, origin);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   RADAR — off-watchlist discovery.  GET /api/radar
+
+   Answers exactly one question: which QUALITY names that are NOT on the saved
+   watchlist deserve attention today. At most RADAR_MAX (5), never padded — a
+   thin day returns two, or zero, and says so.
+
+   NO CLAUDE CALL ANYWHERE ON THIS PATH. Every `why` string is assembled from
+   the numbers that qualified the name, so it is a restatement of the gates
+   rather than generated prose. Origin-gated like the other market reads and
+   deliberately NOT behind `aiGuard`: nothing here spends, and the only write is
+   its own day cache.
+
+   TWO SOURCES, and a failing one is NAMED rather than silently narrowing
+   discovery. `sources: [{name, ok, reason, rows}]` carries one entry each, and
+   `complete` is true only when every source reported ok. A thin day and a
+   broken source must not look the same.
+
+     a. Yahoo predefined screeners (`day_gainers`, `most_actives`). These carry
+        `marketCap`, `regularMarketPrice`, `regularMarketVolume` and
+        `averageDailyVolume3Month` on every row, so the whole gate set runs on
+        the screener payload with ZERO extra fetches.
+     b. The sector `opportunity` picks already banked in `market:sectors`. Those
+        are routinely off-watchlist quality names (CAT, LLY, COST). The banked
+        record carries only the ETF's price, not the pick's, so the picks take
+        ONE batched `/v7/finance/quote` call between them — not one per name.
+
+   S&P 500 GOLDEN-CROSS SWEEP IS DELIBERATELY OUT OF v1. There is no verified
+   constituent source wired into this Worker, and a hand-typed 500-name list is
+   exactly the unverifiable constant that produced 7 wrong super-investor CIKs
+   (honesty rule 18). v2 needs a constituent list fetched from a source whose
+   identifiers can be checked — then the sweep itself is cheap, because
+   `yahooSparkCloses` takes 20 symbols per request and `smaCrossState` already
+   exists (~25 external fetches for 500 names).
+
+   COST, per rule #1, quoted as capCost = extFetches + bindingOps. MEASURED on a
+   `wrangler dev --remote` run against production KV, 2026-08-19:
+
+     warm (any request after the first of the PT day)   1  (one KV get)
+     cold, warm crumb                                  13  (8 ext + 5 bindings)
+     cold, cold crumb                                  16  (10 ext + 6 bindings)
+
+       1  KV get radar:{PT-date}            (miss)
+       1  KV get watchlist:tickers          (the exclusion set)
+       2  screener fetches                  (RADAR_SCREENERS.length)
+       1  KV get market:sectors
+       0-4 Yahoo crumb                      (warm: 0. Cold: 2 fetches + 1 KV get
+                                             + 1 KV put, inside getYahooCrumb)
+       1  batched /v7/finance/quote         (all sector picks in one call)
+       ≤5 option-chain fetches              (RADAR_MAX — the ONLY per-name fetch,
+                                             and it runs on the final ≤5 only,
+                                             never on the whole screener result)
+       1  KV put radar:{PT-date}
+
+   A refusal costs 2 (radar get + watchlist get) and writes nothing.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const RADAR_SCHEMA = 1;
+
+/* THE GATES. Every candidate from every source clears all of these. */
+const RADAR_MIN_MARKET_CAP = 10_000_000_000;  // > $10B — "quality" as size
+const RADAR_MIN_PRICE      = 20;              // > $20  — keeps low-priced churn out
+/* Average daily DOLLAR volume floor, computed as
+   `regularMarketPrice × averageDailyVolume3Month`. Its job is to drop a large
+   cap that barely trades — where the option chain is a fiction even when it is
+   listed. At the $20 price floor, $50M/day is 2.5M shares.
+
+   IT IS A BACKSTOP ON THIS UNIVERSE, NOT A BINDING GATE, and that is measured
+   rather than assumed. Over the 111 rows considered on 2026-08-19 it eliminated
+   ZERO: of the 53 that had already cleared price + market-cap, the minimum
+   average dollar volume was $76M (p10 $245M, median $1.2B, max $46.1B). That is
+   structural — `most_actives` selects for volume by definition and `day_gainers`
+   requires a move — so the earlier gates catch the thin names first. 11 rows in
+   the same raw screener output DID sit below $50M (DRD $9M, ALMR $11M, OGC $13M,
+   AAUC/AYA $17M, KC $19M …), all eliminated by price or market-cap ahead of it.
+
+   THE GATE IS REACHABLE, demonstrated by driving it: raised to $2B on the same
+   data it eliminated 29 rows and changed every survivor. So this is not the
+   `no-leaps` failure (honesty rule 23) — the condition can fire, it simply did
+   not today. Re-read it against the live distribution with `?trail=1`, which
+   prints the dollar volume of every row at every gate, rather than arguing the
+   number. */
+const RADAR_MIN_DOLLAR_VOL = 50_000_000;
+/* "Listed options with real OI": total open interest across BOTH sides of the
+   NEAREST listed expiry. A chain that exists but carries no open interest is
+   not tradeable, and `listed: true, oi: 0` is a finding rather than an absence. */
+const RADAR_MIN_CHAIN_OI   = 1_000;
+
+/* SLOTS. Ranking is by relative volume (today's volume ÷ 3-month average), which
+   is the direct measure of "something is happening here today", tie-broken on
+   the absolute move. Ranked in one pool, the sector picks would never surface —
+   a large cap on an ordinary day sits at ~1.0× while a gainer sits at 3-10× —
+   which would make source (b) a branch that cannot fire (honesty rule 23). So
+   each lane gets a reserved allocation and UNUSED slots spill to the other lane.
+   Spilling only ever promotes a name that already cleared every gate; nothing is
+   padded to reach RADAR_MAX. */
+const RADAR_MAX           = 5;
+const RADAR_MOVER_SLOTS   = 3;
+const RADAR_SECTOR_SLOTS  = 2;
+
+const RADAR_SCREENERS = [
+  { id: 'day_gainers',  count: 50 },
+  { id: 'most_actives', count: 50 },
+];
+
+/* Bound on how many sector picks one batched quote call carries. 11 sectors ×
+   1 opportunity pick = 11, so this does not bite today; it exists so a future
+   sectors payload cannot turn one call into an unbounded URL. If it ever does
+   bite it is LOGGED and reported on the source entry — a silent truncation
+   reads as "covered everything". */
+const RADAR_SECTOR_PROBE_MAX = 20;
+
+const radarKey = d => `radar:${d}`;
+/* Retention outlives the PT day it is keyed on, so a late-evening read still
+   finds the day's answer instead of paying for a rebuild after the close. The
+   key carries its own date, so there is no freshness question to get wrong. */
+const RADAR_TTL      = 36 * 3600;
+/* An INCOMPLETE build (a source was down) is cached like any other so the cost
+   stays bounded, but it is re-built rather than re-served once this much time
+   has passed. Same shape as the EOD placeholder: store the honest partial,
+   retry on a bounded cadence, never let a broken source define the whole day. */
+const RADAR_RETRY_MS = 10 * 60_000;
+
+const RADAR_GATE_ORDER = [
+  'shape', 'exchange', 'on-watchlist', 'duplicate', 'no-quote',
+  'price', 'market-cap', 'dollar-volume', 'rank', 'optionable', 'selected',
+];
+
+function radarGatesDeclared() {
+  return {
+    minMarketCap:         RADAR_MIN_MARKET_CAP,
+    minPrice:             RADAR_MIN_PRICE,
+    minAvgDollarVolume:   RADAR_MIN_DOLLAR_VOL,
+    minChainOpenInterest: RADAR_MIN_CHAIN_OI,
+    max:                  RADAR_MAX,
+    moverSlots:           RADAR_MOVER_SLOTS,
+    sectorSlots:          RADAR_SECTOR_SLOTS,
+    rankedBy:             'rvol (today volume ÷ 3-month average), tie-break |chgPct|',
+    excludedFrom:         'watchlist:tickers',
+  };
+}
+
+/** Compact money for the `why` line. Returns null rather than a fabricated 0 —
+ *  a missing figure and a zero must never render the same way. */
+function radarMoney(n) {
+  if (n == null || !Number.isFinite(n)) return null;
+  const a = Math.abs(n);
+  if (a >= 1e12) return `$${(n / 1e12).toFixed(1)}T`;
+  if (a >= 1e9)  return `$${(n / 1e9).toFixed(n / 1e9 >= 100 ? 0 : 1)}B`;
+  if (a >= 1e6)  return `$${(n / 1e6).toFixed(0)}M`;
+  return `$${Math.round(n)}`;
+}
+
+/**
+ * The exclusion set. THIS IS THE ONLY THING THAT CAN REFUSE THE WHOLE ENDPOINT.
+ *
+ * Radar is defined as "not on my watchlist". With `watchlist:tickers`
+ * unreadable the exclusion cannot be applied, and a radar that quietly includes
+ * watchlist names is not a thinner answer — it is a different question answered
+ * under the first one's label. So all four unusable shapes refuse, each with its
+ * own message, exactly as `sweepUniverse()` does for the crons.
+ *
+ * Deliberately NOT `sweepUniverse()`: that helper caps at 60, is worded for a
+ * cron ("no dedup key has been stamped"), and returns the sweep universe rather
+ * than an exclusion set. Same discipline, different contract.
+ */
+async function radarExclusionSet(env) {
+  let raw = null, why = null;
+  try {
+    raw = await env?.REC_LOG?.get('watchlist:tickers', 'json');
+  } catch (e) {
+    why = `KV read failed — ${e.message}`;
+  }
+  if (!why) {
+    if (raw == null)              why = 'key is absent (no dashboard has ever saved a watchlist)';
+    else if (!Array.isArray(raw)) why = `key holds ${typeof raw}, not an array`;
+    else if (!raw.length)         why = 'key holds an empty array';
+  }
+  let set = null;
+  if (!why) {
+    set = new Set(raw.map(t => String(t).toUpperCase().trim()).filter(t => REC_SYMBOL_RE.test(t)));
+    if (!set.size) { set = null; why = `all ${raw.length} entries failed the symbol-shape test`; }
+  }
+  if (why) {
+    const reason = `radar cannot be built: watchlist:tickers ${why}. Radar is defined as "quality names `
+      + 'NOT on the watchlist", so with no exclusion set every candidate could already be a name you '
+      + 'hold. REFUSING rather than returning a list that answers a different question. Nothing has '
+      + 'been cached, so the next request retries. Fix: open the dashboard, which saves its watchlist.';
+    console.error(`[radar] !! NO-EXCLUSION-SET !! ${reason}`);
+    return { set: null, reason };
+  }
+  return { set, reason: null };
+}
+
+/** One Yahoo predefined screener. Throws with a nameable reason — the caller
+ *  turns that into the source's `reason`, never into a silent empty list. */
+async function radarScreener(id, count) {
+  const r = await fetch(
+    `https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=true`
+    + `&scrIds=${encodeURIComponent(id)}&count=${count}`,
+    { headers: YAHOO_HEADERS },
+  );
+  if (!r.ok) throw new Error(`Yahoo screener ${id} HTTP ${r.status}`);
+  const d = await r.json();
+  const quotes = d?.finance?.result?.[0]?.quotes;
+  if (!Array.isArray(quotes)) throw new Error(`Yahoo screener ${id} returned no quotes array`);
+  return quotes;
+}
+
+/** Screener rows (`formatted=true`, so `{raw,fmt}`) and `/v7/finance/quote` rows
+ *  (bare numbers) carry the same field names; `num` accepts either shape. */
+function radarNormalize(q, source, lane, extra = {}) {
+  const num = v => (v && typeof v === 'object' ? (v.raw ?? null) : (v ?? null));
+  const price  = num(q.regularMarketPrice);
+  const vol    = num(q.regularMarketVolume);
+  const avgVol = num(q.averageDailyVolume3Month) ?? num(q.averageDailyVolume10Day);
+  const cap    = num(q.marketCap);
+  const chg    = num(q.regularMarketChangePercent);
+  return {
+    ticker:    String(q.symbol || '').toUpperCase().trim(),
+    name:      q.longName || q.shortName || '',
+    exchange:  q.exchange || '',
+    price:     price != null ? Math.round(price * 100) / 100 : null,
+    chgPct:    chg   != null ? Math.round(chg   * 100) / 100 : null,
+    marketCap: cap,
+    volume:    vol,
+    avgVol,
+    // Guarded before the arithmetic: a null must not divide or multiply to 0.
+    dollarVol: price != null && avgVol != null ? Math.round(price * avgVol) : null,
+    rvol:      vol != null && avgVol ? Math.round(vol / avgVol * 10) / 10 : null,
+    source, lane, ...extra,
+  };
+}
+
+/** Returns the name of the gate that eliminated this candidate, or null if it
+ *  cleared every one. Order matters only for the trail's readability. */
+function radarGate(c, excluded) {
+  if (!c.ticker || !REC_SYMBOL_RE.test(c.ticker))                 return 'shape';
+  if (c.exchange && !SCANNER_MAJOR_EXCHANGES.has(c.exchange))     return 'exchange';
+  if (excluded.has(c.ticker))                                     return 'on-watchlist';
+  if (c.price == null || c.price <= RADAR_MIN_PRICE)              return 'price';
+  if (c.marketCap == null || c.marketCap <= RADAR_MIN_MARKET_CAP) return 'market-cap';
+  if (c.dollarVol == null || c.dollarVol < RADAR_MIN_DOLLAR_VOL)  return 'dollar-volume';
+  return null;
+}
+
+const radarRank = (a, b) =>
+  (b.rvol ?? 0) - (a.rvol ?? 0) || Math.abs(b.chgPct ?? 0) - Math.abs(a.chgPct ?? 0);
+
+/**
+ * Optionability — ONE chain fetch, and only ever for a name already in the
+ * final ≤5. `listed: false` (Yahoo has no chain) and `listed: null` (the fetch
+ * failed) are different facts and both are recorded; only `true` with enough
+ * open interest passes.
+ */
+async function radarOptionable(sym, env) {
+  let res;
+  try {
+    const d = await yahooAuth(`/v7/finance/options/${encodeURIComponent(sym)}`, '', env);
+    res = d?.optionChain?.result?.[0];
+  } catch (e) {
+    return { listed: null, oi: null, expiries: null, expiry: null, reason: `chain fetch failed — ${e.message}` };
+  }
+  if (!res) return { listed: false, oi: 0, expiries: 0, expiry: null, reason: 'Yahoo returned no option chain for this symbol' };
+  const expiries = Array.isArray(res.expirationDates) ? res.expirationDates.length : 0;
+  const chain    = res.options?.[0];
+  if (!expiries || !chain) {
+    return { listed: false, oi: 0, expiries, expiry: null, reason: 'no listed expiries' };
+  }
+  const sumOi = side => (Array.isArray(side) ? side : [])
+    .reduce((t, o) => t + (Number(o?.openInterest?.raw ?? o?.openInterest) || 0), 0);
+  const oi = sumOi(chain.calls) + sumOi(chain.puts);
+  return {
+    listed: true, oi, expiries,
+    expiry: chain.expirationDate ? expiryIso(chain.expirationDate) : null,
+    reason: null,
+  };
+}
+
+/** MECHANICAL. Every clause is a number that qualified this name, in the units
+ *  the gates are expressed in. Nothing here is generated or inferred. */
+function radarWhy(c) {
+  const bits = [];
+  if (c.lane === 'sector' && c.sector) bits.push(`${c.sector} opportunity pick`);
+  if (c.chgPct != null)  bits.push(`${c.chgPct >= 0 ? '+' : ''}${c.chgPct}% today`);
+  if (c.rvol   != null)  bits.push(`${c.rvol}× avg volume`);
+  if (c.marketCap != null) bits.push(`${radarMoney(c.marketCap)} cap`);
+  if (c.dollarVol != null) bits.push(`${radarMoney(c.dollarVol)}/day avg $-volume`);
+  if (c.optionable?.oi != null) bits.push(`${c.optionable.oi.toLocaleString('en-US')} OI on the front chain`);
+  return bits.join(' · ');
+}
+
+async function radarBuild(env) {
+  const nowIso  = ptDate();
+  const trail   = [];
+  const sources = [];
+  const push    = (c, gate, note = null) => trail.push({
+    ticker: c.ticker, source: c.source, lane: c.lane, gate,
+    price: c.price ?? null, chgPct: c.chgPct ?? null,
+    marketCap: c.marketCap ?? null, dollarVol: c.dollarVol ?? null, rvol: c.rvol ?? null,
+    ...(note ? { note } : {}),
+  });
+
+  const excl = await radarExclusionSet(env);
+  if (!excl.set) {
+    /* candidates is NULL, not []. `[]` means the gates ran and nothing survived;
+       `null` means they never ran. Collapsing the two is the whole failure this
+       endpoint's honesty rules exist to prevent. */
+    return {
+      schema: RADAR_SCHEMA, ts: Date.now(), ptDate: nowIso,
+      refused: true, reason: excl.reason, complete: false,
+      candidates: null, count: null, excludedCount: null,
+      sources: [], funnel: null, trail: [], gates: radarGatesDeclared(),
+    };
+  }
+
+  const pool = new Map();   // ticker -> candidate that cleared every static gate
+
+  /* ── Source (a): Yahoo predefined screeners ─────────────────────────────── */
+  for (const s of RADAR_SCREENERS) {
+    const name = `yahoo:${s.id}`;
+    let rows = null, reason = null;
+    try { rows = await radarScreener(s.id, s.count); }
+    catch (e) { reason = e.message; console.warn(`[radar] source ${name} failed: ${reason}`); }
+    sources.push({ name, ok: rows != null, reason, rows: rows?.length ?? 0 });
+    for (const q of (rows || [])) {
+      const c = radarNormalize(q, name, 'mover');
+      if (c.ticker && pool.has(c.ticker)) { push(c, 'duplicate'); continue; }
+      const g = radarGate(c, excl.set);
+      if (g) { push(c, g); continue; }
+      pool.set(c.ticker, c);
+    }
+  }
+
+  /* ── Source (b): the banked sector opportunity picks ────────────────────── */
+  const bName = `kv:${SECTORS_KV_KEY}`;
+  let sectorRec = null, bReason = null, picks = [];
+  try { sectorRec = await env?.REC_LOG?.get(SECTORS_KV_KEY, 'json'); }
+  catch (e) { bReason = `KV read failed — ${e.message}`; }
+  if (!bReason) {
+    if (!sectorRec) {
+      bReason = 'no market:sectors snapshot is banked (the 4h cache has expired, or the Sectors tab '
+              + 'has never been built on this Worker)';
+    } else if (!Array.isArray(sectorRec.sectors) || !sectorRec.sectors.length) {
+      bReason = 'the banked market:sectors record carries no sectors array';
+    } else {
+      const seen = new Set();
+      for (const s of sectorRec.sectors) {
+        const t = String(s?.opportunity?.ticker || '').toUpperCase().trim();
+        if (!t || seen.has(t)) continue;
+        seen.add(t);
+        picks.push({ ticker: t, sector: s.sector || null });
+      }
+      if (!picks.length) bReason = 'the banked market:sectors record names no opportunity tickers';
+    }
+  }
+
+  // Cheap gates first, so the one batched quote call only carries live prospects.
+  const probe = [];
+  for (const p of picks) {
+    const stub = { ticker: p.ticker, source: bName, lane: 'sector', sector: p.sector };
+    if (!REC_SYMBOL_RE.test(p.ticker))  { push(stub, 'shape');        continue; }
+    if (excl.set.has(p.ticker))         { push(stub, 'on-watchlist'); continue; }
+    if (pool.has(p.ticker))             { push(stub, 'duplicate');    continue; }
+    probe.push(p);
+  }
+  let probeDropped = 0;
+  if (probe.length > RADAR_SECTOR_PROBE_MAX) {
+    probeDropped = probe.length - RADAR_SECTOR_PROBE_MAX;
+    console.warn(`[radar] sector picks capped at ${RADAR_SECTOR_PROBE_MAX}; ${probeDropped} not probed`);
+    probe.length = RADAR_SECTOR_PROBE_MAX;
+  }
+
+  if (!bReason && probe.length) {
+    let quotes = null;
+    try {
+      const d = await yahooAuth(
+        '/v7/finance/quote',
+        `?symbols=${probe.map(p => encodeURIComponent(p.ticker)).join(',')}`,
+        env,
+      );
+      const arr = d?.quoteResponse?.result;
+      if (!Array.isArray(arr)) throw new Error('/v7/finance/quote returned no quoteResponse.result array');
+      quotes = new Map(arr.map(q => [String(q.symbol || '').toUpperCase(), q]));
+    } catch (e) {
+      bReason = `sector picks read from KV, but the batched quote check failed — ${e.message}`;
+      console.warn(`[radar] source ${bName} quote batch failed: ${e.message}`);
+    }
+    for (const p of (quotes ? probe : [])) {
+      const q = quotes.get(p.ticker);
+      if (!q) { push({ ticker: p.ticker, source: bName, lane: 'sector', sector: p.sector }, 'no-quote'); continue; }
+      const c = radarNormalize(q, bName, 'sector', { sector: p.sector });
+      if (!c.ticker) c.ticker = p.ticker;
+      if (pool.has(c.ticker)) { push(c, 'duplicate'); continue; }
+      const g = radarGate(c, excl.set);
+      if (g) { push(c, g); continue; }
+      pool.set(c.ticker, c);
+    }
+  }
+  sources.push({
+    name: bName, ok: !bReason, reason: bReason,
+    rows: picks.length,
+    ...(probeDropped ? { cappedOut: probeDropped, capNote: `RADAR_SECTOR_PROBE_MAX=${RADAR_SECTOR_PROBE_MAX}` } : {}),
+  });
+
+  /* ── Rank into slots ────────────────────────────────────────────────────── */
+  const movers  = [...pool.values()].filter(c => c.lane === 'mover').sort(radarRank);
+  const sectorC = [...pool.values()].filter(c => c.lane === 'sector').sort(radarRank);
+  const takeM = movers.slice(0, RADAR_MOVER_SLOTS);
+  const takeS = sectorC.slice(0, RADAR_SECTOR_SLOTS);
+  const take  = [...takeM, ...takeS];
+  // Unused slots spill — only ever to a name that already cleared every gate.
+  if (take.length < RADAR_MAX) take.push(...movers.slice(takeM.length, takeM.length + (RADAR_MAX - take.length)));
+  if (take.length < RADAR_MAX) take.push(...sectorC.slice(takeS.length, takeS.length + (RADAR_MAX - take.length)));
+  take.sort(radarRank);
+
+  const taken = new Set(take.map(c => c.ticker));
+  for (const c of [...movers, ...sectorC]) if (!taken.has(c.ticker)) push(c, 'rank');
+
+  /* ── Optionability: the ONLY per-name fetch, and only for the final ≤5 ──── */
+  const chains = await allSettledCounted(take.map(c => radarOptionable(c.ticker, env)), 'radar:chains');
+  const candidates = [];
+  take.forEach((c, i) => {
+    const r = chains[i];
+    c.optionable = r.status === 'fulfilled'
+      ? r.value
+      : { listed: null, oi: null, expiries: null, expiry: null, reason: `chain fetch rejected — ${r.reason?.message || r.reason}` };
+    if (c.optionable.listed !== true || (c.optionable.oi ?? 0) < RADAR_MIN_CHAIN_OI) {
+      push(c, 'optionable', c.optionable.reason
+        || `front-chain OI ${c.optionable.oi} < ${RADAR_MIN_CHAIN_OI}`);
+      return;   // No backfill by design: a failed name reduces the count, it
+                // does not promote the next one behind an unchecked chain.
+    }
+    candidates.push({
+      ticker: c.ticker, name: c.name, why: radarWhy(c), source: c.source, lane: c.lane,
+      sector: c.sector ?? null,
+      price: c.price, chgPct: c.chgPct, marketCap: c.marketCap,
+      rvol: c.rvol, dollarVol: c.dollarVol,
+      optionable: { listed: c.optionable.listed, oi: c.optionable.oi, expiry: c.optionable.expiry },
+    });
+    push(c, 'selected');
+  });
+
+  const funnel = Object.fromEntries(RADAR_GATE_ORDER.map(g => [g, trail.filter(t => t.gate === g).length]));
+  const complete = sources.length > 0 && sources.every(s => s.ok);
+
+  return {
+    schema: RADAR_SCHEMA, ts: Date.now(), ptDate: nowIso,
+    refused: false, reason: null, complete,
+    candidates, count: candidates.length,
+    excludedCount: excl.set.size,
+    sources, funnel, trail, gates: radarGatesDeclared(),
+    considered: trail.length,
+  };
+}
+
+/** Shape the stored record into a response. The trail is stored either way and
+ *  emitted only under `?trail=1`, so a cached record can still answer for it. */
+function radarResponse(rec, { cached, wantTrail, mark }) {
+  const { trail, ...rest } = rec;
+  const note = rec.refused
+    ? 'refused — no exclusion set'
+    : `${rec.count} of ${rec.considered ?? 0} considered · ${rec.excludedCount} watchlist names excluded`
+      + (rec.complete ? '' : ' · INCOMPLETE, a source is down');
+  return {
+    ...rest,
+    cached: !!cached,
+    ...(wantTrail ? { trail } : {}),
+    _instr: instrSince(mark, 'radar'),
+    _meta: srcMeta('Yahoo screeners + banked sector picks', {
+      ok: !rec.refused && rec.complete,
+      delayed: true,
+      ttlSeconds: RADAR_TTL,
+      asOf: rec.ptDate,
+      note,
+    }),
+  };
+}
+
+/** GET /api/radar — origin-gated, no `x-dash-key`: no Claude call, no spend,
+ *  and the only write is this endpoint's own day cache. */
+async function handleRadar(origin, env, params) {
+  const mark      = instrMark();
+  const key       = radarKey(ptDate());
+  const wantTrail = params?.get('trail') === '1';
+  const force     = params?.get('refresh') === '1';
+
+  let cached = null;
+  try { cached = await env?.REC_LOG?.get(key, 'json'); } catch (_) {}
+  if (cached && cached.schema !== RADAR_SCHEMA) cached = null;   // strict equality
+
+  /* A COMPLETE build is the day's answer. An INCOMPLETE one is re-served only
+     inside RADAR_RETRY_MS, so a source that was down at 6am does not define
+     discovery for the rest of the day. */
+  if (!force && cached && (cached.complete === true || Date.now() - (cached.ts || 0) < RADAR_RETRY_MS)) {
+    return json(radarResponse(cached, { cached: true, wantTrail, mark }), 200, origin);
+  }
+
+  const built = await radarBuild(env);
+  // A refusal is never cached: it is a fact about our own config, not about the day.
+  if (!built.refused) {
+    try { await env?.REC_LOG?.put(key, JSON.stringify(built), { expirationTtl: RADAR_TTL }); }
+    catch (e) { console.warn('[radar] cache write failed:', e.message); }
+  }
+  return json(radarResponse(built, { cached: false, wantTrail, mark }), 200, origin);
+}
+
 async function handleMarketIPOs(origin, env) {
   const KV_KEY = 'market:ipos';
   const IPO_TTL = 43_200_000; // 12 hours
@@ -11154,6 +11661,10 @@ export default {
           return await handleEarningsAnalysis(sub, url.searchParams, origin, env, ctx);
         }
         case 'daily':    return await handleDailyGet(origin, env, ctx, request);
+        /* Off-watchlist discovery. Origin-gated only — no Claude call anywhere
+           on the path, so there is nothing for `aiGuard` to protect, and the
+           only write is its own `radar:{PT-date}` day cache. */
+        case 'radar':    return await handleRadar(origin, env, url.searchParams);
         case 'market':
           if (sub === 'snapshot')    return await handleMarketSnapshot(origin, env);
           if (sub === 'movers')      return await handleMarketMovers(origin, env);

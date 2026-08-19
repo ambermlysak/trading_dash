@@ -988,6 +988,77 @@ without ever opening that file.
   verdict, never change it, and `sentenceSource` says which the reader is seeing
 - `calib:pooled` lives in the cron and must never move
 - `scheduled()` gates on the Pacific trading day before dispatching
+- `radar:{PT-DATE}` schema check stays strict equality; a radar **refusal is never
+  cached** and returns `candidates: null`, never `[]`
+
+### `GET /api/radar` — off-watchlist discovery
+
+Answers one question: **which quality names NOT on `watchlist:tickers` deserve
+attention today.** At most `RADAR_MAX` (5), never padded — a thin day returns two,
+or zero, and says which it was. **No Claude call anywhere on the path**, so it is
+origin-gated like the other market reads and takes **no `x-dash-key`**; the only
+write is its own `radar:{PT-date}` day cache. Added 2026-08-19 for the
+decision_dash rebuild.
+
+The gates, as named constants in `worker.js`, applied to every candidate from
+every source:
+
+| gate | constant | value |
+|---|---|---|
+| market cap > | `RADAR_MIN_MARKET_CAP` | **$10B** |
+| price > | `RADAR_MIN_PRICE` | **$20** |
+| avg daily $-volume ≥ | `RADAR_MIN_DOLLAR_VOL` | **$50M** — `price × averageDailyVolume3Month` |
+| front-chain open interest ≥ | `RADAR_MIN_CHAIN_OI` | **1,000** — calls + puts, nearest listed expiry |
+| returned / mover slots / sector slots | `RADAR_MAX` / `RADAR_MOVER_SLOTS` / `RADAR_SECTOR_SLOTS` | **5 / 3 / 2** |
+| sector picks priced in one call | `RADAR_SECTOR_PROBE_MAX` | 20 (11 today, so it does not bite — and it logs and reports if it ever does) |
+| day cache | `RADAR_TTL` / `RADAR_RETRY_MS` | 36h retention / 10 min before an **incomplete** build is rebuilt |
+
+Sources are the Yahoo predefined screeners in `RADAR_SCREENERS` (`day_gainers`,
+`most_actives` — their rows already carry every field the gates need, so **zero
+extra fetches**) and the `opportunity` picks banked in `market:sectors`, priced by
+**one batched** `/v7/finance/quote` call rather than one per name. **An S&P 500
+golden-cross sweep is deliberately out of v1**: no verified constituent source is
+wired, and a hand-typed 500-name list is the unverifiable constant honesty rule 18
+exists to kill. v2 needs a constituent list fetched from a checkable source — the
+sweep itself is then cheap, since `yahooSparkCloses` takes 20 symbols a request and
+`smaCrossState()` already exists (~25 fetches for 500 names).
+
+**`watchlist:tickers` unreadable REFUSES**, the same contract as `sweepUniverse()`:
+radar is *defined* as "not on the watchlist", so with no exclusion set it answers a
+different question under the first one's label. A refusal returns
+**`candidates: null`, never `[]`** — `[]` means the gates ran and nothing survived —
+and **is never cached**, because it is a fact about our own config rather than about
+the day. A failing *source* is named instead of silently narrowing discovery:
+`sources: [{name, ok, reason, rows}]`, with `complete` true only when every source
+reported `ok`.
+
+**Ranking is `rvol` (today's volume ÷ 3-month average), tie-broken on `|chgPct|`,
+with RESERVED SLOTS per lane.** Ranked in one pool the sector picks could never
+surface — a large cap on an ordinary day sits at ~0.3× while a gainer sits at 3–15× —
+which would make that source a branch that cannot fire (honesty rule 23). Unused
+slots spill to the other lane, and spilling only ever promotes a name that already
+cleared every gate. **Optionability is checked ONLY on the final ≤5 and there is no
+backfill**: a name that fails it reduces the count rather than promoting the next one
+behind an unchecked chain.
+
+`?trail=1` emits the full elimination trail — every row considered, the gate that
+removed it, and its numbers. The trail is *stored* either way so a cached record can
+answer for it; `funnel` (counts per gate) ships unconditionally.
+
+**Cost, measured** (`wrangler dev --remote` against production KV, 2026-08-19):
+**warm 1** · **cold 13** with a warm crumb (8 ext + 5 bindings) · **cold 16** with a
+cold crumb (10 ext + 6 bindings) · **refusal 2**, writing nothing.
+
+**`RADAR_MIN_DOLLAR_VOL` is a BACKSTOP on this universe, not a binding gate, and
+that is measured rather than assumed.** Over the 111 rows considered on 2026-08-19
+it eliminated **zero**: of the 53 that had cleared price + market-cap, the minimum
+average dollar volume was **$76M** (p10 $245M, median $1.2B, max $46.1B). That is
+structural — `most_actives` selects for volume by definition and `day_gainers`
+requires a move — so the earlier gates catch the thin names first. **The gate is
+reachable and was driven to prove it**: raised to $2B on the same data it eliminated
+**29** rows and changed every survivor, and 11 rows in the raw screener output really
+did sit below $50M (DRD $9M, ALMR $11M, OGC $13M …) but were removed by price or
+market-cap ahead of it. So this is not the `no-leaps` failure.
 
 ### Worker endpoints, data sources, KV and cron → the `worker-internals` skill
 

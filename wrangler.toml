@@ -129,7 +129,18 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #                          screen, so a stale print beats a blank screen)
 #   earnings:{TICKER}   — last-report earnings analysis (2d TTL)
 #   market:ipos         — IPO calendar cache (12h TTL)
-#   market:sectors      — sector summaries + opportunity/avoid picks (4h TTL)
+#   market:sectors      — sector summaries + opportunity/avoid picks (4h TTL).
+#                         Also source (b) of /api/radar: its `opportunity`
+#                         tickers are gate-filtered as radar candidates.
+#   radar:{PT-DATE}     — one PT day's off-watchlist radar: the <=5 candidates,
+#                         the per-source ok/reason verdicts, the funnel counts
+#                         and the full elimination trail. 36h retention
+#                         (RADAR_TTL) so a late-evening read still finds the
+#                         day it names. RADAR_SCHEMA 1, strict equality. An
+#                         INCOMPLETE build (a source was down) is cached but
+#                         rebuilt once RADAR_RETRY_MS (10 min) has passed; a
+#                         REFUSAL (watchlist:tickers unreadable) is never
+#                         written at all.
 #   market:week-ahead   — Friday-only week-ahead preview (18h TTL)
 #   market:goldencross  — golden-cross setups (1h TTL)
 #   scanner:{preset}    — day-trading scanner results (90s TTL)
