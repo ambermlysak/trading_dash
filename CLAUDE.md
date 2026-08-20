@@ -287,7 +287,7 @@ it to an enum in the Worker rather than passing text through.
 | `GET /api/market/week-ahead` | `aiGuard` — reject | ~2000 tokens on a cold cache |
 | `GET /api/market/sectors?refresh=1` | `aiGuard` — reject | ~3500 tokens; a warm read stays ungated so the tab still paints |
 | `GET /api/market/scanner` | `maySpend` — degrade | the ranked list is served either way; only catalyst tagging is skipped |
-| `GET /api/daily` | `maySpend` — degrade | the cached briefing is served; only regeneration is gated |
+| `GET /api/daily` | `maySpend` — degrade | the cached briefing is served; only regeneration is gated. **BOTH regeneration paths, since 2026-08-20** — the snapshot self-heal was gated and the EOD self-heal was not, and this row said otherwise for months |
 | `GET /api/watchlist/batch` | `maySpend` — degrade | **was the second-worst hole**: 30 uncached symbols in one request fanned out to 30 Claude calls |
 
 The `maySpend` paths degrade rather than reject on purpose — their *data* must
@@ -802,7 +802,7 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Thirteen checks exist, all of which print computed vs
+There is no build step. Fifteen checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
 (Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
@@ -855,15 +855,31 @@ midnight-UTC placeholder guard *and its ordering ahead of the anchors*, the
 multi-entry range branch and its inverse, every absent-date shape, the
 `isEarningsDateEstimate` field name, and a live re-probe of the watchlist's
 anchor distribution).
+and `node daily-slots.check.mjs` (the `/api/daily` slot-merge contract: the
+`dailySlotPtDate` classifier over every record shape including the `ts: 0` EOD
+placeholder and a timestamp straddling UTC midnight, sibling survival on
+**raw stored bytes** rather than a parsed object, the rollover, the **mixed**
+case that proves the purge is a per-key date test rather than an all-or-nothing
+switch, the same-slot re-run the spec allows, a failed KV read never deleting,
+and a source-level attribution of **every** `daily:` mutation site to the
+function it lives in — because no behavioural test can see an unconditional
+delete added somewhere else later, plus the `/api/daily` request-path spend gate),
+and `node analysis-shape.check.mjs` (the canonical `analysis:{TICKER}` record:
+`readAnalysisRecord` across all four eras that can be in KV, the `action` ->
+`recommendation` rename with `drivers` deliberately NOT manufactured from
+`factors`, both schemas' required arrays agreeing on the core, the optional half
+omitted rather than nulled, and **the spend leak driven through BOTH the old and
+the new gate** with the `needsAnalysis` predicate lifted from source — a test that
+cannot reproduce the bug cannot prove the fix).
 All of them extract functions from
 `worker.js` by source, not by import, because every named export in `worker.js`
 must be a function or `workerd` refuses to boot.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113** for moves /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99** for moves /
 long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
-sweep-universe / macro / mood / swing / earnings-timing — **1,083 comparisons**
-across the suite.
+sweep-universe / macro / mood / swing / earnings-timing / daily-slots /
+analysis-shape — **1,250 comparisons** across the suite.
 
 **TWO scripts now read live data, and both floors are the FIXED count rather than
 the observed total.** `swing.check.mjs` (below) and `earnings-timing.check.mjs`,
@@ -975,6 +991,18 @@ without ever opening that file.
 - Option-strategy gates are relative, never absolute
 - Provenance badges are derived by `setBadge()`, never authored
 - Do not declare a local `const TTL` — `TTL` is a module-level table
+- The `/api/daily` object is **three keys merged at read time**, not one stored
+  object. A briefing run writes its own slot and may clear a sibling **only** on a
+  PT-date rollover, through `purgeStaleDailySlots()`. Never restore an
+  unconditional `delete('daily:eod'/'daily:midday')`
+- All three `daily:` records carry `ptDate`, placeholders included; an absent
+  `ptDate` **and** an unusable `ts` means STALE, which is the direction that
+  regenerates
+- `analysis:{TICKER}` has **one canonical shape and two writers**. Required core
+  `rating · confidence · recommendation · drivers[] · summary`; `factors{}` and
+  `thesis` are synthesis-only and **omitted, never nulled**; `trend`/`pattern`/
+  `action` are gone. **Never read the key directly — go through
+  `readAnalysisRecord()`**, or a legacy record reads as unanalysed and re-spends
 - `premium:{TICKER}` freshness and retention must not be equal
 - The IV sweep's unconditional overwrite **is the sampling design**, not a missing
   optimisation: one sample per name per day at a fixed 13:15 PT. **Never add
@@ -1505,9 +1533,10 @@ Kill background processes when a task completes. Don't leave wrangler dev, wrang
 
 ## Named failure modes
 
-Nine failure modes have been named in this repo, each from a specific incident. The
+Ten failure modes have been named in this repo, each from a specific incident. The
 assertion is here; the incident narrative, post-mortem and harness detail behind each
-one is in [`docs/failure-modes.md`](docs/failure-modes.md) under the same heading.
+one is in [`docs/failure-modes.md`](docs/failure-modes.md) under the same heading —
+except the tenth, whose narrative is inline below because it is new.
 
 - **No hit rate goes on screen without its base rate** — [evidence](docs/failure-modes.md)
 - **A single negative probe right after a deploy is UNCONFIRMED, not a failure** — [evidence](docs/failure-modes.md)
@@ -1518,6 +1547,45 @@ one is in [`docs/failure-modes.md`](docs/failure-modes.md) under the same headin
 - **`return ''` in a render helper is where this hides — audit them all** — discipline retained below; [evidence](docs/failure-modes.md)
 - **A newly rendered figure gets eyes on it before the commit is done** — [evidence](docs/failure-modes.md)
 - **An empty comparison is not a pass** — [evidence](docs/failure-modes.md)
+- **A whole-object rewrite is a DELETE of every slot the writer does not own** — below
+
+### A whole-object rewrite is a DELETE of every slot the writer does not own
+
+`/api/daily` looks like one object and is three KV keys — `daily:snapshot` (which
+carries the top-level headline **and** the `open` slot), `daily:midday`,
+`daily:eod` — merged at read time by `handleDailyGet`. Each generator writes only
+its own key, so the slots are structurally independent and there is no cross-slot
+read-modify-write to lose a race in.
+
+`generateDailySnapshot` then deleted the other two on **every** successful write.
+That is correct for the 6:00am firing, where the new pre-market briefing exists to
+replace yesterday's recap, and destructive for every other run on the same PT day.
+Measured from the decision_dash side 2026-08-19: all three records present at
+17:56 PT (open 06:02, midday 11:31, eod 13:13); at 18:11 open and eod were
+restamped 18:11 and **midday was gone**.
+
+**The trigger was a request, not a cron.** `handleDailyGet` regenerates the
+briefing when it is more than 12h old, so a 06:02 snapshot went stale at 18:02 and
+the next page poll rebuilt it in the evening. `daily:eod` came back seconds later
+through the `!eod` self-heal — which is why it *looked* like a restamp rather than
+a loss — and `daily:midday`, which deliberately has no self-heal, did not.
+
+Two things generalise:
+
+- **"Deletes yesterday's" and "deletes on every run" are the same line of code
+  until a date is in the record.** The fix is not a smaller delete, it is
+  `ptDate` on every slot and a purge that must positively read an *earlier* day
+  before it removes anything. Unknowable day → treated as stale, because that
+  direction regenerates and the other renders an old recap under today's date.
+- **A slot with a self-heal and a slot without look identical the moment they are
+  both deleted.** The blast radius of a wholesale rewrite is not what it deletes,
+  it is what cannot come back — and that is a property of the *other* slots, which
+  the writer never consults.
+
+Pinned by `node daily-slots.check.mjs`, which asserts sibling survival on raw
+stored bytes, and by a source-level attribution of every `daily:` mutation site to
+its enclosing function — a behavioural test cannot see an unconditional delete
+added elsewhere six months from now.
 
 ### `return ''` in a render helper is where this hides — audit them all
 

@@ -301,6 +301,46 @@ in this codebase and shipped:
    a missing measurement. Caught only by auditing the whole class after the first instance; a
    `.toFixed` sweep alone would have missed it.
 
+   **Breached again, found 2026-08-20, and the audit above had walked right past it.**
+   `renderSynthesis` in `index.html` painted the Sentiment card's four bars from
+   `factors.sentiment?.score ?? 50` — so a stored record written by the nightly
+   watchlist pass, which does not produce `factors` at all, rendered four bars at a
+   measured-looking neutral 50. Same class as `gapBar()`, same page, and it survived
+   the sweep because `?? 50` is not `.toFixed` and not `× 100`. **The audit predicate
+   was the arithmetic, and the failure mode is the DEFAULT.** Every default on a
+   possibly-absent measurement is a candidate, whatever operator carries it. Now
+   gated on `Number.isFinite` at every site, with absence rendered as a named
+   "not produced for this record" state and `renderFactorPanels` writing *every*
+   panel on every call — iterating only the keys present left the previous ticker's
+   panels on screen, which is the stale-value-is-worse-than-blank rule again.
+
+27. **A KV key with two writers needs one shape, and the disagreement is never
+   cosmetic.** `analysis:{TICKER}` was written by the nightly pass as
+   `recommendation` + `drivers[]` and by `POST /api/ai/synthesis` as `action` +
+   `factors{}`. Neither writer knew about the other; both readers had been written
+   against one shape and silently mishandled the other. It cost money in one
+   direction — `handleWatchlistBatch` gated on `cached.recommendation`, so a
+   synthesis record read as *unanalysed* and the row bought a second Claude call for
+   a name already analysed, up to 30 per batch — and fabricated numbers in the other
+   (rule 22 above). Unified 2026-08-20 to a required core
+   (`rating · confidence · recommendation · drivers[] · summary`) plus an optional
+   synthesis-only half (`factors{}`, `thesis`) that is **omitted, never nulled**;
+   `trend`/`pattern`/`action` were dropped after a grep confirmed zero readers.
+   Every read goes through `readAnalysisRecord()`, which names the era of the record
+   it is holding — worth keeping past the migration, because the frontend routinely
+   ships ahead of the Worker here. **Before adding a second writer to any key,
+   enumerate its readers and what each one requires.** The inventory is the work; the
+   schema edit is the easy part.
+
+28. **A whole-object rewrite is a delete of every slot the writer does not own.**
+   `/api/daily` is three KV keys merged at read time, and `generateDailySnapshot`
+   deleted the other two on every successful write — correct at 6:00am, destructive
+   at 18:11 on the same day, when a 12h-staleness self-heal regenerated the briefing
+   and took the midday pulse with it. The slot came back only where a self-heal
+   existed, so the blast radius was a property of the *other* slots, which the writer
+   never consulted. Now date-gated: a sibling is cleared only when it demonstrably
+   belongs to an earlier PT day. See CLAUDE.md's named failure mode of the same name.
+
 ## Design note: overlapping windows and the proxy-vs-thing failure
 
 The Long tab's first concentration metric was `expectancyTop3Share` — the share of
@@ -802,7 +842,8 @@ GET  /api/peers/:ticker            Yahoo recommendationsBySymbol
 POST /api/claude                   REMOVED — returns 410. Was an unauthenticated LLM passthrough.
 POST /api/log-rec                  {ticker, rating, confidence, price, factors}
 GET  /api/track/:ticker            Rating history + calibration
-GET  /api/daily                    Morning briefing + EOD + midday, from KV
+GET  /api/daily                    Morning briefing + EOD + midday, MERGED at read time from
+                                   three keys (daily:snapshot / daily:midday / daily:eod)
 GET  /api/market/snapshot          Index / futures / commodities strip
 GET  /api/market/movers            Pre-market and day movers (≥ ±10%)
 GET  /api/market/ipos              Upcoming IPO calendar
@@ -820,7 +861,8 @@ GET  /api/income/batch?symbols=    Dividend rows: yield, payout, history, growth
 GET  /api/watchlist/batch          Bulk fundamentals + RSI + SMA cross + Claude analysis
 GET  /api/watchlist/auction        Closing-auction block trades
 POST /api/watchlist/save           Persist the watchlist for the cron jobs
-GET|POST|DELETE /api/analysis/:t   Per-ticker Claude analysis cache
+GET|POST|DELETE /api/analysis/:t   Per-ticker Claude verdict cache. GET normalises through
+                                   readAnalysisRecord() and 404s an unusable record
 POST /api/admin/refresh-daily      Bearer-token gated (admin:token in KV)
 POST /api/admin/refresh-midday     Bearer-token gated
 ```

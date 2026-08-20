@@ -3266,47 +3266,99 @@ function renderSynthesis(r, lastPrice) {
   arc.setAttribute('stroke', lvl === 2 ? '#23d18b' : lvl === 1 ? '#f4b740' : '#f25f5c');
   document.getElementById('synth-conf-num').textContent = confLabel(r.confidence);
 
-  // Narrative
-  const paragraphs = (r.thesis || '').split(/\n\n+/);
-  document.getElementById('synth-narrative').innerHTML = paragraphs.map(p => `<p>${p}</p>`).join('');
+  /* ── `factors` AND `thesis` ARE THE OPTIONAL HALF OF THE RECORD ──────────────
+     Two writers share `analysis:{TICKER}`. `POST /api/ai/synthesis` produces
+     factors and a thesis; the nightly watchlist pass does not, deliberately —
+     asking it for six factor objects and two paragraphs across the whole
+     watchlist every night is a ~3.5x token bill on that job for one reader.
 
-  // Factors
-  const factors = r.factors || {};
-  document.getElementById('synth-factors').innerHTML = Object.entries(factors).map(([k, f]) => {
-    const score = f.score ?? 50;
-    const color = score > 60 ? '#23d18b' : score < 40 ? '#f25f5c' : '#f4b740';
-    return `
-      <div class="factor-row" title="${f.note || ''}">
-        <span class="name">${k}</span>
-        <span class="track"><span class="fill" style="width:${score}%;background:${color};"></span></span>
-        <span class="score">${score}</span>
-      </div>`;
-  }).join('');
+     THIS CARD USED TO FABRICATE THEM. `factors.sentiment?.score ?? 50` painted
+     four bars at a measured-looking 50 whenever the stored record came from the
+     nightly pass, and the thesis line rendered a single empty paragraph. A
+     missing measurement became a neutral reading — `x == null` and `x === 50`
+     rendering identically, which is the exact failure the codebase names.
 
-  // Sentiment card derives from the same factors
-  document.getElementById('sentiment-content').innerHTML = `
+     So absence is now a NAMED STATE. The required core (`rating`, `confidence`,
+     `recommendation`, `drivers`, `summary`) is on every record from either
+     writer, so the card still says something real; it just stops drawing bars
+     for numbers nobody computed. */
+  const factors    = (r.factors && typeof r.factors === 'object') ? r.factors : null;
+  const hasFactors = !!(factors && Object.keys(factors).length);
+  const drivers    = Array.isArray(r.drivers) ? r.drivers.filter(Boolean) : [];
+
+  // Narrative — the thesis when there is one, otherwise the core the nightly
+  // pass DOES produce. Both are real; neither is a stand-in for the other, and
+  // the caption says which one is on screen.
+  const narrative = document.getElementById('synth-narrative');
+  if (r.thesis) {
+    narrative.innerHTML = r.thesis.split(/\n\n+/).map(p => `<p>${esc(p)}</p>`).join('');
+  } else if (r.recommendation || r.summary) {
+    narrative.innerHTML = `
+      ${r.recommendation ? `<p><strong>${esc(r.recommendation)}</strong></p>` : ''}
+      ${r.summary ? `<p>${esc(r.summary)}</p>` : ''}
+      ${drivers.length ? `<p style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">${drivers.map(esc).join(' · ')}</p>` : ''}
+      <p style="font-family:var(--mono);font-size:10px;color:var(--ink-3);">Consolidated call from the nightly pass — no long-form thesis in this record.</p>`;
+  } else {
+    narrative.innerHTML = '<p style="color:var(--ink-3);">No stored narrative for this ticker.</p>';
+  }
+
+  // Factor bars — rendered only from scores that exist. A factor present without
+  // a numeric score gets its note and no bar, for the same reason.
+  document.getElementById('synth-factors').innerHTML = hasFactors
+    ? Object.entries(factors).map(([k, f]) => {
+        const score = Number.isFinite(f?.score) ? f.score : null;
+        if (score == null) {
+          return `<div class="factor-row" title="${esc(f?.note || '')}">
+            <span class="name">${esc(k)}</span>
+            <span class="track"></span>
+            <span class="score" style="color:var(--ink-3);">—</span>
+          </div>`;
+        }
+        const color = score > 60 ? '#23d18b' : score < 40 ? '#f25f5c' : '#f4b740';
+        return `
+          <div class="factor-row" title="${esc(f.note || '')}">
+            <span class="name">${esc(k)}</span>
+            <span class="track"><span class="fill" style="width:${score}%;background:${color};"></span></span>
+            <span class="score">${score}</span>
+          </div>`;
+      }).join('')
+    : '<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);">'
+      + 'Factor scores not produced for this record — they come from the on-demand '
+      + 'synthesis, not the nightly watchlist pass. Not scored, not neutral.</div>';
+
+  // Sentiment card derives from the same factors, and inherits the same rule.
+  const sentScore = Number.isFinite(factors?.sentiment?.score) ? factors.sentiment.score : null;
+  document.getElementById('sentiment-content').innerHTML = hasFactors ? `
     <div class="score-large">
-      <span class="num">${factors.sentiment?.score ?? '—'}</span>
+      <span class="num">${sentScore ?? '—'}</span>
       <span class="denom">/ 100</span>
-      <span class="tag ${factors.sentiment?.score > 60 ? 'bull' : factors.sentiment?.score < 40 ? 'bear' : 'neutral'}">
-        ${factors.sentiment?.note || 'neutral'}
+      <span class="tag ${sentScore == null ? 'neutral' : sentScore > 60 ? 'bull' : sentScore < 40 ? 'bear' : 'neutral'}">
+        ${esc(factors.sentiment?.note || (sentScore == null ? 'not scored' : 'neutral'))}
       </span>
     </div>
     <div class="score-bars">
       ${[
-        ['News flow', factors.sentiment?.score ?? 50, '#5ec5ea'],
-        ['Insider net', factors.insider?.score ?? 50, '#23d18b'],
-        ['Analyst stance', factors.analyst?.score ?? 50, '#f4b740'],
-        ['Macro tailwinds', factors.macro?.score ?? 50, '#b48ead'],
-      ].map(([name, s, color]) => `
+        ['News flow',      factors.sentiment?.score, '#5ec5ea'],
+        ['Insider net',    factors.insider?.score,   '#23d18b'],
+        ['Analyst stance', factors.analyst?.score,   '#f4b740'],
+        ['Macro tailwinds',factors.macro?.score,     '#b48ead'],
+      ].map(([name, s, color]) => {
+        // A bar IS a rendered number. No score, no bar — the gapBar() lesson.
+        const has = Number.isFinite(s);
+        return `
         <div class="bar-row">
           <span class="lbl">${name}</span>
-          <span class="bar-track"><span class="bar-fill" style="width:${s}%;background:linear-gradient(90deg,transparent,${color});"></span></span>
-          <span class="val">${s}</span>
-        </div>
-      `).join('')}
+          <span class="bar-track">${has ? `<span class="bar-fill" style="width:${s}%;background:linear-gradient(90deg,transparent,${color});"></span>` : ''}</span>
+          <span class="val"${has ? '' : ' style="color:var(--ink-3);"'}>${has ? s : '—'}</span>
+        </div>`;
+      }).join('')}
     </div>
-    <div style="margin-top:12px;font-family:JetBrains Mono;font-size:10px;color:var(--ink-3);">Synthesis: Claude · factors weighted by recent volatility regime</div>`;
+    <div style="margin-top:12px;font-family:JetBrains Mono;font-size:10px;color:var(--ink-3);">Synthesis: Claude · factors weighted by recent volatility regime</div>`
+    : `<div style="font-family:var(--mono);font-size:11px;color:var(--ink-3);line-height:1.6;">
+        Sentiment scoring not produced for this record. The stored analysis came from
+        the nightly watchlist pass, which commits to a consolidated call rather than
+        scoring six factors. Run a fresh synthesis to populate this card.
+       </div>`;
 
   renderFactorPanels(factors);
 
@@ -3352,20 +3404,34 @@ function initFactorPanels() {
   }
 }
 
+/* Every panel is written on EVERY call, including the no-factors case. Iterating
+   only what `factors` holds left the previous ticker's panels on screen when the
+   new record had none — and a stale panel is a worse lie than a blank one, the
+   same rule the EOD timestamp is under. `?? 50` is gone here too: a factor with
+   no numeric score gets its narrative and no bar. */
+const FACTOR_PANEL_KEYS = ['technical', 'analyst', 'fundamental', 'sentiment', 'insider', 'macro'];
+
 function renderFactorPanels(factors) {
-  for (const [factor, f] of Object.entries(factors || {})) {
+  const has = factors && typeof factors === 'object';
+  for (const factor of FACTOR_PANEL_KEYS) {
     const panel = document.getElementById(`factor-panel-${factor}`);
     if (!panel) continue;
-    const score = f.score ?? 50;
-    const color = score > 60 ? 'var(--bull)' : score < 40 ? 'var(--bear)' : 'var(--amber)';
-    const label = score > 60 ? 'Bullish' : score < 40 ? 'Bearish' : 'Neutral';
+    const f = has ? factors[factor] : null;
+    if (!f) {
+      panel.innerHTML = '<div class="factor-panel-text" style="color:var(--ink-3);">'
+        + 'Not scored in this record — factor scores come from the on-demand synthesis.</div>';
+      continue;
+    }
+    const score = Number.isFinite(f.score) ? f.score : null;
+    const color = score == null ? 'var(--ink-3)' : score > 60 ? 'var(--bull)' : score < 40 ? 'var(--bear)' : 'var(--amber)';
+    const label = score == null ? 'Not scored' : score > 60 ? 'Bullish' : score < 40 ? 'Bearish' : 'Neutral';
     panel.innerHTML = `
       <div class="factor-panel-bar">
-        <span class="factor-panel-score" style="color:${color};">${score}</span>
-        <div class="factor-panel-track"><div class="factor-panel-fill" style="width:${score}%;background:${color};"></div></div>
+        <span class="factor-panel-score" style="color:${color};">${score ?? '—'}</span>
+        <div class="factor-panel-track">${score == null ? '' : `<div class="factor-panel-fill" style="width:${score}%;background:${color};"></div>`}</div>
         <span class="factor-panel-label" style="color:${color};">${label}</span>
       </div>
-      <div class="factor-panel-text">${f.narrative || f.note || '—'}</div>`;
+      <div class="factor-panel-text">${esc(f.narrative || f.note || '—')}</div>`;
   }
 }
 

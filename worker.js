@@ -3742,7 +3742,14 @@ async function directionalRead(sym, env, moves = null) {
     if (p && p.schema === POOLED_CALIB_SCHEMA) pooled = p;
   } catch (_) {}
 
-  const rating = ['BUY', 'HOLD', 'SELL'].includes(a?.rating) ? a.rating : null;
+  /* Through the normaliser like every other reader, but taking `rating` REGARDLESS
+     of `ok`. This tag makes no actionable claim — it reports which way the stored
+     rating points and is explicitly disabled from influencing sort order — so a
+     pre-consolidation record that carries a rating and no call is still a usable
+     input here, where it is not on the watchlist row. `ok` is the gate for
+     rendering a CALL; this renders a DIRECTION. */
+  const stored = readAnalysisRecord(a);
+  const rating = stored.rating;
   // Same bar and base rates the pooled record uses, from the series already in hand.
   const ownRates = baseRatesFrom(moves, 20);
   const ownMap   = ownRates ? new Map([[sym.toUpperCase(), ownRates]]) : new Map();
@@ -3804,7 +3811,7 @@ async function directionalRead(sym, env, moves = null) {
     rating,
     source: rating ? `analysis:${sym}` : null,
     asOf: a?.ts ?? null,
-    confidence: Number.isFinite(a?.confidence) ? a.confidence : null,
+    confidence: stored.confidence,
     calibration: {
       basis, basisReason,
       n:       source ? source.n : own.n,
@@ -6149,15 +6156,44 @@ const AI_FACTOR_SCHEMA = {
   additionalProperties: false,
 };
 
+/* ── THE CANONICAL `analysis:{TICKER}` RECORD ────────────────────────────────
+ * TWO writers share this key and they used to disagree about its shape. The
+ * nightly pass (`ANALYSIS_SCHEMA`) wrote `recommendation` + `drivers[]`; this
+ * one wrote `action` + `factors{}` and no `recommendation` at all. Both
+ * directions were already broken in production:
+ *
+ *   - `handleWatchlistBatch` gated on `cached.recommendation`, so a
+ *     synthesis-written record read as UNANALYSED and the row queued a fresh
+ *     Claude call. Visiting a ticker page invalidated that name's watchlist row
+ *     and re-spent for it — up to 30 per batch request.
+ *   - `renderSynthesis` in index.html read `factors{}`, so a nightly-written
+ *     record painted four sentiment bars at `?? 50` — a missing measurement
+ *     rendered as a measured neutral, which is the fabricated-number rule.
+ *
+ * Unified 2026-08-20. The REQUIRED CORE is what both writers emit and what every
+ * reader may rely on:
+ *
+ *     rating · confidence · recommendation · drivers[] · summary
+ *
+ * `factors{}` and `thesis` are the OPTIONAL rich half. Only synthesis produces
+ * them — asking the nightly pass for six factor objects and a two-paragraph
+ * thesis across the whole watchlist every night is a ~3.5x token bill on that job
+ * for one reader. They are OMITTED, never nulled: absent means "this writer does
+ * not produce them", which a reader can name; `null` would be a claim.
+ *
+ * `trend`, `pattern` and `action` are GONE. Verified by grep across worker.js,
+ * index.html and dashboard.html: zero readers, anywhere. They were the residue of
+ * the four-column watchlist that `recommendation` replaced.
+ *
+ * Anything reading this key goes through `readAnalysisRecord()` below. */
 const AI_SYNTHESIS_SCHEMA = {
   type: 'object',
   properties: {
-    rating:     { type: 'string', enum: ['BUY', 'HOLD', 'SELL'] },
-    confidence: { type: 'integer' },
-    trend:      { type: 'string' },
-    pattern:    { type: 'string' },
-    action:     { type: 'string' },
-    summary:    { type: 'string' },
+    rating:         { type: 'string', enum: ['BUY', 'HOLD', 'SELL'] },
+    confidence:     { type: 'integer' },
+    recommendation: { type: 'string' },
+    drivers:        { type: 'array', items: { type: 'string' } },
+    summary:        { type: 'string' },
     factors: {
       type: 'object',
       properties: {
@@ -6173,9 +6209,113 @@ const AI_SYNTHESIS_SCHEMA = {
     },
     thesis: { type: 'string' },
   },
-  required: ['rating', 'confidence', 'trend', 'pattern', 'action', 'summary', 'factors', 'thesis'],
+  required: ['rating', 'confidence', 'recommendation', 'drivers', 'summary', 'factors', 'thesis'],
   additionalProperties: false,
 };
+
+/** MIGRATE ON READ — the one place any stored `analysis:{TICKER}` record is read.
+ *
+ *  Chosen over migrating in place or letting the 2-day TTL age the old records
+ *  out. Ageing out is the tempting one and it is wrong: for up to 48h after
+ *  deploy a stale synthesis record still lacks `recommendation`, so the watchlist
+ *  keeps treating those names as unanalysed and keeps re-spending — the exact bug
+ *  the unification exists to close, just time-boxed. Migrating in place needs a KV
+ *  list scan plus a Claude call per record to fill the missing field, on records
+ *  that expire within 48h anyway.
+ *
+ *  It also outlives the migration, which is the real argument for it: the
+ *  frontend routinely ships ahead of the Worker in this repo, so a reader that can
+ *  name the era of the record it is holding is worth having permanently.
+ *
+ *  THE ERAS, and what each can supply:
+ *
+ *  | era | what wrote it | core present? |
+ *  |---|---|---|
+ *  | `canonical` | either writer, 2026-08-20 onward | yes |
+ *  | `legacy-synthesis` | `POST /api/ai/synthesis` before 2026-08-20 | after mapping `action` → `recommendation` |
+ *  | `legacy-quartet` | the nightly pass before the four columns were consolidated | **no** — rating only |
+ *  | `absent` | nothing stored, or unparseable | no |
+ *
+ *  `action` → `recommendation` IS A RENAME, not a derivation: both are "the
+ *  actionable phrase", and the old prompt's own example (`Buy dips to $85`) is
+ *  the new prompt's example too.
+ *
+ *  `drivers` STAYS NULL on a legacy-synthesis record and is not synthesised from
+ *  `factors`. The temptation is real — six factor notes are sitting right there —
+ *  but `drivers` claims "these decided the call, most important first", and factor
+ *  notes carry neither the selection nor the ordering. Manufacturing that ordering
+ *  would put an unearned claim on screen, which is the failure this codebase keeps
+ *  naming. `driversSource` says which case the reader is in.
+ */
+function readAnalysisRecord(raw) {
+  const none = {
+    ok: false, era: 'absent', reason: 'no stored record',
+    rating: null, confidence: null, recommendation: null, drivers: null,
+    driversSource: 'none', summary: null, factors: null, thesis: null, ts: null,
+  };
+  if (!raw || typeof raw !== 'object') return none;
+
+  const str = v => (typeof v === 'string' && v.trim()) ? v : null;
+  const rating     = ['BUY', 'HOLD', 'SELL'].includes(raw.rating) ? raw.rating : null;
+  const confidence = Number.isFinite(raw.confidence) ? raw.confidence : null;
+  const summary    = str(raw.summary);
+  const thesis     = str(raw.thesis);
+  const factors    = (raw.factors && typeof raw.factors === 'object') ? raw.factors : null;
+  const ts         = Number.isFinite(raw.ts) ? raw.ts : null;
+
+  const canonicalRec = str(raw.recommendation);
+  const legacyAction = str(raw.action);
+  const recommendation = canonicalRec ?? legacyAction;
+
+  const drivers = Array.isArray(raw.drivers) ? raw.drivers.filter(d => str(d)) : null;
+  const driversSource = drivers && drivers.length ? 'record'
+    : recommendation && !canonicalRec ? 'not-in-legacy-synthesis-shape'
+    : 'none';
+
+  const era = canonicalRec ? 'canonical'
+    : legacyAction || factors || thesis ? 'legacy-synthesis'
+    : rating ? 'legacy-quartet'
+    : 'absent';
+
+  /* `ok` is THE REQUIRED CORE, and the core is what a reader may rely on.
+     Deliberately NOT `rating != null`: a legacy-quartet record has a rating and
+     nothing actionable beside it, and rendering that badge with an empty call is
+     what the pre-consolidation guard was already refusing to do. */
+  const ok = !!(rating && recommendation && summary);
+  const reason = ok ? null
+    : era === 'absent' ? 'no stored record'
+    : era === 'legacy-quartet' ? 'pre-consolidation record: rating only, no actionable call'
+    : !rating ? 'no valid rating'
+    : !recommendation ? 'no recommendation or legacy action'
+    : 'no summary';
+
+  return {
+    ok, era, reason,
+    rating, confidence, recommendation,
+    drivers: drivers && drivers.length ? drivers : null,
+    driversSource,
+    summary, factors, thesis, ts,
+  };
+}
+
+/** The canonical record as it goes back over the wire, with the era attached so a
+ *  consumer can distinguish "this writer does not produce factors" from "this
+ *  Worker is too old to send them". `factors` and `thesis` are OMITTED when
+ *  absent, never nulled — see the schema note above. */
+function analysisRecordPayload(rec) {
+  return {
+    rating: rec.rating,
+    confidence: rec.confidence,
+    recommendation: rec.recommendation,
+    drivers: rec.drivers,
+    driversSource: rec.driversSource,
+    summary: rec.summary,
+    ...(rec.factors ? { factors: rec.factors } : {}),
+    ...(rec.thesis  ? { thesis:  rec.thesis  } : {}),
+    ts: rec.ts,
+    schemaEra: rec.era,
+  };
+}
 
 /** Gather everything the synthesis prompt quotes. ~5 subrequests. */
 async function gatherSynthesisFacts(sym, env) {
@@ -6306,10 +6446,14 @@ ${f.news.length ? f.news.map(h => `- ${h}`).join('\n') : '- none retrieved'}
 TASK:
 Return JSON matching the provided schema.
 - rating: BUY | HOLD | SELL
-- confidence: 0-100 integer
-- trend: under 10 words describing the current trend
-- pattern: chart pattern name (e.g. Bull flag, Double bottom)
-- action: actionable phrase (e.g. Buy dips to $85, Hold above $200)
+- confidence: 0-100 integer. It reflects how strongly the evidence AGREES. Genuine
+  conflict between factors means a lower number, not a hedged recommendation.
+- recommendation: the single actionable line a PM would read in a table row — the
+  call plus its trigger or level, at most 14 words. No hedging both ways.
+  (e.g. "Buy dips to $85", "Hold above $200, trim into $240")
+- drivers: the 2-4 factors that actually decided the call, most important first,
+  2-5 words each, each naming its category (e.g. "Momentum: 3M +18%",
+  "Macro: CPI risk Wed")
 - summary: 2-sentence trader summary
 - factors: technical, fundamental, sentiment, analyst, insider, macro — each with
   score 0-100 (0=very bearish, 50=neutral, 100=very bullish), a note under 8 words,
@@ -10713,15 +10857,27 @@ async function handleWatchlistBatch(symbols, origin, env, ctx, request) {
           earningsIsEstimate = earningsIsEstimateFrom(cal);
         }
 
-        // Claude analysis from KV (written by cron or previous on-demand run)
+        /* Claude analysis from KV (written by the nightly pass, an on-demand
+           watchlist run, or `POST /api/ai/synthesis` — all three share this key).
+           THE GATE IS THE REQUIRED CORE, VIA THE NORMALISER, and that is the fix
+           for a live spend leak: this used to test `cached.recommendation`
+           directly, so a synthesis-written record — which had `action` and no
+           `recommendation` at all — read as unanalysed and put the ticker back in
+           `needsAnalysis` below. Opening a ticker page therefore invalidated that
+           name's watchlist row and bought a second Claude call for a name already
+           analysed. `readAnalysisRecord` maps the legacy `action` across, so both
+           eras now satisfy the gate.
+
+           Pre-consolidation records (`legacy-quartet`: a rating and nothing
+           actionable) still fail it deliberately, and still regenerate — rendering
+           that badge with an empty call beside it is what the original guard was
+           right to refuse. */
         let recommendation = null, drivers = null, summary = null, rating = null, confidence = null, analysisTs = null;
         const cached = analysisRes.status === 'fulfilled' ? analysisRes.value : null;
-        // Entries written before the four columns were consolidated carry a rating
-        // but no `recommendation`. Treat those as absent so the row regenerates in
-        // the new shape instead of rendering a badge with an empty call beside it.
-        if (cached && cached.recommendation && Date.now() - (cached.ts || 0) < 172_800_000) {
-          ({ recommendation, drivers, summary, rating, confidence } = cached);
-          analysisTs = cached.ts;
+        const rec    = readAnalysisRecord(cached);
+        if (rec.ok && Date.now() - (rec.ts || 0) < 172_800_000) {
+          ({ recommendation, drivers, summary, rating, confidence } = rec);
+          analysisTs = rec.ts;
         }
 
         /* Regression channel, evaluated HERE rather than in the chart block above
@@ -10956,14 +11112,27 @@ async function handleDailyGet(origin, env, ctx, request) {
     const isWeekday = ptNow.getDay() >= 1 && ptNow.getDay() <= 5;
     const minsPT    = ptNow.getHours() * 60 + ptNow.getMinutes();
 
-    // Auto-trigger EOD generation if market is closed, data is missing, and we have API access
+    /* Auto-trigger EOD generation if the market is closed, the data is missing,
+       and we have API access.
+
+       GATED ON `maySpend`, 2026-08-20. It was not, and rule #5's own table said
+       `/api/daily` was — the table described the SNAPSHOT regeneration below and
+       silently overstated its coverage of this branch. This is a Claude call
+       fired from an ordinary page load, so it belongs behind the same ceiling as
+       every other request-path spend. `maySpend` DEGRADES rather than rejects:
+       the cached briefing and every other slot still paint, and `eodLoading`
+       simply stays false, which is already the "no recap yet" state the card
+       renders. `generateEODSummary`'s own 2h dedup bounded the blast radius
+       before this and still does; it was never the authorisation.
+
+       Ordering, per the note at the `maySpend` call site below: it INCREMENTS, so
+       it is asked last — only once this branch knows it would actually spend. */
     let eodLoading = false;
-    if (!eod && ctx && env?.ANTHROPIC_API_KEY) {
+    if (!eod && ctx && env?.ANTHROPIC_API_KEY && isWeekday && minsPT >= 780
+        && await maySpend(request, env)) {
       // Market closes at 1pm PT; allow generation from 1pm through midnight
-      if (isWeekday && minsPT >= 780) {
-        ctx.waitUntil(generateEODSummary(env));
-        eodLoading = true;
-      }
+      ctx.waitUntil(generateEODSummary(env));
+      eodLoading = true;
     }
 
     // No fetch-path self-heal for the midday pulse: the pipeline (~50s) outruns
@@ -11742,6 +11911,65 @@ Include 6–10 events total. Order chronologically Mon→Fri.`;
   return json(payload, 200, origin);
 }
 
+/* ── The /api/daily object is THREE KEYS, merged at read time ──────────────────
+ * `daily:snapshot` (the `open` slot plus the top-level headline / newsCards /
+ * opportunity / avoid), `daily:midday` and `daily:eod`. `handleDailyGet` composes
+ * them; nothing writes a combined object, and each generator writes only its own
+ * key. So the slots are structurally independent and a cross-slot read-modify-write
+ * does not exist — which is what makes "last write wins across slots" impossible
+ * here rather than merely unlikely.
+ *
+ * THE ONE PLACE THAT VIOLATED THAT was `generateDailySnapshot`, which deleted the
+ * other two keys unconditionally on every successful write. That is correct for
+ * the 6:00am firing — the new pre-market briefing exists to replace yesterday's
+ * recap — and destructive for any OTHER run on the same PT day. Measured
+ * 2026-08-19: the request-path self-heal in `handleDailyGet` fires when the
+ * snapshot is >12h old, so a 06:02 briefing went stale at 18:02 and the next page
+ * poll regenerated it at 18:11, taking `daily:midday` and `daily:eod` with it. The
+ * EOD self-heal then rebuilt eod at 18:11; midday has no self-heal by design, so
+ * that slot was gone for the day and any client that had not already fetched it
+ * lost it permanently.
+ *
+ * The delete is therefore gated on a DATE ROLLOVER rather than on "a briefing
+ * ran". A slot is cleared only when it demonstrably belongs to an earlier PT day. */
+
+/** The PT calendar day a stored daily-slot record belongs to, or null if unknowable.
+ *  `ptDate` is stamped by every writer from 2026-08-20. Records written before that
+ *  carry none, so it falls back to deriving the day from `ts` — which is the same
+ *  information, just less direct. `ts: 0` is the EOD placeholder (see the two
+ *  guards in generateEODSummary) and deliberately yields null: a placeholder makes
+ *  no claim about a day, and treating it as stale is the right answer anyway
+ *  because clearing it is exactly what makes the next firing retry. */
+function dailySlotPtDate(rec) {
+  if (!rec || typeof rec !== 'object') return null;
+  if (typeof rec.ptDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(rec.ptDate)) return rec.ptDate;
+  if (Number.isFinite(rec.ts) && rec.ts > 0) return ptDate(new Date(rec.ts));
+  return null;
+}
+
+/** Clear the sibling slots ONLY when they belong to an earlier PT day.
+ *  Returns `{ key: 'kept' | 'cleared' | 'absent' }` so the caller can log what it
+ *  decided — a purge that silently does nothing and a purge that silently deletes
+ *  look identical in the tail otherwise, which is rule #7 all over again. */
+async function purgeStaleDailySlots(env, today = ptDate()) {
+  const outcome = {};
+  for (const key of ['daily:eod', 'daily:midday']) {
+    let rec = null;
+    try { rec = await env?.REC_LOG?.get(key, 'json'); } catch (_) { outcome[key] = 'unreadable'; continue; }
+    if (!rec) { outcome[key] = 'absent'; continue; }
+    const day = dailySlotPtDate(rec);
+    /* An unknowable day (no `ptDate`, no usable `ts`) is treated as STALE. That is
+       the safe direction: the only records in that state are pre-2026-08-20 writes
+       and EOD placeholders, both of which regenerate. Treating it as current would
+       let one undated record survive a genuine rollover and render yesterday's
+       recap as today's. */
+    if (day === today) { outcome[key] = 'kept'; continue; }
+    try { await env?.REC_LOG?.delete(key); outcome[key] = 'cleared'; } catch (_) { outcome[key] = 'unreadable'; }
+  }
+  console.log(`[cron] daily slots ${today} · eod=${outcome['daily:eod']} midday=${outcome['daily:midday']}`);
+  return outcome;
+}
+
 /* ── Cron: daily snapshot ── */
 async function generateDailySnapshot(env) {
   const mark = instrMark();
@@ -11808,6 +12036,12 @@ async function generateDailySnapshot(env) {
     weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
     timeZone: 'America/Los_Angeles',
   });
+  /* ONE time basis for this run, taken once. `today` above is the prose form for
+     the prompt; `todayPt` is the ISO PT day the record is stamped with and the
+     purge compares against. Deriving it twice is how two readings of "today in
+     Pacific" drift across a midnight boundary mid-run — the same rule
+     `scheduled()` follows with `ptParts()`. */
+  const todayPt = ptDate();
 
   /* The opportunity/avoid universe. THIS SITE DEGRADES WORSE THAN THE SWEEPS DO:
      with the old `DEFAULT_WATCHLIST.join(', ')` and an empty list the prompt read
@@ -11867,17 +12101,23 @@ Return ONLY valid JSON, no markdown fences.`;
   if (hasContent) {
     await env?.REC_LOG?.put(
       'daily:snapshot',
-      JSON.stringify({ ...snapshot, ts: Date.now(), _instr: instrSince(mark, 'briefing') }),
+      JSON.stringify({ ...snapshot, ts: Date.now(), ptDate: todayPt, _instr: instrSince(mark, 'briefing') }),
       { expirationTtl: 172800 },
     );
     console.log('[cron] daily snapshot saved');
 
-    // Only now is it safe to drop yesterday's close recap and midday pulse: the
-    // new pre-market briefing exists to replace them. Doing this before the
-    // generation (as it used to) meant any failure below wiped the recap and
-    // replaced it with nothing.
-    try { await env?.REC_LOG?.delete('daily:eod'); } catch (_) {}
-    try { await env?.REC_LOG?.delete('daily:midday'); } catch (_) {}
+    /* Only now is it safe to drop YESTERDAY's close recap and midday pulse: the
+       new pre-market briefing exists to replace them. Doing this before the
+       generation (as it used to) meant any failure below wiped the recap and
+       replaced it with nothing.
+
+       AND ONLY YESTERDAY'S. This used to delete both keys unconditionally, which
+       is right for the 6:00am firing and destructive for every other run on the
+       same PT day — see the 2026-08-19 incident in the note above
+       `dailySlotPtDate`. A slot is now cleared only when it demonstrably belongs
+       to an earlier PT day, so a same-day re-run replaces its OWN slot and leaves
+       the siblings byte-identical. */
+    await purgeStaleDailySlots(env, todayPt);
   } else {
     const existingComplete = existingSnapshot &&
       ((existingSnapshot.newsCards?.length || 0) > 0 || existingSnapshot.opportunity);
@@ -11888,7 +12128,7 @@ Return ONLY valid JSON, no markdown fences.`;
       // but with ts=0 so handleDailyGet treats it as stale and keeps retrying.
       await env?.REC_LOG?.put(
         'daily:snapshot',
-        JSON.stringify({ headline: `Market update for ${today}`, newsCards: [], opportunity: null, avoid: null, ts: 0 }),
+        JSON.stringify({ headline: `Market update for ${today}`, newsCards: [], opportunity: null, avoid: null, ts: 0, ptDate: todayPt }),
         { expirationTtl: 172800 },
       );
       console.warn('[cron] headline generation failed and no prior snapshot — wrote stale placeholder');
@@ -12036,6 +12276,12 @@ If you reference an FOMC meeting or CPI release, use ONLY the macro calendar abo
       ...eod,
       complete: generated,
       ts: generated ? Date.now() : 0,
+      /* Stamped even on the placeholder, whose `ts: 0` carries no day. Without it
+         `dailySlotPtDate` falls back to `ts` and reads a placeholder as stale — a
+         same-PT-day briefing re-run would then clear a placeholder the 1:15pm
+         window is still retrying. Harmless (it regenerates) but wasteful, and the
+         stamp makes the record say which day it is a placeholder FOR. */
+      ptDate: ptDate(),
       _instr: instrSince(mark, generated ? 'complete' : 'placeholder'),
     }),
     { expirationTtl: 86400 },
@@ -12239,7 +12485,7 @@ Return ONLY valid JSON.`;
 
   await env?.REC_LOG?.put(
     'daily:midday',
-    JSON.stringify({ ...midday, bigMovers: bigMovers.slice(0, 12), ts: Date.now(), _instr: instrSince(mark, 'complete') }),
+    JSON.stringify({ ...midday, bigMovers: bigMovers.slice(0, 12), ts: Date.now(), ptDate: ptDate(), _instr: instrSince(mark, 'complete') }),
     { expirationTtl: 86400 },
   );
   console.log('[cron] midday pulse saved');
@@ -12533,8 +12779,17 @@ export default {
         case 'analysis':
           if (!sub) return err('ticker required', 400, origin);
           if (request.method === 'GET') {
+            /* THE MIGRATE-ON-READ BOUNDARY. index.html reads this endpoint to paint
+               the cached hero card, so normalising here is what lets a record
+               written in either era render without the page branching on shape.
+               A record that cannot supply the required core 404s rather than
+               returning a half-filled object — `not found` and "found, but every
+               field you need is null" are the same thing to the caller, and only
+               one of them is honest about it. */
             const cached = await env?.REC_LOG?.get(`analysis:${sub.toUpperCase()}`, 'json');
-            return cached ? json(cached, 200, origin) : err('not found', 404, origin);
+            const rec    = readAnalysisRecord(cached);
+            if (!rec.ok) return err(cached ? `unusable record: ${rec.reason}` : 'not found', 404, origin);
+            return json(analysisRecordPayload(rec), 200, origin);
           }
           if (request.method === 'POST') {
             // Was an unauthenticated KV write: anyone could store text that then

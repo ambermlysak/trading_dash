@@ -427,6 +427,79 @@ the Worker by `smaCrossState()` over spark closes — so its `crossFast` runs a 
 Yahoo's `sma50`, which stops at the prior close. The golden-cross scanner's row selection is the
 one place still on **exponential** MAs (`emaCrossState()`).
 
+#### `analysis:{TICKER}` HAS ONE CANONICAL SHAPE AND TWO WRITERS — 2026-08-20
+
+They used to disagree, and it was not cosmetic in either direction:
+
+| writer | wrote | consequence |
+|---|---|---|
+| `refreshTickerAnalysis` (`ANALYSIS_SCHEMA`) | `recommendation` + `drivers[]` | `renderSynthesis` in index.html read `factors{}`, so this record painted four sentiment bars at `?? 50` — a **missing measurement rendered as a measured neutral** |
+| `POST /api/ai/synthesis` (`AI_SYNTHESIS_SCHEMA`) | `action` + `factors{}`, no `recommendation` | `handleWatchlistBatch` gated on `cached.recommendation`, so this record read as **UNANALYSED** and the row queued a fresh Claude call. **Opening a ticker page bought a second analysis for a name already analysed** — up to 30 per batch request |
+
+**The canonical record:**
+
+```
+REQUIRED CORE  rating · confidence · recommendation · drivers[] · summary
+OPTIONAL       factors{} · thesis          ← synthesis only, OMITTED not nulled
+DROPPED        trend · pattern · action    ← zero readers, verified by grep
+```
+
+Both schemas' `required` arrays now carry the core identically; `AI_SYNTHESIS_SCHEMA`
+adds exactly `factors` and `thesis`. **The nightly pass does NOT produce the optional
+half** — six factor objects and a two-paragraph thesis across the whole watchlist every
+night is a ~3.5x token bill on that job for one reader. Absent means *"this writer does
+not produce them"*, which a reader can name; `null` would be a claim.
+
+The synthesis prompt's `recommendation` and `drivers` wording is **copied verbatim from
+`refreshTickerAnalysis`'s prompt**, so the two writers produce the same *kind* of string
+and not merely the same field name.
+
+##### `readAnalysisRecord()` — MIGRATE ON READ, and it outlives the migration
+
+Every read of the key goes through it. Chosen over ageing the old records out on the
+2-day TTL: for up to 48h after deploy a stale synthesis record still lacks
+`recommendation`, so the watchlist keeps re-spending on it — the exact bug, time-boxed.
+Migrating in place needs a KV list scan plus a Claude call per record to fill the missing
+field, on records that expire within 48h anyway.
+
+| era | what wrote it | `ok`? | renders as |
+|---|---|---|---|
+| `canonical` | either writer, 2026-08-20+ | yes | normally |
+| `legacy-synthesis` | synthesis before 2026-08-20 | yes, after mapping | normally, `drivers` null |
+| `legacy-quartet` | the nightly pass before the four columns were consolidated | **no** | regenerates — a rating with no call beside it is what the original guard was right to refuse |
+| `absent` | nothing stored, unparseable | no | regenerates |
+
+**`action` → `recommendation` is a RENAME**, not a derivation: both are "the actionable
+phrase", and the old prompt's own example (`Buy dips to $85`) is the new prompt's example.
+
+**`drivers` STAYS NULL on a legacy-synthesis record.** Six factor notes are sitting right
+there, but `drivers` claims *"these decided the call, most important first"* and factor
+notes carry neither the selection nor the ordering. `driversSource` names the case
+(`record` / `not-in-legacy-synthesis-shape` / `none`) instead.
+
+**`ok` is the required core, deliberately NOT `rating != null`.** `directionalRead` is the
+one reader that takes `rating` regardless of `ok`, because it renders a **direction**, not
+a **call**, and is already disabled from influencing sort order.
+
+**`GET /api/analysis/:ticker` is the migrate-on-read boundary** and **404s an unusable
+record** with the reason rather than returning a half-filled object — "not found" and
+"found, but every field you need is null" are the same thing to the caller and only one is
+honest. `index.html`'s `loadCachedSynthesis` catches that and falls through to live
+synthesis, which is the right outcome.
+
+Verified end-to-end against a local `wrangler dev` with seeded KV, 2026-08-20:
+
+| record | `/api/analysis` | `/api/watchlist/batch` |
+|---|---|---|
+| canonical | 200, no `factors`/`thesis` keys, `schemaEra: canonical` | served, `analysisLoading: false` |
+| legacy-synthesis | 200, `action` mapped, `drivers: null`, `factors`/`thesis` kept | **served, `analysisLoading: false` — the leak** |
+| legacy-quartet | 404 `unusable record: pre-consolidation…` | `analysisLoading: true`, regenerates |
+| absent | 404 `not found` | `analysisLoading: true`, regenerates |
+
+Covered by `node analysis-shape.check.mjs` (99 comparisons), which drives the **old and
+new gates over the same records** — a test that cannot reproduce the bug cannot prove the
+fix — and lifts the `needsAnalysis` predicate **from source** rather than hand-copying it.
+
 **Watchlist `Recommendation` column:** one consolidated call per ticker, replacing the old
 Trend / Pattern / Action / Rating quartet. `refreshTickerAnalysis()` writes
 `{rating, confidence, recommendation, drivers[], summary}` to `analysis:{TICKER}` under
@@ -557,11 +630,11 @@ differs from its retention, both are given and the reason is in the notes.
 | Key | TTL | What it holds |
 |---|---|---|
 | `yahoo:crumb` | 1h | Yahoo session crumb. In-memory `CRUMB_TTL` treats it as good for 50 min; KV keeps it an hour. |
-| `daily:snapshot` | 2d | 6:00am PT Claude morning briefing |
-| `daily:midday` | 2d | 11:30am PT midday pulse (narrative, topics, tomorrow, trades, bigMovers) |
-| `daily:eod` | 2d | 1:15pm PT end-of-day summary |
+| `daily:snapshot` | 2d | 6:00am PT Claude morning briefing. Carries `ptDate` (2026-08-20+) |
+| `daily:midday` | 2d | 11:30am PT midday pulse (narrative, topics, tomorrow, trades, bigMovers). Carries `ptDate` |
+| `daily:eod` | 2d | 1:15pm PT end-of-day summary. Carries `ptDate`, on the placeholder too |
 | `market:week-ahead` | 18h | Friday-only week-ahead preview |
-| `analysis:{TICKER}` | 2d | Per-ticker Claude recommendation for the watchlist column |
+| `analysis:{TICKER}` | 2d | Per-ticker Claude verdict, ONE canonical shape from TWO writers (`refreshTickerAnalysis` and `POST /api/ai/synthesis`). Read only through `readAnalysisRecord()` |
 | `iv:{TICKER}:{DATE}` | **400d** | One daily front-expiry ATM IV sample — the series `ivRank` is built from. `atmIv`/`spot`/`dte` are duplicated into **KV metadata** so `ivHistory()` rebuilds the series from one paged `list()` instead of 400 `get()`s. Metadata caps at 1024 bytes; keep it to those three flat numbers. |
 | `ivsweep:last` | 2d | PT date of the last cron IV sweep, for dedup. **Deliberately outside the `iv:` prefix** so `ivHistory()`'s prefix scan cannot pick it up as a sample. |
 | `calib:pooled` | **none** | Pooled recommendation calibration across every `rec:` key — the basis used when a ticker has fewer than `REC_CALIB_MIN_N` resolved outcomes of its own. Written once a trading day by `fillForwardReturns()`; **no TTL on purpose**, since a stale pooled figure beats none and `d`/`ts` ride along so the reader can age it. |
@@ -861,14 +934,73 @@ ERROR. **37 comparisons.**
 `{ open, reason, calendarStale }` with `reason` one of `weekend` /
 `nyse-holiday` / `weekday`. Both are covered by `node cron-gate.check.mjs`.
 
-**`generateDailySnapshot()` deletes `daily:eod` and `daily:midday` only after the
-new snapshot is successfully written.** It used to delete them at the top, before
+**`generateDailySnapshot()` clears `daily:eod` and `daily:midday` only after the
+new snapshot is successfully written — and, since 2026-08-20, only when they belong
+to an earlier PT day. The unconditional delete this paragraph originally described
+is gone; see the date-gated purge below.** It used to delete them at the top, before
 it knew whether the briefing would generate at all — so a Claude failure, a Yahoo
 outage or any exception below left the page with no morning briefing *and* no
 close recap. A stale-but-labelled recap beats a blank card. This is a distinct
 bug from the cron day-of-week one; fixing the cron would have hidden it rather
 than fixed it, because on a correct schedule the delete is followed within
 seconds by a successful write.
+
+##### AND ONLY YESTERDAY'S — THE PURGE IS DATE-GATED, 2026-08-20
+
+**The `/api/daily` object is THREE KEYS merged at read time by `handleDailyGet`,
+not one stored object.** `daily:snapshot` carries the top-level headline /
+newsCards / opportunity / avoid *and* the `open` slot; `daily:midday` and
+`daily:eod` are separate keys. Each generator writes only its own. That is what
+makes "last write wins across slots" structurally impossible here rather than
+merely unlikely — there is no cross-slot read-modify-write to lose a race in.
+
+**The one place that violated it was this delete**, which fired unconditionally on
+every successful snapshot write. Correct for the 6:00am firing; destructive for
+any other run on the same PT day. Measured from the decision_dash side on
+2026-08-19: the object held all three session records (open 06:02, midday 11:31,
+eod 13:13) at 17:56 PT and a re-run at 18:11 rewrote it wholesale — open and eod
+restamped 18:11, **midday gone**.
+
+The trigger was `handleDailyGet`'s own request-path self-heal, not a cron firing:
+`isStale = Date.now() - snapshot.ts > 43_200_000`, so a 06:02 briefing went stale
+at **18:02** and the next page poll regenerated it. The delete then took both
+siblings; `handleDailyGet` rebuilt `daily:eod` seconds later through its
+`!eod` self-heal, and **midday has no self-heal by design** (its ~50s pipeline
+outruns the ~30s fetch-context `waitUntil` budget), so that slot was gone for the
+day. A client that had not fetched before the rewrite lost it permanently.
+
+So the delete is now `purgeStaleDailySlots(env, todayPt)`, gated on a **date
+rollover** rather than on "a briefing ran":
+
+| helper | contract |
+|---|---|
+| `dailySlotPtDate(rec)` | the PT day a record belongs to — `rec.ptDate` when stamped, else derived from `ts` **in Pacific** (a `ts` at 22:30 PT has a UTC date one day ahead, so `.slice(0,10)` answers the wrong day), else `null` |
+| `purgeStaleDailySlots(env, today)` | deletes a sibling **only** when its day is knowable and `!== today`; returns `{key: 'kept' / 'cleared' / 'absent' / 'unreadable'}` and logs the decision |
+
+**All three writers stamp `ptDate`**, including both placeholder branches. A
+record with no `ptDate` and no usable `ts` — a pre-2026-08-20 write, or the EOD
+`ts: 0` placeholder — classifies **stale**, which is the safe direction: it
+regenerates, where a wrong "current" verdict would render an old recap under
+today's date.
+
+**A failed read never deletes.** `unreadable` keeps the slot, because deleting
+the one record you could not verify is the worst available answer.
+
+**Residual, stated rather than accepted silently:** the purge is a read-modify-
+write across KV's eventual consistency (measured elsewhere in this repo: 404 at
++60ms, 200 at +839ms after a POST). If a sibling were written within that window
+the purge could read the *previous* value and clear a current slot. It does not
+bite in practice — the 6:00am briefing and the 11:30am/1:15pm siblings are hours
+apart, and the request-path snapshot self-heal only fires >12h after the briefing
+— and the failure mode is a wasted regeneration rather than permanent loss,
+because the deleted slot's own generator retries. **Making it race-free would need
+a single key or a Durable Object**; neither is warranted for a window nothing
+currently writes into.
+
+Covered by `node daily-slots.check.mjs` (63 comparisons), which asserts sibling
+survival on **raw stored bytes** rather than on a parsed object — a re-serialised
+record that compared deep-equal would still be a rewrite, and the incident was
+about restamping as much as deletion.
 
 **Every named export in `worker.js` must be a function.** `workerd` validates the
 module's exports at startup and refuses to boot on anything else. Exporting
