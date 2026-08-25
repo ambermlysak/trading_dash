@@ -802,7 +802,7 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Fifteen checks exist, all of which print computed vs
+There is no build step. Sixteen checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
 (Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
@@ -870,16 +870,45 @@ and `node analysis-shape.check.mjs` (the canonical `analysis:{TICKER}` record:
 `factors`, both schemas' required arrays agreeing on the core, the optional half
 omitted rather than nulled, and **the spend leak driven through BOTH the old and
 the new gate** with the `needsAnalysis` predicate lifted from source — a test that
-cannot reproduce the bug cannot prove the fix).
+cannot reproduce the bug cannot prove the fix),
+and `node top3.check.mjs` (the daily top-3 options ranking: the constant table
+cross-checked against the SPEC's own literals rather than restated back at itself,
+`top3Subscores` against a hand-computed 59.5, clipping at **both** bounds plus the
+boundary values where it must NOT fire, the whole-score extremes 0 and 100, the
+min-of-coverage rule shown against the average it is not, **every gate firing AND
+at a non-firing boundary** — including all seven score inputs nulled in turn — the
+sweep's classification with stub bindings covering the `status: 'error'` row that
+does NOT throw, the domain statuses that are complete outcomes, the reuse refusal
+on a cached error row and the consecutive-failure run, then `top3Rank` end to end
+on synthetic rows for both directions, HOLD, a stale verdict, one-slot-per-ticker,
+the top-3 cut, tie-break determinism and the zero-qualifying case that must
+publish `[]`, and `readTop3`'s strict schema equality).
 All of them extract functions from
 `worker.js` by source, not by import, because every named export in `worker.js`
 must be a function or `workerd` refuses to boot.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99** for moves /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 173** for moves /
 long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
 sweep-universe / macro / mood / swing / earnings-timing / daily-slots /
-analysis-shape — **1,250 comparisons** across the suite.
+analysis-shape / top3 — **1,423 comparisons** across the suite.
+
+##### A FIXTURE TIMESTAMP MUST BE RELATIVE TO NOW — 2026-08-25
+
+`analysis-shape.check.mjs` §3 went red on the calendar rather than on the code.
+Its four record fixtures were stamped `Date.parse('2026-08-20T14:00:00Z')`, and §3
+rebuilds the `stocks` map exactly as `handleWatchlistBatch` does — which means
+`usable = r.ok && Date.now() - r.ts < 172_800_000`, the `analysis:` 2-day TTL. From
+**2026-08-22** onward every fixture aged past that window, every record read as
+unusable, and all four names queued a Claude call. Four assertions failed,
+including *"canonical record does NOT queue a call"* and *"exactly two names
+queued"* — **reporting the spend leak of rule #5 as OPEN while the source gate was
+fine.** `TS` is now `Date.now() - 3600_000`; §3's own stale case builds its
+timestamp explicitly, so the stale-path assertions are unaffected.
+
+**A check that goes red on the calendar is worse than no check**, because it trains
+the next reader to ignore a failing spend-gate assertion. Any fixture whose value
+is compared against a freshness window gets a relative timestamp.
 
 **TWO scripts now read live data, and both floors are the FIXED count rather than
 the observed total.** `swing.check.mjs` (below) and `earnings-timing.check.mjs`,
@@ -1024,6 +1053,18 @@ without ever opening that file.
 - income rows live under **`incomerow:`**, never `income:` — `TICKERS` and `PREV`
   both pass `REC_SYMBOL_RE`, so sharing the prefix would let a row scan read the
   sleeve list as a ticker
+- `top3:{PT-DATE}` schema check stays strict equality. **`entries: []` and an
+  ABSENT key are different states**: `[]` means the gates ran and nothing survived
+  (a valid published result), absent means the job has not run or refused
+- `top3sweep:last` lives **outside** the `top3:` prefix, same rule as `ivsweep:last`
+- The top-3 sweep is **strictly sequential** and must stay so — Yahoo crumb
+  rate-limiting, not the cap. A row's `status: 'error'` is a FAILURE that blocks
+  the dedup stamp; `no-options` / `no-iv` / `no-expiries` are complete outcomes
+  about the ticker and must not block it. **`refreshLongTicker` does not throw on a
+  Yahoo failure** — it returns `{ok: false, status: 'error'}`, so a `try/catch`
+  alone would stamp a broken run out of the day
+- `/api/long/batch` is now **`N + 2`** binding ops, not `N + 1` — one macro read
+  and one `top3` read, both in the envelope, never per row
 - `incomerow:{TICKER}` schema check stays strict equality, and its freshness (6h)
   and retention (36h) must not be equal
 
@@ -1207,6 +1248,101 @@ reachable and was driven to prove it**: raised to $2B on the same data it elimin
 **29** rows and changed every survivor, and 11 rows in the raw screener output really
 did sit below $50M (DRD $9M, ALMR $11M, OGC $13M …) but were removed by price or
 market-cap ahead of it. So this is not the `no-leaps` failure.
+
+### `top3:{PT-DATE}` — the daily top-3 options ranking
+
+**Three parts, one cron job, no new endpoint and no new page-load fetch.** Added
+2026-08-25. A fourth job on the 1:15pm PT branch sweeps the watchlist through the
+same computation path `/api/long/:ticker` uses, ranks the result, and writes one
+record that rides on the existing `/api/long/batch` envelope beside `macro`.
+
+| constant | value | what it is |
+|---|---|---|
+| `TOP3_SCHEMA` | 1 | record shape, checked by **strict equality** |
+| `TOP3_MAX` | 3 | slots published, never padded |
+| `TOP3_TTL` | 36h | retention outlives the PT day the key names — same reasoning as `radar:` |
+| `TOP3_SWEEP_KEY` | `top3sweep:last` | dedup, **outside** the `top3:` prefix |
+| `TOP3_LANES` | `B`, `C` | the eligible pool: single-leg longs and debit verticals |
+| `TOP3_MIN_EPISODES_TO_50` | **2** | `expectancyEpisodesTo50` floor. **Missing FAILS** |
+| `TOP3_ANCHORS` | 0.50 / 0.60 / 0.80 / 0.70 / 1.20 ± 0.90 / 5000 | pBe · min-coverage · sharpe · winRate · BE/EM ceiling and span · expected dollars |
+| `TOP3_WEIGHTS` | 20 / 15 / 25 / 15 / 15 / 10 | probMarket · probMeasured · sharpe · win · beEm · dollars, summing to 100 |
+| `TOP3_SWEEP_WALL_WARN_MS` | 150s | the sweep REPORTS past this; it never truncates |
+| `TOP3_SYSTEMIC_FAIL_RUN` | 5 | consecutive failures at which one systemic fault is named |
+| `TOP3_MAX_EXCLUDED` | 60 | stored `excluded[]` cap, with `excludedTotal` beside it |
+
+**THE SWEEP IS STRICTLY SEQUENTIAL AND THAT IS NOT ABOUT THE CAP.** The whole job
+costs well under a tenth of the 10,000. The binding constraint is **Yahoo crumb
+rate-limiting** — the same reason the client's "Load all" is one awaited request at
+a time. Measured cold on the request path 2026-08-25 (isolated by construction,
+three tickers, identical): `/api/long/:ticker` **8 ext / 11 bind / capCost 19**.
+The sweep's per-ticker term is that minus the endpoint's macro read, plus one
+`readLongRow` probe and one `analysis:` verdict read: **≈ 20 per name.** At the
+live 40-name watchlist, all cold, that derives to **≈ 803 capCost**, ~8% of the
+ceiling.
+
+**A CACHED ROW INSIDE `LONG_FRESH_MS` IS REUSED, and an `error` row never is.**
+Reusing a fresh error row would freeze a transient Yahoo failure for four hours.
+
+**`refreshLongTicker` DOES NOT THROW ON A YAHOO FAILURE — it returns
+`{ok: false, status: 'error'}`**, so a `try/catch` alone sees a clean result. That
+would have counted a broken run as complete and dedupped it out of the day, which
+is the `iv-sweep` defect exactly. Classification is therefore on the row's own
+status, and it separates two things one `ok: false` runs together (honesty rule 17):
+
+| status | counted as | blocks the stamp? |
+|---|---|---|
+| `error`, or a thrown exception | **failed** — infrastructure, ours to retry | **yes** |
+| `no-options` / `no-iv` / `no-expiries` | **skipped** — a domain fact about the name | no |
+
+Same split, same reason, as `collectMoveSeries`'s `written + skipped === N`.
+
+**The ranking pass ranks rows held IN MEMORY rather than re-reading KV**, and that
+is a correctness choice rather than a shortcut: KV is eventually consistent
+(measured elsewhere in this repo — 404 at +60ms, 200 at +839ms after a write) and
+the sweep takes minutes, so a read-back of the last names written could return the
+previous day's row. It makes **zero** outbound fetches; its only KV traffic is one
+`analysis:{TICKER}` verdict read per ticker, **through `readAnalysisRecord()`**.
+
+**Direction comes from the verdict and HOLD excludes the ticker entirely.**
+BUY → CALL-type only, SELL → PUT-type only, HOLD or no verdict *for today's PT
+date* → excluded. `rating` is taken regardless of the record's `ok`, the same call
+`directionalRead` makes and for the same reason — this uses the record for a
+DIRECTION, not to render a call — and the record's `era` rides on the entry.
+
+**The score is 0–100 against FIXED anchors, never percentiles of the day's pool.**
+A percentile would make today's score incomparable with yesterday's and would
+guarantee a top 3 exists however bad the day is. Every component is clipped to
+[0,1] and **every subscore is stored** — input, anchor, raw ratio, whether it
+clipped, the clipped component, its weight and the points it contributed. The score
+must be decomposable, never a bare number.
+
+**`probMeasured` takes the MIN of `coverage1y` and `coverage3y`, deliberately.**
+The min makes the worse regime the binding one, so a PLTR-style 1y collapse drags
+the score even where 3y is strong. The two are never averaged — their disagreement
+*is* the regime warning. Measured on the fixture at 1y 0.20 / 3y 0.90 the min gives
+component 0.3333 against an average's 0.9167: **8.75 points** of difference.
+
+**`beEm` is the one INVERTED component**: `(1.20 − beEm) / 0.90`, so 1.20 scores 0
+and 0.30 or lower scores 1.
+
+**ONE SLOT PER TICKER.** A name is represented by its single highest-scoring gated
+candidate and can never fill more than one slot. Ties break score desc → sharpe
+desc → symbol asc, so two runs over the same rows publish the same order.
+
+**A PARTIAL RUN WRITES BUT DOES NOT STAMP** — the `collectMarketMood` split. A
+ranking over 36 of 39 readable names is a finding; the run is not done, so the next
+firing retries and rewrites the key whole, reusing the rows already banked. A run
+where **every** ticker failed writes nothing. An empty universe **refuses before
+stamping**, same contract as `recordWatchlistIv` / `collectMoveSeries` /
+`collectMacroState`.
+
+Measured end to end on a local `wrangler dev` with KV seeded from production,
+2026-08-25 (11 names, all cold): sweep **11 fetched / 0 reused / 0 failed in 8.9s**,
+statuses `{"ok":10,"no-options":1}`; pool 42 in / 25 gated in / 17 out with the
+funnel `{direction 42, liquidity 0, vol 12, episodes 5, inputs 0}`; **3 of 3
+published**. A second firing reported `top3 already built today, skipping`; with the
+stamp cleared it re-ran **0 fetched / 11 reused in 0.1s** and published byte-identical
+entries. Checked by `node top3.check.mjs` (173 comparisons).
 
 ### Worker endpoints, data sources, KV and cron → the `worker-internals` skill
 

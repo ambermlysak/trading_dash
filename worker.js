@@ -4508,6 +4508,19 @@ async function handleLongBatch(params, origin, env) {
      the same object and would invite a renderer to draw it per row. */
   const macro = await readMacroState(env);
 
+  /* ONE read of today's `top3:{PT-date}` record, in the ENVELOPE beside `macro`
+     and for the same reasons: it is one fact about the day, not a per-row field,
+     and repeating it per row would invite a renderer to draw it per row.
+
+     +1 BINDING OP ON THIS ENDPOINT — it is now `N + 2`, not `N + 1`. That is a
+     KV read on a request the page already makes; NO page-load fetch was added
+     anywhere.
+
+     `null` means "no record for today" — the job has not run, or it refused. An
+     older Worker omits the key entirely. Those are different states and the key's
+     presence already distinguishes them, so nothing is invented here. */
+  const top3 = await readTop3(env);
+
   const oldest = rows.length ? Math.min(...rows.map(r => r.ts || 0)) : null;
   return json({
     rows, missing, symbols,
@@ -4539,6 +4552,7 @@ async function handleLongBatch(params, origin, env) {
     },
     rate: rows.find(r => r.rate)?.rate || null,
     macro,
+    top3,
     _instr: instrSince(mark, 'batch'),
     _meta: srcMeta('KV cache (no fetch)', {
       ttlSeconds: LONG_FRESH_MS / 1000,
@@ -8663,6 +8677,683 @@ async function collectMacroState(env) {
     + `sessions ${JSON.stringify(head.sessions)} · macro:state ${headBody.length}B `
     + `macro:series ${seriesBody.length}B · ${JSON.stringify(instrSince(mark, 'complete'))}`,
   );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DAILY TOP-3 OPTIONS RANKING  —  `top3:{PT-DATE}`
+
+   Three parts, one cron job: a strictly sequential sweep of the watchlist through
+   the SAME computation path `/api/long/:ticker` uses, a ranking pass over what
+   that produced, and one KV write folded into `/api/long/batch`'s envelope beside
+   `macro`.
+
+   WHY THE SWEEP IS SEQUENTIAL, and it is not the subrequest cap. The cap is
+   10,000 per invocation and this whole job costs well under a tenth of it. The
+   binding constraint is Yahoo CRUMB RATE-LIMITING: firing N tickers concurrently
+   puts N option-chain requests against Yahoo at once and gets the crumb
+   throttled, which is a different failure from the cap and just as total. The
+   client's "Load all" is one awaited request at a time for exactly this reason,
+   and this sweep copies it rather than inventing a second policy (rule #1).
+
+   WHY THE RANKING PASS RANKS ROWS HELD IN MEMORY RATHER THAN RE-READING KV.
+   Not a shortcut — a correctness choice. KV is eventually consistent (measured
+   elsewhere in this repo: 404 at +60ms, 200 at +839ms after a write), and this
+   sweep takes minutes, so a read-back of the LAST tickers written could return
+   the previous day's row or nothing at all and would silently rank stale data.
+   The in-memory set is the same object `storeLongRow` wrote. The pass makes ZERO
+   outbound fetches, which is the constraint that matters, and its only KV traffic
+   is one `analysis:{TICKER}` verdict read per ticker.
+
+   WHAT IT IS RANKING. One slot per ticker: a name is represented by its single
+   highest-scoring gated candidate and can never fill more than one of the three
+   slots. Fewer than three qualifying names publishes fewer; ZERO qualifying is a
+   valid published result (`entries: []` means the gates ran and nothing
+   survived) and is NOT an error. An ABSENT key is the different state — the job
+   has not run, or refused.
+   ══════════════════════════════════════════════════════════════════════════ */
+
+const TOP3_SCHEMA = 1;
+const TOP3_MAX    = 3;
+/* Retention outlives the PT day the key names, so a late-evening read still
+   finds the answer. There is no freshness question on a date-keyed record —
+   the same reasoning as `radar:{PT-DATE}`. */
+const TOP3_TTL    = 36 * 3600;
+/* OUTSIDE the `top3:` prefix, so nothing scanning that prefix can read the dedup
+   stamp as a day's record — the same rule as `ivsweep:last` / `movesweep:last` /
+   `macrosweep:last` / `moodsweep:last`. */
+const TOP3_SWEEP_KEY = 'top3sweep:last';
+const top3Key = d => `top3:${d}`;
+
+const TOP3_SWEEP_CAP  = 60;          // same ceiling `sweepUniverse` defaults to
+const TOP3_LANES      = ['B', 'C'];  // singles and debit verticals — the eligible pool
+const TOP3_MIN_EPISODES_TO_50 = 2;   // MISSING FAILS: a missing input is not a pass
+const TOP3_MAX_EXCLUDED = 60;        // cap on the stored `excluded[]` list
+/* Wall-clock past which the sweep is REPORTED as long. It never truncates on
+   this — silently covering part of the watchlist and publishing the result as a
+   ranking of the whole is precisely the 13F failure (honesty rules 12 and 16). */
+const TOP3_SWEEP_WALL_WARN_MS = 150_000;
+/* A run of consecutive failures does not read as N independent per-ticker
+   problems. It reads as one systemic fault (crumb throttled, Yahoo down, budget
+   gone), and a per-item catch that cannot tell those apart is the named rule. */
+const TOP3_SYSTEMIC_FAIL_RUN = 5;
+
+/* THE SCORE ANCHORS ARE FIXED CONSTANTS, not percentiles of the day's pool.
+   A percentile would make today's score incomparable with yesterday's and would
+   guarantee a top 3 exists however bad the day's candidates are. */
+const TOP3_ANCHORS = {
+  pBe: 0.50, coverageMin: 0.60, sharpe: 0.80, winRate: 0.70,
+  beEmCeiling: 1.20, beEmSpan: 0.90, expectedDollars: 5000,
+};
+const TOP3_WEIGHTS = { probMarket: 20, probMeasured: 15, sharpe: 25, win: 15, beEm: 15, dollars: 10 };
+const TOP3_WEIGHT_TOTAL = Object.values(TOP3_WEIGHTS).reduce((a, b) => a + b, 0);   // 100
+const TOP3_SCORE_INPUTS = [
+  'pBe', 'coverage1y', 'coverage3y', 'expectancySharpe',
+  'expectancyWinRate', 'expectedDollars', 'beEm',
+];
+const TOP3_GATE_ORDER = ['liquidity', 'vol', 'episodes', 'inputs'];
+
+/** Everything the ranking used, shipped so no consumer hardcodes a threshold the
+ *  Worker owns — the same rule `gates` follows on every other payload here. */
+function top3GatesDeclared() {
+  return {
+    schema: TOP3_SCHEMA,
+    max: TOP3_MAX,
+    lanes: TOP3_LANES,
+    laneNote: 'Lane B single-leg longs and Lane C debit verticals only. Both are DEBIT structures, so '
+      + '`credit` is null on every entry rather than 0 — no credit structure is eligible.',
+    directionRule: 'BUY -> CALL-type candidates only · SELL -> PUT-type only · HOLD or no verdict for '
+      + 'today excludes the ticker entirely.',
+    liquidity: {
+      spreadMaxNear: LONG_SPREAD_MAX_NEAR, spreadMaxLeaps: LONG_SPREAD_MAX_LEAPS, minOi: LONG_MIN_OI,
+      rule: 'candidate status must be `ok` and it must carry no `wide-spread` / `thin-oi` flag — the '
+        + "Worker's own floors, the same ones that dim a candidate on the screen.",
+    },
+    vol: {
+      ivrBuyMax: IVR_BUY_MAX, ratioBuyMax: RATIO_BUY_MAX,
+      rule: 'row.buyable !== false. TRI-STATE: true = cheap, null = still collecting and therefore NO '
+        + 'BASIS TO JUDGE, false = rich. Only `false` excludes — treating null as a failure is the bug '
+        + 'that dimmed the whole premium tab for three months (honesty rule 13).',
+    },
+    episodes: {
+      minEpisodesTo50: TOP3_MIN_EPISODES_TO_50,
+      rule: `expectancyEpisodesTo50 >= ${TOP3_MIN_EPISODES_TO_50}. A MISSING episode count FAILS the gate: `
+        + 'a missing input is not a pass. Low is the warning — 1 means half the expected value comes from '
+        + 'one market episode.',
+    },
+    inputs: {
+      required: TOP3_SCORE_INPUTS,
+      rule: 'every score input must be present and numeric. Any missing one excludes the candidate with '
+        + 'the field named — a null pushed through arithmetic becomes a fabricated measurement '
+        + '(honesty rule 22).',
+    },
+    weights: TOP3_WEIGHTS,
+    weightTotal: TOP3_WEIGHT_TOTAL,
+    anchors: TOP3_ANCHORS,
+    scoreFormula: 'each component clipped to [0,1], score = 100 x SUM(weight_i x component_i) / '
+      + `${TOP3_WEIGHT_TOTAL}. probMarket = pBe/0.50 · probMeasured = min(coverage1y,coverage3y)/0.60 · `
+      + 'sharpe = expectancySharpe/0.80 · win = expectancyWinRate/0.70 · beEm = (1.20-beEm)/0.90 · '
+      + 'dollars = expectedDollars/5000.',
+    tieBreak: 'score desc, then expectancySharpe desc, then symbol asc — deterministic, so two runs over '
+      + 'the same rows publish the same order.',
+    slotRule: 'ONE slot per ticker: each name is represented by its single highest-scoring gated candidate.',
+    longFreshMs: LONG_FRESH_MS,
+    reusedRowNote: `A cached long row inside LONG_FRESH_MS (${LONG_FRESH_MS / 3600_000}h) is REUSED rather `
+      + 'than refetched, so an entry can rest on a row up to that old. `rowSource` and `rowAgeMs` on every '
+      + 'entry say which, and the sweep counts are on the record.',
+  };
+}
+
+/** The six subscores, each clipped to [0,1], plus the score they sum to.
+ *  Every component ships its raw input, its anchor, the clipped component and the
+ *  points it contributed — the score must be decomposable, never a bare number. */
+function top3Subscores(c) {
+  const A = TOP3_ANCHORS, W = TOP3_WEIGHTS;
+  const covMin = Math.min(c.coverage1y, c.coverage3y);
+  const mk = (input, raw, weight, anchor, note) => {
+    const component = clampTo(raw, 0, 1);
+    return {
+      input: +Number(input).toFixed(6),
+      anchor,
+      raw: +Number(raw).toFixed(4),
+      clipped: raw < 0 || raw > 1,
+      component: +component.toFixed(4),
+      weight,
+      points: +(weight * component).toFixed(3),
+      ...(note ? { note } : {}),
+    };
+  };
+  const subscores = {
+    probMarket:   mk(c.pBe, c.pBe / A.pBe, W.probMarket, A.pBe,
+      'P(BE) at expiry, N(d2) off the chain. RISK-NEUTRAL — what the options market prices, not a frequency.'),
+    probMeasured: mk(covMin, covMin / A.coverageMin, W.probMeasured, A.coverageMin,
+      'the MIN of coverage1y and coverage3y, deliberately: the min makes the WORSE regime the binding one, '
+      + 'so a 1y collapse on a re-rated name drags the score even where 3y is strong. The two are never '
+      + 'averaged — their disagreement IS the regime warning.'),
+    sharpe:       mk(c.expectancySharpe, c.expectancySharpe / A.sharpe, W.sharpe, A.sharpe,
+      'mean / stdev of the per-window P/L over the 3y series.'),
+    win:          mk(c.expectancyWinRate, c.expectancyWinRate / A.winRate, W.win, A.winRate,
+      'share of historical windows in which the structure paid.'),
+    beEm:         mk(c.beEm, (A.beEmCeiling - c.beEm) / A.beEmSpan, W.beEm, A.beEmSpan,
+      `INVERTED: lower BE/EM scores higher. ${A.beEmCeiling} scores 0, `
+      + `${+(A.beEmCeiling - A.beEmSpan).toFixed(2)} or lower scores 1. BE/EM is the breakeven distance `
+      + 'measured in the expected move the chain is pricing.'),
+    dollars:      mk(c.expectedDollars, c.expectedDollars / A.expectedDollars, W.dollars, A.expectedDollars,
+      'mean P/L per contract across the historical windows, in dollars. Held to the smallest weight '
+      + 'because it scales with contract price rather than with edge.'),
+  };
+  const points = Object.values(subscores).reduce((a, x) => a + x.points, 0);
+  return {
+    subscores,
+    points: +points.toFixed(3),
+    score: +(100 * points / TOP3_WEIGHT_TOTAL).toFixed(2),
+  };
+}
+
+/** The four hard gates, in order, each returning the gate that stopped it. */
+function top3GateCandidate(c, row) {
+  const flags = c.flags || [];
+  if (c.status !== 'ok' || flags.length) {
+    return {
+      ok: false, gate: 'liquidity',
+      reason: c.status !== 'ok'
+        ? `candidate status is \`${c.status}\`${c.reason ? ` — ${c.reason}` : ''}`
+        : `breached the Worker's liquidity floors: ${flags.join(', ')} `
+          + `(spread ceiling ${c.spreadMax}, min OI ${LONG_MIN_OI})`,
+    };
+  }
+  if (row.buyable === false) {
+    return { ok: false, gate: 'vol', reason: `vol is not cheap enough to buy — ${row.buyableReason}` };
+  }
+  const ep = c.expectancyEpisodesTo50;
+  if (!Number.isFinite(ep)) {
+    return {
+      ok: false, gate: 'episodes',
+      reason: ('no de-clustered episode count on this candidate, so concentration is unmeasured — a missing '
+        + `input is not a pass. ${c.expectancyEpisodesReason || c.expectancyReason || c.coverageReason || ''}`).trim(),
+    };
+  }
+  if (ep < TOP3_MIN_EPISODES_TO_50) {
+    return {
+      ok: false, gate: 'episodes',
+      reason: `expectancyEpisodesTo50 ${ep} is below ${TOP3_MIN_EPISODES_TO_50} — half the expected value `
+        + `rests on ${ep} market episode${ep === 1 ? '' : 's'} out of ${c.expectancyEpisodes}`,
+    };
+  }
+  for (const f of TOP3_SCORE_INPUTS) {
+    if (!Number.isFinite(c[f])) {
+      return {
+        ok: false, gate: 'inputs', field: f,
+        reason: `score input \`${f}\` is ${c[f] === null ? 'null' : String(c[f])} — excluded rather than `
+          + 'scored with a stand-in',
+      };
+    }
+  }
+  return { ok: true };
+}
+
+/** Full contract identity for one entry. `expiry`/`dte` live on the LANE ENTRY,
+ *  not the candidate, so they are carried down here rather than looked up later. */
+function top3Contract(c, laneEntry) {
+  const base = {
+    lane: c.lane,
+    type: c.type,
+    expiry: laneEntry.expiry ?? null,
+    dte: laneEntry.dte ?? null,
+    atmIv: laneEntry.atmIv ?? null,
+    expectedMovePct: laneEntry.expectedMovePct ?? null,
+  };
+  if (c.lane === 'C') {
+    return {
+      ...base, legs: 2,
+      structure: c.type === 'CALL' ? 'debit-call-vertical' : 'debit-put-vertical',
+      longStrike: c.longStrike ?? null, shortStrike: c.shortStrike ?? null,
+      width: c.width ?? null,
+      longDelta: c.longDelta ?? null, shortDelta: c.shortDelta ?? null,
+      maxProfit: c.maxProfit ?? null, maxLoss: c.maxLoss ?? null,
+      contract: `${c.type} ${c.longStrike}/${c.shortStrike} debit vertical exp ${laneEntry.expiry}`,
+    };
+  }
+  return {
+    ...base, legs: 1,
+    structure: c.type === 'CALL' ? 'long-call' : 'long-put',
+    strike: c.strike ?? null,
+    delta: c.delta ?? null,
+    targetDelta: c.targetDelta ?? null,
+    iv: c.iv ?? null,
+    contract: `long ${c.type} ${c.strike} exp ${laneEntry.expiry}`,
+  };
+}
+
+/** One published entry. Everything the record promises, and nothing derived. */
+function top3Entry(sym, c, laneEntry, row, verdict, scored, rowMeta) {
+  return {
+    symbol: sym,
+    ...top3Contract(c, laneEntry),
+    spot: row.spot ?? null,
+    /* DEBIT / CREDIT. Both eligible lanes are debit structures, so `credit` is
+       null rather than 0 — 0 would claim a credit of zero was received. */
+    netKind: 'debit',
+    debit: c.debit ?? null,
+    debitPerShare: c.debitPerShare ?? null,
+    credit: null,
+    breakeven: c.breakeven ?? null,
+    bePct: c.bePct ?? null,
+    beEm: c.beEm ?? null,
+    pBe: c.pBe ?? null,
+    pBeIvStrike: c.pBeIvStrike ?? null,
+    pBeIvUsed: c.pBeIvUsed ?? null,
+    coverage1y: c.coverage1y ?? null,
+    coverage3y: c.coverage3y ?? null,
+    coverageHorizon: c.coverageHorizon ?? null,
+    coverageSessions: c.coverageSessions ?? null,
+    coverageN1y: c.coverageN1y ?? null,
+    coverageN3y: c.coverageN3y ?? null,
+    /* GAP AND DRIFT TRAVEL TOGETHER, ALWAYS. `gap = coverage - pBe` conflates how
+       fat the tails were with which way the stock ran, and on a trending name the
+       drift term dominates. Shipping a gap without its drift beside it is the
+       inference honesty rule 26 exists to stop. */
+    gap1y: c.gap1y ?? null,
+    gap3y: c.gap3y ?? null,
+    drift1y: c.drift1y ?? null,
+    drift3y: c.drift3y ?? null,
+    gapNote: 'gap = coverage - pBe, in POINTS. Coverage carries the realized drift; pBe is driftless by '
+      + 'construction. Read gap and drift together — a positive gap on a name that simply went up is not '
+      + 'a statement about vol. Zero is NOT fair value: a modest negative gap is the variance risk premium.',
+    expectancyEpisodesTo50: c.expectancyEpisodesTo50 ?? null,
+    expectancyEpisodes: c.expectancyEpisodes ?? null,
+    concentrationFlag: c.concentrationFlag ?? false,
+    concentrationLabel: c.concentrationLabel ?? null,
+    expectancySharpe: c.expectancySharpe ?? null,
+    expectancyWinRate: c.expectancyWinRate ?? null,
+    expectedDollars: c.expectedDollars ?? null,
+    expectancyMean: c.expectancyMean ?? null,
+    expectancyMedian: c.expectancyMedian ?? null,
+    expectancyWindows: c.expectancyWindows ?? null,
+    expectancyWindow: c.expectancyWindow ?? null,
+    kellyQuarter: c.kellyQuarter ?? null,
+    upsideTruncated: c.upsideTruncated ?? null,
+    score: scored.score,
+    scorePoints: scored.points,
+    subscores: scored.subscores,
+    verdict,
+    ...rowMeta,
+  };
+}
+
+/**
+ * PART 1 — the sweep. Strictly sequential, one awaited request at a time.
+ *
+ * Returns the rows keyed by symbol plus the counts. A ticker that fails is
+ * recorded as `{symbol, error}` and the walk continues; a RUN of consecutive
+ * failures is reported separately, because N consecutive failures is one systemic
+ * fault wearing the costume of N independent ones (honesty rule 16).
+ *
+ * A FAILED FETCH DOES NOT THROW — and reading this wrong would have silently
+ * dedupped a broken run out of the day. `longRow` catches its own Yahoo failure
+ * and RETURNS `{ok: false, status: 'error'}`, so `try/catch` alone sees a clean
+ * result and the completeness guard would have stamped. So the classification is
+ * on the row's own status, and it separates two things a single `ok: false` runs
+ * together (honesty rule 17):
+ *
+ *   `error`                                 -> INFRASTRUCTURE. Counted as failed,
+ *                                              blocks the stamp, retried next firing.
+ *   `no-options` / `no-iv` / `no-expiries`  -> a DOMAIN fact about the name: it
+ *                                              genuinely has nothing screenable.
+ *                                              A complete outcome, counted as
+ *                                              `skipped`, and it must NOT block
+ *                                              the stamp forever.
+ *
+ * Same split, and the same reason, as `collectMoveSeries`'s
+ * `written + skipped === N`. A cached row is likewise only reused when it is NOT
+ * an `error` row — reusing one would freeze a transient Yahoo failure for the
+ * whole freshness window.
+ */
+const TOP3_DOMAIN_STATUSES = ['no-options', 'no-iv', 'no-expiries'];
+
+async function top3Sweep(env, tickers) {
+  const started = Date.now();
+  const rows = new Map();
+  const failures = [];
+  const byStatus = {};
+  let fetched = 0, reused = 0, skipped = 0, consec = 0, worstConsec = 0;
+
+  // One crumb warm-up for the whole sweep — it is cached in isolate memory and in
+  // KV, so this is 0-2 fetches for N tickers rather than a race at the first one.
+  await getYahooCrumb(env).catch(() => {});
+
+  for (const sym of tickers) {
+    try {
+      const cached = await readLongRow(sym, env);
+      const age = cached?.ts ? Date.now() - cached.ts : null;
+      const reusable = cached && age != null && age < LONG_FRESH_MS && cached.status !== 'error';
+      const row = reusable ? cached : await refreshLongTicker(sym, env);
+      const status = row?.status || 'unknown';
+      byStatus[status] = (byStatus[status] || 0) + 1;
+
+      if (status === 'error') {
+        failures.push({ symbol: sym, error: row?.reason || 'long row returned status `error`',
+                        via: 'row-status' });
+        consec++;
+        if (consec > worstConsec) worstConsec = consec;
+        continue;
+      }
+      rows.set(sym, { row, rowSource: reusable ? 'reused' : 'fetched', rowAgeMs: reusable ? age : 0 });
+      if (reusable) reused++; else fetched++;
+      if (TOP3_DOMAIN_STATUSES.includes(status)) skipped++;
+      consec = 0;
+    } catch (e) {
+      failures.push({ symbol: sym, error: e?.message || String(e), via: 'threw' });
+      consec++;
+      if (consec > worstConsec) worstConsec = consec;
+    }
+  }
+
+  const wallMs = Date.now() - started;
+  const systemicSuspected = worstConsec >= TOP3_SYSTEMIC_FAIL_RUN;
+  if (systemicSuspected) {
+    console.error(`[cron] !! TOP3-SWEEP-SYSTEMIC !! ${worstConsec} consecutive ticker failures — that is one `
+      + 'systemic fault (crumb throttled, Yahoo unreachable, or budget exhausted), not N independent ones. '
+      + 'The sweep did NOT truncate; every remaining name was still attempted.');
+  }
+  if (wallMs > TOP3_SWEEP_WALL_WARN_MS) {
+    console.warn(`[cron] top3 sweep took ${(wallMs / 1000).toFixed(1)}s for ${tickers.length} tickers `
+      + `(${fetched} fetched / ${reused} reused / ${skipped} nothing-screenable / ${failures.length} failed), past the `
+      + `${TOP3_SWEEP_WALL_WARN_MS / 1000}s reporting threshold. NOT truncated — the figure rides on the `
+      + 'record as `sweep.wallMs` so a shrinking margin is visible before it bites.');
+  }
+  return {
+    started, finished: Date.now(), wallMs,
+    tickers: tickers.length, fetched, reused, skipped, byStatus,
+    failed: failures.length, failures,
+    worstConsecutiveFailures: worstConsec, systemicSuspected,
+    wallWarn: wallMs > TOP3_SWEEP_WALL_WARN_MS,
+    wallWarnMs: TOP3_SWEEP_WALL_WARN_MS,
+    rows,
+  };
+}
+
+/**
+ * PART 2 — the ranking pass. No fetches, and no KV read beyond one
+ * `analysis:{TICKER}` verdict per ticker.
+ */
+async function top3Rank(env, tickers, swept, todayPt) {
+  const excluded = [];
+  const funnel = { direction: 0, liquidity: 0, vol: 0, episodes: 0, inputs: 0 };
+  const pool = {
+    tickersConsidered: tickers.length,
+    tickersWithRow: 0, tickersWithTodayRow: 0,
+    tickersWithVerdict: 0, tickersDirectional: 0,
+    tickersQualified: 0, tickersRanked: 0,
+    candidatesConsidered: 0, candidatesInPool: 0,
+    candidatesGatedIn: 0, candidatesGatedOut: 0,
+    gateFunnel: funnel,
+  };
+  const drop = (symbol, stage, reason, extra = {}) => excluded.push({ symbol, stage, reason, ...extra });
+  const best = [];
+
+  for (const sym of tickers) {
+    const got = swept.rows.get(sym);
+    if (!got) {
+      const f = swept.failures.find(x => x.symbol === sym);
+      drop(sym, 'row', f ? `long row could not be computed — ${f.error}` : 'no long row produced by the sweep');
+      continue;
+    }
+    const row = got.row;
+    if (!row?.ok) {
+      drop(sym, 'row', `long row is not ok — status \`${row?.status || 'unknown'}\``
+        + (row?.reason ? `: ${row.reason}` : ''));
+      continue;
+    }
+    pool.tickersWithRow++;
+
+    /* "A long row from TODAY'S sweep." Tested on the row's own PT date rather
+       than on an age in hours, because a date is what the published key is named
+       for and an hours test drifts across the boundary. A reused row inside
+       LONG_FRESH_MS at 1:15pm PT always satisfies this; the check exists so a row
+       that somehow predates today cannot ride in under today's key. */
+    const rowPt = Number.isFinite(row.ts) ? ptDate(new Date(row.ts)) : null;
+    if (rowPt !== todayPt) {
+      drop(sym, 'row', `long row belongs to PT day ${rowPt || 'unknown'}, not ${todayPt}`);
+      continue;
+    }
+    pool.tickersWithTodayRow++;
+
+    /* THE VERDICT. Read through `readAnalysisRecord()` — never the raw key — or a
+       legacy record reads as unanalysed. `rating` is taken regardless of `ok`,
+       the same call `directionalRead` makes and for the same reason: this uses
+       the record for a DIRECTION, not to render a call. The era rides along on
+       the entry so a consumer can see which era it got. */
+    let rawVerdict = null;
+    try { rawVerdict = await env?.REC_LOG?.get(`analysis:${sym}`, 'json'); } catch (_) {}
+    const v = readAnalysisRecord(rawVerdict);
+    const vPt = Number.isFinite(v.ts) ? ptDate(new Date(v.ts)) : null;
+    if (!v.rating) {
+      drop(sym, 'verdict', `no verdict for ${sym} — ${v.reason || 'no stored rating'} (era ${v.era})`);
+      continue;
+    }
+    if (vPt !== todayPt) {
+      drop(sym, 'verdict', `verdict was written on PT day ${vPt || 'unknown'}, not ${todayPt} — a stale `
+        + 'call is not a call about today');
+      continue;
+    }
+    pool.tickersWithVerdict++;
+    if (v.rating === 'HOLD') {
+      drop(sym, 'verdict', 'verdict is HOLD — no directional claim, so no directional structure is ranked');
+      continue;
+    }
+    pool.tickersDirectional++;
+
+    const wantType = v.rating === 'BUY' ? 'CALL' : 'PUT';
+    const verdict = {
+      rating: v.rating, asOf: v.ts ?? null, ptDate: vPt,
+      confidence: v.confidence ?? null, era: v.era,
+      source: `analysis:${sym}`,
+      recommendation: v.recommendation ?? null,
+    };
+    const rowMeta = {
+      rowSource: got.rowSource, rowAgeMs: got.rowAgeMs, rowTs: row.ts ?? null, rowPtDate: rowPt,
+      buyable: row.buyable ?? null, buyableBasis: row.buyableBasis ?? null,
+      buyableReason: row.buyableReason ?? null,
+      ivRank: row.ivRank ?? null, ivHvRatio: row.ivHvRatio ?? null, historyDays: row.historyDays ?? null,
+      regimeState: row.regime?.state ?? null,
+    };
+
+    let symBest = null;
+    const symGates = { direction: 0, liquidity: 0, vol: 0, episodes: 0, inputs: 0 };
+    let symPool = 0;
+    for (const laneEntry of row.lanes || []) {
+      if (!TOP3_LANES.includes(laneEntry.lane)) continue;
+      for (const c of laneEntry.candidates || []) {
+        pool.candidatesConsidered++;
+        if (c.type !== wantType) { funnel.direction++; symGates.direction++; continue; }
+        pool.candidatesInPool++; symPool++;
+        const g = top3GateCandidate(c, row);
+        if (!g.ok) {
+          pool.candidatesGatedOut++;
+          funnel[g.gate]++; symGates[g.gate]++;
+          continue;
+        }
+        pool.candidatesGatedIn++;
+        const scored = top3Subscores(c);
+        const entry = top3Entry(sym, c, laneEntry, row, verdict, scored, rowMeta);
+        if (!symBest
+            || entry.score > symBest.score
+            || (entry.score === symBest.score && entry.expectancySharpe > symBest.expectancySharpe)) {
+          symBest = entry;
+        }
+      }
+    }
+
+    if (!symBest) {
+      const parts = TOP3_GATE_ORDER.filter(k => symGates[k] > 0).map(k => `${k} ${symGates[k]}`);
+      drop(sym, 'gates',
+        symPool === 0
+          ? `no ${wantType}-type Lane B/C candidate was priced for this ${v.rating} verdict`
+              + (symGates.direction
+                  ? ` (${symGates.direction} candidate${symGates.direction === 1 ? '' : 's'} priced, all the `
+                    + 'wrong direction)' : '')
+          : `${symPool} candidate${symPool === 1 ? '' : 's'} in the pool, none survived the gates — `
+              + `eliminated by: ${parts.join(', ')}`,
+        { gates: symGates, inPool: symPool, wantType, rating: v.rating });
+      continue;
+    }
+    best.push(symBest);
+  }
+  pool.tickersQualified = best.length;
+
+  /* ONE SLOT PER TICKER, already enforced above by `symBest`. Sorted score desc,
+     then sharpe desc, then symbol asc so two runs over the same rows publish the
+     same order rather than whatever the iteration happened to give. */
+  best.sort((a, b) =>
+    b.score - a.score
+    || (b.expectancySharpe ?? -Infinity) - (a.expectancySharpe ?? -Infinity)
+    || a.symbol.localeCompare(b.symbol));
+
+  const entries = best.slice(0, TOP3_MAX).map((e, i) => ({ ...e, rank: i + 1 }));
+  for (const e of best.slice(TOP3_MAX)) {
+    excluded.push({ symbol: e.symbol, stage: 'rank', score: e.score,
+      reason: `qualified with score ${e.score} but did not make the top ${TOP3_MAX}` });
+  }
+  pool.tickersRanked = entries.length;
+
+  return {
+    entries, pool,
+    excluded: excluded.slice(0, TOP3_MAX_EXCLUDED),
+    excludedTruncated: excluded.length > TOP3_MAX_EXCLUDED,
+    excludedTotal: excluded.length,
+    excludedCap: TOP3_MAX_EXCLUDED,
+  };
+}
+
+/**
+ * PARTS 1 + 2 + 3 — the cron job. Fourth on the 1:15pm PT branch, dispatched
+ * after the macro bank.
+ *
+ * REFUSES BEFORE STAMPING on an empty universe, the same contract
+ * `recordWatchlistIv` / `collectMoveSeries` / `collectMacroState` follow.
+ *
+ * A PARTIAL RUN STILL WRITES BUT DOES NOT STAMP — the same split
+ * `collectMarketMood` makes, and both halves are deliberate. A ranking over 36 of
+ * 39 names is a finding worth publishing (the record names the three that were
+ * missing); the run is not done, so the next firing retries and rewrites the key
+ * whole. A run where EVERY ticker failed writes nothing at all.
+ */
+async function collectTop3(env) {
+  if (!env?.REC_LOG) return;
+  const mark = instrMark();
+  const today = ptDate();
+
+  try {
+    const last = await env.REC_LOG.get(TOP3_SWEEP_KEY);
+    if (last === today) { console.log('[cron] top3 already built today, skipping'); return; }
+  } catch (_) {}
+
+  const tickers = await sweepUniverse(env, 'top3 sweep', TOP3_SWEEP_CAP);
+  if (!tickers) return;   // refuses loudly inside sweepUniverse; nothing stamped
+
+  const swept = await top3Sweep(env, tickers);
+  if (!swept.rows.size) {
+    console.error(`[cron] !! TOP3-BUILD !! every one of ${tickers.length} tickers failed to produce a long `
+      + `row in ${(swept.wallMs / 1000).toFixed(1)}s. REFUSING to write — a ranking over zero rows is not a `
+      + 'finding. No dedup key stamped, so the next firing retries.');
+    return;
+  }
+  console.log(`[cron] top3 sweep: ${swept.fetched} fetched / ${swept.reused} reused / ${swept.failed} failed `
+    + `of ${tickers.length} in ${(swept.wallMs / 1000).toFixed(1)}s · statuses ${JSON.stringify(swept.byStatus)}`
+    + (swept.skipped ? ` · ${swept.skipped} nothing screenable (a complete outcome, not a failure)` : '')
+    + (swept.failed
+        ? ` · failures: ${swept.failures.map(f => `${f.symbol} [${f.via}] (${f.error})`).join('; ')}`
+        : ''));
+
+  const ranked = await top3Rank(env, tickers, swept, today);
+  const complete = swept.failed === 0;
+
+  const record = {
+    schema: TOP3_SCHEMA,
+    ptDate: today,
+    /* `asOf` is SWEEP COMPLETION, not the write. The entries describe the chains
+       as of the moment the last one was read. */
+    asOf: swept.finished,
+    ts: Date.now(),
+    complete,
+    incompleteReason: complete ? null
+      : `${swept.failed} of ${tickers.length} tickers hit an INFRASTRUCTURE failure `
+        + `(${swept.failures.map(f => f.symbol).join(', ')}), so this ranking was computed over the rest. `
+        + 'It is published because a ranking over the readable names is a finding; the dedup key is NOT '
+        + 'stamped, so the next firing retries and rewrites this key whole. A name with nothing screenable '
+        + '(`no-options` / `no-iv` / `no-expiries`) is NOT counted here — that is a complete outcome.',
+    entries: ranked.entries,
+    entriesNote: ranked.entries.length === 0
+      ? 'ZERO entries means the gates ran and nothing survived — a valid published result, not an error. '
+        + 'An ABSENT `top3:` key is the different state: the job has not run, or it refused.'
+      : null,
+    gates: top3GatesDeclared(),
+    pool: ranked.pool,
+    sweep: {
+      tickers: swept.tickers, fetched: swept.fetched, reused: swept.reused,
+      /* `skipped` is a name with NOTHING SCREENABLE (`no-options` / `no-iv` /
+         `no-expiries`) — a complete outcome about the ticker, deliberately not
+         counted as a failure and deliberately not allowed to block the dedup
+         stamp forever. `failed` is `error` only, which is ours to retry. */
+      skipped: swept.skipped, byStatus: swept.byStatus,
+      domainStatuses: TOP3_DOMAIN_STATUSES,
+      failed: swept.failed, failures: swept.failures,
+      wallMs: swept.wallMs, wallWarn: swept.wallWarn, wallWarnMs: swept.wallWarnMs,
+      worstConsecutiveFailures: swept.worstConsecutiveFailures,
+      systemicSuspected: swept.systemicSuspected,
+      startedTs: swept.started, finishedTs: swept.finished,
+      sequential: true,
+      sequentialNote: 'strictly sequential, one awaited request at a time — Yahoo crumb rate-limiting is '
+        + 'the binding constraint here, not the 10,000 subrequest cap.',
+    },
+    excluded: ranked.excluded,
+    excludedTruncated: ranked.excludedTruncated,
+    excludedTotal: ranked.excludedTotal,
+    excludedCap: ranked.excludedCap,
+  };
+
+  const body = JSON.stringify(record);
+  try {
+    await env.REC_LOG.put(top3Key(today), body, { expirationTtl: TOP3_TTL });
+  } catch (e) {
+    console.error(`[cron] !! TOP3-BUILD !! KV write failed — ${e.message}. No dedup key stamped, so the `
+      + 'next firing retries.');
+    return;
+  }
+
+  /* STAMP ONLY A COMPLETE RUN — the guard every other sweep on this branch
+     carries. A partial run leaves the key unstamped so the next firing retries;
+     that retry reuses every row banked minutes ago (they are inside
+     LONG_FRESH_MS), so it costs only the names that actually failed. */
+  if (complete) {
+    try { await env.REC_LOG.put(TOP3_SWEEP_KEY, today, { expirationTtl: 172800 }); } catch (_) {}
+  } else {
+    console.error(`[cron] !! TOP3-INCOMPLETE !! ${swept.failed}/${tickers.length} tickers failed. `
+      + `top3:${today} WAS written (${ranked.entries.length} entries over the readable names) but `
+      + `${TOP3_SWEEP_KEY} was NOT stamped, so the next firing retries the failures.`);
+  }
+
+  console.log(
+    `[cron] top3 ${today}: ${ranked.entries.length}/${TOP3_MAX} published`
+    + (ranked.entries.length
+        ? ` — ${ranked.entries.map(e => `${e.symbol} ${e.structure} ${e.score}`).join(', ')}`
+        : ' (zero qualified — the gates ran and nothing survived)')
+    + ` · pool ${ranked.pool.candidatesInPool} in / ${ranked.pool.candidatesGatedIn} gated in / `
+    + `${ranked.pool.candidatesGatedOut} out ${JSON.stringify(ranked.pool.gateFunnel)}`
+    + ` · ${ranked.pool.tickersDirectional} directional of ${ranked.pool.tickersWithTodayRow} with a row`
+    + ` · ${body.length}B · ${JSON.stringify(instrSince(mark, complete ? 'complete' : 'partial'))}`,
+  );
+}
+
+/** Today's record for the `/api/long/batch` envelope. ONE binding op, and `null`
+ *  where there is nothing to serve. An OLDER Worker omits the `top3` key
+ *  entirely; this one sends `top3: null` — those are different states and the
+ *  key's presence already distinguishes them, so nothing is invented here. */
+async function readTop3(env) {
+  let rec = null;
+  try { rec = await env?.REC_LOG?.get(top3Key(ptDate()), 'json'); } catch (_) { return null; }
+  if (!rec || rec.schema !== TOP3_SCHEMA) return null;
+  return rec;
 }
 
 /* ── New route handlers ── */
@@ -12928,6 +13619,22 @@ export default {
          invocation's subrequest budget with the two jobs above: `ctx.waitUntil`
          does not get its own. */
       dispatchJob(ctx, 'macro-state', () => collectMacroState(env));            // 1:15pm PT one macro state record
+      /* 1:15pm PT, dispatched AFTER the macro bank — the daily top-3 options
+         ranking. Sweeps every watchlist name through the same path
+         `/api/long/:ticker` uses, STRICTLY SEQUENTIALLY (Yahoo crumb
+         rate-limiting is the binding constraint, not the subrequest cap), then
+         ranks in memory and writes `top3:{PT-date}`.
+
+         THIS IS THE FOURTH JOB ON THE BRANCH, so no per-job `_instr` from here
+         is a measurement — see the concurrency caveat in rule #1. It is also by
+         far the longest: `sweep.wallMs` rides on the stored record precisely so a
+         shrinking margin against the cron limit is visible before it bites. It
+         never truncates the watchlist to fit.
+
+         Its own dedup key (`top3sweep:last`) skips the 1:30pm repeat once a
+         COMPLETE run has landed; a partial run leaves it unstamped and the retry
+         reuses the rows this run banked, so it costs only the names that failed. */
+      dispatchJob(ctx, 'top3', () => collectTop3(env));                          // 1:15pm PT daily top-3 ranking
     } else if (h === 14 && m < 30) {
       branch = 'forward-returns+moves+mood';
       dispatchJob(ctx, 'forward-returns', () => fillForwardReturns(env));       // 2:00pm PT resolve 5/20-session forward returns

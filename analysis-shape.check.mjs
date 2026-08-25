@@ -80,7 +80,21 @@ function row(label, got, want, ok = Object.is(got, want)) {
 }
 const eq = (a, b) => j(a) === j(b);
 
-const TS = Date.parse('2026-08-20T14:00:00Z');
+/* RELATIVE TO NOW, NEVER AN ABSOLUTE DATE — and this was a live defect.
+   §3 builds the `stocks` map exactly as `handleWatchlistBatch` does, which means
+   `usable = r.ok && Date.now() - r.ts < 172_800_000` (the `analysis:` 2-day TTL).
+   This was `Date.parse('2026-08-20T14:00:00Z')`, so from 2026-08-22 onward every
+   fixture aged past that window, every record read as unusable, and all four
+   names queued a Claude call. Four assertions went red — "canonical record does
+   NOT queue a call", "exactly two names queued" among them — reporting the spend
+   leak as OPEN when the source gate was fine.
+
+   A check that goes red on the calendar rather than on the code is worse than no
+   check: it trains the next reader to ignore a failing spend-gate assertion. One
+   hour ago is inside the window in every future run, and §3's own stale case
+   builds its timestamp explicitly (`Date.now() - 200_000_000`), so the
+   stale-path assertions are unaffected. */
+const TS = Date.now() - 3600_000;
 
 /* The four records that can be in KV on the morning of the deploy. */
 const CANONICAL = {

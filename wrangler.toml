@@ -141,6 +141,26 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #                         rebuilt once RADAR_RETRY_MS (10 min) has passed; a
 #                         REFUSAL (watchlist:tickers unreadable) is never
 #                         written at all.
+#   top3:{PT-DATE}      — THE DAILY TOP-3 OPTIONS RANKING. The <=3 entries with
+#                         full contract identity, every score input and EVERY
+#                         component subscore (the score must be decomposable,
+#                         never a bare number), the verdict rating and its as-of,
+#                         the declared gates, the pool counts and gate funnel, the
+#                         sweep counts and wall time, and the capped excluded[]
+#                         with excludedTotal beside it. 36h retention (TOP3_TTL)
+#                         so it outlives the day it names; date-keyed, so there is
+#                         no freshness question. TOP3_SCHEMA 1, strict equality.
+#                         `entries: []` and an ABSENT key are DIFFERENT STATES:
+#                         [] means the gates ran and nothing survived (a valid
+#                         published result), absent means the job has not run or
+#                         refused. Written by the 1:15pm PT collectTop3; read by
+#                         /api/long/batch and nothing else.
+#   top3sweep:last      — PT date of the last COMPLETE top-3 build (dedup).
+#                         Outside the `top3:` prefix, same rule as ivsweep/
+#                         movesweep/macrosweep/moodsweep. Stamped LAST and only
+#                         when zero tickers hit an INFRASTRUCTURE failure; a name
+#                         with nothing screenable (no-options / no-iv /
+#                         no-expiries) is a complete outcome and does not block it.
 #   market:week-ahead   — Friday-only week-ahead preview (18h TTL)
 #   market:goldencross  — golden-cross setups (1h TTL)
 #   scanner:{preset}    — day-trading scanner results (90s TTL)
@@ -208,6 +228,18 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   Midday pulse     — 11:30am PT  (18:30 UTC PDT / 19:30 UTC PST)
 #   EOD summary      — 1:15pm PT   (20:15 UTC PDT / 21:15 UTC PST)
 #   IV history sweep — 1:15pm PT   (runs alongside the EOD job; own daily dedup key)
+#   Macro state      — 1:15pm PT   (one spark call, 4 symbols; own daily dedup key)
+#   Top-3 ranking    — 1:15pm PT   (dispatched AFTER the macro bank. Sweeps the
+#                      whole watchlist SEQUENTIALLY through the /api/long/:ticker
+#                      computation path — one awaited Yahoo request at a time,
+#                      because crumb rate-limiting is the binding constraint here,
+#                      not the subrequest cap — then ranks in memory and writes
+#                      top3:{PT-date}. THIS BRANCH IS NOW FOUR JOBS DEEP sharing
+#                      one invocation budget, so no per-job _instr from it is a
+#                      measurement. Derivation at N=40 all cold: ~20 capCost per
+#                      name, ~803 total, ~8% of the ceiling. It NEVER truncates
+#                      the watchlist to fit; sweep.wallMs is on the record so a
+#                      shrinking margin is visible first. Own daily dedup key.)
 #   Forward-ret fill — 2:00pm PT   (21:00 UTC PDT / 22:00 UTC PST; own daily dedup key)
 #   Move-series sweep— 2:00pm PT   (settled daily bar; own daily dedup key)
 #   Market Mood      — 2:00pm PT   (same settled bar; 15 chart fetches + 1 Claude

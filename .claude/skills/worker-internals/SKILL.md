@@ -21,7 +21,8 @@ GET  /api/quote/:ticker           Yahoo quoteSummary (multi-module) + Alpaca pri
 GET  /api/chart/:ticker           Yahoo v8 OHLCV (?range=1y&interval=1d)
 GET  /api/options/:ticker         Yahoo v7 options chain
 POST /api/premium/*             REMOVED — returns 410. Became Lane F of the Long screen.
-GET  /api/long/batch?symbols=     Long screen, KV only — no fetches; 1 KV read/symbol
+GET  /api/long/batch?symbols=     Long screen, KV only — no fetches; N+2 KV reads
+                                    (1/symbol + macro + top3, both in the envelope)
 GET  /api/long/:ticker            One ticker (capCost 13 warm, 18-20 cold - cold is a RANGE)
 GET  /api/insider/:ticker         SEC EDGAR Form 4, last 90 days (12h KV)
 GET  /api/short/:ticker           FINRA consolidated short interest, 6 settlements (Yahoo fallback)
@@ -660,6 +661,8 @@ differs from its retention, both are given and the reason is in the notes.
 | `market:ipos` | 12h | IPO calendar |
 | `market:sectors` | 4h | Sector summaries + opportunity/avoid picks. **Also source (b) of `/api/radar`** — its `opportunity` tickers are gate-filtered as radar candidates |
 | `radar:{PT-DATE}` | **36h** (`RADAR_TTL`) | One PT day's off-watchlist radar: the ≤5 candidates, the `sources` verdicts, the `funnel` counts and the full elimination `trail`. Keyed on the PT date, so there is no freshness question — retention outlives the day it names so a late-evening read still finds the answer instead of paying for a rebuild after the close. `RADAR_SCHEMA` 1, checked by **strict equality**; any other value reads as ABSENT and the next request rebuilds. An **incomplete** build (a source was down) is cached like any other so cost stays bounded, but is re-built rather than re-served once `RADAR_RETRY_MS` (10 min) has passed — a source that was down at 6am must not define discovery for the whole day. A **refusal is never written**, because it is a fact about our own config rather than about the day. |
+| `top3:{PT-DATE}` | **36h** (`TOP3_TTL`) | One PT day's top-3 options ranking: the ≤3 entries with full contract identity, every score input and **every component subscore**, the verdict rating and its as-of, the declared `gates`, the `pool` counts and gate funnel, the `sweep` counts and wall time, and the capped `excluded[]` with `excludedTotal` beside it. Keyed on the PT date, so there is no freshness question; retention outlives the day it names. `TOP3_SCHEMA` 1, **strict equality** — any other value reads as ABSENT. **`entries: []` and an ABSENT key are DIFFERENT STATES**: `[]` means the gates ran and nothing survived, which is a valid published result; absent means the job has not run, or refused. A partial run (an infrastructure failure on some names) still WRITES — a ranking over the readable names is a finding — but does not stamp. A run where **every** ticker failed writes nothing. Written by the 1:15pm PT `collectTop3`; read by `/api/long/batch` and nothing else. **~15 KB** measured at N=11. |
+| `top3sweep:last` | 2d | PT date of the last **complete** top-3 build, for dedup. **Outside the `top3:` prefix**, the same rule as `ivsweep:last` / `movesweep:last` / `macrosweep:last` / `moodsweep:last`. Stamped LAST, and only when zero tickers hit an infrastructure failure — a name with nothing screenable (`no-options` / `no-iv` / `no-expiries`) is a complete outcome and must not block it forever. |
 | `market:goldencross` | 2h | Golden-cross setups (served fresh for 1h via `GOLDEN_TTL`) |
 | `scanner:{preset}` | 5min | Day-trading scanner results (served fresh for 90s via `SCAN_TTL`) |
 | `auction:{DATE}:{SYMBOLS}` | 20h | Closing-auction block trades, keyed by ET date |
@@ -743,7 +746,18 @@ their own `const TTL = <number>`, which shadowed it silently and turned
 the badge. They are now **`CRUMB_TTL`, `SCAN_TTL`, `GOLDEN_TTL`, `IPO_TTL`**. Any
 new local cache window needs its own name.
 
-**Cron trigger:** a single `*/15 13-22 * * *` UTC cron — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), the **`eod+iv-sweep+macro`** branch (1:15pm PT — EOD summary, IV sample sweep, and the macro-regime collection), the **`forward-returns+moves+mood`** branch (2pm PT — the forward-return fill, the move-series sweep, *and* the Market Mood collection), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
+**Cron trigger:** a single `*/15 13-22 * * *` UTC cron — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), midday pulse (11:30am PT), the **`eod+iv-sweep+macro`** branch (1:15pm PT — EOD summary, IV sample sweep, the macro-regime collection, **and, dispatched after the macro bank, the daily top-3 options ranking**), the **`forward-returns+moves+mood`** branch (2pm PT — the forward-return fill, the move-series sweep, *and* the Market Mood collection), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
+
+**The 1:15pm branch is FOUR jobs deep since 2026-08-25**, so no per-job `_instr`
+from it is a measurement — the concurrency caveat in rule #1 applies with more
+force, not less. `collectTop3` is also by far the longest-running job on any
+branch: it sweeps the whole watchlist sequentially through `refreshLongTicker`
+(one awaited Yahoo request at a time, because crumb rate-limiting is the binding
+constraint), so `sweep.wallMs` rides on the stored record precisely so a shrinking
+margin against the cron limit is visible before it bites. **It never truncates the
+watchlist to fit** — that is the 13F failure (honesty rules 12 and 16). Measured
+locally 2026-08-25 at N=11 all cold: **8.9s**, ~0.8s/name, deriving to ~35s at the
+live 40-name list; a warm re-run (every row inside `LONG_FRESH_MS`) took **0.1s**.
 
 **`collectMarketMood` runs at 2:00pm PT for the same bar-settlement reason as
 `collectMoveSeries`**, and it is the third job on that branch. Cost, stated

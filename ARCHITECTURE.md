@@ -923,6 +923,7 @@ The two skills load on demand, not every session.
 | **3** | **Lane E** — straddle + strangle, two-sided coverage and P(BE), the hold-to-expiry caveat | **SHIPPED** 2026-08-10 |
 | **4** | **Premium merged into Long as Lane F** — defined-risk credit spreads; the standalone Premium tab, its row model and `/api/premium/*` deleted | **SHIPPED** 2026-08-10 |
 | **5** | **`macroRegime` phase 1** — SPY/QQQ trend + VIX level + VIX term structure, one chip in the Long tab header, **display only: no sort, no gate, no blend** | **SHIPPED** 2026-08-11 |
+| **6** | **The daily top-3 options ranking** — `top3:{PT-DATE}`, a fourth job on the 1:15pm PT branch: a sequential watchlist sweep through the `/api/long/:ticker` path, a gated ranking over Lanes B and C directed by that day's `analysis:` verdict, and one KV read folded into `/api/long/batch`'s envelope beside `macro`. **No new endpoint and no new page-load fetch.** Every component subscore is stored, so the 0–100 score is decomposable rather than a bare number | **BUILT** 2026-08-25, **NOT DEPLOYED** — deploys are manual by standing rule |
 
 Everything under "Not yet done" is genuinely outstanding. It does **not** include
 steps 1–5, but it **does** include `macroRegime` **phase 2**, which is specified

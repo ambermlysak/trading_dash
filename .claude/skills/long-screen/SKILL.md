@@ -150,9 +150,15 @@ tickers because one is a coincidence:
 one KV read of the ~727-byte `macro:state` key. **The delta is a single number; two
 of the three absolutes are not.**
 
+> **SUPERSEDED FOR THE BATCH ROW, 2026-08-25.** `/api/long/batch` now also reads
+> `top3:{PT-date}` into the envelope beside `macro`, so it is **`N + 2`**, not
+> `N + 1`. Measured on the same day: N=10 → capCost **12**, N=1 → capCost **3**,
+> both `extFetches 0`. The `+1` delta below still describes the macro read on its
+> own and is left as measured; the *absolute* for this row is now N + 2.
+
 | path | absolute after | is it one value? |
 |---|---|---|
-| `/api/long/batch`, 33 symbols | **34** | **yes** — `N + 1`, exactly, by construction |
+| `/api/long/batch`, 33 symbols | **34** → now **35** | **yes** — `N + 1`, now `N + 2`, exactly, by construction |
 | `/api/long/:ticker` **warm** | **13** | **yes** — all three tickers identical |
 | `/api/long/:ticker` **cold** | **18–20** | **NO — a range, and quote it as one** |
 
