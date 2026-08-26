@@ -882,16 +882,24 @@ does NOT throw, the domain statuses that are complete outcomes, the reuse refusa
 on a cached error row and the consecutive-failure run, then `top3Rank` end to end
 on synthetic rows for both directions, HOLD, a stale verdict, one-slot-per-ticker,
 the top-3 cut, tie-break determinism and the zero-qualifying case that must
-publish `[]`, and `readTop3`'s strict schema equality).
+publish `[]`, `readTop3`'s strict schema equality, and the SERVING WINDOW — the
+walk back from today's key to the newest one that still exists, driven with a
+PINNED clock and a key-aware KV stub over raw bytes, including the byte compare
+proving the served record is not rewritten and a re-derivation of the reachable
+walk-back depth from `TOP3_TTL` so the unreachable `back=3` probe is measured
+rather than shipped in silence).
 All of them extract functions from
 `worker.js` by source, not by import, because every named export in `worker.js`
 must be a function or `workerd` refuses to boot.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 173** for moves /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 219** for moves /
 long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
 sweep-universe / macro / mood / swing / earnings-timing / daily-slots /
-analysis-shape / top3 — **1,423 comparisons** across the suite.
+analysis-shape / top3 — **1,469 comparisons** across the suite. `top3` went 173 -> 219
+on 2026-08-26 with §10, the serving window; its `minComparisons` floor moved 130 -> 170.
+A full run on 2026-08-26 reported **1,518** observed, the gap being the two tape-dependent
+scripts (`swing` 95, `earnings-timing` 158) whose floors are deliberately their FIXED counts.
 
 ##### A FIXTURE TIMESTAMP MUST BE RELATIVE TO NOW — 2026-08-25
 
@@ -1063,8 +1071,24 @@ without ever opening that file.
   about the ticker and must not block it. **`refreshLongTicker` does not throw on a
   Yahoo failure** — it returns `{ok: false, status: 'error'}`, so a `try/catch`
   alone would stamp a broken run out of the day
-- `/api/long/batch` is now **`N + 2`** binding ops, not `N + 1` — one macro read
-  and one `top3` read, both in the envelope, never per row
+- `/api/long/batch` is **`N + 2`** binding ops on the top3 HIT path and at most
+  **`N + 5`** on the miss — one macro read plus one `top3` read, both in the
+  envelope, never per row. `readTop3` serves today's key when it exists and
+  otherwise walks back up to `TOP3_SERVE_WALKBACK_DAYS` (3) calendar days, so a
+  miss costs at most 3 further reads. Measured at N=2 on 2026-08-26: hit **4**,
+  `-1` hop **5**, full miss **7**, `extFetches 0` on all three
+- **`readTop3` serves the NEWEST SURVIVING record, not only today's.** The record
+  is written by the 1:15pm PT cron, so reading only `top3:{today}` served `null`
+  through every trading morning while yesterday's sat in KV inside its 36h TTL —
+  the feature's own design (an EOD-banked ranking rendered next morning under its
+  real as-of) was unreachable in production. **The record is served UNMODIFIED and
+  carries no `served` marker**: its own `ptDate` / `asOf` date it, and a second
+  field claiming the same fact is a second field that can disagree. A KV throw
+  ABORTS the walk; a schema mismatch reads as absent and the walk CONTINUES.
+  **`back=3` cannot fire at `TOP3_TTL` 36h** — three calendar days back is ≥48h
+  old at the most favourable clock — and is kept so raising the TTL needs no
+  second edit; `top3.check.mjs` §10 re-derives the reachable depth (2) from the
+  TTL and prints it rather than letting the dead branch ship silently
 - `incomerow:{TICKER}` schema check stays strict equality, and its freshness (6h)
   and retention (36h) must not be equal
 
@@ -1269,6 +1293,7 @@ record that rides on the existing `/api/long/batch` envelope beside `macro`.
 | `TOP3_SWEEP_WALL_WARN_MS` | 150s | the sweep REPORTS past this; it never truncates |
 | `TOP3_SYSTEMIC_FAIL_RUN` | 5 | consecutive failures at which one systemic fault is named |
 | `TOP3_MAX_EXCLUDED` | 60 | stored `excluded[]` cap, with `excludedTotal` beside it |
+| `TOP3_SERVE_WALKBACK_DAYS` | **3** | how far `readTop3` probes back when today's key is absent — a **key-existence probe, not a validity judgment**; `TOP3_TTL` decides what still exists |
 
 **THE SWEEP IS STRICTLY SEQUENTIAL AND THAT IS NOT ABOUT THE CAP.** The whole job
 costs well under a tenth of the 10,000. The binding constraint is **Yahoo crumb
@@ -1279,6 +1304,37 @@ The sweep's per-ticker term is that minus the endpoint's macro read, plus one
 `readLongRow` probe and one `analysis:` verdict read: **≈ 20 per name.** At the
 live 40-name watchlist, all cold, that derives to **≈ 803 capCost**, ~8% of the
 ceiling.
+
+**THE SERVING WINDOW IS "THE NEWEST RECORD THAT STILL EXISTS", NOT "TODAY'S".**
+Fixed 2026-08-26. `readTop3` reads `top3:{today}` and, on a miss, walks back up
+to `TOP3_SERVE_WALKBACK_DAYS` (3) calendar days. The write happens at 1:15pm PT,
+so today-only reading returned `top3: null` on every trading morning while a
+valid record sat in KV inside its 36h TTL. Nothing about the writer, the stamp,
+the TTL, the schema or the ranking changed — only which key is read.
+
+| path | `top3` reads | `/api/long/batch` capCost at N=2, measured 2026-08-26 |
+|---|---|---|
+| today present | 1 | **4** — `N + 2`, unchanged from before the fix |
+| today absent, `-1` hit (the live morning case) | 2 | **5** |
+| nothing in the window | 4 | **7** — the ceiling, `N + 5` |
+
+The record is **served unmodified and carries no `served` marker** — `ptDate` and
+`asOf` are already on every record from every writer, and the consumer compares
+`ptDate` against its own today. **A KV throw aborts the walk** rather than
+spending three more reads against a binding that just failed, which keeps the
+pre-fix behaviour on that path exactly. **A schema mismatch reads as absent and
+the walk continues**, which is what absent means everywhere else in the file.
+
+**`back=3` IS UNREACHABLE AT THE CURRENT TTL AND IS KEPT ANYWAY, MEASURED RATHER
+THAN ASSUMED.** A record read k calendar days back is at least `(k−1)×24h` old,
+so `back=k` is reachable only while `(k−1)×24h < TOP3_TTL`: at 36h that is
+**k ≤ 2**. `top3.check.mjs` §10 re-derives that 2 from `TOP3_TTL` and prints the
+count of unreachable depths (1), so the dead branch is a stated number rather
+than a silent one — and raising the TTL needs no second edit here.
+
+**CONSEQUENCE, NOT FIXED AND OUT OF SCOPE: a Monday morning still finds nothing.**
+Friday's 13:15 PT record expires ~01:15 PT Sunday, so the weekend gap is a
+`TOP3_TTL` question rather than a serving-window one.
 
 **A CACHED ROW INSIDE `LONG_FRESH_MS` IS REUSED, and an `error` row never is.**
 Reusing a fresh error row would freeze a transient Yahoo failure for four hours.

@@ -21,6 +21,12 @@
  *      zero-qualifying case that must publish `[]` rather than refuse.
  *   8. `readTop3`'s STRICT schema equality and its failure paths.
  *   9. what `gates` actually ships, since a consumer is told not to hardcode.
+ *  10. the SERVING WINDOW — `readTop3` walking back from today's key to the
+ *      newest one that still exists, which is the whole point of a record banked
+ *      at 1:15pm PT and read the following morning. Includes the byte compare
+ *      proving the served record is not rewritten, and a RE-DERIVATION of the
+ *      reachable walk-back depth from `TOP3_TTL` so the dead `back=3` branch is
+ *      measured rather than silently shipped.
  *
  * Everything is extracted from `worker.js` BY SOURCE, not imported — every named
  * export there must be a function or `workerd` refuses to boot.
@@ -86,6 +92,7 @@ const M = new Function([
   grabConst('IVR_BUY_MAX'), grabConst('RATIO_BUY_MAX'),
   grabConst('TOP3_SCHEMA'), grabConst('TOP3_MAX'), grabConst('TOP3_TTL'),
   grabConst('TOP3_SWEEP_KEY'), grabConst('top3Key'),
+  grabConst('TOP3_SERVE_WALKBACK_DAYS'), grabConst('isoShiftDays'),
   grabConst('TOP3_SWEEP_CAP'), grabConst('TOP3_LANES'), grabConst('TOP3_MIN_EPISODES_TO_50'),
   grabConst('TOP3_MAX_EXCLUDED'), grabConst('TOP3_SWEEP_WALL_WARN_MS'),
   grabConst('TOP3_SYSTEMIC_FAIL_RUN'),
@@ -97,6 +104,7 @@ const M = new Function([
   STUBS,
   grab('top3Sweep'), grab('top3Rank'), grab('readTop3'),
   `return { clampTo, ptDate, LONG_FRESH_MS, TOP3_SCHEMA, TOP3_MAX, TOP3_TTL, TOP3_SWEEP_KEY, top3Key,
+            TOP3_SERVE_WALKBACK_DAYS, isoShiftDays,
             TOP3_SWEEP_CAP, TOP3_LANES, TOP3_MIN_EPISODES_TO_50, TOP3_MAX_EXCLUDED,
             TOP3_SWEEP_WALL_WARN_MS, TOP3_SYSTEMIC_FAIL_RUN, TOP3_ANCHORS, TOP3_WEIGHTS,
             TOP3_WEIGHT_TOTAL, TOP3_SCORE_INPUTS, TOP3_GATE_ORDER, TOP3_DOMAIN_STATUSES,
@@ -543,9 +551,194 @@ row('one-slot-per-ticker is stated', /ONE slot per ticker/.test(G.slotRule), tru
 row('the reuse window is stated',  G.longFreshMs, M.LONG_FRESH_MS);
 row('the null-is-not-a-failure rule is stated', /null = still collecting/.test(G.vol.rule), true);
 
+
+/* ═══ 10. THE SERVING WINDOW — today, then a bounded walk back ══════════════
+   The record is written by the 1:15pm PT cron, so on every trading morning
+   today's key does not exist yet while yesterday's is still in KV. Reading only
+   today's key served `null` through every morning and made the feature's own
+   design — an EOD-banked ranking rendered next morning under its real as-of —
+   unreachable in production.
+
+   THE CLOCK IS AN INPUT HERE, NOT AN AMBIENT FACT. `readTop3` calls `ptDate()`
+   with no argument, so every case below pins `Date` to a chosen instant and the
+   harness PRINTS the PT date that pinning produced before any case leans on it —
+   a fixture that rebuilds a call's bars but not its clock is a named failure in
+   this repo (swing.check.mjs §5). 20:00Z is 13:00 PDT / 12:00 PST, safely inside
+   the same PT calendar day under both regimes. */
+console.log('\n§10 the serving window — today first, then a bounded calendar walk back');
+
+const RealDate = Date;
+/** Run `fn` with `new Date()` and `Date.now()` pinned to midday PT on `iso`. */
+async function atPtDay(iso, fn) {
+  const fixed = RealDate.parse(iso + 'T20:00:00Z');
+  class Fake extends RealDate {
+    constructor(...a) { if (a.length === 0) super(fixed); else super(...a); }
+    static now() { return fixed; }
+  }
+  globalThis.Date = Fake;
+  try { return await fn(); } finally { globalThis.Date = RealDate; }
+}
+
+/** A key-aware KV stub over RAW STORED BYTES. `get(k, 'json')` parses, exactly as
+    the real binding does, so the byte compares below are byte compares and not a
+    deep-equal wearing the costume of one. Every read is recorded, because the
+    added cost is part of the contract and an unmeasured cost claim is an
+    assertion. */
+function kvOf(store, throwOn = null) {
+  const reads = [];
+  return { reads, env: { REC_LOG: { get: async (k) => {
+    reads.push(k);
+    if (throwOn && k === throwOn) throw new Error('kv down');
+    const bytes = store[k];
+    return bytes === undefined ? null : JSON.parse(bytes);
+  } } } };
+}
+
+const dowOf = iso =>
+  ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][new RealDate(iso + 'T12:00:00Z').getUTCDay()];
+
+/* ── 10a. the clock harness itself, before anything leans on it ───────────── */
+const WED = '2026-08-26', TUE = '2026-08-25', MON = '2026-08-24',
+      SUN = '2026-08-23', SAT = '2026-08-22', FRI = '2026-08-21';
+row('2026-08-26 is a Wednesday', dowOf(WED), 'Wed');
+row('2026-08-24 is a Monday',    dowOf(MON), 'Mon');
+row('2026-08-21 is a Friday',    dowOf(FRI), 'Fri');
+row('pinned clock -> ptDate() reads WED', await atPtDay(WED, async () => M.ptDate()), WED);
+row('pinned clock -> ptDate() reads MON', await atPtDay(MON, async () => M.ptDate()), MON);
+
+/* ── 10b. isoShiftDays is CALENDAR arithmetic, and so DST-immune ──────────── */
+row('shift -1 across a month end',   M.isoShiftDays('2026-09-01', -1), '2026-08-31');
+row('shift -3 from a Monday is Fri', M.isoShiftDays(MON, -3), FRI);
+row('shift -1 over the SPRING-forward PT boundary (23h day)',
+    M.isoShiftDays('2026-03-09', -1), '2026-03-08');
+row('shift -1 over the FALL-back PT boundary (25h day)',
+    M.isoShiftDays('2026-11-02', -1), '2026-11-01');
+row('shift -1 across a leap day',    M.isoShiftDays('2028-03-01', -1), '2028-02-29');
+row('shift 0 is identity',           M.isoShiftDays(WED, 0), WED);
+
+/* Records are built as RAW BYTES. `ptDate` is what a consumer reads to date the
+   record, so each carries its own day and nothing may rewrite it on the way out. */
+const bytesFor = d => JSON.stringify({
+  schema: M.TOP3_SCHEMA, ptDate: d, asOf: `${d}T20:16:04.000Z`, ts: 1,
+  complete: true, entries: [{ symbol: 'NVDA', structure: 'long call', score: 71.5 }],
+  pool: { candidatesInPool: 42 },
+});
+
+/* ── 10c. (a) today's key present -> served, at ONE read ──────────────────── */
+{
+  const k = kvOf({ [M.top3Key(WED)]: bytesFor(WED) });
+  const got = await atPtDay(WED, () => M.readTop3(k.env));
+  row('today present -> served',              got?.ptDate, WED);
+  row('  ...and it cost exactly ONE read',    k.reads.length, 1);
+  row('  ...of today\'s key',                 k.reads[0], `top3:${WED}`);
+}
+
+/* ── 10d. (b) today ABSENT, yesterday present — the live morning case ─────── */
+{
+  const stored = bytesFor(TUE);
+  const k = kvOf({ [M.top3Key(TUE)]: stored });
+  const got = await atPtDay(WED, () => M.readTop3(k.env));
+  row('today absent, yesterday present -> served', got?.ptDate, TUE);
+  row('  ...ptDate is YESTERDAY, not relabelled today', got?.ptDate === WED, false);
+  row('  ...asOf survives unmodified',        got?.asOf, `${TUE}T20:16:04.000Z`);
+  row('  ...(e) BYTE-IDENTICAL to the stored value', JSON.stringify(got), stored);
+  row('  ...no `served` marker was invented', 'served' in got, false);
+  row('  ...cost 2 reads (today, then -1)',   k.reads.length, 2);
+  row('  ...probed in order today -> -1',     k.reads.join(' '), `top3:${WED} top3:${TUE}`);
+}
+
+/* ── 10e. (c) a Friday record read on a MONDAY, via the -3 hop ──────────────
+   STUB-ONLY BY CONSTRUCTION, and that is the finding rather than a caveat on it:
+   this stub has no TTL, and 10g RE-DERIVES that `TOP3_TTL` (36h) cannot keep a
+   Friday record alive to Monday. So this proves the WALK reaches -3; it makes no
+   claim that the case occurs in production. The reachable weekend case is 10f. */
+{
+  const stored = bytesFor(FRI);
+  const k = kvOf({ [M.top3Key(FRI)]: stored });
+  const got = await atPtDay(MON, () => M.readTop3(k.env));
+  row('Monday, only Friday stored -> served via -3', got?.ptDate, FRI);
+  row('  ...byte-identical',                  JSON.stringify(got), stored);
+  row('  ...cost 4 reads, the declared ceiling', k.reads.length, 1 + M.TOP3_SERVE_WALKBACK_DAYS);
+  row('  ...walked Mon -> Sun -> Sat -> Fri', k.reads.join(' '),
+      `top3:${MON} top3:${SUN} top3:${SAT} top3:${FRI}`);
+}
+
+/* ── 10f. the weekend hops that ARE reachable under a 36h TTL ─────────────── */
+{
+  const stored = bytesFor(FRI);
+  const k = kvOf({ [M.top3Key(FRI)]: stored });
+  row('Saturday, Friday stored -> served via -1',
+      (await atPtDay(SAT, () => M.readTop3(k.env)))?.ptDate, FRI);
+  const k2 = kvOf({ [M.top3Key(FRI)]: stored });
+  const got2 = await atPtDay(SUN, () => M.readTop3(k2.env));
+  row('Sunday, Friday stored -> served via -2', got2?.ptDate, FRI);
+  row('  ...byte-identical on the -2 hop',    JSON.stringify(got2), stored);
+}
+
+/* ── 10g. THE DEAD BRANCH, RE-DERIVED FROM `TOP3_TTL` RATHER THAN RESTATED ──
+   A record written at PT time T on day D and read at T' on day D+k is at least
+   (k-1)*24h old. So back=k is reachable iff (k-1)*24h < TTL. Anything past that
+   is a probe that can only ever miss — the `no-leaps` failure — and it is kept
+   deliberately so that raising the TTL needs no second edit. Measured here, so
+   the dead branch is a stated number rather than a silent one. */
+{
+  const ttlH = M.TOP3_TTL / 3600;
+  let kMax = 0;
+  while (kMax * 24 < ttlH) kMax++;            // smallest k with k*24 >= ttlH
+  row('TOP3_TTL in hours',                       ttlH, 36);
+  row('deepest walk-back REACHABLE at that TTL', kMax, 2);
+  row('declared walk-back depth',                M.TOP3_SERVE_WALKBACK_DAYS, 3);
+  row('unreachable probe depths, kept on purpose',
+      Math.max(0, M.TOP3_SERVE_WALKBACK_DAYS - kMax), 1);
+  row('a Friday 13:15 PT write expires BEFORE Monday',
+      new RealDate(RealDate.parse(FRI + 'T20:15:00Z') + M.TOP3_TTL * 1000)
+        .toISOString().slice(0, 10) < MON, true);
+}
+
+/* ── 10h. (d) nothing in the window -> null, and the walk is BOUNDED ──────── */
+{
+  const k = kvOf({ [M.top3Key('2026-08-01')]: bytesFor('2026-08-01') });
+  const got = await atPtDay(WED, () => M.readTop3(k.env));
+  row('nothing within the walk -> null',      got, null);
+  row('  ...stopped at the declared ceiling', k.reads.length, 1 + M.TOP3_SERVE_WALKBACK_DAYS);
+  row('  ...never probed past -3',            k.reads.includes(`top3:${M.isoShiftDays(WED, -4)}`), false);
+}
+
+/* ── 10i. a schema mismatch reads as ABSENT and the WALK CONTINUES ────────── */
+{
+  const stale = JSON.stringify({ ...JSON.parse(bytesFor(WED)), schema: 99 });
+  const stored = bytesFor(TUE);
+  const k = kvOf({ [M.top3Key(WED)]: stale, [M.top3Key(TUE)]: stored });
+  const got = await atPtDay(WED, () => M.readTop3(k.env));
+  row('today has schema 99 -> falls through to -1', got?.ptDate, TUE);
+  row('  ...and serves it byte-identical',    JSON.stringify(got), stored);
+  const k2 = kvOf({ [M.top3Key(WED)]: stale });
+  row('schema 99 with nothing behind it -> null', await atPtDay(WED, () => M.readTop3(k2.env)), null);
+}
+
+/* ── 10j. a KV throw ABORTS the walk — unchanged from before the fix ──────── */
+{
+  const k = kvOf({ [M.top3Key(TUE)]: bytesFor(TUE) }, `top3:${WED}`);
+  row('a throw on today\'s key -> null, not a crash',
+      await atPtDay(WED, () => M.readTop3(k.env)), null);
+  row('  ...and it did NOT spend three more reads', k.reads.length, 1);
+  const k2 = kvOf({}, `top3:${TUE}`);
+  row('a throw mid-walk -> null', await atPtDay(WED, () => M.readTop3(k2.env)), null);
+  row('  ...aborting at the throw',           k2.reads.length, 2);
+}
+
+/* ── 10k. no binding, and the today-hit path is untouched by the fix ──────── */
+{
+  row('no binding -> null, walk still bounded', await atPtDay(WED, () => M.readTop3({})), null);
+  const k = kvOf({ [M.top3Key(WED)]: bytesFor(WED), [M.top3Key(TUE)]: bytesFor(TUE) });
+  const got = await atPtDay(WED, () => M.readTop3(k.env));
+  row('today WINS over yesterday when both exist', got?.ptDate, WED);
+  row('  ...and yesterday is never even read', k.reads.length, 1);
+}
+
 process.exit(reportVerdict({
   label: 'top3 daily options ranking',
   comparisons: t.comparisons,
   failures: t.failures,
-  minComparisons: 130,
+  minComparisons: 170,
 }));

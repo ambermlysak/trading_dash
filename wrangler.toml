@@ -155,6 +155,18 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #                         published result), absent means the job has not run or
 #                         refused. Written by the 1:15pm PT collectTop3; read by
 #                         /api/long/batch and nothing else.
+#                         THE SERVING WINDOW IS THE NEWEST SURVIVING RECORD, NOT
+#                         TODAY'S. readTop3 reads top3:{today} and, on a miss,
+#                         walks back up to TOP3_SERVE_WALKBACK_DAYS (3) calendar
+#                         days — the write happens at 1:15pm PT, so today-only
+#                         reading returned null on every trading morning while a
+#                         valid record sat here inside the 36h TTL. The record is
+#                         served UNMODIFIED and carries no `served` marker: its
+#                         own ptDate/asOf date it. The walk is a KEY-EXISTENCE
+#                         PROBE, not a validity judgment — TOP3_TTL decides what
+#                         still exists, and at 36h only back=1 and back=2 can
+#                         ever hit (back=3 is >=48h old and is kept only so a
+#                         TTL increase needs no second edit).
 #   top3sweep:last      — PT date of the last COMPLETE top-3 build (dedup).
 #                         Outside the `top3:` prefix, same rule as ivsweep/
 #                         movesweep/macrosweep/moodsweep. Stamped LAST and only

@@ -4508,17 +4508,26 @@ async function handleLongBatch(params, origin, env) {
      the same object and would invite a renderer to draw it per row. */
   const macro = await readMacroState(env);
 
-  /* ONE read of today's `top3:{PT-date}` record, in the ENVELOPE beside `macro`
-     and for the same reasons: it is one fact about the day, not a per-row field,
-     and repeating it per row would invite a renderer to draw it per row.
+  /* The newest surviving `top3:` record, in the ENVELOPE beside `macro` and for
+     the same reasons: it is one fact about the day, not a per-row field, and
+     repeating it per row would invite a renderer to draw it per row.
 
-     +1 BINDING OP ON THIS ENDPOINT — it is now `N + 2`, not `N + 1`. That is a
-     KV read on a request the page already makes; NO page-load fetch was added
-     anywhere.
+     BINDING COST IS `N + 2` ON THE HIT PATH AND AT MOST `N + 5` ON THE MISS.
+     One macro read plus one `top3` read is the steady state — the afternoon
+     case, and any request after the 1:15pm PT build. When today's key is absent
+     (every trading morning before 1:15pm) `readTop3` walks back up to
+     `TOP3_SERVE_WALKBACK_DAYS` (3) further keys, so the worst case is 4 reads
+     for `top3` rather than 1. NO page-load fetch was added anywhere, and the
+     extra reads are paid only on the miss.
 
-     `null` means "no record for today" — the job has not run, or it refused. An
-     older Worker omits the key entirely. Those are different states and the key's
-     presence already distinguishes them, so nothing is invented here. */
+     `null` means nothing survives anywhere in the serving window — the job has
+     not run, or it refused, or everything in range has aged past `TOP3_TTL`. An
+     older Worker omits the key entirely. Those are different states and the
+     key's presence already distinguishes them, so nothing is invented here.
+
+     A SERVED RECORD MAY BE YESTERDAY'S, AND IT SAYS SO ITSELF. `ptDate` and
+     `asOf` ride on the record unmodified; the consumer compares `ptDate`
+     against its own today. Nothing here relabels it. */
   const top3 = await readTop3(env);
 
   const oldest = rows.length ? Math.min(...rows.map(r => r.ts || 0)) : null;
@@ -8724,6 +8733,49 @@ const TOP3_TTL    = 36 * 3600;
 const TOP3_SWEEP_KEY = 'top3sweep:last';
 const top3Key = d => `top3:${d}`;
 
+/* HOW FAR BACK `readTop3` PROBES when today's key is absent — a KEY-EXISTENCE
+   PROBE, never a validity judgment. The record is written by the 1:15pm PT cron,
+   so on every trading morning before 1:15pm today's key does not exist yet while
+   yesterday's sits in KV inside its 36h TTL. Serving `null` there defeats the
+   feature's own design: an EOD-banked ranking rendered next morning under its
+   real as-of. So the serving window is "the newest record that still exists",
+   and `TOP3_TTL` — not this constant — decides what still exists.
+
+   THE INTERACTION WITH `TOP3_TTL` IS ARITHMETIC AND IS STATED RATHER THAN
+   ASSUMED, because a probe depth wider than the TTL contains branches that
+   cannot fire (the `no-leaps` failure). At 36h retention and a 13:15 PT write:
+
+     back=0  today's own record            fires every afternoon, once built
+     back=1  yesterday's                    fires every trading morning — the case
+                                            this whole walk exists for
+     back=2  reachable only in a narrow window: a Friday 13:15 PT record read
+             before 01:15 PT Sunday is 35.25h old and still alive
+     back=3  UNREACHABLE at 36h. Three calendar days back is >=48h old even at
+             the most favourable clock, so that key has always already expired.
+
+   back=3 is therefore a probe that costs one KV read and can only ever miss
+   under today's TTL. It is kept deliberately, so that raising `TOP3_TTL` needs
+   no second edit here — and it is pinned by `top3.check.mjs` §10, which
+   RE-DERIVES the reachable depth from `TOP3_TTL` and prints it, so the dead
+   branch is measured rather than silently shipped.
+
+   CONSEQUENCE, NOT FIXED HERE AND OUT OF SCOPE: a Monday morning finds nothing.
+   Friday's record expires ~01:15 PT Sunday, so the weekend gap is a TTL
+   question, not a serving-window one. */
+const TOP3_SERVE_WALKBACK_DAYS = 3;
+
+/** An ISO `YYYY-MM-DD` shifted by whole CALENDAR days.
+
+    Done as UTC calendar arithmetic on the date PARTS rather than by subtracting
+    24h from a `Date` and re-formatting in Pacific: a PT day is 23h or 25h long
+    across a DST boundary, so a 24h subtraction repeats or skips a date exactly
+    twice a year — and it would do it silently, serving the wrong day's ranking
+    under today's label. Nothing here is timezone-aware, which is the point:
+    `ptDate()` has already resolved the zone and this only walks the calendar. */
+const isoShiftDays = (iso, delta) =>
+  new Date(Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7) - 1, +iso.slice(8, 10)) + delta * 86_400_000)
+    .toISOString().slice(0, 10);
+
 const TOP3_SWEEP_CAP  = 60;          // same ceiling `sweepUniverse` defaults to
 const TOP3_LANES      = ['B', 'C'];  // singles and debit verticals — the eligible pool
 const TOP3_MIN_EPISODES_TO_50 = 2;   // MISSING FAILS: a missing input is not a pass
@@ -9345,15 +9397,49 @@ async function collectTop3(env) {
   );
 }
 
-/** Today's record for the `/api/long/batch` envelope. ONE binding op, and `null`
- *  where there is nothing to serve. An OLDER Worker omits the `top3` key
- *  entirely; this one sends `top3: null` — those are different states and the
- *  key's presence already distinguishes them, so nothing is invented here. */
+/** The newest surviving `top3:` record for the `/api/long/batch` envelope.
+
+    TODAY FIRST, then a bounded walk back over calendar days. The record is
+    written by the 1:15pm PT cron, so before 1:15pm on any trading day today's
+    key does not exist while yesterday's is still in KV inside `TOP3_TTL` —
+    reading only today's key served `null` through every trading morning and
+    made the feature's own design (an EOD-banked ranking rendered next morning
+    under its real as-of) unreachable in production.
+
+    THE RECORD IS SERVED UNMODIFIED. Nothing is rewritten, relabelled or
+    synthesized: the record's own `ptDate` and `asOf` are the truth of its age,
+    `collectTop3` stamps both on every record it writes (including a partial run,
+    which writes but does not stamp the dedup key), and a consumer compares
+    `ptDate` against its own today to decide whether it is looking at today's
+    ranking or a banked one. That is why NO `served`
+    marker is added — a second field claiming the same fact is a second field
+    that can disagree with the first.
+
+    COST. Today-hit is ONE binding op, exactly as before — nothing was added to
+    the path that already worked. The miss path costs at most
+    `TOP3_SERVE_WALKBACK_DAYS` (3) additional reads, so 4 in the worst case, and
+    only when today's key is genuinely absent.
+
+    A KV THROW ABORTS THE WALK rather than probing on. A binding that just threw
+    is not a binding to spend three more reads against, and returning `null`
+    keeps the pre-existing behaviour on that path byte-for-byte.
+
+    A SCHEMA MISMATCH READS AS ABSENT AND THE WALK CONTINUES — strict equality,
+    unchanged. A record left by an older Worker is not a record this one can
+    serve, and "absent" is what absent means everywhere else in this file.
+
+    An OLDER Worker omits the `top3` key entirely; this one sends `top3: null`
+    when nothing survives anywhere in the window. Those are different states and
+    the key's presence already distinguishes them, so nothing is invented here. */
 async function readTop3(env) {
-  let rec = null;
-  try { rec = await env?.REC_LOG?.get(top3Key(ptDate()), 'json'); } catch (_) { return null; }
-  if (!rec || rec.schema !== TOP3_SCHEMA) return null;
-  return rec;
+  const today = ptDate();
+  for (let back = 0; back <= TOP3_SERVE_WALKBACK_DAYS; back++) {
+    const day = back === 0 ? today : isoShiftDays(today, -back);
+    let rec = null;
+    try { rec = await env?.REC_LOG?.get(top3Key(day), 'json'); } catch (_) { return null; }
+    if (rec && rec.schema === TOP3_SCHEMA) return rec;
+  }
+  return null;
 }
 
 /* ── New route handlers ── */

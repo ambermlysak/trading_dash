@@ -155,6 +155,15 @@ of the three absolutes are not.**
 > `N + 1`. Measured on the same day: N=10 → capCost **12**, N=1 → capCost **3**,
 > both `extFetches 0`. The `+1` delta below still describes the macro read on its
 > own and is left as measured; the *absolute* for this row is now N + 2.
+>
+> **AND IT IS NO LONGER A SINGLE VALUE, 2026-08-26.** `readTop3` serves today's
+> key when it exists and otherwise walks back up to `TOP3_SERVE_WALKBACK_DAYS`
+> (3) calendar days, because the record is written at 1:15pm PT and today-only
+> reading served `null` on every trading morning while a valid record sat in KV
+> inside its 36h TTL. So the row is **`N + 2` on the hit and at most `N + 5` on
+> the miss**. Measured at N=2 on 2026-08-26: hit **4**, `-1` hop **5**, full
+> miss **7**, with `extFetches 0` on all three. **Quote which path you are on**
+> — the same discipline the cold row below demands.
 
 | path | absolute after | is it one value? |
 |---|---|---|

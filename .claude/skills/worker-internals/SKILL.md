@@ -21,8 +21,9 @@ GET  /api/quote/:ticker           Yahoo quoteSummary (multi-module) + Alpaca pri
 GET  /api/chart/:ticker           Yahoo v8 OHLCV (?range=1y&interval=1d)
 GET  /api/options/:ticker         Yahoo v7 options chain
 POST /api/premium/*             REMOVED — returns 410. Became Lane F of the Long screen.
-GET  /api/long/batch?symbols=     Long screen, KV only — no fetches; N+2 KV reads
-                                    (1/symbol + macro + top3, both in the envelope)
+GET  /api/long/batch?symbols=     Long screen, KV only — no fetches; N+2 KV reads on the
+                                    top3 hit path, at most N+5 on the miss
+                                    (1/symbol + macro + top3; top3 walks back <=3 days)
 GET  /api/long/:ticker            One ticker (capCost 13 warm, 18-20 cold - cold is a RANGE)
 GET  /api/insider/:ticker         SEC EDGAR Form 4, last 90 days (12h KV)
 GET  /api/short/:ticker           FINRA consolidated short interest, 6 settlements (Yahoo fallback)
