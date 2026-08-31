@@ -33,6 +33,11 @@ const toPt = (utcIso) =>
    divergence shows as a wrong branch name in the table below. */
 function branchFor(h, m) {
   if (h === 6 && m < 30) return 'morning-briefing';
+  /* 7:00am PT long-row sweep, added 2026-08-31. Mirrored here so this function
+     does not quietly disagree with the dispatcher about an hour it has no CASE
+     for — no row below fires at hour 7, and the branch is driven against the REAL
+     `scheduled()` in `longarch.check.mjs` §6, which is where it is pinned. */
+  if (h === 7 && m < 30) return 'morning-rows';
   if ((h === 11 && m >= 30) || h === 12) return 'midday-pulse';
   if (h === 13 && m >= 15 && m < 45) return 'eod+iv-sweep';
   if (h === 14 && m < 30) return 'forward-returns';

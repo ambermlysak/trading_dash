@@ -802,7 +802,7 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Sixteen checks exist, all of which print computed vs
+There is no build step. Seventeen checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
 (Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
@@ -892,20 +892,57 @@ the nothing-within-five-days null, a `-6` record that exists and is still refuse
 because the walk's cap and the TTL are separate bounds, and a re-derivation of
 the reachable walk-back depth from `TOP3_TTL` that prints the count of
 unreachable probe depths — **1 at the old 36h, 0 at 7d** — rather than letting a
-dead branch ship in silence).
+dead branch ship in silence),
+and `node longarch.check.mjs` (long-row RETENTION, the 7:00am PT row sweep and the
+`longarch:` sweep archive: the key shape with the `longarch:`/`long:` prefix
+disjointness asserted in **both** directions, `LONG_ROW_TTL` **re-derived from
+real Date arithmetic** — the 66.75h weekend that caused the incident and the
+114.75h Thu→Tue binding case, each compared against the OLD 24h *and* the new 7d,
+because a test that only shows 7d clears the gap would pass on any large number —
+the three guards that make longer retention safe driven **behaviourally** (the
+sweep's reuse gate at ±5s of `LONG_FRESH_MS`, a 6-day-old row still refetched, a
+fresh `error` row never reused, `readLongRow` retiring `LONG_SCHEMA ± 1`) **and**
+at source, `archiveSweptRows` against stub bindings including a reused row keeping
+its own `ts` and a KV throw reported rather than propagated, the read route through
+the REAL module — byte-identical service, zero writes, exactly one key read, no
+`macro`, and the miss that must NOT fall through to a live refetch — the dispatch
+edges through the REAL `scheduled()` at 06:45 / 07:00 / 07:15 / 07:30 / 08:00 plus
+both closure kinds, the whole branch→jobs table lifted from source so "the 1:15pm
+branch gained nothing" is pinned without spending a fetch, the 7am hour checked
+against the 13-22 UTC window in **both** DST regimes, and a **structural
+attribution** proving `collectMorningRows` contains no reference to `collectTop3`,
+`top3Key` or `TOP3_SWEEP_KEY` — the one thing no behavioural test can see being
+added later, and the thing that would silently replace the day's post-close
+ranking with one priced off opening spreads).
 All of them extract functions from
 `worker.js` by source, not by import, because every named export in `worker.js`
-must be a function or `workerd` refuses to boot.
+must be a function or `workerd` refuses to boot. **`longarch` is the exception and
+deliberately does both**: it extracts by source for the unit half *and* imports the
+default export to drive the real router and dispatcher — which is also the ES-module
+parse `node --check` cannot perform, and which caught a real syntax error in this
+very change after `node --check` returned exit 0 on it.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 240** for moves /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 240 / 166** for moves /
 long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
 sweep-universe / macro / mood / swing / earnings-timing / daily-slots /
-analysis-shape / top3 — **1,490 comparisons** across the suite. `top3` went 173 -> 219
+analysis-shape / top3 / longarch — **1,656 comparisons** across the suite. `top3` went 173 -> 219
 on 2026-08-26 with §10, the serving window, and **219 -> 240 on 2026-08-31** with the
 7d TTL and the 5-day walk; its `minComparisons` floor moved 130 -> 170 -> **235**.
-A full run on 2026-08-31 reported **1,536** observed, the gap being the two tape-dependent
+`longarch` landed 2026-08-31 at **166**, and its floor is the **exact** count rather
+than a count minus slack: every section of it is deterministic and offline, so
+unlike `swing` and `earnings-timing` there is no observed total to distinguish from
+a fixed one, and a section that stops running drops the count into a NO VERDICT.
+A full run on 2026-08-31 reported **1,536** observed before `longarch` (so **1,702**
+after it), the gap being the two tape-dependent
 scripts (`swing` 92, `earnings-timing` 158) whose floors are deliberately their FIXED counts.
+
+**BOTH DIRECTIONS WERE DRIVEN BEFORE `longarch` WAS BELIEVED**, because a check
+that cannot fail is a check that proves nothing. Reverting `LONG_ROW_TTL` to 24h
+turns §2 red in **7** comparisons; making `collectMorningRows` stamp
+`TOP3_SWEEP_KEY` instead of its own key turns §7 red in **5**, naming the function
+in the output; and raising the floor above the observed count produces NO VERDICT
+rather than a pass.
 
 ##### A FIXTURE TIMESTAMP MUST BE RELATIVE TO NOW — 2026-08-25
 
@@ -1635,6 +1672,15 @@ in the reason — never an empty 200.** A bad `date` or an unknown `slot` is a 4
 ≈ 39 × 2 × 7 × ~25 KB ≈ **15 MB** against the included 1 GB. **The archive only
 runs forward — it cannot recover anything from before its first deploy**, which
 is why the 2026-08-31 GOOGL discrepancy itself stays undiagnosable.
+
+**Checked by `node longarch.check.mjs` (166 comparisons).** It is the only script
+in the suite that both extracts by source *and* imports the module, because half
+of what is at stake here is structural (who may write which key) and half is
+routed behaviour (the archive read must not fall through to a live refetch). Its
+floor is the exact count — every section is deterministic and offline. Both
+failure directions were driven before it was believed: reverting `LONG_ROW_TTL`
+to 24h reddens 7 comparisons, and making the 7am job stamp `TOP3_SWEEP_KEY`
+reddens 5 and names the function.
 
 ### Worker endpoints, data sources, KV and cron → the `worker-internals` skill
 
