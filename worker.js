@@ -4512,11 +4512,11 @@ async function handleLongBatch(params, origin, env) {
      the same reasons: it is one fact about the day, not a per-row field, and
      repeating it per row would invite a renderer to draw it per row.
 
-     BINDING COST IS `N + 2` ON THE HIT PATH AND AT MOST `N + 5` ON THE MISS.
+     BINDING COST IS `N + 2` ON THE HIT PATH AND AT MOST `N + 7` ON THE MISS.
      One macro read plus one `top3` read is the steady state — the afternoon
      case, and any request after the 1:15pm PT build. When today's key is absent
      (every trading morning before 1:15pm) `readTop3` walks back up to
-     `TOP3_SERVE_WALKBACK_DAYS` (3) further keys, so the worst case is 4 reads
+     `TOP3_SERVE_WALKBACK_DAYS` (5) further keys, so the worst case is 6 reads
      for `top3` rather than 1. NO page-load fetch was added anywhere, and the
      extra reads are paid only on the miss.
 
@@ -8725,44 +8725,87 @@ const TOP3_SCHEMA = 1;
 const TOP3_MAX    = 3;
 /* Retention outlives the PT day the key names, so a late-evening read still
    finds the answer. There is no freshness question on a date-keyed record —
-   the same reasoning as `radar:{PT-DATE}`. */
-const TOP3_TTL    = 36 * 3600;
+   the same reasoning as `radar:{PT-DATE}`.
+
+   SEVEN DAYS, RAISED FROM 36h ON 2026-08-31, AND THE OLD VALUE WAS EVICTING THE
+   FEATURE'S MOST USEFUL RECORD. The writer runs at 13:15 PT on TRADING days
+   only, so at 36h a Friday record expired ~01:15 PT Sunday and **every Monday
+   morning — and every morning after a market holiday — had no servable record at
+   all.** A walk-back reader cannot recover an evicted key: the walk probes for
+   keys that exist, and the TTL decides which ones do.
+
+   That is the aged-not-suppressed rule. A Friday-banked ranking read on Monday
+   morning is VALID, just old, and should render under its own `ptDate` with the
+   consumer's own staleness reading — exactly how the `macro:state` rider on the
+   very same `/api/long/batch` envelope already behaves (90d retention against a
+   26h freshness window, so an aged read is LABELLED rather than blanked).
+   Blanking a card is the strictly worse lie: the reader cannot tell "the job has
+   not run" from "the answer expired underneath you".
+
+   WHY 7d RATHER THAN NO TTL. A three-day holiday weekend plus one missed cron is
+   four calendar days; 7d clears that with margin and still leaves the key
+   bounded. Footprint is ~7 records at the ~15 KB measured at N=11 (~40 KB is the
+   pessimistic figure at the live 40-name list) — negligible against KV's 25 MB
+   per-value ceiling and irrelevant at this key count. Bounded growth is still
+   worth keeping, so the TTL stays; only its length changed.
+
+   THE RECORD'S OWN `ptDate` IS THE HONESTY MECHANISM, NOT EVICTION. Nothing
+   about the writer, the stamp, the schema, the ranking or the gates moved — see
+   `TOP3_SERVE_WALKBACK_DAYS` for what this buys the reader. */
+const TOP3_TTL    = 7 * 24 * 3600;
 /* OUTSIDE the `top3:` prefix, so nothing scanning that prefix can read the dedup
    stamp as a day's record — the same rule as `ivsweep:last` / `movesweep:last` /
    `macrosweep:last` / `moodsweep:last`. */
 const TOP3_SWEEP_KEY = 'top3sweep:last';
+/* THE DEDUP STAMP AGES WITH THE RECORD IT DEDUPS. It was a bare `172800` (2d) at
+   the `put()` site, which is harmless for the stamp's own job — an absent stamp
+   simply PERMITS a run, and the run then rebuilds the day it is asked for — but
+   it made the two keys age apart, and the pair is read together as a diagnostic:
+   "the stamp says Friday and a Friday record is present" is one coherent reading
+   of a weekend; "the stamp expired but the record did not" is a third state that
+   means nothing and has to be reasoned away every time it is seen. Naming it and
+   tying it to `TOP3_TTL` keeps that reading coherent and keeps a literal out of
+   the write site, which is where the old value hid. */
+const TOP3_SWEEP_STAMP_TTL = TOP3_TTL;
 const top3Key = d => `top3:${d}`;
 
 /* HOW FAR BACK `readTop3` PROBES when today's key is absent — a KEY-EXISTENCE
    PROBE, never a validity judgment. The record is written by the 1:15pm PT cron,
    so on every trading morning before 1:15pm today's key does not exist yet while
-   yesterday's sits in KV inside its 36h TTL. Serving `null` there defeats the
+   yesterday's sits in KV inside `TOP3_TTL`. Serving `null` there defeats the
    feature's own design: an EOD-banked ranking rendered next morning under its
    real as-of. So the serving window is "the newest record that still exists",
    and `TOP3_TTL` — not this constant — decides what still exists.
 
+   FIVE, RAISED FROM 3 ON 2026-08-31 ALONGSIDE THE TTL, AND THE TWO NUMBERS ARE
+   SET TOGETHER BECAUSE NEITHER WORKS ALONE. A deeper walk over an evicted key
+   finds nothing; a longer TTL nothing walks back to is unreadable. What the pair
+   buys is the two gaps the writer's own trading-day schedule creates:
+
+     back=0  today's own record         every afternoon, once built
+     back=1  yesterday's                every trading morning — the ordinary case
+     back=2  Sunday reading Friday's, and the Monday morning after a one-day gap
+     back=3  MONDAY MORNING READING FRIDAY'S — the ordinary weekend, and the case
+             that returned `null` for the whole of every Monday before this
+     back=4  the Tuesday after a Monday market holiday, reading Friday's
+     back=5  THE TUESDAY AFTER A FRIDAY+MONDAY CLOSURE, reading Thursday's — the
+             deepest gap the NYSE calendar can produce around a single missed run
+
    THE INTERACTION WITH `TOP3_TTL` IS ARITHMETIC AND IS STATED RATHER THAN
    ASSUMED, because a probe depth wider than the TTL contains branches that
-   cannot fire (the `no-leaps` failure). At 36h retention and a 13:15 PT write:
+   cannot fire (the `no-leaps` failure). A record written at PT time T on day D
+   and read at T' on day D+k is at least (k-1)*24h old, so back=k is reachable
+   only while (k-1)*24h < TOP3_TTL. **At 7d that is k <= 7, so ALL FIVE depths
+   declared here are reachable and there is no dead branch** — where at the old
+   36h it was k <= 2 and back=3 could only ever miss. `top3.check.mjs` §10g
+   RE-DERIVES that bound from `TOP3_TTL` and prints the count of unreachable
+   depths, so if either number moves again the dead branch is a stated figure
+   rather than a silent one.
 
-     back=0  today's own record            fires every afternoon, once built
-     back=1  yesterday's                    fires every trading morning — the case
-                                            this whole walk exists for
-     back=2  reachable only in a narrow window: a Friday 13:15 PT record read
-             before 01:15 PT Sunday is 35.25h old and still alive
-     back=3  UNREACHABLE at 36h. Three calendar days back is >=48h old even at
-             the most favourable clock, so that key has always already expired.
-
-   back=3 is therefore a probe that costs one KV read and can only ever miss
-   under today's TTL. It is kept deliberately, so that raising `TOP3_TTL` needs
-   no second edit here — and it is pinned by `top3.check.mjs` §10, which
-   RE-DERIVES the reachable depth from `TOP3_TTL` and prints it, so the dead
-   branch is measured rather than silently shipped.
-
-   CONSEQUENCE, NOT FIXED HERE AND OUT OF SCOPE: a Monday morning finds nothing.
-   Friday's record expires ~01:15 PT Sunday, so the weekend gap is a TTL
-   question, not a serving-window one. */
-const TOP3_SERVE_WALKBACK_DAYS = 3;
+   MISS-PATH COST IS CAPPED AT FIVE EXTRA KV READS — six in total including
+   today's — and it is paid only when today's key is genuinely absent. The hit
+   path costs exactly one read, unchanged. */
+const TOP3_SERVE_WALKBACK_DAYS = 5;
 
 /** An ISO `YYYY-MM-DD` shifted by whole CALENDAR days.
 
@@ -9378,7 +9421,7 @@ async function collectTop3(env) {
      that retry reuses every row banked minutes ago (they are inside
      LONG_FRESH_MS), so it costs only the names that actually failed. */
   if (complete) {
-    try { await env.REC_LOG.put(TOP3_SWEEP_KEY, today, { expirationTtl: 172800 }); } catch (_) {}
+    try { await env.REC_LOG.put(TOP3_SWEEP_KEY, today, { expirationTtl: TOP3_SWEEP_STAMP_TTL }); } catch (_) {}
   } else {
     console.error(`[cron] !! TOP3-INCOMPLETE !! ${swept.failed}/${tickers.length} tickers failed. `
       + `top3:${today} WAS written (${ranked.entries.length} entries over the readable names) but `
@@ -9406,6 +9449,12 @@ async function collectTop3(env) {
     made the feature's own design (an EOD-banked ranking rendered next morning
     under its real as-of) unreachable in production.
 
+    THE WALK IS ONLY AS DEEP AS THE TTL LETS IT BE, which is why `TOP3_TTL` moved
+    to 7d in the same commit that took this walk to 5 days (2026-08-31). At 36h a
+    Friday record was already evicted by Monday, so no depth of walk could find
+    it and every Monday morning served `null` — a valid, merely-old ranking
+    suppressed by retention rather than by any judgment about it.
+
     THE RECORD IS SERVED UNMODIFIED. Nothing is rewritten, relabelled or
     synthesized: the record's own `ptDate` and `asOf` are the truth of its age,
     `collectTop3` stamps both on every record it writes (including a partial run,
@@ -9417,7 +9466,7 @@ async function collectTop3(env) {
 
     COST. Today-hit is ONE binding op, exactly as before — nothing was added to
     the path that already worked. The miss path costs at most
-    `TOP3_SERVE_WALKBACK_DAYS` (3) additional reads, so 4 in the worst case, and
+    `TOP3_SERVE_WALKBACK_DAYS` (5) additional reads, so 6 in the worst case, and
     only when today's key is genuinely absent.
 
     A KV THROW ABORTS THE WALK rather than probing on. A binding that just threw

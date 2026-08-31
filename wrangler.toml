@@ -147,9 +147,14 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #                         never a bare number), the verdict rating and its as-of,
 #                         the declared gates, the pool counts and gate funnel, the
 #                         sweep counts and wall time, and the capped excluded[]
-#                         with excludedTotal beside it. 36h retention (TOP3_TTL)
-#                         so it outlives the day it names; date-keyed, so there is
-#                         no freshness question. TOP3_SCHEMA 1, strict equality.
+#                         with excludedTotal beside it. 7d retention (TOP3_TTL)
+#                         so it outlives the day it names AND the weekend and
+#                         holiday gaps the writer's trading-day schedule creates;
+#                         date-keyed, so there is no freshness question. It was
+#                         36h until 2026-08-31, which evicted every Friday record
+#                         before Monday morning and left the walk-back reader
+#                         below with nothing to walk back TO. TOP3_SCHEMA 1,
+#                         strict equality.
 #                         `entries: []` and an ABSENT key are DIFFERENT STATES:
 #                         [] means the gates ran and nothing survived (a valid
 #                         published result), absent means the job has not run or
@@ -157,22 +162,31 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #                         /api/long/batch and nothing else.
 #                         THE SERVING WINDOW IS THE NEWEST SURVIVING RECORD, NOT
 #                         TODAY'S. readTop3 reads top3:{today} and, on a miss,
-#                         walks back up to TOP3_SERVE_WALKBACK_DAYS (3) calendar
+#                         walks back up to TOP3_SERVE_WALKBACK_DAYS (5) calendar
 #                         days — the write happens at 1:15pm PT, so today-only
 #                         reading returned null on every trading morning while a
-#                         valid record sat here inside the 36h TTL. The record is
+#                         valid record sat here inside its TTL. The record is
 #                         served UNMODIFIED and carries no `served` marker: its
 #                         own ptDate/asOf date it. The walk is a KEY-EXISTENCE
 #                         PROBE, not a validity judgment — TOP3_TTL decides what
-#                         still exists, and at 36h only back=1 and back=2 can
-#                         ever hit (back=3 is >=48h old and is kept only so a
-#                         TTL increase needs no second edit).
+#                         still exists, and at 7d every declared depth (0..5) is
+#                         reachable: back=3 is Monday morning reading Friday's
+#                         and back=5 is the Tuesday after a Fri+Mon closure
+#                         reading Thursday's. Miss-path cost is capped at 5 extra
+#                         KV reads; the hit path is one read, unchanged.
 #   top3sweep:last      — PT date of the last COMPLETE top-3 build (dedup).
 #                         Outside the `top3:` prefix, same rule as ivsweep/
 #                         movesweep/macrosweep/moodsweep. Stamped LAST and only
 #                         when zero tickers hit an INFRASTRUCTURE failure; a name
 #                         with nothing screenable (no-options / no-iv /
 #                         no-expiries) is a complete outcome and does not block it.
+#                         TTL is TOP3_SWEEP_STAMP_TTL = TOP3_TTL (7d), raised
+#                         from a bare 2d literal on 2026-08-31 so the stamp and
+#                         the record it dedups AGE TOGETHER. The dedup itself
+#                         does not care — an absent stamp merely PERMITS a run —
+#                         but "stamp expired, record still here" is a third state
+#                         that means nothing, and the pair is read together as a
+#                         diagnostic.
 #   market:week-ahead   — Friday-only week-ahead preview (18h TTL)
 #   market:goldencross  — golden-cross setups (1h TTL)
 #   scanner:{preset}    — day-trading scanner results (90s TTL)
