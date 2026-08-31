@@ -68,8 +68,71 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #    UNCACHED response, so it tells the badge how stale to consider a figure
 #    rather than how long anything is kept. A key listed here that does not exist
 #    is worse than an omission — it reads as a cache someone can go and inspect.)
-#   premium:{TICKER}    — premium-screen row, cached on demand (4h fresh, 24h retained)
-#   long:{TICKER}       — long-screen row, cached on demand (4h fresh, 24h retained)
+#   premium:{TICKER}    — the shared IV/earnings header, cached on demand
+#                         (4h fresh, 24h retained). DELIBERATELY NOT RAISED
+#                         alongside long: on 2026-08-31: refreshLongTicker gates
+#                         the warm path on PREMIUM_FRESH_MS (4h) and reuses a
+#                         FRESH header only, so a longer retention here would
+#                         never be read by anything.
+#   long:{TICKER}       — long-screen row (4h fresh, 7d retained). Written on
+#                         demand by /api/long/:ticker AND by both cron sweeps
+#                         (7:00am PT collectMorningRows, 1:15pm PT collectTop3).
+#                         RETENTION WENT 24h -> 7d ON 2026-08-31. At 24h a Friday
+#                         1:15pm write was evicted on the Saturday and no cron
+#                         runs at a weekend, so the entire Options surface read
+#                         "not loaded" from Saturday afternoon until Monday
+#                         1:15pm. The binding case is a Thursday 1:15pm write
+#                         read on the Tuesday after a Friday+Monday closure —
+#                         ~115h ≈ 4.8d — plus headroom for one missed cron. Same
+#                         figure and same class of gap as TOP3_TTL and MOVES_TTL.
+#                         FRESHNESS IS UNCHANGED at LONG_FRESH_MS (4h): this is
+#                         retention only, and nothing that ranks or scores can
+#                         reach an older row — top3Sweep reuses only inside 4h
+#                         and only a non-`error` row, top3Rank drops any row
+#                         whose own PT date is not today, and readLongRow retires
+#                         any row whose schema is not LONG_SCHEMA.
+#   longarch:{TICKER}:{PT-DATE}:{SLOT}
+#                       — THE SWEEP ARCHIVE. One banked snapshot of a swept long
+#                         row, verbatim. slot = `open` (7:00am PT sweep) or `eod`
+#                         (1:15pm PT sweep). 7d retention (LONGARCH_TTL), matching
+#                         long:. Added 2026-08-31: long:{TICKER} is overwritten in
+#                         place, so every computation DESTROYED the evidence of
+#                         the last one — Friday's GOOGL row carried a Lane B Oct
+#                         360 call at E[R] 165% and Monday's recompute put the
+#                         same expiry at 14-19%, undiagnosably, because the Friday
+#                         row was gone.
+#                         OWN PREFIX, DELIBERATELY NOT long:{TICKER}:{DATE}.
+#                         `longarch:` and `long:` are DISJOINT string prefixes —
+#                         after `long` comes `a`, not `:` — so a
+#                         list({prefix:'long:'}) can never read an archive record
+#                         as a ticker. Same rule as ivsweep:last outside iv: and
+#                         incomerow: not being income:.
+#                         CRON SWEEPS ONLY, never an on-demand /api/long/:ticker
+#                         refresh: a fixed-clock write is a daily series, an
+#                         on-demand write is a record of what someone opened, and
+#                         only the former makes a Monday-vs-Friday diff
+#                         like-for-like (the recordIvSample principle).
+#                         REUSED ROWS ARE ARCHIVED TOO. The SLOT names when the
+#                         SNAPSHOT was taken; the row's own `ts` names when its
+#                         DATA was computed, which for a row reused inside
+#                         LONG_FRESH_MS is an earlier moment. Neither is rewritten
+#                         to agree with the other. A retry firing overwrites the
+#                         same slot — newest per slot wins.
+#                         Read by GET /api/long/:ticker?date=&slot= and nothing
+#                         else; served verbatim, never recomputed or backfilled,
+#                         and it only ever runs FORWARD from its first deploy.
+#   morningrows:last    — PT date of the last COMPLETE 7:00am PT long-row sweep
+#                         (dedup). OUTSIDE any scanned prefix, same rule as
+#                         ivsweep:last / movesweep:last / macrosweep:last /
+#                         moodsweep:last / top3sweep:last. 2d TTL
+#                         (MORNING_ROWS_STAMP_TTL), matching the siblings.
+#                         Stamped only when ZERO tickers hit an INFRASTRUCTURE
+#                         failure; a name with nothing screenable (no-options /
+#                         no-iv / no-expiries) is a complete outcome and does not
+#                         block it. THIS KEY IS NOT top3sweep:last AND MUST NEVER
+#                         BE: the 7am job populates rows and RANKS NOTHING, so it
+#                         must not be able to dedup the 1:15pm ranking out of the
+#                         day.
 #   moves:{TICKER}      — historical N-session return distribution behind the Long
 #                         tab's measured `cov` column and its expectancy ranking.
 #                         Banked by the 2:00pm PT sweep, 7d TTL, ~60 KB/ticker.
@@ -251,6 +314,24 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 # UTC hours across DST. 13-22 covers 6:00am-3:00pm PDT and 5:00am-2:00pm PST,
 # so every PT job below is inside the window in both regimes:
 #   Morning briefing — 6:00am PT   (13:00 UTC PDT / 14:00 UTC PST)
+#   Morning long rows— 7:00am PT   (14:00 UTC PDT / 15:00 UTC PST — inside this
+#                      window in BOTH regimes, checked before scheduling per
+#                      rule #2). 10:00am ET, 30 min after the open: the earliest
+#                      firing that reads TODAY'S chain rather than yesterday's.
+#                      Runs the SAME sequential watchlist sweep the 1:15pm top-3
+#                      job runs, so every name has a fresh long:{TICKER} row for
+#                      the trading morning, and banks the `open` slot of the
+#                      sweep archive. IT RANKS NOTHING: no collectTop3, no
+#                      top3:{PT-date}, no top3sweep:last — collectTop3's dedup is
+#                      a PT-date compare, so a 7am stamp there would make the
+#                      1:15pm firing skip and replace the day's official
+#                      post-close ranking with one priced off opening spreads.
+#                      ONE JOB ON THIS BRANCH, so its _instr IS a measurement
+#                      rather than an upper bound. ~20 capCost a name all-cold,
+#                      ~800 at N≈40, zero Claude calls. Own daily dedup key
+#                      (morningrows:last); `m < 30` admits exactly two firings,
+#                      7:00 and 7:15, and the retry costs only the names that
+#                      failed.
 #   Midday pulse     — 11:30am PT  (18:30 UTC PDT / 19:30 UTC PST)
 #   EOD summary      — 1:15pm PT   (20:15 UTC PDT / 21:15 UTC PST)
 #   IV history sweep — 1:15pm PT   (runs alongside the EOD job; own daily dedup key)

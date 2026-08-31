@@ -2139,8 +2139,76 @@ async function readPremiumRow(sym, env) {
 //    `gates.laneF`. A 3 row renders the Long tab with a lane missing.
 const LONG_SCHEMA      = 4;
 const LONG_FRESH_MS    = 4 * 3600_000;   // freshness horizon — drives the stale badge
-const LONG_ROW_TTL     = 24 * 3600;      // KV retention: outlives freshness so stale can render
+/* KV RETENTION ONLY — it outlives freshness so a stale row can still render.
+   NOT the freshness horizon: `LONG_FRESH_MS` (4h) is unchanged and still decides
+   the stale badge, the `/api/long/:ticker` cache hit and the sweep's reuse gate.
+
+   24h -> 7d on 2026-08-31, after the entire Options surface read "not loaded" on
+   Monday 2026-08-31 at 8am PT. Friday's 1:15pm PT sweep had written a row for
+   every watchlist name; the cron gate skips weekends, so nothing rewrote them,
+   and at 24h every `long:{TICKER}` key was evicted on the Saturday afternoon.
+   The tab had no rows at all until Monday's own 1:15pm sweep — the *writer's own
+   trading-day schedule* opened a gap its retention could not span.
+
+   THE DERIVATION, WHICH IS A CALENDAR FACT AND NOT A ROUND NUMBER. The binding
+   case is a Thursday 1:15pm PT write read on the Tuesday morning after a
+   Friday+Monday market closure: Thu 13:15 -> Tue 08:00 is ~115h = ~4.8d. Add
+   headroom for one missed cron and 7d clears it. That is the same figure, for
+   the same class of gap, as `TOP3_TTL` and `MOVES_TTL` — "the weekend / holiday
+   gaps the writer's trading-day schedule creates".
+
+   VERIFIED THAT LONGER RETENTION CANNOT REACH ANYTHING THAT RANKS OR SCORES,
+   because a row that merely renders older is a labelled read while a row that
+   silently enters a ranking is a fabricated one:
+     · `top3Sweep` reuses a cached row only when
+       `age < LONG_FRESH_MS && cached.status !== 'error'` — a 4h gate, untouched.
+     · `top3Rank` drops any row whose own PT date is not `todayPt`, so a banked
+       row can never ride into a published ranking under a later day's key.
+     · `readLongRow` retires any row whose `schema !== LONG_SCHEMA` by strict
+       equality, so a longer-lived row cannot outlive its own shape.
+   Nothing in either frontend reads this constant; the stale badge is driven by
+   `_meta.ttlSeconds`, which is `LONG_FRESH_MS`. */
+const LONG_ROW_TTL     = 7 * 24 * 3600;
 const LONG_MAX_SYMBOLS = 60;
+
+/* ── THE SWEEP ARCHIVE — `longarch:{TICKER}:{PT-DATE}:{SLOT}` ────────────────
+   `long:{TICKER}` is ONE key per ticker, overwritten in place, so every
+   computation DESTROYS the evidence of the last one. That is the second finding
+   of 2026-08-31: Friday's GOOGL row carried a Lane B Oct 360 call at E[R] 165%
+   and Monday's recompute put the same expiry at 14-19%. An order-of-magnitude
+   disagreement, and undiagnosable, because the Friday row no longer existed.
+
+   So each CRON sweep banks every row it swept, verbatim, under its own key.
+
+   OWN PREFIX, NOT `long:{TICKER}:{DATE}`. `longarch:` and `long:` are disjoint
+   string prefixes — after `long` comes `a`, not `:` — so a `list({prefix:'long:'})`
+   can never read an archive record as a ticker. That is the same rule the
+   wrangler.toml KV table records for `ivsweep:last` sitting outside `iv:` and
+   for `incomerow:` not being `income:`.
+
+   CRON SWEEPS ONLY — never an on-demand `/api/long/:ticker` refresh. The
+   principle is already written beside `recordIvSample`: a FIXED-CLOCK write is a
+   daily series, an on-demand write is a record of what someone happened to open.
+   Two snapshots a day at the same two clock points is what makes a Monday-vs-Friday
+   diff like-for-like; mixing in whatever anyone expanded at 11:04am would make the
+   archive a log of attention rather than a series.
+
+   THE SLOT AND THE ROW'S `ts` ARE DIFFERENT FACTS AND BOTH ARE KEPT. A sweep
+   reuses any row inside `LONG_FRESH_MS`, so the 1:15pm sweep may archive a row
+   computed at 11am when someone expanded it. The SLOT names when the SNAPSHOT was
+   taken; the row's own `ts` names when its DATA was computed. Neither is
+   rewritten to agree with the other.
+
+   RETENTION 7d, matching `LONG_ROW_TTL` — the diff this exists for is
+   "yesterday against the last session before a gap", which is the same span.
+   A retry firing overwrites the same slot: newest per slot wins, the same rule
+   the daily briefing slots follow.
+
+   IT ONLY EVER RUNS FORWARD. Nothing before its first deploy can be recovered. */
+const LONGARCH_TTL   = 7 * 24 * 3600;
+const LONGARCH_SLOTS = ['open', 'eod'];   // 7:00am PT sweep | 1:15pm PT sweep
+const LONGARCH_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const longArchKey = (sym, date, slot) => `longarch:${String(sym).toUpperCase()}:${date}:${slot}`;
 
 /* Lane A — stock replacement. The two nearest Januaries clearing the LTCG line.
    §2 selects "nearest 540 DTE" and "nearest January ≥365 DTE"; on most dates
@@ -4574,14 +4642,97 @@ async function handleLongBatch(params, origin, env) {
   }, 200, origin);
 }
 
+/* ── GET /api/long/:ticker?date=&slot= — THE ARCHIVE READ ────────────────────
+   Serves one banked sweep snapshot from `longarch:{TICKER}:{PT-DATE}:{SLOT}`,
+   VERBATIM. It is the diagnostic half of the archive: it exists so that
+   "Friday said E[R] 165% and Monday says 17%" is a diff between two stored rows
+   rather than an argument about a row that no longer exists.
+
+   NOTHING IS RECOMPUTED, BACKFILLED OR RELABELLED. No Yahoo touch, no cache
+   write, no promotion of the archived row into `long:{TICKER}`. The row carries
+   its own `ts`, `rate`, `gates` and lane statuses as computed on that day, and
+   they are served as they were stored — the honesty rule that applies to every
+   aged read in this file.
+
+   `macro` is DELIBERATELY NOT ATTACHED. Every live path on this route puts
+   today's `macro:state` in the envelope so the row and the chip beside it
+   describe the same moment; on an archive read that guarantee inverts — today's
+   regime next to a row from four sessions ago is two different days' facts under
+   one header. Costing one fewer binding op is a side effect, not the reason.
+
+   A MISS IS A REFUSAL THAT NAMES THE KEY IT PROBED, never an empty 200. The
+   archive only runs forward from its first deploy, and it keeps 7 days, so
+   "nothing there" has several ordinary causes and the caller is told which key
+   came back empty rather than being handed a blank row to interpret. */
+async function handleLongArchive(sym, date, slotParam, origin, env) {
+  const mark = instrMark();
+  const slot = String(slotParam || 'eod').toLowerCase();
+
+  if (!LONGARCH_DATE_RE.test(date)) {
+    return err(`date must be an ISO PT date, YYYY-MM-DD — got \`${date}\``, 400, origin);
+  }
+  if (!LONGARCH_SLOTS.includes(slot)) {
+    return err(`slot must be one of ${LONGARCH_SLOTS.join(' | ')} — got \`${slot}\``, 400, origin);
+  }
+
+  const key = longArchKey(sym, date, slot);
+  let row = null, readFailed = null;
+  try { row = await env?.REC_LOG?.get(key, 'json'); }
+  catch (e) { readFailed = e?.message || String(e); }
+
+  const archive = { key, symbol: sym, ptDate: date, slot, slots: LONGARCH_SLOTS,
+                    retentionDays: LONGARCH_TTL / 86400 };
+
+  if (!row) {
+    /* The standard long-row refusal shape — the same `{ row: null, missing }`
+       the `?cached=1` miss returns — with the probed key named in the reason. */
+    return json({
+      row: null, archive, cached: true,
+      missing: {
+        symbol: sym, status: readFailed ? 'archive-read-failed' : 'archive-miss',
+        reason: readFailed
+          ? `KV read of \`${key}\` failed — ${readFailed}`
+          : `no archived row at \`${key}\`. The archive is written by the 7:00am PT `
+            + `(slot \`open\`) and 1:15pm PT (slot \`eod\`) cron sweeps ONLY, keeps `
+            + `${LONGARCH_TTL / 86400} days, and only runs forward from the day it was `
+            + 'deployed — it cannot be backfilled.',
+      },
+      _instr: instrSince(mark, 'archive-miss'),
+      _meta: srcMeta('KV sweep archive (no fetch)', {
+        ok: false, note: `nothing banked for ${sym} on ${date} · slot ${slot}`,
+      }),
+    }, 404, origin);
+  }
+
+  return json({
+    row, archive, cached: true, archived: true,
+    _instr: instrSince(mark, 'archive-hit'),
+    _meta: srcMeta('KV sweep archive (no fetch)', {
+      ok: !!row.ok,
+      asOf: row.ts ? new Date(row.ts).toISOString().slice(0, 16).replace('T', ' ') : null,
+      note: `archived snapshot · PT ${date} · slot ${slot} (${slot === 'open' ? '7:00am' : '1:15pm'} PT sweep)`
+          + ' · served verbatim, nothing recomputed'
+          + ' · the SLOT names when the snapshot was taken, the row carries its own `ts` for when its data was computed',
+    }),
+  }, 200, origin);
+}
+
 /* ── GET /api/long/:ticker ───────────────────────────────────────────────────
    The only path in this screen that spends subrequests.
      (no param)   cached row if inside LONG_FRESH_MS, else refetch
      ?refresh=1   always refetch
-     ?cached=1    never fetch */
+     ?cached=1    never fetch
+     ?date=&slot= ARCHIVE READ — a banked sweep snapshot, never a fetch */
 async function handleLongTicker(ticker, params, origin, env) {
   const sym = String(ticker || '').toUpperCase();
   if (!sym) return err('ticker required', 400, origin);
+
+  /* The archive read is answered FIRST and returns before the crumb, the cache
+     probe and the macro read. It is a different question — "what did the sweep
+     store on that day" — and must not fall through to a live refetch on a miss,
+     which would silently answer today's question under a past date's URL. */
+  const archDate = params.get('date');
+  if (archDate) return await handleLongArchive(sym, archDate, params.get('slot'), origin, env);
 
   /* Baseline at the TOP of the handler, not just before the refetch.
      It used to sit after the cache read and the crumb call, which quietly
@@ -4818,6 +4969,22 @@ async function recordIvSample(ticker, snap, env, { src = null, skipIfPresent = f
     // deliberately not backfilled: the gaps and their provenance are the evidence
     // for how biased the series is, and rewriting them would destroy it. Anything
     // reading `src` must treat absent as UNKNOWN, never as a default.
+    //
+    // A FIFTH WRITER SINCE 2026-08-31, AND IT WRITES AT THE OPEN. The new 7:00am
+    // PT `collectMorningRows` sweep runs the whole watchlist through the cold
+    // long path, which lands here as `long-live` with no `skipIfPresent` — so
+    // every watchlist name now gets an OPENING reading written to this key each
+    // trading morning. On an ordinary day that is harmless and by design: the
+    // dedicated 1:15pm `recordWatchlistIv` sweep overwrites the same key
+    // unconditionally (that overwrite IS the sampling design), so the series
+    // stays a fixed-clock POST-CLOSE series.
+    //
+    // THE RESIDUAL, STATED RATHER THAN FIXED: on a day the 1:15pm IV sweep
+    // fails, that date's sample is silently an OPENING reading sitting in a
+    // post-close series — and because `src` is last-writer-wins, nothing stored
+    // says which it was. It is not suppressed here because the `long-live` write
+    // is what collects history for OFF-watchlist names, which is the whole
+    // reason that path exists.
     ...(src ? { src } : {}),
   };
   await env.REC_LOG.put(
@@ -9105,6 +9272,12 @@ function top3Entry(sym, c, laneEntry, row, verdict, scored, rowMeta) {
  */
 const TOP3_DOMAIN_STATUSES = ['no-options', 'no-iv', 'no-expiries'];
 
+/* TWO CALLERS, AND THE NAME IS HISTORICAL. This function RANKS NOTHING and
+   WRITES NO `top3:` KEY — it is the plain sequential watchlist long-row sweep,
+   shared by `collectTop3` (1:15pm PT) and `collectMorningRows` (7:00am PT). The
+   name is kept because renaming it would rewrite a line inside `collectTop3`,
+   which is deliberately left untouched, and because `top3.check.mjs` extracts it
+   from source by that name. Do not read the name as "this builds the top 3". */
 async function top3Sweep(env, tickers) {
   const started = Date.now();
   const rows = new Map();
@@ -9360,6 +9533,13 @@ async function collectTop3(env) {
         ? ` · failures: ${swept.failures.map(f => `${f.symbol} [${f.via}] (${f.error})`).join('; ')}`
         : ''));
 
+  /* THE ARCHIVE HOOK — the only line of this function that changed on 2026-08-31.
+     Banks every row this sweep produced under `longarch:{TICKER}:{today}:eod`
+     before the ranking is written. It ranks nothing, reads nothing back, and is
+     fully swallowed: a failed archive write must never cost the day its top-3
+     record, which is this job's actual product. */
+  const archived = await archiveSweptRows(env, swept, today, 'eod');
+
   const ranked = await top3Rank(env, tickers, swept, today);
   const complete = swept.failed === 0;
 
@@ -9400,6 +9580,10 @@ async function collectTop3(env) {
       sequential: true,
       sequentialNote: 'strictly sequential, one awaited request at a time — Yahoo crumb rate-limiting is '
         + 'the binding constraint here, not the 10,000 subrequest cap.',
+      /* What the `eod` slot of the sweep archive banked. Reported, never gating:
+         the archive is a diagnostic artifact and a failure to write it does not
+         make this ranking any less complete. */
+      archive: archived,
     },
     excluded: ranked.excluded,
     excludedTruncated: ranked.excludedTruncated,
@@ -9489,6 +9673,174 @@ async function readTop3(env) {
     if (rec && rec.schema === TOP3_SCHEMA) return rec;
   }
   return null;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   THE SWEEP ARCHIVE WRITER  —  `longarch:{TICKER}:{PT-DATE}:{SLOT}`
+   ═══════════════════════════════════════════════════════════════════════════
+
+   Banks every row a CRON sweep produced, verbatim, so a later disagreement is a
+   diff between two stored records rather than an argument about a row that has
+   been overwritten. See the constant block beside `LONGARCH_TTL` for why this
+   has its own prefix, why it never runs on an on-demand refresh, and why the
+   slot and the row's own `ts` are two different facts that are both kept.
+
+   REUSED ROWS ARE ARCHIVED TOO. `top3Sweep` reuses any cached row inside
+   `LONG_FRESH_MS`, so the 1:15pm snapshot may hold a row computed at 11:04am
+   when someone expanded it. That is not a defect to correct: the row carries its
+   own `ts`, the slot carries the snapshot clock, and the sweep's own `rowSource`
+   records which of the two it was. Refetching to make the timestamps agree would
+   spend Yahoo calls to destroy information.
+
+   FULLY SWALLOWED, PER KEY, AND NEVER GATING. The archive is a diagnostic
+   artifact; the sweeps' actual products are the `long:` rows and the `top3:`
+   record. A KV write failure here must not cost the day either of those, and it
+   must not block a dedup stamp — a run whose data landed and whose archive did
+   not is a COMPLETE run with a reported gap, not an incomplete one. The counts
+   come back so that gap is a number on the record rather than a silence.
+
+   @returns {{slot,ptDate,attempted,written,failed,failures,ttlSeconds}} */
+async function archiveSweptRows(env, swept, todayPt, slot) {
+  const out = { slot, ptDate: todayPt, attempted: 0, written: 0, failed: 0,
+                failures: [], ttlSeconds: LONGARCH_TTL };
+  if (!env?.REC_LOG || !swept?.rows?.size) return out;
+  if (!LONGARCH_SLOTS.includes(slot)) {
+    console.error(`[cron] !! ARCHIVE-SLOT !! refusing to write a sweep archive under unknown slot `
+      + `\`${slot}\` — it must be one of ${LONGARCH_SLOTS.join(' | ')}. Nothing was written.`);
+    return out;
+  }
+
+  for (const [sym, got] of swept.rows) {
+    out.attempted++;
+    try {
+      await env.REC_LOG.put(longArchKey(sym, todayPt, slot), JSON.stringify(got.row),
+                            { expirationTtl: LONGARCH_TTL });
+      out.written++;
+    } catch (e) {
+      out.failed++;
+      out.failures.push({ symbol: sym, error: e?.message || String(e) });
+    }
+  }
+
+  if (out.failed) {
+    console.warn(`[cron] sweep archive ${slot} ${todayPt}: ${out.written}/${out.attempted} banked, `
+      + `${out.failed} KV writes failed (${out.failures.map(f => f.symbol).join(', ')}). This does NOT `
+      + 'block the sweep or its dedup stamp — the archive is a diagnostic artifact, not the product.');
+  } else {
+    console.log(`[cron] sweep archive ${slot} ${todayPt}: ${out.written} rows banked under `
+      + `longarch:{TICKER}:${todayPt}:${slot}, ${LONGARCH_TTL / 86400}d retention.`);
+  }
+  return out;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   collectMorningRows  —  THE 7:00am PT SWEEP-ONLY JOB
+   ═══════════════════════════════════════════════════════════════════════════
+
+   WHAT IT IS. The same strictly-sequential watchlist sweep the 1:15pm top-3 job
+   runs — `sweepUniverse()` then `top3Sweep()` — so every watchlist name has a
+   fresh `long:{TICKER}` row for the trading morning, plus the `open` slot of the
+   sweep archive. It exists because on 2026-08-31 the whole Options surface read
+   "not loaded" at 8am PT: the only writer of those rows fired at 1:15pm, so on
+   any morning after an eviction the tab had nothing until the afternoon.
+
+   IT MUST NEVER RANK. THIS IS THE WHOLE CONSTRAINT AND IT IS NOT A STYLE
+   PREFERENCE. This job does NOT call `collectTop3`, does NOT write
+   `top3:{PT-date}`, and does NOT touch `top3sweep:last`. `collectTop3`'s dedup is
+   a PT-DATE COMPARE (`last === today`), so a 7am stamp would make the 1:15pm
+   firing log "top3 already built today, skipping" and silently replace the day's
+   official post-close ranking with one priced off opening spreads — the widest,
+   least reliable quotes of the session — under the same key and the same label.
+   Populating rows and publishing a ranking are two different acts, and only the
+   second one belongs to 1:15pm. Do not "simplify" this by calling `collectTop3`.
+
+   WHY 7:00am PT. That is 10:00am ET, thirty minutes after the open: the earliest
+   firing of this cron that reads TODAY'S chain rather than yesterday's, and late
+   enough that the opening auction's spreads have settled somewhat. It is inside
+   the trigger's 13-22 UTC window in BOTH DST regimes (14:00 UTC under PDT, 15:00
+   UTC under PST), which rule #2 requires be checked before any new Pacific hour
+   is scheduled.
+
+   NO CALENDAR LOGIC HERE. `scheduled()` gates on the Pacific trading day before
+   it dispatches anything, so weekends and NYSE holidays are already handled
+   upstream and nothing date-shaped belongs in this function.
+
+   BUDGET. ~8-9 external fetches per name on the cold path (`refreshLongTicker`'s
+   measured figure), and 7am is ALWAYS cold: the shared `premium:{TICKER}` header
+   banked by yesterday's 1:15pm sweep is long past `PREMIUM_FRESH_MS` (4h), so the
+   warm branch cannot fire. With the per-name KV traffic that derives to ~20
+   capCost a name, ~800 at the live N≈40 — ~8% of this invocation's own 10,000
+   ceiling, and THIS INVOCATION CARRIES NO OTHER JOB, so it does not share that
+   ceiling with anything. Zero Claude calls. Strictly sequential, because Yahoo
+   crumb rate-limiting is the binding constraint here, not the cap.
+
+   COMPLETENESS, following `top3Sweep`'s own split. An `error` row is an
+   INFRASTRUCTURE failure, ours to retry, and it blocks the stamp; `no-options` /
+   `no-iv` / `no-expiries` are complete DOMAIN outcomes about the ticker and must
+   not block it forever. An unstamped run means the 7:15 firing retries — and it
+   costs only the names that failed, because every row the 7:00 run banked is
+   inside `LONG_FRESH_MS` and gets reused. A run where EVERY name failed writes no
+   stamp and says so.
+
+   KNOWN INTERACTION WITH THE IV SERIES, DOCUMENTED RATHER THAN FIXED. The cold
+   long path banks the day's `iv:{TICKER}:{DATE}` sample unconditionally (the
+   `long-live` writer, no `skipIfPresent`), so this job now writes an OPENING IV
+   reading into that key every morning. On an ordinary day that is harmless: the
+   dedicated 1:15pm `recordWatchlistIv` sweep overwrites the same key
+   unconditionally — that unconditional overwrite IS the sampling design — so the
+   series stays a post-close series. THE RESIDUAL IS THE DAY THE 1:15pm IV SWEEP
+   FAILS: that date's sample is then silently an opening reading sitting in a
+   post-close series, and `src` is last-writer-wins so nothing stored says which
+   it was. The same note is recorded beside `recordIvSample`. It is not fixed here
+   because suppressing the write would break the off-watchlist collection that
+   path exists for. */
+const MORNING_ROWS_KEY = 'morningrows:last';
+/* 2d, matching `ivsweep:last` / `movesweep:last` / the other sibling stamps, and
+   OUTSIDE any listed prefix — `morningrows:` collides with nothing that is
+   scanned, the same rule that keeps `ivsweep:last` out of the `iv:` prefix. */
+const MORNING_ROWS_STAMP_TTL = 172800;
+
+async function collectMorningRows(env) {
+  if (!env?.REC_LOG) return;
+  const mark = instrMark();
+  const today = ptDate();
+
+  try {
+    const last = await env.REC_LOG.get(MORNING_ROWS_KEY);
+    if (last === today) { console.log('[cron] morning rows already swept today, skipping'); return; }
+  } catch (_) {}
+
+  const tickers = await sweepUniverse(env, 'morning row sweep', TOP3_SWEEP_CAP);
+  if (!tickers) return;   // refuses loudly inside sweepUniverse; nothing stamped
+
+  const swept = await top3Sweep(env, tickers);
+  if (!swept.rows.size) {
+    console.error(`[cron] !! MORNING-ROWS !! every one of ${tickers.length} tickers failed to produce a long `
+      + `row in ${(swept.wallMs / 1000).toFixed(1)}s. No dedup key stamped, so the next firing retries.`);
+    return;
+  }
+
+  /* Bank the `open` slot. Same hook, same rules and the same non-gating status as
+     the `eod` slot written by `collectTop3`. */
+  const archived = await archiveSweptRows(env, swept, today, 'open');
+
+  const complete = swept.failed === 0;
+  console.log(`[cron] morning rows ${today}: ${swept.fetched} fetched / ${swept.reused} reused / `
+    + `${swept.failed} failed of ${tickers.length} in ${(swept.wallMs / 1000).toFixed(1)}s · statuses `
+    + `${JSON.stringify(swept.byStatus)}`
+    + (swept.skipped ? ` · ${swept.skipped} nothing screenable (a complete outcome, not a failure)` : '')
+    + ` · archive ${archived.written}/${archived.attempted} banked`
+    + ' · NO ranking written (top3 is a 1:15pm-only act)'
+    + ` · ${JSON.stringify(instrSince(mark, complete ? 'complete' : 'partial'))}`);
+
+  if (complete) {
+    try { await env.REC_LOG.put(MORNING_ROWS_KEY, today, { expirationTtl: MORNING_ROWS_STAMP_TTL }); } catch (_) {}
+  } else {
+    console.error(`[cron] !! MORNING-ROWS-INCOMPLETE !! ${swept.failed}/${tickers.length} tickers hit an `
+      + `INFRASTRUCTURE failure (${swept.failures.map(f => `${f.symbol} [${f.via}]`).join(', ')}). The rows `
+      + `that DID compute are banked; ${MORNING_ROWS_KEY} was NOT stamped, so the 7:15 firing retries and `
+      + 'costs only the names that failed — the rest are inside LONG_FRESH_MS and get reused.');
+  }
 }
 
 /* ── New route handlers ── */
@@ -13739,6 +14091,28 @@ export default {
     if (h === 6 && m < 30) {
       branch = 'morning-briefing';
       dispatchJob(ctx, 'morning-briefing', () => generateDailySnapshot(env));   // 6:00am PT
+    } else if (h === 7 && m < 30) {
+      /* 7:00am PT — SWEEP ONLY. Writes a fresh `long:{TICKER}` row for every
+         watchlist name and banks the `open` slot of the sweep archive. It
+         RANKS NOTHING: no `collectTop3`, no `top3:{PT-date}`, no
+         `top3sweep:last`. A 7am stamp on that key would make the 1:15pm firing
+         skip and replace the day's post-close ranking with one priced off
+         opening spreads — see the constraint written out on collectMorningRows.
+
+         `m < 30` admits exactly two firings, 7:00 and 7:15, the same bound the
+         1:15pm window uses: a persistently failing name costs one extra pass a
+         day and no more. Own dedup key (`morningrows:last`), stamped only on a
+         run with zero INFRASTRUCTURE failures, so the 7:15 retry costs only the
+         names that failed — the rest are inside LONG_FRESH_MS and get reused.
+
+         THIS BRANCH CARRIES ONE JOB, so its `_instr` IS a measurement rather
+         than an upper bound: nothing else shares the invocation. ~20 capCost a
+         name all-cold, ~800 at N≈40, against this invocation's own 10,000.
+
+         7:00am PT is inside the trigger's 13-22 UTC window under BOTH regimes —
+         14:00 UTC on PDT, 15:00 UTC on PST (rule #2). */
+      branch = 'morning-rows';
+      dispatchJob(ctx, 'morning-rows', () => collectMorningRows(env));           // 7:00am PT long-row sweep, no ranking
     } else if ((h === 11 && m >= 30) || h === 12) {
       branch = 'midday-pulse';
       dispatchJob(ctx, 'midday-pulse', () => generateMiddaySnapshot(env));      // 11:30am PT (retries to 1pm; KV dedup skips once complete)

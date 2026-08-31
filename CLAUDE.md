@@ -1105,6 +1105,26 @@ without ever opening that file.
   has to be reasoned away every time it is read
 - `incomerow:{TICKER}` schema check stays strict equality, and its freshness (6h)
   and retention (36h) must not be equal
+- **`LONG_ROW_TTL` is 7d and `LONG_FRESH_MS` is 4h, and they are different
+  questions.** Retention outlives the weekend/holiday gaps the writer's own
+  trading-day schedule creates (24h evicted every Friday row before Monday and
+  the whole Options surface read "not loaded"); freshness still decides the stale
+  badge, the cache hit and the sweep's reuse gate. Never raise freshness to
+  "match" retention. Nothing that ranks or scores can reach an aged row —
+  `top3Sweep` reuses only inside `LONG_FRESH_MS` and only a non-`error` row,
+  `top3Rank` drops any row whose own PT date is not today, and `readLongRow`
+  retires any row whose schema is not `LONG_SCHEMA`
+- **The 7:00am PT `collectMorningRows` job RANKS NOTHING.** It must never call
+  `collectTop3`, write `top3:{PT-date}`, or stamp `top3sweep:last` — that dedup
+  is a PT-date compare, so a 7am stamp would make the 1:15pm firing skip and
+  replace the day's post-close ranking with one priced off opening spreads. Its
+  own stamp is `morningrows:last`, outside any scanned prefix
+- `longarch:{TICKER}:{PT-DATE}:{SLOT}` is written by the **cron sweeps only**,
+  never by an on-demand `/api/long/:ticker` refresh — a fixed-clock write is a
+  daily series, an on-demand one is a record of what someone opened. The SLOT
+  names when the snapshot was taken; the row's own `ts` names when its data was
+  computed, and a reused row legitimately disagrees with its slot. Served
+  verbatim by `?date=&slot=`, never recomputed, and it only runs forward
 
 ### `GET /api/income/*` — the income sleeve
 
@@ -1462,6 +1482,159 @@ funnel `{direction 42, liquidity 0, vol 12, episodes 5, inputs 0}`; **3 of 3
 published**. A second firing reported `top3 already built today, skipping`; with the
 stamp cleared it re-ran **0 fetched / 11 reused in 0.1s** and published byte-identical
 entries. Checked by `node top3.check.mjs` (240 comparisons).
+
+### `long:{TICKER}` retention, the 7:00am row sweep, and the `longarch:` archive
+
+**One class of fix, from two findings on Monday 2026-08-31 at 8am PT: retention
+that survives the writer's own schedule gaps, and snapshots that survive their
+own overwrites.** It sits beside the `TOP3_TTL` entry above because it is the
+same failure wearing a different key.
+
+| constant | before | after | what it is |
+|---|---|---|---|
+| `LONG_ROW_TTL` | 24h | **7d** | KV retention for `long:{TICKER}` |
+| `LONG_FRESH_MS` | 4h | **4h — unchanged** | the freshness horizon. NOT touched |
+| `LONGARCH_TTL` | — | **7d** | retention for one banked sweep snapshot |
+| `LONGARCH_SLOTS` | — | `open` \| `eod` | 7:00am PT sweep / 1:15pm PT sweep |
+| `MORNING_ROWS_KEY` | — | `morningrows:last` | the 7am job's own daily dedup stamp |
+| `MORNING_ROWS_STAMP_TTL` | — | **172800** (2d) | matching `ivsweep:last` and the other siblings |
+
+#### FINDING 1 — the whole Options surface read "not loaded", and 24h is why
+
+Friday's 1:15pm PT top-3 sweep had written a `long:{TICKER}` row for every
+watchlist name. The cron gate skips weekends, so nothing rewrote them; at 24h
+every one of those keys was **evicted on the Saturday afternoon**, and the tab
+had no rows at all until Monday's own 1:15pm sweep — the writer's own
+trading-day schedule opened a gap its retention could not span.
+
+**THE DERIVATION, WHICH IS A CALENDAR FACT AND NOT A ROUND NUMBER.** The binding
+case is a **Thursday 1:15pm PT write read on the Tuesday morning after a
+Friday+Monday market closure**: Thu 13:15 → Tue 08:00 is **~115h ≈ 4.8d**. Add
+headroom for one missed cron and 7d clears it. That is the same figure, for the
+same class of gap, as `TOP3_TTL` and `MOVES_TTL` — *"the weekend / holiday gaps
+the writer's trading-day schedule creates"*.
+
+**`LONG_FRESH_MS` STAYS 4h. THIS CHANGES RETENTION ONLY.** The stale badge, the
+`/api/long/:ticker` cache-hit test and the sweep's reuse gate all read freshness
+and are untouched. **Verified, not assumed, that longer retention cannot reach
+anything that ranks or scores** — a row that merely renders older is a labelled
+read, while a row that silently enters a ranking is a fabricated one:
+
+| guard | where | holds? |
+|---|---|---|
+| `age < LONG_FRESH_MS && cached.status !== 'error'` — the sweep's reuse gate | `top3Sweep`, `worker.js` | **yes**, a 4h gate, untouched |
+| a row whose own PT date is not `todayPt` is dropped | `top3Rank`, `worker.js` | **yes** — a banked row can never ride into a published ranking under a later day's key |
+| `row.schema === LONG_SCHEMA`, strict equality | `readLongRow`, `worker.js` | **yes** — a longer-lived row cannot outlive its own shape |
+
+Neither frontend reads `LONG_ROW_TTL`; the stale badge is driven by
+`_meta.ttlSeconds`, which is `LONG_FRESH_MS`.
+
+**`premium:{TICKER}` is deliberately NOT raised alongside it.**
+`refreshLongTicker` gates the warm path on `PREMIUM_FRESH_MS` (4h) and reuses a
+**fresh** header only, so a longer retention there would never be read.
+
+#### The 7:00am PT branch — `collectMorningRows`, which RANKS NOTHING
+
+`h === 7 && m < 30` dispatches one job, `collectMorningRows(env)`. It runs the
+same sequential `sweepUniverse()` → `top3Sweep()` path the 1:15pm job runs, so
+every watchlist name has a fresh row for the trading morning rather than only
+after 1:15pm. **7:00am PT is 10:00am ET, 30 minutes after the open: the earliest
+firing that reads today's chain rather than yesterday's.**
+
+**IT MUST NEVER RANK, AND THIS IS THE WHOLE CONSTRAINT.** It does not call
+`collectTop3`, does not write `top3:{PT-date}`, and **does not touch
+`top3sweep:last`**. `collectTop3`'s dedup is a **PT-date compare** — a 7am stamp
+would make the 1:15pm firing log *"top3 already built today, skipping"* and
+silently replace the day's official post-close top-3 with one **priced off
+opening spreads**, under the same key and the same label. Populating rows and
+publishing a ranking are two different acts; only the second belongs to 1:15pm.
+The constraint is written out on the function so nobody "simplifies" it later.
+
+- **Own dedup stamp**, `morningrows:last`, outside any scanned prefix — the
+  `ivsweep:last` rule. Stamped only when **zero** tickers hit an INFRASTRUCTURE
+  failure; `no-options` / `no-iv` / `no-expiries` are complete domain outcomes
+  and do not block it. `m < 30` admits exactly two firings (7:00 and 7:15), the
+  same bound the 1:15pm window uses, so a persistently failing name costs one
+  extra pass a day and no more — and the 7:15 retry costs **only** the names
+  that failed, because the rest are inside `LONG_FRESH_MS` and get reused.
+- **No calendar logic was added.** `scheduled()` gates on the Pacific trading day
+  upstream of branch dispatch, so weekends and NYSE holidays are already handled.
+- **7:00am PT is inside the 13–22 UTC window in BOTH regimes** — 14:00 UTC on
+  PDT, 15:00 UTC on PST — which rule #2 requires be checked before scheduling
+  any new Pacific hour. **The cron expression itself does not change.**
+- **Budget, derived not estimated:** ~8–9 external fetches per name cold
+  (`refreshLongTicker`'s measured figure), and **7am is always cold** — the
+  shared `premium:{TICKER}` header banked by yesterday's 1:15pm sweep is long
+  past `PREMIUM_FRESH_MS`, so the warm branch cannot fire. With the per-name KV
+  traffic that is ~20 capCost a name, **~800 at N≈40**, zero Claude calls,
+  strictly sequential because the Yahoo crumb is the binding constraint.
+  **This branch carries ONE job**, so unlike the 1:15pm and 2:00pm branches its
+  `_instr` *is* a measurement rather than an upper bound.
+
+**KNOWN INTERACTION, DOCUMENTED RATHER THAN FIXED.** The cold long path banks
+the day's `iv:{TICKER}:{DATE}` sample unconditionally (`src: 'long-live'`, no
+`skipIfPresent`), so this job now writes an **opening** IV reading every trading
+morning. Ordinarily harmless: the dedicated 1:15pm iv-sweep overwrites the same
+key unconditionally — *that overwrite is the sampling design* — so the series
+stays post-close-based. **Residual: on a day the 1:15pm iv-sweep fails, that
+date's sample is silently an opening reading in a post-close series**, and `src`
+is last-writer-wins so nothing stored says which it was. Noted beside
+`recordIvSample`'s provenance comment. Not suppressed, because the `long-live`
+write is what collects history for **off-watchlist** names.
+
+#### FINDING 2 — every computation destroys the evidence of the last one
+
+Friday's GOOGL row carried a **Lane B Oct 360 call at E[R] 165%**; Monday's
+recompute put the same expiry at **14–19%**. An order-of-magnitude disagreement,
+and **undiagnosable**, because `long:{TICKER}` is one key per ticker overwritten
+in place and the Friday row was gone.
+
+So both cron sweeps now bank every swept row, verbatim, to
+
+```
+longarch:{TICKER}:{PT-date}:{slot}      slot = 'open' (7am) | 'eod' (1:15pm)
+```
+
+with `LONGARCH_TTL` 7d. The rules, each with its reason:
+
+- **Own prefix, NOT `long:{TICKER}:{date}`.** `longarch:` and `long:` are
+  **disjoint string prefixes** — after `long` comes `a`, not `:` — so a
+  `list({prefix:'long:'})` can never read an archive record as a ticker. Same
+  rule the KV table records for `ivsweep:last` outside `iv:` and for
+  `incomerow:` not being `income:`. (Confirmed: nothing in `worker.js` lists
+  over `long:` today; the prefix discipline holds regardless.)
+- **Cron sweeps ONLY — never an on-demand `/api/long/:ticker` refresh.**
+  `recordIvSample`'s provenance note already states the principle: a fixed-clock
+  write is a **daily series**, an on-demand write is a **record of what someone
+  opened**. Two stable snapshots a day at the same two clock points is what makes
+  a Monday-vs-Friday diff like-for-like.
+- **Reused rows are archived too.** The 1:15pm sweep may reuse a row expanded at
+  11am (inside `LONG_FRESH_MS`). That is not a defect to correct: **the SLOT
+  names when the snapshot was taken, the row's own `ts` names when its data was
+  computed**, and neither is rewritten to agree with the other.
+- **A retry firing overwrites the same slot** — newest per slot wins, the
+  session-brief precedent.
+- **The write is fully swallowed per key and never gates anything.** The archive
+  is a diagnostic artifact; the sweeps' products are the `long:` rows and the
+  `top3:` record. A run whose data landed and whose archive did not is a
+  **complete** run with a reported gap — the counts ride on `sweep.archive` of
+  the `top3:` record and on the 7am job's log line.
+
+**Read path:** `GET /api/long/:ticker?date=YYYY-MM-DD&slot=eod` (slot optional,
+default `eod`). Serves the archived row **verbatim** — no Yahoo touch, no cache
+write, no promotion into `long:{TICKER}`, nothing recomputed or backfilled. It is
+answered **before** the crumb, the cache probe and the macro read, so a miss can
+never fall through to a live refetch and answer today's question under a past
+date's URL. **`macro` is deliberately not attached**: every live path puts today's
+`macro:state` in the envelope so the row and the chip describe the same moment,
+and on an archive read that guarantee inverts. **A miss is a 404 carrying the
+standard `{ row: null, missing: {...} }` refusal shape with the probed key named
+in the reason — never an empty 200.** A bad `date` or an unknown `slot` is a 400.
+
+**Cost, for the record:** ~78 extra KV writes/day (39 names × 2 slots); storage
+≈ 39 × 2 × 7 × ~25 KB ≈ **15 MB** against the included 1 GB. **The archive only
+runs forward — it cannot recover anything from before its first deploy**, which
+is why the 2026-08-31 GOOGL discrepancy itself stays undiagnosable.
 
 ### Worker endpoints, data sources, KV and cron → the `worker-internals` skill
 
