@@ -297,7 +297,7 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 [triggers]
 # THIS EXPRESSION IS A COARSE WAKEUP AND NOTHING ELSE.
 #
-# It says "every 15 minutes, UTC hours 13-22, every day". It does NOT encode
+# It says "every 15 minutes, UTC hours 12-22, every day". It does NOT encode
 # which days to run — scheduled() in worker.js decides that, in code, against
 # Pacific wall-clock time, and skips weekends and NYSE holidays there.
 #
@@ -311,8 +311,21 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 # express a calendar rule you can test, and scheduled() can.
 #
 # The UTC hour range is still load-bearing, because a Pacific hour maps to two
-# UTC hours across DST. 13-22 covers 6:00am-3:00pm PDT and 5:00am-2:00pm PST,
+# UTC hours across DST. 12-22 covers 5:00am-3:00pm PDT and 4:00am-2:00pm PST,
 # so every PT job below is inside the window in both regimes:
+#
+# WIDENED 13-22 -> 12-22 ON 2026-09-01, for the print-vs-tape BMO first pass.
+# That pass is 05:30am PT, which is 12:30 UTC under PDT and 13:30 under PST. The
+# old 13-22 window covered the PST reading and NOT the PDT one, so the pass would
+# have silently not run for the summer half of the year -- the 13F failure
+# exactly, and the reason rule #2 requires both regimes be checked before any new
+# Pacific hour is scheduled. The four extra wakeups a day (12:00/:15/:30/:45 UTC)
+# are 05:00-05:45 PT under PDT and 04:00-04:45 under PST; only the 05:30 PDT one
+# has a job, and the rest log `branch=none`/`branch=idle` and return.
+#
+# THIS IS A CHANGE TO HOW OFTEN WE WAKE UP AND TO NOTHING ELSE. No day-of-week,
+# day-of-month or month goes into this expression; every date and time decision
+# is still made in scheduled(), in code, where it is testable.
 #   Morning briefing — 6:00am PT   (13:00 UTC PDT / 14:00 UTC PST)
 #   Morning long rows— 7:00am PT   (14:00 UTC PDT / 15:00 UTC PST — inside this
 #                      window in BOTH regimes, checked before scheduling per
@@ -357,6 +370,29 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #   13F index slice  — 10:00am PT  (4 managers per firing, ~13 external fetches)
 #                      NOT 3:00pm PT: that is 23:00 UTC under PST, outside this
 #                      window, so the job never ran for half the year.
+#   Print vs tape    — 05:30am + 06:15am PT (BMO names) and 1:30pm + 2:30pm PT
+#                      (AMC names). FOUR passes, each a 15-minute window that
+#                      admits exactly one firing. Two per session because Yahoo's
+#                      ACTUALS LAG THE PRINT -- measured 2026-09-01, 42 minutes
+#                      after three names reported AMC, the consensus for the
+#                      reported quarter was published and the actuals were not.
+#                      Pass 1 banks the consensus (which ROLLS OUT of the API
+#                      once the actual lands), pass 2 catches the actual, and the
+#                      record merges them field by field within one quarter.
+#                      Pass 2 skips any ticker already answered.
+#                      UTC in both regimes: 05:30 -> 12:30 PDT / 13:30 PST (this
+#                      is why the window was widened), 06:15 -> 13:15 / 14:15,
+#                      13:30 -> 20:30 / 21:30, 14:30 -> 21:30 / 22:30.
+#                      Dispatched OUTSIDE the branch chain on its own clock test,
+#                      because three of the four windows overlap branches the
+#                      chain already owns; the pass is named in the [cron] line.
+#                      capCost `ceil(N/20) + 4E + 4` -- derives to 18 at N=40
+#                      with E=3 reporting; MEASURED 17 at N=6/E=3 cold crumb and
+#                      5 on a firing where nobody reported. Zero Claude calls
+#                      unless a name is DIVERGENT, which costs one, against the
+#                      same AI_RATE_GLOBAL_DAY ceiling the request paths use.
+#                      Its evidence is the printtapeday:{DATE} index, written on
+#                      every pass including a zero-eligible one.
 # Each job deduplicates via KV timestamp check (2-hour window).
 #
 # ONE EXPRESSION. A temporary every-5-minutes diagnostic probe sat here from
@@ -374,7 +410,7 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 # dedup absorbs on a successful run but not on a failed morning briefing — that
 # retries by design, and the probe would turn 2 attempts into 6 (~150 Claude
 # calls instead of ~50).
-crons = ["*/15 13-22 * * *"]
+crons = ["*/15 12-22 * * *"]
 
 # Required secrets (set via: npx wrangler secret put <NAME>):
 #   AI_GATE_SECRET     — REQUIRED. Shared secret gating every AI-spend and KV-write

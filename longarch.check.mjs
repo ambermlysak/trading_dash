@@ -581,9 +581,45 @@ console.log('\n== 6. DISPATCH — the real scheduled(), offline ================
   const pst = utcHour('2027-01-06T07:00:00-08:00');
   row('6e 7:00am PT under PDT, in UTC hours', pdt, 14);
   row('6e 7:00am PT under PST, in UTC hours', pst, 15);
-  row('6e both are inside the 13-22 trigger window', [pdt, pst].every(h => h >= 13 && h <= 22), true);
-  row('6e the cron expression itself is unchanged',
-      /crons = \["\*\/15 13-22 \* \* \*"\]/.test(fs.readFileSync('wrangler.toml', 'utf8')), true);
+
+  /* THE HOUR RANGE IS READ FROM `wrangler.toml`, NOT HARD-CODED HERE.
+     This assertion used to pin the whole literal expression, which made a
+     LEGITIMATE widening of the window read as a regression — and the window is
+     the one thing in that expression that is allowed to change, because it is
+     how often we wake up rather than a calendar rule. It widened to 12-22 on
+     2026-09-01 for the print-vs-tape 05:30am PT pass (12:30 UTC under PDT).
+
+     What must NOT change is the shape: minute step, an hour RANGE, and `*` in
+     all three calendar fields. A day-of-week, day-of-month or month
+     reappearing is the failure rule #2 exists for, and that is what is pinned. */
+  const toml = fs.readFileSync('wrangler.toml', 'utf8');
+  const cronM = toml.match(/crons = \["([^"]+)"\]/);
+  row('6e wrangler.toml declares exactly one cron', !!cronM && toml.match(/crons = \[/g).length === 1, true);
+  const expr = cronM ? cronM[1] : '';
+  const parts = expr.split(/\s+/);
+  row('6e cron expression', expr, expr);                      // printed for the record
+  row('6e it has five fields', parts.length, 5);
+  row('6e minute field is a step, not a calendar rule', /^\*\/\d+$/.test(parts[0] || ''), true);
+  row('6e day-of-month field is `*` (no calendar logic)', parts[2], '*');
+  row('6e month field is `*` (no calendar logic)', parts[3], '*');
+  row('6e day-of-week field is `*` (no calendar logic)', parts[4], '*');
+  const hm = (parts[1] || '').match(/^(\d+)-(\d+)$/);
+  const [lo, hi] = hm ? [Number(hm[1]), Number(hm[2])] : [NaN, NaN];
+  row('6e hour field is a UTC range', !!hm, true);
+  row('6e 7:00am PT is inside it in BOTH regimes', [pdt, pst].every(h => h >= lo && h <= hi), true);
+  /* Every OTHER scheduled Pacific hour, re-derived the same way — so widening or
+     narrowing the window can never silently orphan a job that already exists. */
+  for (const [ptH, ptM, what] of [[6, 0, 'morning briefing'], [7, 0, 'morning rows'],
+                                  [10, 0, '13F slice'], [11, 30, 'midday pulse'],
+                                  [13, 15, 'EOD branch'], [14, 0, '2pm branch'],
+                                  [5, 30, 'print-tape BMO pass 1'], [6, 15, 'print-tape BMO pass 2'],
+                                  [13, 30, 'print-tape AMC pass 1'], [14, 30, 'print-tape AMC pass 2']]) {
+    const p = String(ptH).padStart(2, '0') + ':' + String(ptM).padStart(2, '0');
+    const a = utcHour(`2026-09-02T${p}:00-07:00`);   // PDT
+    const b = utcHour(`2027-01-06T${p}:00-08:00`);   // PST
+    row(`6e ${what} (${p} PT) inside ${lo}-${hi} UTC in both regimes`,
+        [a, b].every(h => h >= lo && h <= hi), true);
+  }
 }
 
 console.log('\n== 7. STRUCTURAL — who may write what ======================================\n');
@@ -695,5 +731,5 @@ process.exit(reportVerdict({
      distinguish from a fixed one, and the floor is the exact number of
      comparisons the script makes. If a section stops running, the count drops
      and the run reports NO VERDICT rather than a pass over nothing. */
-  minComparisons: 166,
+  minComparisons: 183,
 }));

@@ -149,7 +149,7 @@ rejection whose `reason` throws on property access.
 
 ### 2. The cron expression is a coarse wakeup — put no calendar logic in it
 
-The trigger is `*/15 13-22 * * *`: every 15 minutes, UTC hours 13–22, **every
+The trigger is `*/15 12-22 * * *`: every 15 minutes, UTC hours 12–22, **every
 day**. It decides *how often we wake up* and nothing else. Which day, which date,
 which job — all of that is decided in `scheduled()`, in code, against Pacific
 wall-clock time.
@@ -187,17 +187,36 @@ The **UTC hour range is still load-bearing**, for the original reason:
 `scheduled()` dispatches on **Pacific wall-clock time**, but the trigger is
 expressed in **UTC**, and a Pacific hour maps to two different UTC hours across
 the year. A job whose UTC hour falls outside the window **silently does not run
-for half the year**. `13-22` covers **6:00am–3:00pm PDT** and **5:00am–2:00pm
+for half the year**. `12-22` covers **5:00am–3:00pm PDT** and **4:00am–2:00pm
 PST**. Before scheduling anything, check the target Pacific hour in *both*
 regimes:
 
 ```
 PT hour  →  UTC under PDT (UTC-7)  |  UTC under PST (UTC-8)
- 5:00am  →  12:00  ✗ outside       |  13:00  ✓
+ 4:00am  →  11:00  ✗ outside       |  12:00  ✓
+ 5:00am  →  12:00  ✓               |  13:00  ✓
+ 5:30am  →  12:30  ✓               |  13:30  ✓
  6:00am  →  13:00  ✓               |  14:00  ✓
  1:15pm  →  20:15  ✓               |  21:15  ✓
+ 2:30pm  →  21:30  ✓               |  22:30  ✓
  3:00pm  →  22:00  ✓               |  23:00  ✗ outside
 ```
+
+**THE RANGE WIDENED 13-22 → 12-22 ON 2026-09-01, AND THE REASON IS THIS EXACT
+CHECK.** The print-vs-tape BMO first pass is **05:30 PT**, which is 12:30 UTC under
+PDT and 13:30 under PST. Under `13-22` the PST reading was covered and the PDT one
+was not, so that pass **would have silently not run for the summer half of the
+year** — the 13F failure, caught this time by running the table above before
+scheduling rather than after. The four extra wakeups a day are idle under PST and
+carry one job under PDT.
+
+**This is the ONE thing in the expression that is allowed to change**, because it is
+the only part that decides *how often we wake up* rather than *when a job is due*.
+`longarch.check.mjs` §6e used to pin the whole literal expression, which made this
+legitimate widening read as a regression; it now READS the range from
+`wrangler.toml`, asserts the three calendar fields are still `*`, and re-derives
+**every** scheduled PT hour against the range in both regimes — which is the half
+that can actually catch a job scheduled outside the window.
 
 > **Evidence for this rule** — the measured runs, cost tables and incident
 > write-ups behind it — is in [`docs/rules-evidence.md`](docs/rules-evidence.md),
@@ -802,7 +821,7 @@ const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
 
 The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. Seventeen checks exist, all of which print computed vs
+There is no build step. Eighteen checks exist, all of which print computed vs
 expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
 gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
 (Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
@@ -909,33 +928,64 @@ the REAL module — byte-identical service, zero writes, exactly one key read, n
 edges through the REAL `scheduled()` at 06:45 / 07:00 / 07:15 / 07:30 / 08:00 plus
 both closure kinds, the whole branch→jobs table lifted from source so "the 1:15pm
 branch gained nothing" is pinned without spending a fetch, the 7am hour checked
-against the 13-22 UTC window in **both** DST regimes, and a **structural
+against the cron's UTC window in **both** DST regimes, and a **structural
 attribution** proving `collectMorningRows` contains no reference to `collectTop3`,
 `top3Key` or `TOP3_SWEEP_KEY` — the one thing no behavioural test can see being
 added later, and the thing that would silently replace the day's post-close
-ranking with one priced off opening spreads).
+ranking with one priced off opening spreads),
+and `node printtape.check.mjs` (PRINT vs TAPE: the key-shape prefix disjointness in
+**both** directions, the report date including the midnight-UTC placeholder — the one
+shape where a UTC and an ET reading differ by a whole day — all four pass windows plus
+ten non-firing boundaries and a proof that each admits exactly ONE firing, the four PT
+hours re-derived against the cron range in both DST regimes with the range READ from
+`wrangler.toml`, the null-before-arithmetic surprise guard including a zero and a
+negative consensus, **the quarter-alignment gate driven from REAL captured Yahoo
+payloads in both directions** — the shipped code's `null` against the fabricated
+**-13.04%** PANW miss that appears the moment the gate is removed — the consensus-roll
+test at and either side of its boundary, both tape windows checked against the two
+DIFFERENT regular closes they reference with the change cross-checked against
+price-minus-close, the staleness refusal at one second either side, the unconditional
+volume refusal, the implied move and the fact that nothing in it calls itself an
+earnings move, every divergence refusal path with `null` shown to be a different value
+from `false`, the threshold at -2.99 / -3.00 / -3.01, the field-level cross-pass merge
+and the quarter mismatch that must carry nothing, the endpoint through the REAL router
+including a fail-closed gate and an absent day distinguished from an empty one, and
+the structural attributions no behavioural test can make — that guidance is reachable
+only from `divergent === true`, that the verdict is re-run AFTER the merge, that the
+read path contains no write, and that the job writes no sibling feature's key).
 All of them extract functions from
 `worker.js` by source, not by import, because every named export in `worker.js`
-must be a function or `workerd` refuses to boot. **`longarch` is the exception and
-deliberately does both**: it extracts by source for the unit half *and* imports the
+must be a function or `workerd` refuses to boot. **`longarch` and `printtape` are the exceptions and
+deliberately do both**: they extract by source for the unit half *and* import the
 default export to drive the real router and dispatcher — which is also the ES-module
 parse `node --check` cannot perform, and which caught a real syntax error in this
 very change after `node --check` returned exit 0 on it.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 240 / 166** for moves /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 240 / 183 / 272** for moves /
 long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
 sweep-universe / macro / mood / swing / earnings-timing / daily-slots /
-analysis-shape / top3 / longarch — **1,656 comparisons** across the suite. `top3` went 173 -> 219
-on 2026-08-26 with §10, the serving window, and **219 -> 240 on 2026-08-31** with the
-7d TTL and the 5-day walk; its `minComparisons` floor moved 130 -> 170 -> **235**.
-`longarch` landed 2026-08-31 at **166**, and its floor is the **exact** count rather
-than a count minus slack: every section of it is deterministic and offline, so
-unlike `swing` and `earnings-timing` there is no observed total to distinguish from
-a fixed one, and a section that stops running drops the count into a NO VERDICT.
-A full run on 2026-08-31 reported **1,536** observed before `longarch` (so **1,702**
-after it), the gap being the two tape-dependent
-scripts (`swing` 92, `earnings-timing` 158) whose floors are deliberately their FIXED counts.
+analysis-shape / top3 / longarch / printtape — **1,945 comparisons** across the suite.
+`top3` went 173 -> 219 on 2026-08-26 with §10, the serving window, and **219 -> 240 on
+2026-08-31** with the 7d TTL and the 5-day walk; its `minComparisons` floor moved
+130 -> 170 -> **235**.
+`longarch` landed 2026-08-31 at **166** and went **166 -> 183 on 2026-09-01**, when its
+§6e cron assertion was rewritten: it had pinned the whole literal expression, so the
+LEGITIMATE widening of the UTC hour range read as a regression. It now READS the range
+from `wrangler.toml`, pins the three calendar fields as `*`, and re-derives every
+scheduled PT hour against the range in both DST regimes — which is the part that can
+catch a future job being scheduled outside the window.
+`printtape` landed 2026-09-01 at **272**.
+Both floors are the **exact** count rather than a count minus slack: every section of
+either is deterministic and offline, so unlike `swing` and `earnings-timing` there is no
+observed total to distinguish from a fixed one, and a section that stops running drops
+the count into a NO VERDICT.
+The **1,945** above is the sum of the eighteen FLOORS, not of an observed run. A full
+run on 2026-09-01 observed **1,994, with 0 scripts failing**; the 49-comparison gap is
+entirely the two tape-dependent scripts, which observed `swing` **95** against its
+floor of 91 and `earnings-timing` **158** against 113. Their floors are deliberately
+their FIXED counts, so a quiet tape reports a verdict instead of a false NO VERDICT —
+never raise either to an observed total.
 
 **BOTH DIRECTIONS WERE DRIVEN BEFORE `longarch` WAS BELIEVED**, because a check
 that cannot fail is a check that proves nothing. Reverting `LONG_ROW_TTL` to 24h
@@ -943,6 +993,23 @@ turns §2 red in **7** comparisons; making `collectMorningRows` stamp
 `TOP3_SWEEP_KEY` instead of its own key turns §7 red in **5**, naming the function
 in the output; and raising the floor above the observed count produces NO VERDICT
 rather than a pass.
+
+**AND BEFORE `printtape` WAS BELIEVED, for the same reason.** Removing the
+quarter-alignment gate from `printTapePrintFrom` makes §5f print the fabricated
+**-13.04%** PANW miss beside the shipped code's `null`; reverting the cron range to
+`13-22` reddens exactly one comparison — *"print-tape BMO pass 1 (05:30 PT) inside
+12-22 UTC in both regimes"* — which is the assertion that widening the window was
+necessary at all; putting a day-of-week `2-6` back in reddens the calendar-logic
+assertion; and dropping the post-merge verdict re-run reddens §11a-bis in **2**.
+
+**TWO REAL DEFECTS WERE FOUND BY WRITING THE CHECK, not by reading the code.**
+`mergePrintTapeRecord` mutated its own `next` argument through a shallow spread, so
+§9's later assertions were driven against a fixture the earlier ones had silently
+rewritten. And the divergence verdict was computed in `printTapeMeasure`, i.e.
+**before** the merge — so a record whose merged print reported `revSurprisePct 3.77`
+still carried `divergent: null, "1 is absent: revEst"`, a refusal that had outlived
+its own cause and that also made `guidance` unreachable for exactly the names the two
+passes exist for.
 
 ##### A FIXTURE TIMESTAMP MUST BE RELATIVE TO NOW — 2026-08-25
 
@@ -1011,7 +1078,7 @@ a `[^;]+` grab truncates the table mid-string — the generated module then fail
 to parse, which reads as a missing constant rather than as a harness bug. Copy
 that version, not the older one, for any table holding prose.
 
-**`node iv-capture.fixture.mjs` is an eleventh script and is deliberately NOT in
+**`node iv-capture.fixture.mjs` is a nineteenth script and is deliberately NOT in
 that total**, because it tests `iv-capture.mjs` — an operational capture tool —
 rather than anything in `worker.js`, and the 592 has always meant "comparisons
 against the Worker". It contributes **15** of its own. It exists because
@@ -1156,12 +1223,199 @@ without ever opening that file.
   is a PT-date compare, so a 7am stamp would make the 1:15pm firing skip and
   replace the day's post-close ranking with one priced off opening spreads. Its
   own stamp is `morningrows:last`, outside any scanned prefix
+- **`printtape:` NEVER COMPARES AN ACTUAL AGAINST A CONSENSUS FROM A DIFFERENT
+  QUARTER.** The two must carry the same period-end date, by string equality, or the
+  half that cannot be matched is `{status:'not-published'}`. Yahoo publishes the
+  consensus for the reporting quarter *before* it publishes that quarter's actual,
+  so the newest of each are routinely a quarter apart — pairing them prints a
+  confident surprise percentage for a comparison nobody made
+- **`printtape:` `divergent` is THREE-VALUED and `null` is a REFUSAL, not a "no".**
+  An unknown session, an unpublished actual or a missing consensus means the question
+  could not be asked; `refusalReason` always says which. `divergent === true` is the
+  ONLY thing that may reach the Claude guidance call, by strict equality
+- **The print-tape verdict is re-run AFTER `mergePrintTapeRecord`.** One pass cannot
+  see both halves — that is why there are two — so a verdict decided pre-merge
+  outlives its own cause and makes guidance unreachable for exactly those names
+- `printtapeday:{ET-DATE}` is written on **every** pass, a zero-eligible one included:
+  it is this job's only dispatch evidence, and it sits outside the `printtape:` prefix
 - `longarch:{TICKER}:{PT-DATE}:{SLOT}` is written by the **cron sweeps only**,
   never by an on-demand `/api/long/:ticker` refresh — a fixed-clock write is a
   daily series, an on-demand one is a record of what someone opened. The SLOT
   names when the snapshot was taken; the row's own `ts` names when its data was
   computed, and a reused row legitimately disagrees with its slot. Served
   verbatim by `?date=&slot=`, never recomputed, and it only runs forward
+
+### `printtape:` — print vs tape, the earnings-divergence record
+
+**One record per watchlist name per report day, four cron passes, one new read-only
+endpoint, and no change to any existing job.** Added 2026-09-01. It measures the
+PRINT (what was reported against consensus) beside the TAPE (what extended hours did
+with it) and fires on exactly one direction: **a double beat the tape sold.**
+
+| constant | value | what it is |
+|---|---|---|
+| `PRINTTAPE_SCHEMA` | 1 | record shape, **strict equality** |
+| `PRINTTAPE_TTL` | **7d** | retention for both the record and the day index — the `TOP3_TTL` / `LONG_ROW_TTL` figure, outliving the weekend and holiday gaps a trading-day writer creates |
+| `PRINTTAPE_DIVERGENCE_PCT` | **-3.0** | the tape gate, read as `changePct <= -3.0` |
+| `PRINTTAPE_QUOTE_CHUNK` | 20 | symbols per v7 quote request, the `yahooSparkCloses` ceiling |
+| `PRINTTAPE_SWEEP_CAP` | 60 | the `sweepUniverse` default |
+| `PRINTTAPE_PASSES` | 05:30 · 06:15 · 13:30 · 14:30 PT | two BMO, two AMC; each a 15-min window admitting exactly one firing |
+| `PRINTTAPE_GUIDANCE_CLASSES` | `raised` `held` `cut` `not-found` | the only values the guidance field may take |
+
+#### THE MEASUREMENT THE WHOLE FEATURE IS BUILT AROUND — 2026-09-01
+
+Probed live at **20:42 UTC, 42 minutes after PANW, DELL and MDB all reported AMC**:
+
+```
+earningsTrend 0q           endDate 2026-07-31   <- the quarter reported TODAY, consensus PRESENT
+calendarEvents averages    same figures, same quarter
+earningsHistory[-1]        quarter 2026-04-30   <- the PREVIOUS quarter
+earnings.earningsChart[-1] periodEnd 2026-04-30, reportedDate 2026-06-02
+```
+
+**The consensus for today's quarter is published and the actuals are not.** Yahoo's
+actuals lag by days — NVDA reported 2026-08-26 and six days later `earningsChart`
+carried the quarter while `financialsChart` still had no revenue for it.
+
+Taking `earningsHistory[-1]` as "the actual" compares **EPS 0.85 for the quarter
+ending 2026-04-30 against the 0.97745 consensus for the quarter ending 2026-07-31**
+and prints PANW at a confident **13.04% MISS that never happened** — arithmetically
+correct, completely fabricated, and indistinguishable on screen from a real one. The
+divergence flag downstream of it would have looked entirely ordinary.
+
+**SO: AN ACTUAL AND A CONSENSUS ARE COMPARED ONLY WITHIN ONE QUARTER, by string
+equality on the period-end date.** No fallback, no nearest match, no inference. A
+mismatch is `{status:'not-published'}` naming the quarter it actually found.
+`printtape.check.mjs` §5f removes that gate from a copy of the function and prints
+the -13.04% appearing, because a check that cannot fail proves nothing.
+
+#### AND THE CONSENSUS EXPIRES — which is why there are TWO passes a session
+
+Once Yahoo ingests the actual, `earningsTrend.0q` **rolls forward** and the reported
+quarter's consensus is gone. EPS consensus survives on the `earningsChart` entry;
+**revenue consensus survives nowhere.** So the two passes read *different halves*:
+pass 1 banks the consensus, pass 2 catches the actual, and `mergePrintTapeRecord`
+carries banked fields forward **field by field and only within one quarter**.
+
+The roll is detected by arithmetic, not guessed: a company reports a quarter that has
+already ended, so `0q.endDate <= reportDate` means `0q` still names it and
+`> reportDate` means it has rolled. Verified in both states on the same day.
+
+**THE VERDICT IS RE-RUN AFTER THE MERGE.** This was a defect found by writing the
+check: the verdict was decided in `printTapeMeasure` from what one pass could read, so
+a record whose merged print reported `revSurprisePct 3.77` still carried
+`divergent: null, "1 is absent: revEst"` — a refusal that had outlived its own cause,
+and one that also made `guidance` unreachable for exactly the names two passes exist
+for.
+
+#### THE RECORD
+
+`print` · `tape` · `implied` · `divergent` · `guidance` · `baseRate`, each either a
+measurement carrying `source` + `asOf` or a refusal carrying `status` + `reason`.
+
+- **`divergent` is `true` / `false` / `null`, and `null` is a REFUSAL.** All five
+  inputs must be present. An unknown session, an unpublished actual or a missing
+  consensus means the question could not be asked, and `false` would claim it was.
+- **`tape` change% references two DIFFERENT closes** and both are "vs the regular
+  close": post is against `regularMarketPrice` (today's), pre against
+  `regularMarketPreviousClose` (yesterday's). Verified against Yahoo's own
+  `postMarketChange` / `preMarketChange`. A quote stamped earlier than `earningsTs`
+  is **refused** — it is a previous session's and would render as this print's
+  reaction.
+- **EXTENDED-HOURS VOLUME IS OMITTED WITH THE REASON SHIPPED, and costs zero
+  fetches.** No Yahoo field carries it: `quoteSummary.price` and `v7/finance/quote`
+  both have only `regularMarketVolume` plus the two averages. The v8 1m
+  `includePrePost` feed cannot be summed honestly — measured over PANW/DELL/MDB/
+  NVDA/AVGO, **pre-market read 0 on every bar for 5 of 5 names** (111–330 bars each,
+  despite real price movement), and **4 of 5 carried their whole post-window figure
+  on the single 20:00:00Z boundary bar** at 8.7% / 9.6% / 12.6% of that day's regular
+  volume — the closing-auction share, on a day NVDA was not even reporting — while
+  DELL instead put 10,610,858 on one 20:03 bar. `regular + post` reconciles to
+  `regularMarketVolume` for no name. This is the income sleeve's tax-character
+  precedent: omitted with the reason, never nulled and never estimated.
+- **`implied` is the `long:` row's front-expiry `expectedMove`, and is NOT an
+  earnings-isolated move.** It spans every session to that expiry. The `basis` field
+  says so in words and `straddlesReport` says whether the expiry is even past the
+  print — calling it "the implied earnings move" would be the HV30-labelled-as-IV
+  failure.
+- **`guidance` fires ONLY on `divergent === true`**, once per ticker per report
+  (banked on the record and carried forward, so it is structural rather than a rule
+  to remember). Its input is `gatherEarningsFacts`' news window — **there is no 8-K
+  or press-release feed wired to this Worker** and none is invented; `source` names
+  what was read and `not-found` is the honest answer when it said nothing about
+  guidance. It debits the same `AI_RATE_GLOBAL_DAY` bucket via `cronMaySpend`, which
+  **REFUSES on a KV failure** where `aiGuard` proceeds — `aiGuard` has already checked
+  a secret and is serving a user, a cron has no second control at all.
+- **`baseRate` is `{status:'not-measured'}`.** Scoring beat-and-fade outcomes needs a
+  logged history these records only start accumulating now.
+
+#### THE PASSES, AND THE CRON WINDOW THAT HAD TO WIDEN
+
+Dispatched **outside the branch chain**, on `printTapePassAt(h, m)` ahead of the
+`if/else`: three of the four windows fall inside branches the chain already owns
+(06:15 in `morning-briefing`, 13:30 in the EOD branch), so a branch arm would
+silently never fire on two of them. The pass is named in the `[cron]` line.
+
+**RULE #2 CHECK, WHICH CAUGHT A REAL PROBLEM.** 05:30 PT is **12:30 UTC under PDT**
+and 13:30 under PST. The trigger's range was `13-22`, which covered the PST reading
+and not the PDT one — the BMO first pass **would have silently not run for the summer
+half of the year**, the 13F failure exactly. The range is widened to **`12-22`**.
+That is a change to *how often we wake up* and nothing else; no day, date or month
+goes into the expression. `longarch.check.mjs` §6e now READS the range from
+`wrangler.toml` and re-derives every scheduled PT hour against it in both regimes,
+rather than pinning the literal expression — pinning the literal made this legitimate
+widening read as a regression.
+
+| PT | UTC under PDT | UTC under PST |
+|---|---|---|
+| 05:30 | **12:30** — needed the widening | 13:30 |
+| 06:15 | 13:15 | 14:15 |
+| 13:30 | 20:30 | 21:30 |
+| 14:30 | 21:30 | 22:30 |
+
+An `unknown`-session name is measured on the **AMC** passes, not dropped: by 13:30 PT
+the bell has rung, so a report filed that day has landed whatever session it was
+filed in. Its record carries `divergent: null` with the unknown-session refusal.
+
+#### COST, MEASURED
+
+`capCost = ceil(N/20) + 4E + 4`, N the watchlist and E the names reporting that day —
+`ceil(N/20)` batched v7 quotes for eligibility plus one quoteSummary per eligible
+name; 1 watchlist + 1 crumb + 1 day-index read + 1 day-index write, plus 3 bindings
+per eligible name.
+
+| run | measured |
+|---|---|
+| N=6, E=3, cold crumb | ext 4 · bind 13 · **capCost 17** |
+| N=1, E=1, warm crumb | ext 1 · bind 6 · **capCost 7** |
+| N=6, E=0 | ext 1 · bind 4 · **capCost 5** |
+
+which is the formula exactly. At the live **N=40 with E=3 that derives to ~18**;
+E=10 is 46. **A day nobody reports costs 6**, which is what makes four passes a day
+unremarkable. Zero Claude calls unless a name is divergent.
+
+**THE 05:30 AND 14:30 PASSES RUN ALONE, so their `_instr` IS a measurement.** 06:15
+shares with `morning-briefing` and 13:30 with the four-job EOD branch, where it is an
+upper bound (rule #1).
+
+#### THE ENDPOINT
+
+```
+GET /api/printtape?date=YYYY-MM-DD      default: ET today
+```
+
+KV assembly only — **zero fetches, zero writes, nothing recomputed**. Gated with
+**`requireSecret`, not `aiGuard`**: both check the same `x-dash-key`, but only
+`aiGuard` debits `AI_RATE_GLOBAL_DAY`, and charging a ceiling denominated in Claude
+calls for a request that makes none would let a page poll exhaust the budget the
+crons need.
+
+`meta.ran` distinguishes **an absent day index from an empty one**: `records: []` with
+`ran: true` means the job ran and nobody on the watchlist reported; `ran: false` means
+it did not run, or the day is past `PRINTTAPE_TTL`. A ticker skipped on one pass and
+measured on a later one is **not** reported as skipped.
+
+Checked by `node printtape.check.mjs` (272 comparisons).
 
 ### `GET /api/income/*` — the income sleeve
 

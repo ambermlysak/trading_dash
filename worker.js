@@ -9757,7 +9757,7 @@ async function archiveSweptRows(env, swept, todayPt, slot) {
    WHY 7:00am PT. That is 10:00am ET, thirty minutes after the open: the earliest
    firing of this cron that reads TODAY'S chain rather than yesterday's, and late
    enough that the opening auction's spreads have settled somewhat. It is inside
-   the trigger's 13-22 UTC window in BOTH DST regimes (14:00 UTC under PDT, 15:00
+   the trigger's UTC window in BOTH DST regimes (14:00 UTC under PDT, 15:00
    UTC under PST), which rule #2 requires be checked before any new Pacific hour
    is scheduled.
 
@@ -9841,6 +9841,1076 @@ async function collectMorningRows(env) {
       + `that DID compute are banked; ${MORNING_ROWS_KEY} was NOT stamped, so the 7:15 firing retries and `
       + 'costs only the names that failed — the rest are inside LONG_FRESH_MS and get reused.');
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PRINT vs TAPE  —  `printtape:{TICKER}:{ET-REPORT-DATE}`
+   ═══════════════════════════════════════════════════════════════════════════
+
+   One record per watchlist name per report day, measuring the PRINT (what the
+   company reported against consensus) beside the TAPE (what extended hours did
+   with it). It fires on exactly ONE direction: a double beat that the tape sold.
+
+   ── THE MEASUREMENT THAT DEFINES THIS FILE, 2026-09-01 ──────────────────────
+
+   Probed live at 20:42 UTC (16:42 ET) — 42 minutes after the close on a day
+   PANW, DELL and MDB all reported AMC — against the raw Yahoo v10 modules:
+
+     earningsTrend `0q`           endDate 2026-07-31   <- THE QUARTER REPORTED TODAY
+     calendarEvents.earningsAverage / revenueAverage   <- same figures, same quarter
+     earningsHistory.history[-1]   quarter 2026-04-30  <- THE PREVIOUS QUARTER
+     earnings.earningsChart[-1]    periodEnd 2026-04-30, reportedDate 2026-05-28
+
+   So 42 minutes after the print: **the CONSENSUS for today's quarter is
+   published and the ACTUALS are not.** Yahoo's actuals lag by days — NVDA
+   reported 2026-08-26 and six days later `earningsChart` carried the quarter
+   while `financialsChart` still had no revenue for it.
+
+   TAKING `earningsHistory[-1]` AS "the actual" WOULD HAVE COMPARED THE QUARTER
+   ENDING 2026-04-30 AGAINST THE CONSENSUS FOR THE QUARTER ENDING 2026-07-31 and
+   printed PANW at EPS 0.85 vs 0.97745 — a confident 13% MISS that never
+   happened, arithmetically correct and completely fabricated. Every number
+   downstream of it, the divergence flag included, would have looked ordinary.
+
+   HENCE THE ONE RULE THIS WHOLE BLOCK IS BUILT AROUND: an actual and a consensus
+   may only be compared when they carry the SAME quarter period-end date, checked
+   by string equality. There is no fallback, no nearest-match and no inference —
+   a mismatch is `not-published` with the quarter it actually found named in the
+   reason.
+
+   ── AND THE CONSENSUS EXPIRES, WHICH IS WHY THERE ARE TWO PASSES ────────────
+
+   Once Yahoo ingests the actual, `earningsTrend.0q` ROLLS FORWARD to the next
+   quarter and the reported quarter's consensus is gone from every module. EPS
+   consensus survives on the `earningsChart` entry itself (`estimate`), but
+   REVENUE consensus survives NOWHERE. Measured on NVDA (rolled: 0q endDate
+   2026-10-31 against a reported quarter ending 2026-07-31).
+
+   So the two passes are not a retry of the same reading — they read DIFFERENT
+   halves. Pass 1 (30 min after the print) reliably banks the consensus; pass 2
+   may catch the actual. `mergePrintTapeRecord` carries banked fields forward
+   FIELD BY FIELD, and only when the two records agree on the quarter — merging
+   across a quarter boundary would recreate the exact bug above.
+
+   THE ROLL IS DETECTED BY ARITHMETIC, NOT BY GUESSING: a company reports a
+   quarter that has already ended, so `0q.endDate <= reportDate` means `0q` still
+   names the reported quarter and `0q.endDate > reportDate` means it has rolled.
+   Verified in both states on the same day — PANW/DELL/MDB 2026-07-31 <=
+   2026-09-01 (not rolled), NVDA 2026-10-31 > 2026-09-01 (rolled).
+
+   ── PROVENANCE ──────────────────────────────────────────────────────────────
+
+   Every block is either a measurement carrying `source` + `asOf`, or a refusal
+   carrying `status` + `reason`. Nothing is null without a reason beside it, and
+   nothing is defaulted. `divergent` is `true` / `false` / `null`, where `null`
+   is a REFUSAL and never a "no" — an unknown session or a missing consensus
+   cannot answer the question, and answering `false` would claim it did.        */
+
+const PRINTTAPE_SCHEMA = 1;
+
+/* 7d, the same figure and the same reasoning as `TOP3_TTL` and `LONG_ROW_TTL`:
+   retention has to outlive the weekend and holiday gaps the writer's own
+   trading-day schedule creates, so a Thursday report is still readable on the
+   Tuesday after a Friday+Monday closure (~115h). The record's own `reportDate`
+   and `ts` are what date it — eviction is not the honesty mechanism. */
+const PRINTTAPE_TTL = 7 * 24 * 3600;
+
+/* The ONE direction this fires on: a double beat the tape sold. Read as a
+   PERCENT and compared as `changePct <= PRINTTAPE_DIVERGENCE_PCT`, so -3.0 means
+   "down 3% or more". */
+const PRINTTAPE_DIVERGENCE_PCT = -3.0;
+
+/* v7 `/finance/quote` takes 20 symbols per request, the same ceiling
+   `yahooSparkCloses` works to. At the live 40-name watchlist the whole
+   eligibility scan is TWO fetches; quote the formula, never the 2. */
+const PRINTTAPE_QUOTE_CHUNK = 20;
+const PRINTTAPE_SWEEP_CAP   = 60;   // same ceiling `sweepUniverse` defaults to
+
+/* Answer tokens for the guidance classification. Small on purpose: it returns
+   one enum and one quoted sentence, nothing else. */
+const PRINTTAPE_GUIDANCE_TOKENS = 350;
+const PRINTTAPE_GUIDANCE_CLASSES = ['raised', 'held', 'cut', 'not-found'];
+
+const printTapeKey    = (sym, date) => `printtape:${String(sym).toUpperCase()}:${date}`;
+
+/* THE DAY INDEX, and it is deliberately NOT inside the `printtape:` prefix.
+   `printtapeday:` and `printtape:` are disjoint string prefixes — at index 9
+   one has `d` and the other `:` — so a `list({prefix:'printtape:'})` can never
+   read the index as a ticker called `DAY`. Same rule as `ivsweep:last` sitting
+   outside `iv:`, `incomerow:` not being `income:`, and `longarch:` not being
+   `long:`.
+
+   IT IS ALSO THIS JOB'S DISPATCH EVIDENCE (rule #7), which is why it is written
+   on EVERY pass including one that finds nothing. A day on which no watchlist
+   name reported writes a record saying so, with the pass clock on it. "Zero
+   eligible" is then falsifiable; silence is not — and this job would otherwise
+   be invisible on the ~95% of days when nobody reports. It replaces the
+   `:last`-style dedup stamp the sibling sweeps carry rather than adding to it:
+   the skip decision here is PER TICKER and reads the ticker's own record, so a
+   day-level stamp would have nothing to say. */
+const printTapeDayKey = date => `printtapeday:${date}`;
+
+/* THE FOUR PASSES, as PT wall-clock windows.
+
+   Each window is 15 minutes wide and the trigger fires every 15 minutes, so each
+   admits EXACTLY ONE firing — there is no in-pass double-run to dedup. Two
+   passes a session because Yahoo's actuals lag the print (see the measurement
+   above); the second is what catches a late fill, and it skips any ticker whose
+   record is already complete.
+
+   RULE #2 — EVERY PT HOUR HERE CHECKED IN BOTH DST REGIMES BEFORE SCHEDULING:
+
+     PT       UTC under PDT (UTC-7)   UTC under PST (UTC-8)
+     05:30 -> 12:30  <- needs hour 12  13:30  ok
+     06:15 -> 13:15  ok                14:15  ok
+     13:30 -> 20:30  ok                21:30  ok
+     14:30 -> 21:30  ok                22:30  ok  (hour 22 spans 22:00-22:59)
+
+   05:30 PT is 12:30 UTC under PDT, which the trigger's old UTC hour range of
+   13-22 did NOT cover — the BMO first pass would have silently not run for the
+   summer half of the year, which is the 13F failure exactly. The range is
+   therefore widened to 12-22 in `wrangler.toml`. That is a change to how often
+   we wake up and to nothing else: no day, no date, no month goes into the
+   expression, and every one of these four decisions is made below in code. */
+const PRINTTAPE_PASSES = [
+  { session: 'bmo', pass: 1, h: 5,  m0: 30, m1: 45 },
+  { session: 'bmo', pass: 2, h: 6,  m0: 15, m1: 30 },
+  { session: 'amc', pass: 1, h: 13, m0: 30, m1: 45 },
+  { session: 'amc', pass: 2, h: 14, m0: 30, m1: 45 },
+];
+
+/** Which pass, if any, this PT wall-clock instant is. */
+function printTapePassAt(h, m) {
+  return PRINTTAPE_PASSES.find(p => p.h === h && m >= p.m0 && m < p.m1) || null;
+}
+
+/* ── THE REPORT DATE IS THE UTC CALENDAR DATE OF `earningsTs` ────────────────
+
+   Not an ET conversion of it, and the difference is one whole day on exactly the
+   shape that breaks: Yahoo's DATE-ONLY placeholder is midnight UTC, which read
+   as ET is 19:00/20:00 on the PREVIOUS day. `earningsTimingFrom` already rejects
+   that instant as a session (`utcSec === 0` -> `unknown`), but the row still has
+   to be FILED under the day the source meant, or it lands under yesterday and
+   nothing ever looks for it there.
+
+   For every value that is not a placeholder the two readings agree, because both
+   of Yahoo's fixed session anchors sit inside the ET day they name: 12:30Z is
+   08:30/07:30 ET and 20:00Z is 16:00/15:00 ET. Measured over all 40 watchlist
+   names 2026-09-01: 0 placeholders, 0 disagreements. */
+const printTapeReportDate = tsIso => (typeof tsIso === 'string' ? tsIso.slice(0, 10) : null);
+
+const ptNum = v => (v && typeof v === 'object' && 'raw' in v) ? v.raw : (typeof v === 'number' ? v : null);
+
+/** Surprise percent, guarded BEFORE the arithmetic.
+ *
+ *  `x == null` and `x === 0` must never render the same way — a null divided
+ *  into a percentage is the fabricated-measurement failure this repo has already
+ *  shipped twice (the `hitRate` legend, `gapBar()`). A zero consensus is also
+ *  refused rather than dividing by it. */
+function printTapeSurprise(actual, est) {
+  if (!Number.isFinite(actual) || !Number.isFinite(est) || est === 0) return null;
+  return +(((actual - est) / Math.abs(est)) * 100).toFixed(2);
+}
+
+/* ── THE PRINT ──────────────────────────────────────────────────────────────
+
+   Builds the print block from ONE `quoteSummary` response. Returns either a
+   measurement or `{status, reason}`; inside a measurement, the EPS half and the
+   revenue half refuse INDEPENDENTLY, because Yahoo publishes them at different
+   times — measured 2026-09-01, NVDA had EPS for the quarter it reported six days
+   earlier and still no revenue for it.
+
+   @param r          the quoteSummary result object
+   @param reportDate ET report date, `YYYY-MM-DD`                                */
+function printTapePrintFrom(r, reportDate) {
+  const trend = r?.earningsTrend?.trend || [];
+  const t0    = trend.find(t => t.period === '0q') || null;
+  const cal   = r?.calendarEvents?.earnings || {};
+
+  const consQuarter = typeof t0?.endDate === 'string' ? t0.endDate : null;
+  /* THE ROLL TEST. A company reports a quarter that has already ended, so a `0q`
+     whose period-end is on or before the report date still names the quarter
+     being reported; one that is AFTER the report date has rolled forward to the
+     next quarter and its figures belong to a report that has not happened. */
+  const consRolled = consQuarter != null && consQuarter > reportDate;
+  const consUsable = consQuarter != null && !consRolled;
+
+  const ec        = r?.earnings?.earningsChart?.quarterly || [];
+  const ecLast    = ec.length ? ec[ec.length - 1] : null;
+  const actQuarter = ecLast?.periodEndDate?.fmt ?? null;
+  const actReported = ecLast?.reportedDate?.fmt ?? null;
+
+  /* WHICH QUARTER DOES THIS REPORT COVER? The consensus names it while it is
+     still current; once that has rolled, only an actual whose own reportedDate
+     IS this report date can name it. Anything else and we do not know, which is
+     a refusal rather than a guess. */
+  let quarter = null, quarterVia = null;
+  if (consUsable) { quarter = consQuarter; quarterVia = 'earningsTrend.0q.endDate (consensus still current)'; }
+  else if (actQuarter && actReported === reportDate) {
+    quarter = actQuarter; quarterVia = 'earnings.earningsChart.quarterly[-1].periodEndDate (consensus has rolled forward)';
+  }
+
+  if (!quarter) {
+    return { status: 'not-published',
+      reason: 'could not establish which quarter this report covers: '
+        + `earningsTrend 0q endDate ${consQuarter ?? '(absent)'}`
+        + (consRolled ? ` has ROLLED PAST the report date ${reportDate}` : '')
+        + `, and the newest quarter in earnings.earningsChart is ${actQuarter ?? '(absent)'} reported `
+        + `${actReported ?? '(absent)'}, which is not this report. No actual is compared against a `
+        + 'consensus from a different quarter.' };
+  }
+
+  /* THE ALIGNMENT GATE. String equality on the period-end date, no tolerance. */
+  const actAligned = actQuarter != null && actQuarter === quarter;
+
+  // ── EPS ──
+  let epsActual = null, epsEst = null, epsEstVia = null, eps = null;
+  if (actAligned) epsActual = ptNum(ecLast.actual);
+  if (consUsable) { epsEst = ptNum(t0?.earningsEstimate?.avg); epsEstVia = 'earningsTrend.0q.earningsEstimate.avg'; }
+  else if (actAligned) { epsEst = ptNum(ecLast.estimate); epsEstVia = 'earnings.earningsChart.quarterly[-1].estimate (survives the roll on the entry)'; }
+  if (epsActual == null) {
+    eps = { status: 'not-published',
+      reason: actQuarter
+        ? `Yahoo's newest published quarter is ${actQuarter} (reported ${actReported ?? 'unknown'}), not the `
+          + `${quarter} quarter this report covers — the actual has not been ingested yet. Measured 2026-09-01: `
+          + 'actuals lagged the print by more than 42 minutes on all three names reporting that day.'
+        : 'earnings.earningsChart.quarterly carries no entries' };
+  }
+
+  // ── REVENUE ──
+  const fc = r?.earnings?.financialsChart?.quarterly || [];
+  const fcMatch = actAligned && ecLast?.date ? fc.find(q => q.date === ecLast.date) : null;
+  let revActual = fcMatch ? ptNum(fcMatch.revenue) : null;
+  let revEst = null, revEstVia = null, rev = null;
+  if (consUsable) { revEst = ptNum(t0?.revenueEstimate?.avg); revEstVia = 'earningsTrend.0q.revenueEstimate.avg'; }
+  if (revActual == null || revEst == null) {
+    rev = { status: 'not-published', reason: [
+      revActual == null
+        ? (actAligned
+            ? `earnings.financialsChart.quarterly carries no entry for ${ecLast?.date ?? quarter} — revenue lags `
+              + 'the EPS actual (measured: NVDA reported 2026-08-26 and had no revenue for that quarter six days later)'
+            : 'revenue actual belongs to a quarter Yahoo has not published yet')
+        : null,
+      revEst == null
+        ? (consRolled
+            ? `revenue consensus for ${quarter} is no longer published anywhere: earningsTrend 0q has rolled to `
+              + `${consQuarter} and NO module retains a prior quarter's revenue estimate. It can only be banked `
+              + 'before the roll, which is what the first pass exists for.'
+            : 'earningsTrend 0q carries no revenueEstimate.avg')
+        : null,
+    ].filter(Boolean).join(' · ') };
+    // A refused half publishes no number, not a partial one.
+    if (revActual == null || revEst == null) { /* keep whichever side exists for the carry-forward merge */ }
+  }
+
+  const epsSurprisePct = printTapeSurprise(epsActual, epsEst);
+  const revSurprisePct = printTapeSurprise(revActual, revEst);
+
+  /* Yahoo publishes its own EPS surprise on the entry. Recomputing it and saying
+     whether the two agree is a cross-check against a DIFFERENT derivation, which
+     is what the verification standard asks for — not a second copy of our own
+     arithmetic. Yahoo's figure is only comparable when the entry is the aligned
+     one. */
+  const yahooSurprise = actAligned && ecLast?.surprisePct != null ? Number(ecLast.surprisePct) : null;
+
+  return {
+    quarter,
+    quarterLabel: actAligned ? (ecLast?.date ?? null) : null,
+    quarterVia,
+    epsActual, epsEst, epsSurprisePct,
+    revActual, revEst, revSurprisePct,
+    ...(eps ? { eps } : {}),
+    ...(rev ? { revenue: rev } : {}),
+    epsEstVia, revEstVia,
+    epsSurpriseYahoo: yahooSurprise,
+    epsSurpriseAgrees: (epsSurprisePct != null && yahooSurprise != null)
+      ? Math.abs(epsSurprisePct - yahooSurprise) < 0.15 : null,
+    /* Both consensus figures are published twice by Yahoo, in earningsTrend and
+       again in calendarEvents. Recording whether they agree costs nothing and
+       makes a one-sided change visible instead of silent. */
+    consensusCrosscheck: consUsable ? {
+      calendarEps: ptNum(cal.earningsAverage),
+      calendarRev: ptNum(cal.revenueAverage),
+      agrees: ptNum(cal.earningsAverage) === epsEst && ptNum(cal.revenueAverage) === revEst,
+    } : null,
+    reportedDate: actReported,
+    source: 'Yahoo quoteSummary — earningsTrend(0q) consensus · earnings.earningsChart actual EPS · '
+      + 'earnings.financialsChart actual revenue · calendarEvents cross-check',
+    asOf: new Date().toISOString(),
+  };
+}
+
+/* ── THE TAPE ───────────────────────────────────────────────────────────────
+
+   Extended-hours price and change, from the `price` module of the SAME
+   quoteSummary response the print came from — zero added subrequests, the same
+   pattern the Swing column and the earnings-session fields already use.
+
+   THE TWO WINDOWS REFERENCE DIFFERENT CLOSES AND BOTH ARE "vs the regular
+   close", which is the easiest thing here to get backwards. Verified against the
+   live payload 2026-09-01:
+
+     post: postMarketPrice - regularMarketPrice          (TODAY's close)
+           NVDA 217.47 - 217.44 = 0.03 = postMarketChange              ok
+     pre : preMarketPrice  - regularMarketPreviousClose  (YESTERDAY's close)
+           NVDA 216.77 - 220.50 = -3.73 = preMarketChange              ok
+
+   STALENESS IS A REAL FAILURE HERE, not a nicety: a `postMarketTime` earlier
+   than the print is yesterday's extended session, and it would render as this
+   report's reaction. Refused with the two timestamps named.                     */
+function printTapeTapeFrom(price, session, earningsTsIso) {
+  const p = price || {};
+  const window = session === 'bmo' ? 'pre' : session === 'amc' ? 'post' : null;
+  if (!window) {
+    return { status: 'unavailable',
+      reason: `session is '${session}', so neither the pre-market nor the post-market window can be `
+        + 'identified as the one that traded this print' };
+  }
+
+  const priceRaw = ptNum(window === 'pre' ? p.preMarketPrice : p.postMarketPrice);
+  const chgPct   = ptNum(window === 'pre' ? p.preMarketChangePercent : p.postMarketChangePercent);
+  const quoteSec = ptNum(window === 'pre' ? p.preMarketTime : p.postMarketTime);
+  const refClose = ptNum(window === 'pre' ? p.regularMarketPreviousClose : p.regularMarketPrice);
+
+  if (priceRaw == null || chgPct == null || quoteSec == null) {
+    return { status: 'unavailable',
+      reason: `Yahoo published no complete ${window}-market quote on the price module — `
+        + `${window}MarketPrice ${priceRaw ?? 'absent'}, ${window}MarketChangePercent `
+        + `${chgPct ?? 'absent'}, ${window}MarketTime ${quoteSec ?? 'absent'}` };
+  }
+
+  const quoteTime = new Date(quoteSec * 1000).toISOString();
+  if (earningsTsIso && quoteTime < earningsTsIso) {
+    return { status: 'unavailable',
+      reason: `the newest ${window}-market quote is stamped ${quoteTime}, which is EARLIER than the report `
+        + `instant ${earningsTsIso} — it belongs to a session before this print and would render as its `
+        + 'reaction' };
+  }
+
+  return {
+    window,
+    price: priceRaw,
+    /* Yahoo carries the change as a DECIMAL FRACTION here (NVDA post 0.00013796
+       for +0.01%), the same units trap as `impliedVolatility`. Carried through
+       this record as PERCENT. */
+    changePct: +(chgPct * 100).toFixed(4),
+    referenceClose: refClose,
+    referenceCloseField: window === 'pre' ? 'regularMarketPreviousClose' : 'regularMarketPrice',
+    /* ── VOLUME IS REFUSED UNCONDITIONALLY, AND THE REFUSAL IS THE MEASUREMENT ──
+
+       Yahoo publishes NO extended-hours volume field. Probed 2026-09-01 across
+       both candidate sources: `quoteSummary.price` carries regularMarketVolume,
+       averageDailyVolume10Day and averageDailyVolume3Month and NO
+       postMarketVolume or preMarketVolume; `v7/finance/quote` carries the same
+       three and none either.
+
+       The one remaining source is the v8 1m chart with `includePrePost=true`,
+       and summing it would ship a fabricated number. Measured over PANW, DELL,
+       MDB, NVDA and AVGO on 2026-09-01:
+
+         PRE  — 0 volume on EVERY bar for 5 of 5 names (111-330 bars each),
+                despite real pre-market price movement (PANW 382.55 -> 373.70).
+         POST — 4 of 5 names carried their ENTIRE post-window volume on the
+                single 20:00:00Z boundary bar with every later minute at 0, at
+                8.7% / 9.6% / 12.6% of that day's regular volume — the closing
+                auction's share, and NVDA was not even reporting. DELL instead
+                carried 10,610,858 on a single 20:03 bar.
+
+       So the feed publishes sparse consolidated prints, one of which sits on the
+       session boundary, and nothing in it separates a closing auction from real
+       post-market volume: `regular + post` reconciles to `regularMarketVolume`
+       for no name (PANW 7,547,557 vs 8,228,416; DELL 20,524,736 vs 12,815,592).
+       A summed figure would look entirely ordinary and mean nothing.
+
+       This follows the income sleeve's tax-character precedent: OMITTED with the
+       reason shipped, never nulled and never estimated, so a consumer reaching
+       for the value finds why rather than a field to fill. It also costs ZERO
+       fetches — there is no point spending a subrequest to refuse. */
+    volume: null,
+    volumeStatus: 'not-published',
+    volumeReason: 'Yahoo publishes no extended-hours volume field on quoteSummary.price or v7/finance/quote, '
+      + 'and the v8 1m includePrePost feed cannot be distinguished from the closing auction — measured '
+      + '2026-09-01: pre-market volume 0 on every bar for 5 of 5 names, and 4 of 5 carried the whole '
+      + 'post-window figure on the single session-boundary bar at closing-auction share. Not summed, '
+      + 'because a summed figure here is indistinguishable from a fabricated one.',
+    quoteTime,
+    marketState: p.marketState ?? null,
+    source: 'Yahoo quoteSummary price module (extended-hours quote)',
+  };
+}
+
+/* ── THE IMPLIED MOVE ───────────────────────────────────────────────────────
+
+   Read from the `long:{TICKER}` row the Long lanes already compute — one KV
+   read, zero fetches, and nothing recomputed.
+
+   IT IS NOT AN EARNINGS-ISOLATED MOVE AND MUST NEVER BE LABELLED AS ONE. The
+   row's `expectedMove` is the front-expiry ATM-IV move over that expiry's whole
+   DTE: `atmIv/100 * sqrt(dte/365)`. It contains the earnings event only if the
+   front expiry falls after the report, and it contains every other session
+   between now and that expiry regardless. Calling it "the implied earnings move"
+   would be the HV30-labelled-as-IV failure again — a real number under a name
+   that belongs to a different quantity. So the expiry and DTE ride along, a
+   `basis` field says what it is in words, and `straddlesReport` says whether the
+   expiry is even on the far side of the print. */
+function printTapeImpliedFrom(row, reportDate) {
+  if (!row) {
+    return { status: 'not-computed',
+      reason: `no long:{TICKER} row in KV within LONG_ROW_TTL, or its schema is not LONG_SCHEMA ${LONG_SCHEMA}` };
+  }
+  const em = row.expectedMove;
+  if (!em || !Number.isFinite(em.pct)) {
+    return { status: 'not-computed',
+      reason: `the long row (ts ${row.ts ? new Date(row.ts).toISOString() : 'unknown'}) carries no usable `
+        + 'expectedMove — front-expiry ATM IV was unavailable when it was built' };
+  }
+  return {
+    movePct: em.pct,
+    moveDollars: em.dollars ?? null,
+    expiry: em.expiry ?? null,
+    dte: em.dte ?? null,
+    straddlesReport: em.expiry && reportDate ? em.expiry >= reportDate : null,
+    basis: 'front-expiry ATM implied vol over that expiry (atmIv/100 * sqrt(dte/365)) — NOT an '
+      + 'earnings-isolated move: it spans every session to that expiry, not the report alone',
+    source: `long:${row.symbol} expectedMove (Long-lane computation, unchanged)`,
+    asOf: row.ts ? new Date(row.ts).toISOString() : null,
+  };
+}
+
+/* ── THE DIVERGENCE TEST ────────────────────────────────────────────────────
+
+   ONE DIRECTION ONLY: EPS beat AND revenue beat AND the tape sold it.
+
+   `null` IS A REFUSAL AND IS NOT `false`. All five inputs must be present; a
+   missing consensus, an unpublished actual, an unknown session or an
+   unavailable tape means the question could not be asked, and answering `false`
+   would claim it was asked and came back negative. That distinction is the whole
+   reason this returns three values instead of two. */
+function printTapeDivergence(session, print, tape) {
+  const refuse = reason => ({ divergent: null, refusalReason: reason });
+
+  if (session !== 'bmo' && session !== 'amc') {
+    return refuse(`session is '${session}' — Yahoo published no session anchor for this report, so the `
+      + 'window that traded the print is unknown and the tape reading cannot be attributed to it');
+  }
+  if (print?.status) return refuse(`print unavailable: ${print.reason}`);
+  if (tape?.status)  return refuse(`tape unavailable: ${tape.reason}`);
+
+  const missing = [];
+  if (!Number.isFinite(print.epsActual)) missing.push('epsActual');
+  if (!Number.isFinite(print.epsEst))    missing.push('epsEst');
+  if (!Number.isFinite(print.revActual)) missing.push('revActual');
+  if (!Number.isFinite(print.revEst))    missing.push('revEst');
+  if (!Number.isFinite(tape.changePct))  missing.push('tape.changePct');
+  if (missing.length) {
+    return refuse(`the test needs all five inputs and ${missing.length} ${missing.length === 1 ? 'is' : 'are'} `
+      + `absent: ${missing.join(', ')}`
+      + (print.revenue?.reason ? ` · revenue: ${print.revenue.reason}` : '')
+      + (print.eps?.reason ? ` · eps: ${print.eps.reason}` : ''));
+  }
+
+  const epsBeat = print.epsActual > print.epsEst;
+  const revBeat = print.revActual > print.revEst;
+  const sold    = tape.changePct <= PRINTTAPE_DIVERGENCE_PCT;
+  return {
+    divergent: epsBeat && revBeat && sold,
+    refusalReason: null,
+    test: {
+      epsBeat, revBeat, sold,
+      changePct: tape.changePct,
+      thresholdPct: PRINTTAPE_DIVERGENCE_PCT,
+      note: 'fires only on beat + beat + sold; any other combination is a real `false`, not a refusal',
+    },
+  };
+}
+
+/* ── GUIDANCE, ONLY ON A DIVERGENT NAME ─────────────────────────────────────
+
+   ONE Claude call, and only when `divergent === true`. It is stored on the
+   record and never recomputed, so "at most one call per ticker per report" is
+   structural rather than a rule someone has to remember: the second pass reads
+   the banked `guidance` and carries it forward.
+
+   INPUT, STATED PLAINLY: `gatherEarningsFacts` — the same gather the
+   `/api/earnings` path uses, whose news window is the closest thing this Worker
+   has to a release or 8-K feed. THERE IS NO 8-K SOURCE WIRED HERE and none is
+   invented; `guidance.source` names the window that was actually read, and
+   `class: 'not-found'` is the honest answer when that window carried no guidance
+   language. Without `ALPACA_KEY` the window is Yahoo search, which cannot be
+   queried by date — so coverage is good for a fresh report and thin for an old
+   one, exactly as `newsStatus` already documents for the earnings card.
+
+   The CEILING is the same `AI_RATE_GLOBAL_DAY` bucket every request-path spend
+   counts against — see `cronMaySpend`. */
+const PRINTTAPE_GUIDANCE_SCHEMA = {
+  type: 'object',
+  properties: {
+    class: { type: 'string', enum: PRINTTAPE_GUIDANCE_CLASSES },
+    quote: { type: ['string', 'null'] },
+  },
+  required: ['class', 'quote'],
+  additionalProperties: false,
+};
+
+/** The daily AI ceiling, applied from a cron where there is no `Request`.
+ *
+ *  `aiGuard` cannot be reused: it reads a secret header off a request object and
+ *  a scheduled invocation has none. What matters for the BILL is the global
+ *  day bucket, so this increments the SAME key `aiGuard` does rather than
+ *  keeping a second ceiling that would let the two drift. The per-IP bucket is
+ *  meaningless for a cron and is not touched.
+ *
+ *  A KV failure REFUSES here, which is the opposite of `aiGuard`'s choice and
+ *  deliberately so: `aiGuard` has already checked a secret and is serving a user,
+ *  while this has no second control at all, so an unenforceable ceiling must not
+ *  become an unbounded one. */
+async function cronMaySpend(env, cost, job) {
+  const kv = env?.REC_LOG;
+  if (!kv) return false;
+  const dayKey = `ratelimit:ai:global:${utcDayBucket()}`;
+  try {
+    const dayN = Number(await kv.get(dayKey)) || 0;
+    if (dayN + cost > AI_RATE_GLOBAL_DAY) {
+      console.warn(`[cron] ${job}: global daily AI ceiling reached (${dayN} + ${cost} > ${AI_RATE_GLOBAL_DAY}) `
+        + '— skipping the call, not queueing it');
+      return false;
+    }
+    await kv.put(dayKey, String(dayN + cost), { expirationTtl: 90_000 });
+    return true;
+  } catch (e) {
+    console.warn(`[cron] ${job}: AI ceiling bookkeeping failed (${e.message}) — REFUSING to spend, because a `
+      + 'cron has no second control and an unenforceable ceiling must not become an unbounded one');
+    return false;
+  }
+}
+
+async function printTapeGuidance(sym, env, print) {
+  if (!env?.ANTHROPIC_API_KEY) {
+    return { status: 'not-computed', reason: 'ANTHROPIC_API_KEY is not configured on this Worker' };
+  }
+  if (!await cronMaySpend(env, 1, `print-tape guidance ${sym}`)) {
+    return { status: 'not-computed',
+      reason: `the ${AI_RATE_GLOBAL_DAY}/day global AI ceiling refused this call — the divergence stands, only `
+        + 'the guidance read was skipped' };
+  }
+
+  let facts;
+  try { facts = await gatherEarningsFacts(sym, env); }
+  catch (e) { return { status: 'not-computed', reason: `earnings fact gather failed: ${e.message}` }; }
+
+  const newsBlock = facts.news.length
+    ? facts.news.map(n => `• [${n.date}${n.source ? ' · ' + n.source : ''}] ${n.title}${n.summary ? ` — ${n.summary}` : ''}`).join('\n')
+    : 'NONE AVAILABLE.';
+
+  const prompt = `Classify the FORWARD GUIDANCE ${facts.company} (${sym}) issued with the earnings report dated ${print?.quarter ? 'for the quarter ending ' + print.quarter : 'just released'}.
+
+COVERAGE PUBLISHED AROUND THE REPORT${facts.newsWindow ? ` (window ${facts.newsWindow.from} → ${facts.newsWindow.to}${facts.newsSource ? ', via ' + facts.newsSource : ''})` : ''}:
+${newsBlock}
+
+Return ONLY the classification:
+  class — "raised" if the company raised its forward outlook, "held" if it reaffirmed or left it unchanged, "cut" if it lowered it, "not-found" if the coverage above does not state what the company guided.
+  quote — the single sentence from the coverage above that states the guidance, copied VERBATIM, or null when class is "not-found".
+
+CRITICAL RULES:
+- Decide ONLY from the coverage block above. Do not use anything you recall about this company.
+- "not-found" is the correct and expected answer when the block is empty or says nothing about guidance. Never infer guidance from the earnings numbers, from the share price, or from what a company like this usually does.
+- The quote must appear verbatim in the block above. If no single sentence there states the guidance, return "not-found" with a null quote.`;
+
+  let out;
+  try {
+    const res = await workerClaude(prompt, env, PRINTTAPE_GUIDANCE_TOKENS, PRINTTAPE_GUIDANCE_SCHEMA, { raw: true });
+    /* `claudeText()` cannot tell a complete answer from a truncated one, and a
+       half-sentence stored as a verbatim quote is worse than no quote. */
+    if (res?.stopReason === 'max_tokens') {
+      return { status: 'not-computed', reason: 'the guidance answer hit max_tokens and was truncated — a '
+        + 'cut-off quote would be stored as though it were the whole sentence' };
+    }
+    out = JSON.parse(String(res?.text ?? '').replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim());
+  } catch (e) {
+    return { status: 'not-computed', reason: `guidance classification failed: ${e.message}` };
+  }
+
+  const cls = PRINTTAPE_GUIDANCE_CLASSES.includes(out?.class) ? out.class : null;
+  if (!cls) {
+    return { status: 'not-computed',
+      reason: `the model returned class ${JSON.stringify(out?.class)}, which is not one of `
+        + PRINTTAPE_GUIDANCE_CLASSES.join(' | ') };
+  }
+  const quote = cls === 'not-found' ? null : (typeof out.quote === 'string' && out.quote.trim() ? out.quote.trim() : null);
+  return {
+    class: cls,
+    quote,
+    /* A `raised`/`held`/`cut` with no quote behind it is a claim with nothing
+       supporting it, so the absence is NAMED rather than left as a bare null. */
+    quoteNote: cls !== 'not-found' && !quote
+      ? 'the model classified the guidance but returned no verbatim sentence to support it' : null,
+    source: facts.newsSource
+      ? `${facts.newsSource} · window ${facts.newsWindow?.from} → ${facts.newsWindow?.to} (newsStatus ${facts.newsStatus})`
+      : `no coverage retrieved (newsStatus ${facts.newsStatus}) — there is no 8-K or press-release feed wired to this Worker`,
+    asOf: new Date().toISOString(),
+  };
+}
+
+/* ── THE CROSS-PASS MERGE ───────────────────────────────────────────────────
+
+   "Newest ts wins per key; a later measurement REPLACES, an absence never does."
+
+   That has to be applied FIELD BY FIELD on the print, not block by block, and
+   the reason is the measurement at the top of this file: pass 1 reliably has the
+   consensus and not the actual, pass 2 may have the actual after the consensus
+   has rolled out of the API. Block-level merging would lose exactly one of the
+   two halves every time.
+
+   THE MERGE IS GATED ON THE QUARTER. Carrying a banked consensus onto an actual
+   from a DIFFERENT quarter is the fabricated-miss bug with an extra step, so a
+   quarter mismatch merges nothing and says so. */
+function mergePrintTapeRecord(prev, next) {
+  if (!prev || prev.schema !== PRINTTAPE_SCHEMA) return next;
+
+  const carried = [];
+  const out = { ...next };
+
+  // ── print: field-level, only within one quarter ──
+  const pPrint = prev.print, nPrint = next.print;
+  if (pPrint && !pPrint.status) {
+    if (nPrint?.status) {
+      // This pass got nothing; the banked measurement stands.
+      out.print = { ...pPrint, carriedFromPass: prev.pass ?? null, carriedFromTs: prev.ts,
+                    carriedNote: `this pass could not read the print (${nPrint.reason}); the banked `
+                      + 'measurement is served unchanged' };
+      carried.push('print (whole block)');
+    } else if (nPrint && pPrint.quarter === nPrint.quarter) {
+      /* COPY BEFORE MUTATING. `out` is a shallow spread of `next`, so
+         `out.print` is still the CALLER'S object and writing carried fields into
+         it would edit the record that was passed in. In this job `next` is built
+         fresh each pass, so nothing downstream reads it again — but a merge
+         helper that silently rewrites its own input is a trap for the next
+         caller, and it already made a test assert against a fixture the previous
+         assertion had quietly altered. */
+      out.print = { ...nPrint };
+      for (const f of ['epsActual', 'epsEst', 'revActual', 'revEst']) {
+        if (!Number.isFinite(nPrint[f]) && Number.isFinite(pPrint[f])) { out.print[f] = pPrint[f]; carried.push(f); }
+      }
+      if (carried.length) {
+        out.print.epsSurprisePct = printTapeSurprise(out.print.epsActual, out.print.epsEst);
+        out.print.revSurprisePct = printTapeSurprise(out.print.revActual, out.print.revEst);
+        if (Number.isFinite(out.print.epsActual) && Number.isFinite(out.print.epsEst)) delete out.print.eps;
+        if (Number.isFinite(out.print.revActual) && Number.isFinite(out.print.revEst)) delete out.print.revenue;
+        out.print.carriedFields = carried.slice();
+        out.print.carriedFromPass = prev.pass ?? null;
+        out.print.carriedFromTs = prev.ts;
+      }
+    } else if (nPrint) {
+      out.print = { ...nPrint };
+      out.print.mergeRefused = `the banked print covers quarter ${pPrint.quarter} and this pass read `
+        + `${nPrint.quarter} — nothing was carried forward, because comparing an actual against a consensus `
+        + 'from a different quarter is exactly the fabricated-surprise failure this record exists to avoid';
+    }
+  }
+
+  // ── tape / implied: whole-block, newest measurement wins, an absence never replaces ──
+  for (const k of ['tape', 'implied']) {
+    if (prev[k] && !prev[k].status && next[k]?.status) {
+      out[k] = { ...prev[k], carriedFromPass: prev.pass ?? null, carriedFromTs: prev.ts,
+                 carriedNote: `this pass could not read it (${next[k].reason}); the banked reading stands` };
+      carried.push(`${k} (whole block)`);
+    }
+  }
+
+  // ── guidance: never re-asked. One Claude call per ticker per report. ──
+  if (prev.guidance && !prev.guidance.status && (!next.guidance || next.guidance.status)) {
+    out.guidance = prev.guidance;
+    carried.push('guidance');
+  }
+
+  out.carriedForward = carried.length ? carried : null;
+  out.passes = [...(prev.passes || []), ...(next.passes || [])];
+  return out;
+}
+
+/** One ticker's record for this pass, before the merge. */
+async function printTapeMeasure(env, cand, reportDate, passLabel) {
+  const sym = cand.symbol;
+  let r = null, fetchError = null;
+  try {
+    r = await yahooAuth(`/v10/finance/quoteSummary/${sym}`,
+      '?modules=earnings,earningsHistory,earningsTrend,calendarEvents,price', env);
+    r = r?.quoteSummary?.result?.[0] || null;
+  } catch (e) { fetchError = e.message; }
+
+  const print = r
+    ? printTapePrintFrom(r, reportDate)
+    : { status: 'not-published', reason: `Yahoo quoteSummary failed: ${fetchError}` };
+  const tape = r
+    ? printTapeTapeFrom(r.price, cand.session, cand.earningsTs)
+    : { status: 'unavailable', reason: `Yahoo quoteSummary failed: ${fetchError}` };
+
+  const row = await readLongRow(sym, env);
+  const implied = printTapeImpliedFrom(row, reportDate);
+
+  const { divergent, refusalReason, test } = printTapeDivergence(cand.session, print, tape);
+
+  return {
+    schema: PRINTTAPE_SCHEMA,
+    ticker: sym,
+    reportDate,
+    session: cand.session,
+    earningsTs: cand.earningsTs,
+    earningsIsEstimate: cand.earningsIsEstimate,
+    pass: passLabel,
+    ts: Date.now(),
+    print, tape, implied,
+    divergent, refusalReason,
+    ...(test ? { divergenceTest: test } : {}),
+    guidance: null,
+    /* Stated, not computed. Scoring "how often does a beat-and-fade recover"
+       needs a logged history of these records resolving forward, and none exists
+       — this feature only runs forward from its first deploy. A number here with
+       nothing behind it is the `hit rate 0% over n=12` failure. */
+    baseRate: { status: 'not-measured', reason: 'no logged history of beat-and-fade outcomes yet' },
+    passes: [{ pass: passLabel, ts: Date.now(), divergent, printOk: !print.status, tapeOk: !tape.status }],
+  };
+}
+
+/** True when a record needs no further pass: the question was ANSWERED (either
+ *  way) and every field it needs was present. A refusal is NOT complete — that is
+ *  the whole reason the second pass exists. */
+function printTapeComplete(rec) {
+  return !!rec && rec.schema === PRINTTAPE_SCHEMA
+    && (rec.divergent === true || rec.divergent === false)
+    && !rec.print?.status && !rec.tape?.status;
+}
+
+/* ── THE ELIGIBILITY SCAN ───────────────────────────────────────────────────
+
+   `ceil(N/20)` fetches for the WHOLE watchlist — two at the live N=40 — and no
+   per-ticker cost at all. Quote the formula, never the 2 (the sweeps' `2` is an
+   artifact of N <= 40 and stops being true at 41).
+
+   THE FIELD IS `earningsTimestampStart`/`End`, NOT `earningsTimestamp`, and this
+   is a measured trap. Probed over all 40 names 2026-09-01: `earningsTimestamp`
+   is the LAST report for many of them while `Start`/`End` is the next — PLTR
+   2026-08-03 against 2026-11-02, MRVL 2026-08-27 against 2026-12-01. On the
+   report day itself all three agree, so either would have worked TODAY and the
+   wrong one would have gone unnoticed until a name whose stale
+   `earningsTimestamp` happened to land on a later report date.
+
+   `Start`/`End` also mirrors `calendarEvents.earnings.earningsDate` exactly
+   (cross-checked on 5 names), which is what lets the session be classified by
+   the EXISTING `earningsTimingFrom` rather than by a second copy of the anchor
+   logic — that function is pinned by `earnings-timing.check.mjs` and two copies
+   of a rule is how they drift. A `Start !== End` pair is Yahoo saying "sometime
+   that day" and `earningsTimingFrom` already resolves it to `unknown`.          */
+async function printTapeEligible(env, tickers, todayEt) {
+  const out = { candidates: [], skipped: [], fetches: 0, sourceOk: true, sourceReason: null };
+  const { crumb, cookie } = await getYahooCrumb(env).catch(() => ({ crumb: null, cookie: '' }));
+  if (!crumb) {
+    out.sourceOk = false;
+    out.sourceReason = 'Yahoo crumb unavailable — the eligibility scan could not run, so NO name was '
+      + 'checked. This is not "nobody reported today".';
+    return out;
+  }
+
+  const seen = new Set();
+  for (let i = 0; i < tickers.length; i += PRINTTAPE_QUOTE_CHUNK) {
+    const chunk = tickers.slice(i, i + PRINTTAPE_QUOTE_CHUNK);
+    let rows = null;
+    try {
+      const headers = { ...YAHOO_HEADERS };
+      if (cookie) headers.Cookie = cookie;
+      const resp = await fetch(
+        `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${chunk.join(',')}`
+        + `&crumb=${encodeURIComponent(crumb)}`,
+        { headers, cf: { cacheTtl: 30, cacheEverything: true } },
+      );
+      out.fetches++;
+      if (!resp.ok) throw new Error(`v7 quote ${resp.status}`);
+      rows = (await resp.json())?.quoteResponse?.result || [];
+    } catch (e) {
+      out.sourceOk = false;
+      out.sourceReason = `v7 quote chunk ${i / PRINTTAPE_QUOTE_CHUNK + 1} failed: ${e.message}`;
+      for (const t of chunk) out.skipped.push({ ticker: t, reason: `eligibility scan failed: ${e.message}` });
+      continue;
+    }
+
+    const byS = new Map(rows.map(q => [String(q.symbol).toUpperCase(), q]));
+    for (const t of chunk) {
+      const q = byS.get(t);
+      if (!q) { out.skipped.push({ ticker: t, reason: 'v7 quote returned no row for this symbol' }); continue; }
+      const start = Number.isFinite(q.earningsTimestampStart) ? q.earningsTimestampStart : null;
+      const end   = Number.isFinite(q.earningsTimestampEnd) ? q.earningsTimestampEnd : start;
+      if (start == null) {
+        out.skipped.push({ ticker: t, reason: 'Yahoo published no earningsTimestampStart for this symbol' });
+        continue;
+      }
+      /* Reuse the pinned classifier by handing it the shape it already reads.
+         Two entries so a genuine start/end RANGE still resolves to `unknown`
+         through its own `new Set(raws).size > 1` test. */
+      const { earningsTs, earningsSession } = earningsTimingFrom({
+        earningsDate: [{ raw: start }, { raw: end }],
+        isEarningsDateEstimate: q.isEarningsDateEstimate,
+      });
+      const reportDate = printTapeReportDate(earningsTs);
+      if (reportDate !== todayEt) continue;   // not reporting today — not a skip, just not eligible
+      if (seen.has(t)) continue;
+      seen.add(t);
+      out.candidates.push({
+        symbol: t, earningsTs, session: earningsSession,
+        earningsIsEstimate: typeof q.isEarningsDateEstimate === 'boolean' ? q.isEarningsDateEstimate : null,
+        /* `earningsTimestamp` is recorded ONLY as a corroborating field, never
+           read for eligibility — see the trap above. */
+        earningsTimestampAlso: Number.isFinite(q.earningsTimestamp)
+          ? new Date(q.earningsTimestamp * 1000).toISOString() : null,
+      });
+    }
+  }
+  return out;
+}
+
+/* ── THE JOB ────────────────────────────────────────────────────────────────
+
+   COST, DERIVED FROM THE STRUCTURE (rule #1 — one pool, `capCost` = external
+   fetches + binding ops), with N the watchlist size and E the number of names
+   reporting that day:
+
+     external : ceil(N/20) eligibility  +  1 quoteSummary per eligible  = ceil(N/20) + E
+     bindings : 1 watchlist + 1 crumb + 1 day-index read + 1 day-index write
+                + per eligible: 1 prior-record read + 1 long-row read + 1 write = 4 + 3E
+     capCost  : ceil(N/20) + 4E + 4
+
+   MEASURED, not estimated, on the replay harness driving the real `scheduled()`
+   (`_instr` from a firing this job had to itself, so it IS a measurement):
+
+     N=6,  E=3, cold crumb : extFetches 4 · bindingOps 13 · capCost 17
+     N=1,  E=1, warm crumb : extFetches 1 · bindingOps  6 · capCost  7
+     N=6,  E=0             : extFetches 1 · bindingOps  4 · capCost  5
+
+   which is the formula exactly (the crumb read drops out once `_crumbCache` is
+   warm in the isolate). At the live N=40 with E=3 that derives to **capCost 18**
+   against this invocation's 10,000. A heavy day at E=10 is 46. A day on which
+   nobody reports is **6** — one or two fetches and four binding ops — which is
+   what makes running this four times a day unremarkable.
+
+   A divergent name adds `gatherEarningsFacts` (2-3 external) plus one Anthropic
+   call, and only then.
+
+   WHICH FIRINGS SHARE AN INVOCATION, because `_instr` is a counter DELTA and
+   concurrent jobs contaminate each other:
+
+     05:30 PT  no other branch      -> `_instr` IS a measurement
+     06:15 PT  morning-briefing     -> upper bound on this job
+     13:30 PT  eod+iv-sweep+macro+top3 (four jobs) -> upper bound, and a loose one
+     14:30 PT  no branch (the mood branch is `m < 30`) -> `_instr` IS a measurement
+
+   THE SCAN IS SEQUENTIAL, and not because of the cap. Yahoo crumb rate-limiting
+   is the binding constraint here as everywhere else in this file. E is small, so
+   this costs almost nothing in wall time.                                       */
+async function collectPrintTape(env, sessionWanted, passNo) {
+  if (!env?.REC_LOG) return;
+  const mark  = instrMark();
+  const today = etToday();
+  const label = `${sessionWanted}-pass${passNo}`;
+  const startedMs = Date.now();
+
+  const tickers = await sweepUniverse(env, `print-tape ${label} sweep`, PRINTTAPE_SWEEP_CAP);
+  if (!tickers) return;   // refuses loudly inside sweepUniverse; nothing written
+
+  const scan = await printTapeEligible(env, tickers, today);
+
+  /* A NAME WHOSE SESSION IS `unknown` IS MEASURED ON THE AMC PASSES, NOT DROPPED.
+     By 13:30 PT the bell has rung, so a report filed that day has landed whatever
+     session it was filed in — which is the safest point at which "the report
+     should have landed" is true for a name we cannot classify. Its record then
+     carries `divergent: null` with the unknown-session refusal, which is a
+     finding. Measuring it on both the BMO and the AMC passes would write the same
+     ticker twice from two different clocks. */
+  const wanted = scan.candidates.filter(c =>
+    c.session === sessionWanted || (sessionWanted === 'amc' && c.session === 'unknown'));
+
+  const measured = [], skipped = [...scan.skipped], divergentNames = [];
+  for (const cand of wanted) {
+    const key = printTapeKey(cand.symbol, today);
+    let prev = null;
+    try { prev = await env.REC_LOG.get(key, 'json'); } catch (_) {}
+
+    /* THE PER-TICKER SKIP the spec asks for: a record that already ANSWERED the
+       question with every field present needs no second pass. A refusal is never
+       complete — the second pass exists precisely to retry those. */
+    if (passNo > 1 && printTapeComplete(prev)) {
+      skipped.push({ ticker: cand.symbol,
+        reason: `already answered on ${prev.pass} (divergent: ${prev.divergent}) with print and tape both `
+          + 'present — nothing left for this pass to read' });
+      continue;
+    }
+
+    let rec;
+    try { rec = await printTapeMeasure(env, cand, today, label); }
+    catch (e) {
+      skipped.push({ ticker: cand.symbol, reason: `measurement threw: ${e.message}` });
+      continue;
+    }
+    rec = mergePrintTapeRecord(prev, rec);
+
+    /* RE-RUN THE VERDICT ON THE MERGED RECORD. `printTapeMeasure` decides it from
+       what THIS pass alone could read, and the merge exists precisely because one
+       pass alone cannot see both halves — so a verdict computed before the merge
+       is answered on inputs the record no longer has. Measured: with the
+       consensus carried forward from pass 1 and the actual read by pass 2, the
+       merged print reports revSurprisePct 3.77 while the pre-merge verdict still
+       said "1 is absent: revEst" and refused. The refusal survived its own cause,
+       which also meant `guidance` could never fire on a name whose evidence only
+       became complete across two passes — the whole point of having two. */
+    const merged = printTapeDivergence(rec.session, rec.print, rec.tape);
+    rec.divergent = merged.divergent;
+    rec.refusalReason = merged.refusalReason;
+    if (merged.test) rec.divergenceTest = merged.test; else delete rec.divergenceTest;
+    // The pass log entry describes this pass's OUTCOME, so it follows the verdict.
+    const own = rec.passes?.[rec.passes.length - 1];
+    if (own && own.pass === label) {
+      own.divergent = merged.divergent;
+      own.printOk = !rec.print?.status;
+      own.tapeOk = !rec.tape?.status;
+      own.merged = Array.isArray(rec.carriedForward) ? rec.carriedForward : null;
+    }
+
+    /* GUIDANCE FIRES ONLY ON A DIVERGENT NAME, and only when one has not already
+       been banked. `divergent === true` by strict equality — `null` is a refusal
+       and must never spend. */
+    if (rec.divergent === true && (!rec.guidance || rec.guidance.status)) {
+      rec.guidance = await printTapeGuidance(cand.symbol, env, rec.print);
+    }
+    if (rec.divergent === true) divergentNames.push(cand.symbol);
+
+    try {
+      await env.REC_LOG.put(key, JSON.stringify(rec), { expirationTtl: PRINTTAPE_TTL });
+      measured.push(cand.symbol);
+    } catch (e) {
+      skipped.push({ ticker: cand.symbol, reason: `KV write failed: ${e.message}` });
+    }
+  }
+
+  /* THE DAY INDEX — written on EVERY pass, zero-eligible included. It is what
+     makes a quiet day falsifiable (rule #7) and it is what the endpoint reads to
+     answer `eligible` / `measured` / `skipped` without a single fetch.
+
+     Read-modify-write across KV's eventual consistency, stated rather than
+     hidden: the four passes are 45 minutes apart at the closest, against a
+     measured convergence of well under a second in this repo, so the window is
+     not reachable in practice. A lost append would cost one pass's entry in
+     `passes[]`; the per-ticker records are separate keys and cannot be affected. */
+  let dayRec = null;
+  try { dayRec = await env.REC_LOG.get(printTapeDayKey(today), 'json'); } catch (_) {}
+  const passEntry = {
+    pass: label, ptTs: new Date().toISOString(), wallMs: Date.now() - startedMs,
+    eligible: scan.candidates.map(c => ({ ticker: c.symbol, session: c.session })),
+    measured, skipped,
+    scanOk: scan.sourceOk, scanReason: scan.sourceReason, scanFetches: scan.fetches,
+    universe: tickers.length,
+    divergent: divergentNames,
+  };
+  const dayOut = {
+    schema: PRINTTAPE_SCHEMA,
+    date: today,
+    ts: Date.now(),
+    passes: [...(dayRec?.schema === PRINTTAPE_SCHEMA ? (dayRec.passes || []) : []), passEntry],
+  };
+  try { await env.REC_LOG.put(printTapeDayKey(today), JSON.stringify(dayOut), { expirationTtl: PRINTTAPE_TTL }); }
+  catch (e) { console.warn(`[cron] print-tape ${label}: day index write failed: ${e.message}`); }
+
+  console.log(
+    `[cron] print-tape ${label} ${today}: ${scan.candidates.length} reporting today of ${tickers.length} `
+    + `(${scan.candidates.map(c => `${c.symbol}/${c.session}`).join(', ') || 'none'}) · `
+    + `${wanted.length} for this pass · ${measured.length} measured · ${skipped.length} skipped`
+    + (divergentNames.length ? ` · !! DIVERGENT !! ${divergentNames.join(', ')}` : '')
+    + (scan.sourceOk ? '' : ` · SCAN INCOMPLETE: ${scan.sourceReason}`)
+    + ` · ${JSON.stringify(instrSince(mark, label))}`,
+  );
+}
+
+/* ── THE READ ───────────────────────────────────────────────────────────────
+
+   `GET /api/printtape?date=YYYY-MM-DD` — KV assembly only, zero fetches, nothing
+   recomputed and nothing written.
+
+   GATED WITH `requireSecret`, NOT `aiGuard`, and the difference matters. Both
+   check the same `x-dash-key`; only `aiGuard` also DEBITS the
+   `AI_RATE_GLOBAL_DAY` bucket. This endpoint cannot spend an Anthropic credit —
+   it reads banked records — so charging it against the spend ceiling would let a
+   page poll exhaust the budget the crons need, which is the "ceilings are
+   denominated in Claude calls, not requests" rule read backwards.
+
+   AN ABSENT DAY INDEX AND AN EMPTY ONE ARE DIFFERENT STATES. `records: []` with
+   `eligible: []` means the job RAN and nobody on the watchlist reported that day;
+   a missing index means it did not run, or the day is outside `PRINTTAPE_TTL`.
+   The reader is told which.                                                     */
+async function handlePrintTape(params, origin, env) {
+  const raw = params?.get('date');
+  if (raw != null && !LONGARCH_DATE_RE.test(raw)) {
+    return err(`date must be YYYY-MM-DD; got ${JSON.stringify(raw)}`, 400, origin);
+  }
+  const date = raw || etToday();
+
+  let day = null, dayErr = null;
+  try { day = await env?.REC_LOG?.get(printTapeDayKey(date), 'json'); }
+  catch (e) { dayErr = e.message; }
+  if (day && day.schema !== PRINTTAPE_SCHEMA) day = null;   // strict equality, same rule as everywhere
+
+  const passes = day?.passes || [];
+  /* `eligible` is the UNION across the day's passes — the BMO and AMC passes see
+     different halves of the day and neither alone is the day's eligible set. */
+  const eligible = [];
+  const seen = new Set();
+  for (const p of passes) for (const e of (p.eligible || [])) {
+    if (!seen.has(e.ticker)) { seen.add(e.ticker); eligible.push(e); }
+  }
+  const measured = [...new Set(passes.flatMap(p => p.measured || []))];
+  /* A ticker that was skipped on one pass and measured on a later one is NOT a
+     skip — reporting it as one would describe a name whose record is sitting
+     right there in `records`. */
+  const skipped = [];
+  const skipSeen = new Set();
+  for (const p of passes) for (const s of (p.skipped || [])) {
+    if (measured.includes(s.ticker) || skipSeen.has(s.ticker)) continue;
+    skipSeen.add(s.ticker); skipped.push(s);
+  }
+
+  const records = [];
+  const unreadable = [];
+  for (const t of measured) {
+    try {
+      const rec = await env?.REC_LOG?.get(printTapeKey(t, date), 'json');
+      if (rec && rec.schema === PRINTTAPE_SCHEMA) records.push(rec);
+      else unreadable.push({ ticker: t, reason: rec ? `schema ${rec.schema}, not ${PRINTTAPE_SCHEMA}` : 'record absent or expired' });
+    } catch (e) { unreadable.push({ ticker: t, reason: `KV read failed: ${e.message}` }); }
+  }
+  records.sort((a, b) => a.ticker.localeCompare(b.ticker));
+
+  return json({
+    records,
+    meta: {
+      date,
+      asOf: day?.ts ? new Date(day.ts).toISOString() : null,
+      ran: !!day,
+      ranReason: day ? null
+        : (dayErr ? `KV read failed: ${dayErr}`
+          : `no print-tape pass has written an index for ${date} — the job did not run that day, or the day `
+            + `is older than PRINTTAPE_TTL (${PRINTTAPE_TTL / 86400}d)`),
+      eligible,
+      measured,
+      skipped,
+      unreadable,
+      passes: passes.map(p => ({ pass: p.pass, ptTs: p.ptTs, wallMs: p.wallMs, universe: p.universe,
+                                 scanOk: p.scanOk, scanReason: p.scanReason, divergent: p.divergent })),
+      divergencePct: PRINTTAPE_DIVERGENCE_PCT,
+      schema: PRINTTAPE_SCHEMA,
+    },
+    _meta: srcMeta('Cloudflare KV — banked print-vs-tape records', {
+      ok: !!day, delayed: false, ttlSeconds: PRINTTAPE_TTL, asOf: date,
+      note: day ? `${records.length} record${records.length === 1 ? '' : 's'} over ${passes.length} pass`
+                  + `${passes.length === 1 ? '' : 'es'}`
+                : 'no pass index for this date',
+    }),
+  }, 200, origin);
 }
 
 /* ── New route handlers ── */
@@ -13906,6 +14976,17 @@ export default {
           return await handleEarningsAnalysis(sub, url.searchParams, origin, env, ctx);
         }
         case 'daily':    return await handleDailyGet(origin, env, ctx, request);
+        /* Print vs tape. A read-only KV assembly — zero fetches, zero writes and
+           no Claude call anywhere on the path — so it takes `requireSecret`
+           (the same `x-dash-key`) rather than `aiGuard`. Both check the same
+           header; only `aiGuard` also DEBITS `AI_RATE_GLOBAL_DAY`, and charging
+           a ceiling denominated in Claude calls for a request that makes none
+           would let a page poll exhaust the budget the crons spend from. */
+        case 'printtape': {
+          const g = requireSecret(request, env, origin);
+          if (g) return g;
+          return await handlePrintTape(url.searchParams, origin, env);
+        }
         /* Off-watchlist discovery. Origin-gated only — no Claude call anywhere
            on the path, so there is nothing for `aiGuard` to protect, and the
            only write is its own `radar:{PT-date}` day cache. */
@@ -14047,7 +15128,7 @@ export default {
     env = instrWrapBindings(env);
 
     // ── The cron expression is a COARSE WAKEUP AND NOTHING ELSE ──────────────
-    // Every 15 min, UTC hours 13-22, ALL days. Every date and time decision is
+    // Every 15 min, UTC hours 12-22, ALL days. Every date and time decision is
     // made here, in code, against Pacific wall-clock. The expression carries no
     // day, no date, no month, and it must stay that way.
     //
@@ -14087,6 +15168,31 @@ export default {
       return;
     }
 
+    /* ── PRINT vs TAPE — dispatched OUTSIDE the branch chain, deliberately ────
+       Its four passes are 05:30 / 06:15 / 13:30 / 14:30 PT, and three of those
+       fall inside windows the if/else chain below already owns (06:15 in
+       `morning-briefing`'s `h===6 && m<30`, 13:30 in the EOD branch's
+       `m>=15 && m<45`, 05:30 in nothing, 14:30 in nothing since the 2pm branch
+       is `m<30`). A new `else if` would therefore never fire on two of them.
+       Folding the job into those branches instead would tie its schedule to
+       theirs and silently move it the next time one of their windows changes.
+
+       So the pass is decided by its OWN clock test and dispatched here, and the
+       decision is appended to the branch name in the log line below so rule #7
+       still holds: every firing says whether a print-tape pass was due.
+
+       It shares the invocation's subrequest budget with whatever branch also
+       fires — `ctx.waitUntil` does not get its own — so at 06:15 and 13:30 no
+       per-job `_instr` from it is a measurement. At 05:30 and 14:30 it runs
+       alone and its `_instr` IS one. The cost is small either way: capCost
+       `ceil(N/20) + 4E + 4`, which derives to 18 at the live N=40 with E=3 and
+       was MEASURED at 5 on a firing where nobody reported. */
+    const ptPass = printTapePassAt(h, m);
+    if (ptPass) {
+      dispatchJob(ctx, `print-tape-${ptPass.session}-${ptPass.pass}`,
+        () => collectPrintTape(env, ptPass.session, ptPass.pass));
+    }
+
     let branch = 'idle';                        // in-window wakeup with no job due
     if (h === 6 && m < 30) {
       branch = 'morning-briefing';
@@ -14109,7 +15215,7 @@ export default {
          than an upper bound: nothing else shares the invocation. ~20 capCost a
          name all-cold, ~800 at N≈40, against this invocation's own 10,000.
 
-         7:00am PT is inside the trigger's 13-22 UTC window under BOTH regimes —
+         7:00am PT is inside the trigger's UTC window under BOTH regimes —
          14:00 UTC on PDT, 15:00 UTC on PST (rule #2). */
       branch = 'morning-rows';
       dispatchJob(ctx, 'morning-rows', () => collectMorningRows(env));           // 7:00am PT long-row sweep, no ranking
@@ -14168,7 +15274,8 @@ export default {
     }
 
     console.log(
-      `[cron] ${at} · ${via} · trading day · branch=${branch}` +
+      `[cron] ${at} · ${via} · trading day · branch=${branch}`
+      + (ptPass ? ` + print-tape=${ptPass.session}-pass${ptPass.pass}` : '') +
       (day.calendarStale ? ` · WARN holiday calendar ends ${NYSE_HOLIDAYS_THROUGH}, holidays no longer skipped` : ''),
     );
   },
