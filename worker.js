@@ -537,24 +537,71 @@ const ECON_CALENDAR_THROUGH = '2027-12-08'; // last date covered by the tables b
  * is a Saturday), not an early close — two of the three sources consulted got
  * that one backwards.
  */
-const NYSE_HOLIDAYS = new Set([
+/* THE TABLE CARRIES THE NAME AS DATA, not only as a trailing comment, because
+   `GET /api/calendar/holidays` serves it to a consumer that would otherwise
+   hardcode its own weekday arithmetic — and a date with no name is a date
+   nobody can check against NYSE's published calendar. The Set below is DERIVED
+   from this table so the gate and the endpoint cannot disagree about which
+   days are closed.
+
+   SOURCE, cited rather than recalled: NYSE Group's published holiday calendar
+   at https://www.nyse.com/markets/hours-calendars (2026 and 2027 full-day
+   closures), cross-derived from the observance rules as described above. */
+const NYSE_HOLIDAY_TABLE = [
   // 2026
-  '2026-09-07', // Labor Day
-  '2026-11-26', // Thanksgiving
-  '2026-12-25', // Christmas Day
+  { date: '2026-09-07', name: 'Labor Day' },
+  { date: '2026-11-26', name: 'Thanksgiving Day' },
+  { date: '2026-12-25', name: 'Christmas Day' },
   // 2027
-  '2027-01-01', // New Year's Day
-  '2027-01-18', // Martin Luther King, Jr. Day
-  '2027-02-15', // Washington's Birthday
-  '2027-03-26', // Good Friday
-  '2027-05-31', // Memorial Day
-  '2027-06-18', // Juneteenth observed (Jun 19 is a Saturday)
-  '2027-07-05', // Independence Day observed (Jul 4 is a Sunday)
-  '2027-09-06', // Labor Day
-  '2027-11-25', // Thanksgiving
-  '2027-12-24', // Christmas Day observed (Dec 25 is a Saturday)
-]);
+  { date: '2027-01-01', name: "New Year's Day" },
+  { date: '2027-01-18', name: 'Martin Luther King, Jr. Day' },
+  { date: '2027-02-15', name: "Washington's Birthday" },
+  { date: '2027-03-26', name: 'Good Friday' },
+  { date: '2027-05-31', name: 'Memorial Day' },
+  { date: '2027-06-18', name: 'Juneteenth National Independence Day (observed — Jun 19 is a Saturday)' },
+  { date: '2027-07-05', name: 'Independence Day (observed — Jul 4 is a Sunday)' },
+  { date: '2027-09-06', name: 'Labor Day' },
+  { date: '2027-11-25', name: 'Thanksgiving Day' },
+  { date: '2027-12-24', name: 'Christmas Day (observed — Dec 25 is a Saturday)' },
+];
+const NYSE_HOLIDAYS = new Set(NYSE_HOLIDAY_TABLE.map(h => h.date));
 const NYSE_HOLIDAYS_THROUGH = '2027-12-31'; // past this the gate can only see weekends
+
+/* ── TRADING-DAY WALKERS ─────────────────────────────────────────────────────
+
+   "Yesterday" and "tomorrow" are NOT `±1 day`, and they are not `±1 weekday`
+   either. Labor Day 2026-09-07 is the first live case in this table: a Friday
+   2026-09-04 AMC print is reacted to in the pre-market of TUESDAY 2026-09-08,
+   not Monday, so a weekday-only walk looks for the report under a day the
+   exchange was shut and finds nothing — silently, because "no record for that
+   date" is indistinguishable from "nobody reported".
+
+   Both walkers read the SAME `tradingDayStatus` the cron gate reads, so the
+   holiday list can never be applied in one place and not the other. Past
+   `NYSE_HOLIDAYS_THROUGH` every weekday reads as open, which the callers
+   surface as `calendarStale` rather than pretending otherwise. */
+
+/** Day-of-week for an ISO date, read in UTC so a local timezone cannot shift it. */
+function isoDow(isoDate) {
+  const [y, m, d] = String(isoDate).split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+}
+
+/** Walk `step` trading days from an ISO date, skipping weekends and NYSE
+ *  full-day closures. Returns null rather than guessing if the walk runs past
+ *  `cap` calendar days — a four-day closure is the longest this calendar holds,
+ *  so 10 is generous and a null means something is wrong with the input. */
+function walkTradingDays(isoDate, step, cap = 10) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(isoDate))) return null;
+  let cur = isoDate;
+  for (let i = 0; i < cap; i++) {
+    cur = isoAddDays(cur, step);
+    if (tradingDayStatus(cur, isoDow(cur)).open) return cur;
+  }
+  return null;
+}
+const prevTradingDay = isoDate => walkTradingDays(isoDate, -1);
+const nextTradingDay = isoDate => walkTradingDays(isoDate, +1);
 
 /** PT calendar date + weekday, read off the SAME Date object the dispatch uses. */
 function ptParts(pt) {
@@ -9906,7 +9953,23 @@ async function collectMorningRows(env) {
    is a REFUSAL and never a "no" — an unknown session or a missing consensus
    cannot answer the question, and answering `false` would claim it did.        */
 
-const PRINTTAPE_SCHEMA = 1;
+/* SCHEMA 2 (was 1, one day). Two shape changes landed together on 2026-09-01:
+   `tape` became a PAIR of windows (`pre` / `post`) with `usedWindow` naming
+   which one the verdict read, and the record gained `consensusSource` /
+   `consensusBankedTs`. Strict equality means every schema-1 record reads as
+   absent, which is correct — a schema-1 `tape` has `changePct` at the top level
+   and a reader of the new shape would find it nowhere. */
+const PRINTTAPE_SCHEMA = 2;
+
+/* The two extended-hours windows that can be a reaction to one print, newest
+   first for readability only — `printTapeFreshestWindow` decides by quoteTime,
+   never by array order. */
+const PRINTTAPE_TAPE_WINDOWS = ['pre', 'post'];
+
+/* Where a record's consensus figures came from. `pre-banked` means they were
+   read BEFORE the report, on the prebank pass, and survived the roll-forward;
+   `live-pass` means a measurement pass read them itself. */
+const PRINTTAPE_CONSENSUS_SOURCES = ['pre-banked', 'live-pass'];
 
 /* 7d, the same figure and the same reasoning as `TOP3_TTL` and `LONG_ROW_TTL`:
    retention has to outlive the weekend and holiday gaps the writer's own
@@ -9963,6 +10026,7 @@ const printTapeDayKey = date => `printtapeday:${date}`;
      PT       UTC under PDT (UTC-7)   UTC under PST (UTC-8)
      05:30 -> 12:30  <- needs hour 12  13:30  ok
      06:15 -> 13:15  ok                14:15  ok
+     13:15 -> 20:15  ok                21:15  ok   <- the pre-bank
      13:30 -> 20:30  ok                21:30  ok
      14:30 -> 21:30  ok                22:30  ok  (hour 22 spans 22:00-22:59)
 
@@ -9973,10 +10037,24 @@ const printTapeDayKey = date => `printtapeday:${date}`;
    we wake up and to nothing else: no day, no date, no month goes into the
    expression, and every one of these four decisions is made below in code. */
 const PRINTTAPE_PASSES = [
-  { session: 'bmo', pass: 1, h: 5,  m0: 30, m1: 45 },
-  { session: 'bmo', pass: 2, h: 6,  m0: 15, m1: 30 },
-  { session: 'amc', pass: 1, h: 13, m0: 30, m1: 45 },
-  { session: 'amc', pass: 2, h: 14, m0: 30, m1: 45 },
+  /* THE PRE-BANK, 13:15 PT — 16:15 ET, fifteen minutes after the close.
+     `kind: 'prebank'` and it measures NOTHING: it reads the consensus for names
+     reporting in the NEXT trading session and banks it, so the roll-forward can
+     no longer eat it. See the pre-bank note above `collectPrintTapePreBank`.
+
+     13:15 PT rather than a new clock slot because it is the nearest existing
+     daily wakeup that is (a) POST-CLOSE, so it cannot race a same-session print,
+     and (b) a whole trading session ahead of every pass that will read the bank:
+     tomorrow's 05:30 BMO passes and tomorrow's 13:30 AMC passes both find it
+     already there. It shares the invocation with the four jobs of the
+     `eod+iv-sweep+macro` branch, which is why no `_instr` from it is a
+     measurement (rule #1). Its window is 13:15-13:30, which admits exactly one
+     firing and does not overlap `amc-pass1` at 13:30. */
+  { kind: 'prebank', session: null,  pass: 0, h: 13, m0: 15, m1: 30 },
+  { kind: 'measure', session: 'bmo', pass: 1, h: 5,  m0: 30, m1: 45 },
+  { kind: 'measure', session: 'bmo', pass: 2, h: 6,  m0: 15, m1: 30 },
+  { kind: 'measure', session: 'amc', pass: 1, h: 13, m0: 30, m1: 45 },
+  { kind: 'measure', session: 'amc', pass: 2, h: 14, m0: 30, m1: 45 },
 ];
 
 /** Which pass, if any, this PT wall-clock instant is. */
@@ -10020,9 +10098,19 @@ function printTapeSurprise(actual, est) {
    times — measured 2026-09-01, NVDA had EPS for the quarter it reported six days
    earlier and still no revenue for it.
 
-   @param r          the quoteSummary result object
-   @param reportDate ET report date, `YYYY-MM-DD`                                */
-function printTapePrintFrom(r, reportDate) {
+   @param r             the quoteSummary result object
+   @param reportDate    ET report date, `YYYY-MM-DD`
+   @param bankedQuarter the period-end date a PRE-BANK pass banked for this
+                        report, or null. It is the LAST of three ways to
+                        establish the quarter and it fabricates nothing: the
+                        alignment gate below still requires the actual to carry
+                        this exact period-end string before a single figure is
+                        compared. Without it, a report whose consensus has
+                        already rolled AND whose actual Yahoo has not yet
+                        stamped with this report date is unidentifiable, so the
+                        whole print refuses — which is the state the carry-over
+                        morning pass would otherwise land in every time.        */
+function printTapePrintFrom(r, reportDate, bankedQuarter = null) {
   const trend = r?.earningsTrend?.trend || [];
   const t0    = trend.find(t => t.period === '0q') || null;
   const cal   = r?.calendarEvents?.earnings || {};
@@ -10049,6 +10137,18 @@ function printTapePrintFrom(r, reportDate) {
   else if (actQuarter && actReported === reportDate) {
     quarter = actQuarter; quarterVia = 'earnings.earningsChart.quarterly[-1].periodEndDate (consensus has rolled forward)';
   }
+  /* THE PRE-BANKED QUARTER IS THE LAST RESORT, AND IT IS NOT A GUESS. It is a
+     value THIS Worker read out of `earningsTrend.0q.endDate` for this exact
+     report before the roll, so it is the same field the first branch reads —
+     just read earlier. It is tried last so a live reading always wins, and it
+     loosens nothing downstream: `actAligned` below is still string equality
+     against this quarter, so an actual from a different quarter is refused
+     exactly as before. */
+  else if (typeof bankedQuarter === 'string' && bankedQuarter) {
+    quarter = bankedQuarter;
+    quarterVia = 'the PRE-BANKED consensus quarter (earningsTrend.0q.endDate, read on the prebank pass '
+      + 'before it rolled forward)';
+  }
 
   if (!quarter) {
     return { status: 'not-published',
@@ -10056,8 +10156,9 @@ function printTapePrintFrom(r, reportDate) {
         + `earningsTrend 0q endDate ${consQuarter ?? '(absent)'}`
         + (consRolled ? ` has ROLLED PAST the report date ${reportDate}` : '')
         + `, and the newest quarter in earnings.earningsChart is ${actQuarter ?? '(absent)'} reported `
-        + `${actReported ?? '(absent)'}, which is not this report. No actual is compared against a `
-        + 'consensus from a different quarter.' };
+        + `${actReported ?? '(absent)'}, which is not this report, and no quarter was pre-banked for it `
+        + '(the prebank pass did not run, or this name was added to the watchlist after it). No actual is '
+        + 'compared against a consensus from a different quarter.' };
   }
 
   /* THE ALIGNMENT GATE. String equality on the period-end date, no tolerance. */
@@ -10157,86 +10258,167 @@ function printTapePrintFrom(r, reportDate) {
 
    STALENESS IS A REAL FAILURE HERE, not a nicety: a `postMarketTime` earlier
    than the print is yesterday's extended session, and it would render as this
-   report's reaction. Refused with the two timestamps named.                     */
+   report's reaction. Refused with the two timestamps named.
+
+   ── SCHEMA 2: THE BLOCK IS A PAIR, NOT ONE READING ──────────────────────────
+
+   An AMC print is traded TWICE in extended hours — that evening's post-market
+   and the NEXT trading morning's pre-market — and the second is the one that
+   matters, because Yahoo needs overnight to publish the actual the print half
+   is compared against. Measured 2026-09-01: MDB printed EPS +18.09% with the
+   post-market down 14.56%, and the 14:30 PT pass refused the divergence because
+   the REVENUE actual was not published yet. The record was correct; the clock
+   was too early.
+
+   So the block now carries `pre` and `post` side by side, each independently a
+   reading or a refusal, plus `usedWindow` naming which one the verdict read —
+   the freshest by `quoteTime`. Nothing is hoisted to the top level: a duplicated
+   `changePct` beside the window it came from is a second field that can
+   disagree with the first.                                                      */
 function printTapeTapeFrom(price, session, earningsTsIso) {
   const p = price || {};
-  const window = session === 'bmo' ? 'pre' : session === 'amc' ? 'post' : null;
-  if (!window) {
+  if (session !== 'bmo' && session !== 'amc') {
     return { status: 'unavailable',
       reason: `session is '${session}', so neither the pre-market nor the post-market window can be `
         + 'identified as the one that traded this print' };
   }
 
-  const priceRaw = ptNum(window === 'pre' ? p.preMarketPrice : p.postMarketPrice);
-  const chgPct   = ptNum(window === 'pre' ? p.preMarketChangePercent : p.postMarketChangePercent);
-  const quoteSec = ptNum(window === 'pre' ? p.preMarketTime : p.postMarketTime);
-  const refClose = ptNum(window === 'pre' ? p.regularMarketPreviousClose : p.regularMarketPrice);
+  /* WHICH WINDOWS COULD HAVE TRADED THIS PRINT.
 
-  if (priceRaw == null || chgPct == null || quoteSec == null) {
-    return { status: 'unavailable',
-      reason: `Yahoo published no complete ${window}-market quote on the price module — `
-        + `${window}MarketPrice ${priceRaw ?? 'absent'}, ${window}MarketChangePercent `
-        + `${chgPct ?? 'absent'}, ${window}MarketTime ${quoteSec ?? 'absent'}` };
-  }
+     A BMO print lands before the open, so the pre-market of the report day is
+     the only extended session that reacted to it — the post-market of that same
+     day is a whole regular session later and is a reaction to the session, not
+     to the print.
 
-  const quoteTime = new Date(quoteSec * 1000).toISOString();
-  if (earningsTsIso && quoteTime < earningsTsIso) {
-    return { status: 'unavailable',
-      reason: `the newest ${window}-market quote is stamped ${quoteTime}, which is EARLIER than the report `
-        + `instant ${earningsTsIso} — it belongs to a session before this print and would render as its `
-        + 'reaction' };
-  }
+     An AMC print has TWO: the post-market of the report day, and the pre-market
+     of the NEXT trading day. Both are reactions to the same release and both are
+     measured against the same regular close (`regularMarketPrice` on the report
+     day IS `regularMarketPreviousClose` the next morning), so they are directly
+     comparable. Which one a given quoteSummary response can answer for depends
+     on when it was fetched, and NOTHING here decides that by clock: the
+     staleness guard below refuses any quote stamped earlier than the print, so
+     the same-evening read simply finds that morning's pre-market quote is older
+     than the report and refuses it, while the next-morning read finds a pre
+     quote that is newer and takes it. */
+  const allow = session === 'bmo' ? ['pre'] : ['pre', 'post'];
 
-  return {
-    window,
-    price: priceRaw,
-    /* Yahoo carries the change as a DECIMAL FRACTION here (NVDA post 0.00013796
-       for +0.01%), the same units trap as `impliedVolatility`. Carried through
-       this record as PERCENT. */
-    changePct: +(chgPct * 100).toFixed(4),
-    referenceClose: refClose,
-    referenceCloseField: window === 'pre' ? 'regularMarketPreviousClose' : 'regularMarketPrice',
-    /* ── VOLUME IS REFUSED UNCONDITIONALLY, AND THE REFUSAL IS THE MEASUREMENT ──
+  const readWindow = (window) => {
+    const priceRaw = ptNum(window === 'pre' ? p.preMarketPrice : p.postMarketPrice);
+    const chgPct   = ptNum(window === 'pre' ? p.preMarketChangePercent : p.postMarketChangePercent);
+    const quoteSec = ptNum(window === 'pre' ? p.preMarketTime : p.postMarketTime);
+    const refClose = ptNum(window === 'pre' ? p.regularMarketPreviousClose : p.regularMarketPrice);
 
-       Yahoo publishes NO extended-hours volume field. Probed 2026-09-01 across
-       both candidate sources: `quoteSummary.price` carries regularMarketVolume,
-       averageDailyVolume10Day and averageDailyVolume3Month and NO
-       postMarketVolume or preMarketVolume; `v7/finance/quote` carries the same
-       three and none either.
+    if (priceRaw == null || chgPct == null || quoteSec == null) {
+      return { status: 'unavailable',
+        reason: `Yahoo published no complete ${window}-market quote on the price module — `
+          + `${window}MarketPrice ${priceRaw ?? 'absent'}, ${window}MarketChangePercent `
+          + `${chgPct ?? 'absent'}, ${window}MarketTime ${quoteSec ?? 'absent'}` };
+    }
 
-       The one remaining source is the v8 1m chart with `includePrePost=true`,
-       and summing it would ship a fabricated number. Measured over PANW, DELL,
-       MDB, NVDA and AVGO on 2026-09-01:
+    const quoteTime = new Date(quoteSec * 1000).toISOString();
+    /* STALENESS IS A REAL FAILURE HERE, not a nicety: a quote stamped earlier
+       than the print belongs to a session BEFORE this report and would render as
+       its reaction. It is also what makes the two-window read safe — the report
+       morning's pre-market quote is older than an AMC print and is refused on
+       exactly this line, without anything here consulting a clock. */
+    if (earningsTsIso && quoteTime < earningsTsIso) {
+      return { status: 'unavailable',
+        reason: `the newest ${window}-market quote is stamped ${quoteTime}, which is EARLIER than the report `
+          + `instant ${earningsTsIso} — it belongs to a session before this print and would render as its `
+          + 'reaction' };
+    }
 
-         PRE  — 0 volume on EVERY bar for 5 of 5 names (111-330 bars each),
-                despite real pre-market price movement (PANW 382.55 -> 373.70).
-         POST — 4 of 5 names carried their ENTIRE post-window volume on the
-                single 20:00:00Z boundary bar with every later minute at 0, at
-                8.7% / 9.6% / 12.6% of that day's regular volume — the closing
-                auction's share, and NVDA was not even reporting. DELL instead
-                carried 10,610,858 on a single 20:03 bar.
+    return {
+      window,
+      price: priceRaw,
+      /* Yahoo carries the change as a DECIMAL FRACTION here (NVDA post 0.00013796
+         for +0.01%), the same units trap as `impliedVolatility`. Carried through
+         this record as PERCENT. */
+      changePct: +(chgPct * 100).toFixed(4),
+      referenceClose: refClose,
+      referenceCloseField: window === 'pre' ? 'regularMarketPreviousClose' : 'regularMarketPrice',
+      /* ── VOLUME IS REFUSED UNCONDITIONALLY, AND THE REFUSAL IS THE MEASUREMENT ──
 
-       So the feed publishes sparse consolidated prints, one of which sits on the
-       session boundary, and nothing in it separates a closing auction from real
-       post-market volume: `regular + post` reconciles to `regularMarketVolume`
-       for no name (PANW 7,547,557 vs 8,228,416; DELL 20,524,736 vs 12,815,592).
-       A summed figure would look entirely ordinary and mean nothing.
+         Yahoo publishes NO extended-hours volume field. Probed 2026-09-01 across
+         both candidate sources: `quoteSummary.price` carries regularMarketVolume,
+         averageDailyVolume10Day and averageDailyVolume3Month and NO
+         postMarketVolume or preMarketVolume; `v7/finance/quote` carries the same
+         three and none either.
 
-       This follows the income sleeve's tax-character precedent: OMITTED with the
-       reason shipped, never nulled and never estimated, so a consumer reaching
-       for the value finds why rather than a field to fill. It also costs ZERO
-       fetches — there is no point spending a subrequest to refuse. */
-    volume: null,
-    volumeStatus: 'not-published',
-    volumeReason: 'Yahoo publishes no extended-hours volume field on quoteSummary.price or v7/finance/quote, '
-      + 'and the v8 1m includePrePost feed cannot be distinguished from the closing auction — measured '
-      + '2026-09-01: pre-market volume 0 on every bar for 5 of 5 names, and 4 of 5 carried the whole '
-      + 'post-window figure on the single session-boundary bar at closing-auction share. Not summed, '
-      + 'because a summed figure here is indistinguishable from a fabricated one.',
-    quoteTime,
-    marketState: p.marketState ?? null,
-    source: 'Yahoo quoteSummary price module (extended-hours quote)',
+         The one remaining source is the v8 1m chart with `includePrePost=true`,
+         and summing it would ship a fabricated number. Measured over PANW, DELL,
+         MDB, NVDA and AVGO on 2026-09-01:
+
+           PRE  — 0 volume on EVERY bar for 5 of 5 names (111-330 bars each),
+                  despite real pre-market price movement (PANW 382.55 -> 373.70).
+           POST — 4 of 5 names carried their ENTIRE post-window volume on the
+                  single 20:00:00Z boundary bar with every later minute at 0, at
+                  8.7% / 9.6% / 12.6% of that day's regular volume — the closing
+                  auction's share, and NVDA was not even reporting. DELL instead
+                  carried 10,610,858 on a single 20:03 bar.
+
+         So the feed publishes sparse consolidated prints, one of which sits on the
+         session boundary, and nothing in it separates a closing auction from real
+         post-market volume: `regular + post` reconciles to `regularMarketVolume`
+         for no name (PANW 7,547,557 vs 8,228,416; DELL 20,524,736 vs 12,815,592).
+         A summed figure would look entirely ordinary and mean nothing.
+
+         This follows the income sleeve's tax-character precedent: OMITTED with the
+         reason shipped, never nulled and never estimated, so a consumer reaching
+         for the value finds why rather than a field to fill. It also costs ZERO
+         fetches — there is no point spending a subrequest to refuse. */
+      volume: null,
+      volumeStatus: 'not-published',
+      volumeReason: 'Yahoo publishes no extended-hours volume field on quoteSummary.price or v7/finance/quote, '
+        + 'and the v8 1m includePrePost feed cannot be distinguished from the closing auction — measured '
+        + '2026-09-01: pre-market volume 0 on every bar for 5 of 5 names, and 4 of 5 carried the whole '
+        + 'post-window figure on the single session-boundary bar at closing-auction share. Not summed, '
+        + 'because a summed figure here is indistinguishable from a fabricated one.',
+      quoteTime,
+      marketState: p.marketState ?? null,
+      source: 'Yahoo quoteSummary price module (extended-hours quote)',
+    };
   };
+
+  const out = { sessionWindows: allow };
+  for (const w of PRINTTAPE_TAPE_WINDOWS) {
+    out[w] = allow.includes(w)
+      ? readWindow(w)
+      : { status: 'not-applicable',
+          reason: `a '${session}' print is not traded in the ${w}-market window of its report day` };
+  }
+  out.usedWindow = printTapeFreshestWindow(out);
+
+  /* BOTH WINDOWS REFUSED IS A BLOCK-LEVEL REFUSAL, not a tape with no reading.
+     `printTapeComplete` and `mergePrintTapeRecord` both test `tape.status`, and
+     a measurement object with nothing measurable in it would slip straight past
+     them and be treated as an answer. */
+  if (!out.usedWindow) {
+    return { status: 'unavailable',
+      reason: `no usable extended-hours quote in any window that could have traded this ${session} print — `
+        + PRINTTAPE_TAPE_WINDOWS.map(w => `${w}: ${out[w].reason}`).join(' · ') };
+  }
+  return out;
+}
+
+/** Which of a tape block's windows the verdict reads: the FRESHEST readable one,
+ *  by `quoteTime`, never by array order and never by session.
+ *
+ *  THIS IS WHAT MAKES THE CARRY-OVER WORK. The morning after an AMC print the
+ *  record holds yesterday evening's `post` reading (carried forward by the merge)
+ *  and this morning's `pre` reading; the pre quote is newer, so the verdict reads
+ *  the pre-market's reaction to the same print — the one that had overnight for
+ *  Yahoo to publish the actual against it. `usedWindow` is stored, so which
+ *  reading answered is a field rather than something a reader has to infer by
+ *  comparing timestamps. */
+function printTapeFreshestWindow(tape) {
+  let best = null, bestT = null;
+  for (const w of PRINTTAPE_TAPE_WINDOWS) {
+    const r = tape?.[w];
+    if (!r || r.status || typeof r.quoteTime !== 'string') continue;
+    if (bestT == null || r.quoteTime > bestT) { best = w; bestT = r.quoteTime; }
+  }
+  return best;
 }
 
 /* ── THE IMPLIED MOVE ───────────────────────────────────────────────────────
@@ -10296,12 +10478,20 @@ function printTapeDivergence(session, print, tape) {
   if (print?.status) return refuse(`print unavailable: ${print.reason}`);
   if (tape?.status)  return refuse(`tape unavailable: ${tape.reason}`);
 
+  /* THE VERDICT READS ONE WINDOW, AND THE RECORD SAYS WHICH. `usedWindow` is
+     re-derived by `printTapeFreshestWindow` after every merge, so a record whose
+     post-market reading was banked last night and whose pre-market reading
+     landed this morning is judged on the pre-market one. Read through
+     `tape[tape.usedWindow]` rather than off a hoisted copy: one place for the
+     number means the number and its provenance cannot come apart. */
+  const used = tape && typeof tape.usedWindow === 'string' ? tape[tape.usedWindow] : null;
+
   const missing = [];
   if (!Number.isFinite(print.epsActual)) missing.push('epsActual');
   if (!Number.isFinite(print.epsEst))    missing.push('epsEst');
   if (!Number.isFinite(print.revActual)) missing.push('revActual');
   if (!Number.isFinite(print.revEst))    missing.push('revEst');
-  if (!Number.isFinite(tape.changePct))  missing.push('tape.changePct');
+  if (!used || used.status || !Number.isFinite(used.changePct)) missing.push('tape.changePct');
   if (missing.length) {
     return refuse(`the test needs all five inputs and ${missing.length} ${missing.length === 1 ? 'is' : 'are'} `
       + `absent: ${missing.join(', ')}`
@@ -10311,15 +10501,18 @@ function printTapeDivergence(session, print, tape) {
 
   const epsBeat = print.epsActual > print.epsEst;
   const revBeat = print.revActual > print.revEst;
-  const sold    = tape.changePct <= PRINTTAPE_DIVERGENCE_PCT;
+  const sold    = used.changePct <= PRINTTAPE_DIVERGENCE_PCT;
   return {
     divergent: epsBeat && revBeat && sold,
     refusalReason: null,
     test: {
       epsBeat, revBeat, sold,
-      changePct: tape.changePct,
+      usedWindow: tape.usedWindow,
+      quoteTime: used.quoteTime ?? null,
+      changePct: used.changePct,
       thresholdPct: PRINTTAPE_DIVERGENCE_PCT,
-      note: 'fires only on beat + beat + sold; any other combination is a real `false`, not a refusal',
+      note: 'fires only on beat + beat + sold; any other combination is a real `false`, not a refusal. '
+        + '`changePct` is the reading from `usedWindow` and from nowhere else.',
     },
   };
 }
@@ -10472,6 +10665,7 @@ function mergePrintTapeRecord(prev, next) {
 
   // ── print: field-level, only within one quarter ──
   const pPrint = prev.print, nPrint = next.print;
+  let bankUsed = false;
   if (pPrint && !pPrint.status) {
     if (nPrint?.status) {
       // This pass got nothing; the banked measurement stands.
@@ -10479,6 +10673,7 @@ function mergePrintTapeRecord(prev, next) {
                     carriedNote: `this pass could not read the print (${nPrint.reason}); the banked `
                       + 'measurement is served unchanged' };
       carried.push('print (whole block)');
+      bankUsed = true;
     } else if (nPrint && pPrint.quarter === nPrint.quarter) {
       /* COPY BEFORE MUTATING. `out` is a shallow spread of `next`, so
          `out.print` is still the CALLER'S object and writing carried fields into
@@ -10491,6 +10686,7 @@ function mergePrintTapeRecord(prev, next) {
       for (const f of ['epsActual', 'epsEst', 'revActual', 'revEst']) {
         if (!Number.isFinite(nPrint[f]) && Number.isFinite(pPrint[f])) { out.print[f] = pPrint[f]; carried.push(f); }
       }
+      if (carried.includes('epsEst') || carried.includes('revEst')) bankUsed = true;
       if (carried.length) {
         out.print.epsSurprisePct = printTapeSurprise(out.print.epsActual, out.print.epsEst);
         out.print.revSurprisePct = printTapeSurprise(out.print.revActual, out.print.revEst);
@@ -10508,13 +10704,42 @@ function mergePrintTapeRecord(prev, next) {
     }
   }
 
-  // ── tape / implied: whole-block, newest measurement wins, an absence never replaces ──
-  for (const k of ['tape', 'implied']) {
-    if (prev[k] && !prev[k].status && next[k]?.status) {
-      out[k] = { ...prev[k], carriedFromPass: prev.pass ?? null, carriedFromTs: prev.ts,
-                 carriedNote: `this pass could not read it (${next[k].reason}); the banked reading stands` };
-      carried.push(`${k} (whole block)`);
+  /* ── tape: PER WINDOW, then `usedWindow` RE-DERIVED from the merged pair ────
+
+     Schema 1 merged the tape whole-block, which was right when a record could
+     hold one reading. It cannot be right now: the morning carry-over pass reads
+     a `pre` window and can no longer see last night's `post` window, so a
+     whole-block rule would either discard the post reading or discard the fresh
+     pre one depending on which side happened to carry a refusal. Each window
+     carries forward on its own, and the freshest of the merged pair is then the
+     one the verdict reads. */
+  const pTape = prev.tape, nTape = next.tape;
+  if (pTape && !pTape.status) {
+    if (nTape?.status) {
+      out.tape = { ...pTape, carriedFromPass: prev.pass ?? null, carriedFromTs: prev.ts,
+                   carriedNote: `this pass could not read it (${nTape.reason}); the banked reading stands` };
+      carried.push('tape (whole block)');
+    } else if (nTape) {
+      const t = { ...nTape };
+      for (const w of PRINTTAPE_TAPE_WINDOWS) {
+        const pw = pTape[w], nw = t[w];
+        if (pw && !pw.status && (!nw || nw.status)) {
+          t[w] = { ...pw, carriedFromPass: prev.pass ?? null, carriedFromTs: prev.ts };
+          carried.push(`tape.${w}`);
+        }
+      }
+      /* Re-derived, never carried: a `usedWindow` copied from either side would
+         be a claim about a pair neither side had. */
+      t.usedWindow = printTapeFreshestWindow(t);
+      out.tape = t;
     }
+  }
+
+  // ── implied: whole-block, newest measurement wins, an absence never replaces ──
+  if (prev.implied && !prev.implied.status && next.implied?.status) {
+    out.implied = { ...prev.implied, carriedFromPass: prev.pass ?? null, carriedFromTs: prev.ts,
+                    carriedNote: `this pass could not read it (${next.implied.reason}); the banked reading stands` };
+    carried.push('implied (whole block)');
   }
 
   // ── guidance: never re-asked. One Claude call per ticker per report. ──
@@ -10523,13 +10748,31 @@ function mergePrintTapeRecord(prev, next) {
     carried.push('guidance');
   }
 
+  /* ── CONSENSUS PROVENANCE ───────────────────────────────────────────────────
+
+     Two fields, deliberately answering two different questions:
+
+       `consensusBankedTs`  — WAS a pre-bank taken for this report? Carried
+                              forward unconditionally, because it is a fact about
+                              the report that stays true however the figures are
+                              later re-read.
+       `consensusSource`    — where the figures IN THIS RECORD came from. It is
+                              `pre-banked` only when the merge actually took
+                              epsEst / revEst (or the whole print block) from the
+                              bank; a pass that read a live consensus of its own
+                              says `live-pass`, even with a bank sitting beside
+                              it. Anything else would have the field describe a
+                              read that did not happen. */
+  if (prev.consensusBankedTs && !out.consensusBankedTs) out.consensusBankedTs = prev.consensusBankedTs;
+  if (bankUsed && prev.consensusSource === 'pre-banked') out.consensusSource = 'pre-banked';
+
   out.carriedForward = carried.length ? carried : null;
   out.passes = [...(prev.passes || []), ...(next.passes || [])];
   return out;
 }
 
 /** One ticker's record for this pass, before the merge. */
-async function printTapeMeasure(env, cand, reportDate, passLabel) {
+async function printTapeMeasure(env, cand, reportDate, passLabel, prev = null) {
   const sym = cand.symbol;
   let r = null, fetchError = null;
   try {
@@ -10538,8 +10781,14 @@ async function printTapeMeasure(env, cand, reportDate, passLabel) {
     r = r?.quoteSummary?.result?.[0] || null;
   } catch (e) { fetchError = e.message; }
 
+  /* The banked quarter is handed in from the PREVIOUS record so a rolled-forward
+     consensus can still be identified. It is the last resort inside
+     `printTapePrintFrom` and it relaxes no comparison — see the note there. */
+  const bankedQuarter = (prev && prev.schema === PRINTTAPE_SCHEMA && prev.print && !prev.print.status
+    && typeof prev.print.quarter === 'string') ? prev.print.quarter : null;
+
   const print = r
-    ? printTapePrintFrom(r, reportDate)
+    ? printTapePrintFrom(r, reportDate, bankedQuarter)
     : { status: 'not-published', reason: `Yahoo quoteSummary failed: ${fetchError}` };
   const tape = r
     ? printTapeTapeFrom(r.price, cand.session, cand.earningsTs)
@@ -10559,6 +10808,11 @@ async function printTapeMeasure(env, cand, reportDate, passLabel) {
     earningsIsEstimate: cand.earningsIsEstimate,
     pass: passLabel,
     ts: Date.now(),
+    /* This pass read whatever consensus it could see for itself. If the merge
+       then takes the figures from the bank instead, it overwrites this to
+       `pre-banked` — the field describes where the SERVED numbers came from. */
+    consensusSource: 'live-pass',
+    consensusBankedTs: null,
     print, tape, implied,
     divergent, refusalReason,
     ...(test ? { divergenceTest: test } : {}),
@@ -10581,6 +10835,50 @@ function printTapeComplete(rec) {
     && !rec.print?.status && !rec.tape?.status;
 }
 
+/* ── THE CARRY-OVER TEST ────────────────────────────────────────────────────
+
+   WHY IT EXISTS, measured live 2026-09-01: MDB printed EPS +18.09% with the
+   post-market down 14.56% — the exact shape this feature was built to catch —
+   and the 14:30 PT pass refused the divergence because Yahoo had not published
+   the REVENUE actual yet. The record was correct. The schedule was too early,
+   and every AMC name would have missed the open the same way, because both AMC
+   passes sit inside the ninety minutes after the print and Yahoo's actuals lag
+   it by hours to days.
+
+   So a prior-session AMC name rejoins the NEXT morning's BMO passes, by which
+   time Yahoo has had overnight to ingest the actual and the pre-market has
+   traded the same print. The test is deliberately the SPEC'S OWN WORDS — any
+   print field still `not-published`, or `divergent` still `null` — and not
+   `printTapeComplete`, because the two answer different questions: complete asks
+   "is there anything left for a same-session pass to read", this asks "is there
+   anything a NIGHT could have fixed".
+
+   AN ABSENT RECORD CARRIES OVER TOO. It means both of yesterday's passes failed
+   to write anything at all, which is strictly worse than a refusal, and the day
+   index still holds the name, its session and its `earningsTs` — everything the
+   measurement needs. Refusing it because there is no record to inspect would
+   make the worst case the one nothing retries.                                  */
+function printTapeNeedsCarryOver(rec) {
+  if (!rec || rec.schema !== PRINTTAPE_SCHEMA) {
+    return { need: true, reason: rec
+      ? `the banked record is schema ${rec.schema}, not ${PRINTTAPE_SCHEMA} — it reads as absent`
+      : 'no record was banked for this report at all, so neither of the report session\'s passes wrote one' };
+  }
+  if (rec.divergent !== true && rec.divergent !== false) {
+    return { need: true, reason: `divergent is ${JSON.stringify(rec.divergent)} — the question was REFUSED, `
+      + `not answered${rec.refusalReason ? `: ${rec.refusalReason}` : ''}` };
+  }
+  if (rec.print?.status) {
+    return { need: true, reason: `the print block is a refusal (${rec.print.status}): ${rec.print.reason}` };
+  }
+  for (const half of ['eps', 'revenue']) {
+    if (rec.print?.[half]?.status) {
+      return { need: true, reason: `print.${half} is ${rec.print[half].status}: ${rec.print[half].reason}` };
+    }
+  }
+  return { need: false, reason: `answered (divergent: ${rec.divergent}) with every print field published` };
+}
+
 /* ── THE ELIGIBILITY SCAN ───────────────────────────────────────────────────
 
    `ceil(N/20)` fetches for the WHOLE watchlist — two at the live N=40 — and no
@@ -10601,7 +10899,17 @@ function printTapeComplete(rec) {
    logic — that function is pinned by `earnings-timing.check.mjs` and two copies
    of a rule is how they drift. A `Start !== End` pair is Yahoo saying "sometime
    that day" and `earningsTimingFrom` already resolves it to `unknown`.          */
-async function printTapeEligible(env, tickers, todayEt) {
+async function printTapeEligible(env, tickers, wantDates) {
+  /* A SET of accepted report dates, not one, because the pre-bank pass asks
+     about the NEXT trading session while a measurement pass asks about today —
+     one scan, one `ceil(N/20)`, and the candidate carries the date it matched.
+
+     NOTE WHAT THIS CANNOT DO, because it is the reason the carry-over does not
+     use it: a v7 quote row carries the NEXT earnings date, and Yahoo rolls that
+     forward within a day or so of a report. So the morning after an AMC print
+     this scan no longer sees that print at all. The carry-over therefore reads
+     yesterday's own day index instead of re-scanning — see `collectPrintTape`. */
+  const want = wantDates instanceof Set ? wantDates : new Set([wantDates]);
   const out = { candidates: [], skipped: [], fetches: 0, sourceOk: true, sourceReason: null };
   const { crumb, cookie } = await getYahooCrumb(env).catch(() => ({ crumb: null, cookie: '' }));
   if (!crumb) {
@@ -10651,11 +10959,11 @@ async function printTapeEligible(env, tickers, todayEt) {
         isEarningsDateEstimate: q.isEarningsDateEstimate,
       });
       const reportDate = printTapeReportDate(earningsTs);
-      if (reportDate !== todayEt) continue;   // not reporting today — not a skip, just not eligible
+      if (!want.has(reportDate)) continue;   // not reporting in a wanted session — not a skip, just not eligible
       if (seen.has(t)) continue;
       seen.add(t);
       out.candidates.push({
-        symbol: t, earningsTs, session: earningsSession,
+        symbol: t, reportDate, earningsTs, session: earningsSession,
         earningsIsEstimate: typeof q.isEarningsDateEstimate === 'boolean' ? q.isEarningsDateEstimate : null,
         /* `earningsTimestamp` is recorded ONLY as a corroborating field, never
            read for eligibility — see the trap above. */
@@ -10667,29 +10975,202 @@ async function printTapeEligible(env, tickers, todayEt) {
   return out;
 }
 
+/* ── THE DAY INDEX APPEND, shared by every pass ─────────────────────────────
+
+   Read-modify-write across KV's eventual consistency, stated rather than hidden:
+   the passes are 45 minutes apart at the closest, against a measured convergence
+   of well under a second in this repo, so the window is not reachable in
+   practice. A lost append would cost one pass's entry in `passes[]`; the
+   per-ticker records are separate keys and cannot be affected.
+
+   THE CARRY-OVER APPENDS TO **YESTERDAY'S** INDEX, not only today's, and that is
+   what keeps `/api/printtape?date=<report day>` honest: the endpoint assembles
+   records from that day's `measured` list, so a name first measured on the
+   morning after its report would otherwise be a banked record nothing pointed
+   at. Today's index separately records that the carry-over ran, because a pass
+   that measured nothing of its own still has to be falsifiable (rule #7). */
+async function printTapeAppendDay(env, date, passEntry) {
+  let dayRec = null;
+  try { dayRec = await env.REC_LOG.get(printTapeDayKey(date), 'json'); } catch (_) {}
+  const dayOut = {
+    schema: PRINTTAPE_SCHEMA,
+    date,
+    ts: Date.now(),
+    passes: [...(dayRec?.schema === PRINTTAPE_SCHEMA ? (dayRec.passes || []) : []), passEntry],
+  };
+  try { await env.REC_LOG.put(printTapeDayKey(date), JSON.stringify(dayOut), { expirationTtl: PRINTTAPE_TTL }); }
+  catch (e) { console.warn(`[cron] print-tape: day index write for ${date} failed: ${e.message}`); }
+}
+
+/* ── THE PRE-BANK PASS ──────────────────────────────────────────────────────
+
+   THE PROBLEM IT SOLVES, and it is the same one twice. Yahoo's
+   `earningsTrend.0q` carries the consensus for the quarter about to be reported
+   and ROLLS FORWARD once the actual is ingested. Revenue consensus survives the
+   roll NOWHERE. Schema 1 banked it on the first measurement pass, thirty minutes
+   after the print — which works only while the roll is slower than our own
+   passes, and puts the one irreplaceable figure in the record behind a fetch
+   that can simply fail.
+
+   So it is read a whole trading session EARLY instead, at 13:15 PT (16:15 ET) on
+   the session before the report, for every watchlist name whose
+   `earningsTimestampStart` lands in the NEXT trading session — `nextTradingDay`,
+   so a Friday pre-bank reaches Monday and, over Labor Day 2026-09-07, Tuesday.
+
+   IT MEASURES NOTHING AND IT CANNOT. The report has not happened: there is no
+   actual, no extended-hours reaction and no verdict, so `tape` is a refusal
+   naming that and `divergent` is `null` for the ordinary reason. What it writes
+   is the consensus half of the print, stamped `consensusSource: 'pre-banked'`
+   with a `consensusBankedTs`, which every later pass merges onto.
+
+   COST, DERIVED: `ceil(N/20)` eligibility + one quoteSummary per eligible name,
+   plus 1 watchlist + 1 crumb + 1 day-index read + 1 day-index write + 2 bindings
+   per eligible (prior read, write) — `capCost = ceil(N/20) + 3E + 4`, with no
+   long-row read because there is no implied move to attach to a report that has
+   not happened. At the live N=40 with E=3 that is 15. It shares the 13:15
+   invocation with the four jobs of the `eod+iv-sweep+macro` branch, so its
+   `_instr` is an UPPER BOUND on this job and a lower bound on the invocation
+   (rule #1) — the derivation above is the checkable figure, not the counter.  */
+async function collectPrintTapePreBank(env) {
+  if (!env?.REC_LOG) return;
+  const mark  = instrMark();
+  const today = etToday();
+  const target = nextTradingDay(today);
+  const label = 'prebank';
+  const startedMs = Date.now();
+
+  if (!target) {
+    console.warn(`[cron] print-tape ${label}: could not resolve the next trading day from ${today} — `
+      + 'nothing banked. Check NYSE_HOLIDAYS_THROUGH.');
+    return;
+  }
+
+  const tickers = await sweepUniverse(env, `print-tape ${label} sweep`, PRINTTAPE_SWEEP_CAP);
+  if (!tickers) return;   // refuses loudly inside sweepUniverse; nothing written
+
+  const scan = await printTapeEligible(env, tickers, new Set([target]));
+
+  const banked = [], skipped = [...scan.skipped];
+  for (const cand of scan.candidates) {
+    const key = printTapeKey(cand.symbol, target);
+    let prev = null;
+    try { prev = await env.REC_LOG.get(key, 'json'); } catch (_) {}
+
+    /* Already banked by an earlier firing of this same window. The window admits
+       exactly one firing, so this only fires if the pass is ever widened — but a
+       second bank would re-read a consensus that is already correct and could
+       only make it worse. */
+    if (prev?.schema === PRINTTAPE_SCHEMA && prev.consensusSource === 'pre-banked'
+        && prev.print && !prev.print.status) {
+      skipped.push({ ticker: cand.symbol,
+        reason: `consensus for ${prev.print.quarter} already banked at ${prev.consensusBankedTs}` });
+      continue;
+    }
+
+    let r = null, fetchError = null;
+    try {
+      r = await yahooAuth(`/v10/finance/quoteSummary/${cand.symbol}`,
+        '?modules=earnings,earningsHistory,earningsTrend,calendarEvents,price', env);
+      r = r?.quoteSummary?.result?.[0] || null;
+    } catch (e) { fetchError = e.message; }
+
+    const print = r
+      ? printTapePrintFrom(r, target)
+      : { status: 'not-published', reason: `Yahoo quoteSummary failed: ${fetchError}` };
+    /* NOT a measurement and NOT `unavailable`: the window has not opened. A
+       distinct status so a reader can tell "we looked and Yahoo had nothing"
+       from "there was nothing to look at yet". */
+    const tape = { status: 'not-yet',
+      reason: `the ${cand.session} report on ${target} has not happened — there is no extended-hours `
+        + 'reaction to read, and this pass exists to bank the consensus before it rolls forward' };
+    const { divergent, refusalReason } = printTapeDivergence(cand.session, print, tape);
+    const bankedTs = new Date().toISOString();
+
+    let rec = {
+      schema: PRINTTAPE_SCHEMA,
+      ticker: cand.symbol,
+      reportDate: target,
+      session: cand.session,
+      earningsTs: cand.earningsTs,
+      earningsIsEstimate: cand.earningsIsEstimate,
+      pass: label,
+      ts: Date.now(),
+      consensusSource: print.status ? 'live-pass' : 'pre-banked',
+      consensusBankedTs: print.status ? null : bankedTs,
+      print, tape,
+      implied: { status: 'not-computed',
+        reason: 'the pre-bank pass reads the consensus only — the implied move is attached by the '
+          + 'measurement passes, from the long: row priced on the report day itself' },
+      divergent, refusalReason,
+      guidance: null,
+      baseRate: { status: 'not-measured', reason: 'no logged history of beat-and-fade outcomes yet' },
+      passes: [{ pass: label, ts: Date.now(), divergent, printOk: !print.status, tapeOk: false }],
+    };
+    rec = mergePrintTapeRecord(prev, rec);
+
+    try {
+      await env.REC_LOG.put(key, JSON.stringify(rec), { expirationTtl: PRINTTAPE_TTL });
+      if (rec.consensusSource === 'pre-banked') banked.push(cand.symbol);
+      else skipped.push({ ticker: cand.symbol, reason: `nothing to bank: ${print.reason}` });
+    } catch (e) {
+      skipped.push({ ticker: cand.symbol, reason: `KV write failed: ${e.message}` });
+    }
+  }
+
+  /* The index for the TARGET day, written on every pre-bank including one that
+     banks nothing — dispatch evidence, and it is the index tomorrow's passes
+     append to rather than create. */
+  await printTapeAppendDay(env, target, {
+    pass: label, ptTs: new Date().toISOString(), wallMs: Date.now() - startedMs,
+    eligible: scan.candidates.map(c => ({ ticker: c.symbol, session: c.session, earningsTs: c.earningsTs })),
+    measured: [], banked, skipped,
+    scanOk: scan.sourceOk, scanReason: scan.sourceReason, scanFetches: scan.fetches,
+    universe: tickers.length, divergent: [], forDate: target, ranOn: today,
+  });
+
+  console.log(
+    `[cron] print-tape ${label} ${today} -> ${target}: ${scan.candidates.length} reporting next session of `
+    + `${tickers.length} (${scan.candidates.map(c => `${c.symbol}/${c.session}`).join(', ') || 'none'}) · `
+    + `${banked.length} consensus banked · ${skipped.length} skipped`
+    + (scan.sourceOk ? '' : ` · SCAN INCOMPLETE: ${scan.sourceReason}`)
+    + ` · ${JSON.stringify(instrSince(mark, label))}`,
+  );
+}
+
 /* ── THE JOB ────────────────────────────────────────────────────────────────
 
    COST, DERIVED FROM THE STRUCTURE (rule #1 — one pool, `capCost` = external
-   fetches + binding ops), with N the watchlist size and E the number of names
-   reporting that day:
+   fetches + binding ops). N is the watchlist, E the names measured on this pass,
+   and — on the BMO passes only — S the prior-session AMC names screened for
+   carry-over of which C are actually carried (so E = today's BMO names + C):
 
-     external : ceil(N/20) eligibility  +  1 quoteSummary per eligible  = ceil(N/20) + E
-     bindings : 1 watchlist + 1 crumb + 1 day-index read + 1 day-index write
-                + per eligible: 1 prior-record read + 1 long-row read + 1 write = 4 + 3E
-     capCost  : ceil(N/20) + 4E + 4
+     AMC passes, unchanged:
+       external : ceil(N/20) eligibility  +  1 quoteSummary per eligible
+       bindings : 1 watchlist + 1 crumb + 1 day-index read + 1 day-index write
+                  + per eligible: 1 prior read + 1 long-row read + 1 write
+       capCost  : ceil(N/20) + 4E + 4
 
-   MEASURED, not estimated, on the replay harness driving the real `scheduled()`
-   (`_instr` from a firing this job had to itself, so it IS a measurement):
+     BMO passes, with the carry-over:
+       + 1 read of yesterday's day index
+       + 1 record read per screened name (S) — which IS the carried name's prior
+         read, so it is not paid twice
+       + 2 for appending to yesterday's index, and only when C > 0
+       capCost  : ceil(N/20) + 4E + (S - C) + 5 + (C > 0 ? 2 : 0)
+
+   MEASURED on the replay harness at schema 1 (`_instr` from a firing this job
+   had to itself, so it IS a measurement):
 
      N=6,  E=3, cold crumb : extFetches 4 · bindingOps 13 · capCost 17
      N=1,  E=1, warm crumb : extFetches 1 · bindingOps  6 · capCost  7
      N=6,  E=0             : extFetches 1 · bindingOps  4 · capCost  5
 
-   which is the formula exactly (the crumb read drops out once `_crumbCache` is
-   warm in the isolate). At the live N=40 with E=3 that derives to **capCost 18**
-   against this invocation's 10,000. A heavy day at E=10 is 46. A day on which
-   nobody reports is **6** — one or two fetches and four binding ops — which is
-   what makes running this four times a day unremarkable.
+   which is the AMC formula exactly (the crumb read drops out once `_crumbCache`
+   is warm in the isolate). At the live N=40: an AMC pass with E=3 derives to 18,
+   and a BMO pass with 1 name reporting today, S=3 screened and C=2 carried
+   (E=3) derives to ceil(40/20) + 12 + 1 + 5 + 2 = **22**. A heavy morning at
+   E=10, S=12, C=8 is 2 + 40 + 4 + 5 + 2 = 53. A day on which nobody reports and
+   nothing carries over is **6**, which is what makes five passes a day
+   unremarkable against this invocation's 10,000.
 
    A divergent name adds `gatherEarningsFacts` (2-3 external) plus one Anthropic
    call, and only then.
@@ -10699,7 +11180,8 @@ async function printTapeEligible(env, tickers, todayEt) {
 
      05:30 PT  no other branch      -> `_instr` IS a measurement
      06:15 PT  morning-briefing     -> upper bound on this job
-     13:30 PT  eod+iv-sweep+macro+top3 (four jobs) -> upper bound, and a loose one
+     13:15 PT  eod+iv-sweep+macro+top3 (four jobs) -> the PRE-BANK, upper bound
+     13:30 PT  eod branch's window is m<45, so still four jobs -> upper bound
      14:30 PT  no branch (the mood branch is `m < 30`) -> `_instr` IS a measurement
 
    THE SCAN IS SEQUENTIAL, and not because of the cap. Yahoo crumb rate-limiting
@@ -10715,7 +11197,7 @@ async function collectPrintTape(env, sessionWanted, passNo) {
   const tickers = await sweepUniverse(env, `print-tape ${label} sweep`, PRINTTAPE_SWEEP_CAP);
   if (!tickers) return;   // refuses loudly inside sweepUniverse; nothing written
 
-  const scan = await printTapeEligible(env, tickers, today);
+  const scan = await printTapeEligible(env, tickers, new Set([today]));
 
   /* A NAME WHOSE SESSION IS `unknown` IS MEASURED ON THE AMC PASSES, NOT DROPPED.
      By 13:30 PT the bell has rung, so a report filed that day has landed whatever
@@ -10727,101 +11209,189 @@ async function collectPrintTape(env, sessionWanted, passNo) {
   const wanted = scan.candidates.filter(c =>
     c.session === sessionWanted || (sessionWanted === 'amc' && c.session === 'unknown'));
 
-  const measured = [], skipped = [...scan.skipped], divergentNames = [];
-  for (const cand of wanted) {
-    const key = printTapeKey(cand.symbol, today);
-    let prev = null;
-    try { prev = await env.REC_LOG.get(key, 'json'); } catch (_) {}
+  const work = wanted.map(cand => ({ cand, reportDate: today, prev: undefined, carry: false }));
+
+  /* ── THE PRIOR-SESSION AMC CARRY-OVER, on the BMO passes only ──────────────
+
+     The list comes from YESTERDAY'S OWN DAY INDEX and never from a re-scan.
+     A v7 quote row carries the NEXT earnings date, and Yahoo rolls that forward
+     within a day or so of a report — measured 2026-09-01, PLTR's
+     `earningsTimestampStart` was already 2026-11-02 while `earningsTimestamp`
+     still read 2026-08-03 — so a morning re-scan would find yesterday's
+     reporters had vanished from the universe. Our own index cannot be wrong
+     about who we measured, costs one read, and carries the `earningsTs` the
+     staleness guard needs.
+
+     "Yesterday" is `prevTradingDay`, which skips weekends AND NYSE holidays.
+     Labor Day 2026-09-07 is the first live case: on Tuesday 2026-09-08 this
+     must resolve to Friday 2026-09-04, and a weekday-only walk would look for
+     Monday, find no index, and silently carry nothing. */
+  const prevDate = sessionWanted === 'bmo' ? prevTradingDay(today) : null;
+  const carrySkipped = [], carryScreened = [];
+  if (prevDate) {
+    let prevDay = null, prevDayErr = null;
+    try { prevDay = await env.REC_LOG.get(printTapeDayKey(prevDate), 'json'); }
+    catch (e) { prevDayErr = e.message; }
+    if (prevDay && prevDay.schema !== PRINTTAPE_SCHEMA) prevDay = null;
+
+    const seenCarry = new Set();
+    for (const p of (prevDay?.passes || [])) {
+      for (const e of (p.eligible || [])) {
+        if (e.session !== 'amc' && e.session !== 'unknown') continue;
+        if (seenCarry.has(e.ticker)) continue;
+        seenCarry.add(e.ticker);
+        carryScreened.push(e);
+      }
+    }
+    if (!prevDay) {
+      console.log(`[cron] print-tape ${label}: no readable day index for the prior session ${prevDate}`
+        + `${prevDayErr ? ` (KV read failed: ${prevDayErr})` : ''} — nothing to carry over. This is not `
+        + '"nobody reported yesterday".');
+    }
+
+    for (const e of carryScreened) {
+      const key = printTapeKey(e.ticker, prevDate);
+      let prev = null;
+      try { prev = await env.REC_LOG.get(key, 'json'); } catch (_) {}
+      const verdict = printTapeNeedsCarryOver(prev);
+      if (!verdict.need) { carrySkipped.push({ ticker: e.ticker, reason: verdict.reason }); continue; }
+      const earningsTs = prev?.earningsTs ?? e.earningsTs ?? null;
+      if (!earningsTs) {
+        /* Without the report instant the staleness guard cannot tell this
+           print's reaction from the previous session's, which is the one
+           refusal this feature will not trade away. */
+        carrySkipped.push({ ticker: e.ticker,
+          reason: 'carry-over needed but neither the banked record nor the day index carries an '
+            + 'earningsTs, so the tape staleness guard could not be applied' });
+        continue;
+      }
+      work.push({
+        cand: {
+          symbol: e.ticker,
+          session: prev?.session ?? e.session,
+          earningsTs,
+          earningsIsEstimate: prev?.earningsIsEstimate ?? null,
+        },
+        reportDate: prevDate, prev, carry: true, carryReason: verdict.reason,
+      });
+    }
+  }
+
+  const measured = [], carryMeasured = [], skipped = [...scan.skipped];
+  const divergentNames = [], carryDivergent = [];
+  for (const item of work) {
+    const cand = item.cand;
+    const key = printTapeKey(cand.symbol, item.reportDate);
+    let prev = item.prev;
+    if (prev === undefined) {
+      prev = null;
+      try { prev = await env.REC_LOG.get(key, 'json'); } catch (_) {}
+    }
 
     /* THE PER-TICKER SKIP the spec asks for: a record that already ANSWERED the
        question with every field present needs no second pass. A refusal is never
-       complete — the second pass exists precisely to retry those. */
-    if (passNo > 1 && printTapeComplete(prev)) {
+       complete — the second pass exists precisely to retry those. A carry-over
+       item has already been screened by `printTapeNeedsCarryOver`, which is a
+       different and stricter question, so it does not re-run this one. */
+    if (passNo > 1 && !item.carry && printTapeComplete(prev)) {
       skipped.push({ ticker: cand.symbol,
         reason: `already answered on ${prev.pass} (divergent: ${prev.divergent}) with print and tape both `
           + 'present — nothing left for this pass to read' });
       continue;
     }
 
+    const passLabel = item.carry ? `${label}-carryover` : label;
     let rec;
-    try { rec = await printTapeMeasure(env, cand, today, label); }
+    try { rec = await printTapeMeasure(env, cand, item.reportDate, passLabel, prev); }
     catch (e) {
-      skipped.push({ ticker: cand.symbol, reason: `measurement threw: ${e.message}` });
+      (item.carry ? carrySkipped : skipped).push({ ticker: cand.symbol, reason: `measurement threw: ${e.message}` });
       continue;
     }
     rec = mergePrintTapeRecord(prev, rec);
+    if (item.carry) rec.carriedOverFrom = { reportDate: item.reportDate, reason: item.carryReason };
 
     /* RE-RUN THE VERDICT ON THE MERGED RECORD. `printTapeMeasure` decides it from
        what THIS pass alone could read, and the merge exists precisely because one
        pass alone cannot see both halves — so a verdict computed before the merge
        is answered on inputs the record no longer has. Measured: with the
-       consensus carried forward from pass 1 and the actual read by pass 2, the
-       merged print reports revSurprisePct 3.77 while the pre-merge verdict still
-       said "1 is absent: revEst" and refused. The refusal survived its own cause,
-       which also meant `guidance` could never fire on a name whose evidence only
-       became complete across two passes — the whole point of having two. */
+       consensus carried forward from the pre-bank and the actual read the next
+       morning, the merged print reports revSurprisePct 3.77 while the pre-merge
+       verdict still said "1 is absent: revEst" and refused. The refusal survived
+       its own cause, which also meant `guidance` could never fire on a name whose
+       evidence only became complete across two passes — the whole point of
+       having more than one. */
     const merged = printTapeDivergence(rec.session, rec.print, rec.tape);
     rec.divergent = merged.divergent;
     rec.refusalReason = merged.refusalReason;
     if (merged.test) rec.divergenceTest = merged.test; else delete rec.divergenceTest;
     // The pass log entry describes this pass's OUTCOME, so it follows the verdict.
     const own = rec.passes?.[rec.passes.length - 1];
-    if (own && own.pass === label) {
+    if (own && own.pass === passLabel) {
       own.divergent = merged.divergent;
       own.printOk = !rec.print?.status;
       own.tapeOk = !rec.tape?.status;
+      own.usedWindow = rec.tape?.usedWindow ?? null;
       own.merged = Array.isArray(rec.carriedForward) ? rec.carriedForward : null;
     }
 
     /* GUIDANCE FIRES ONLY ON A DIVERGENT NAME, and only when one has not already
        been banked. `divergent === true` by strict equality — `null` is a refusal
-       and must never spend. */
+       and must never spend. The banked-and-carried-forward guidance is what makes
+       "at most one call per ticker per report" structural rather than a rule
+       someone has to remember, and it holds across the carry-over unchanged
+       because the carry-over writes the SAME key. */
     if (rec.divergent === true && (!rec.guidance || rec.guidance.status)) {
       rec.guidance = await printTapeGuidance(cand.symbol, env, rec.print);
     }
-    if (rec.divergent === true) divergentNames.push(cand.symbol);
+    if (rec.divergent === true) (item.carry ? carryDivergent : divergentNames).push(cand.symbol);
 
     try {
       await env.REC_LOG.put(key, JSON.stringify(rec), { expirationTtl: PRINTTAPE_TTL });
-      measured.push(cand.symbol);
+      (item.carry ? carryMeasured : measured).push(cand.symbol);
     } catch (e) {
-      skipped.push({ ticker: cand.symbol, reason: `KV write failed: ${e.message}` });
+      (item.carry ? carrySkipped : skipped).push({ ticker: cand.symbol, reason: `KV write failed: ${e.message}` });
     }
   }
 
   /* THE DAY INDEX — written on EVERY pass, zero-eligible included. It is what
      makes a quiet day falsifiable (rule #7) and it is what the endpoint reads to
-     answer `eligible` / `measured` / `skipped` without a single fetch.
-
-     Read-modify-write across KV's eventual consistency, stated rather than
-     hidden: the four passes are 45 minutes apart at the closest, against a
-     measured convergence of well under a second in this repo, so the window is
-     not reachable in practice. A lost append would cost one pass's entry in
-     `passes[]`; the per-ticker records are separate keys and cannot be affected. */
-  let dayRec = null;
-  try { dayRec = await env.REC_LOG.get(printTapeDayKey(today), 'json'); } catch (_) {}
-  const passEntry = {
+     answer `eligible` / `measured` / `skipped` without a single fetch. */
+  await printTapeAppendDay(env, today, {
     pass: label, ptTs: new Date().toISOString(), wallMs: Date.now() - startedMs,
-    eligible: scan.candidates.map(c => ({ ticker: c.symbol, session: c.session })),
+    eligible: scan.candidates.map(c => ({ ticker: c.symbol, session: c.session, earningsTs: c.earningsTs })),
     measured, skipped,
     scanOk: scan.sourceOk, scanReason: scan.sourceReason, scanFetches: scan.fetches,
     universe: tickers.length,
     divergent: divergentNames,
-  };
-  const dayOut = {
-    schema: PRINTTAPE_SCHEMA,
-    date: today,
-    ts: Date.now(),
-    passes: [...(dayRec?.schema === PRINTTAPE_SCHEMA ? (dayRec.passes || []) : []), passEntry],
-  };
-  try { await env.REC_LOG.put(printTapeDayKey(today), JSON.stringify(dayOut), { expirationTtl: PRINTTAPE_TTL }); }
-  catch (e) { console.warn(`[cron] print-tape ${label}: day index write failed: ${e.message}`); }
+    /* Named on TODAY's index even when it carried nothing, so "the carry-over
+       ran and found everything already answered" is falsifiable in the same way
+       a zero-eligible day is. */
+    carryOver: prevDate ? {
+      date: prevDate, screened: carryScreened.map(e => e.ticker),
+      measured: carryMeasured, skipped: carrySkipped, divergent: carryDivergent,
+    } : null,
+  });
+
+  /* AND THE REPORT DAY'S OWN INDEX, so the endpoint can find the records this
+     pass wrote under yesterday's date. Only when something was actually
+     measured — an append that adds nothing is two binding ops for no fact. */
+  if (carryMeasured.length) {
+    await printTapeAppendDay(env, prevDate, {
+      pass: `${label}-carryover`, ptTs: new Date().toISOString(), wallMs: Date.now() - startedMs,
+      eligible: carryScreened, measured: carryMeasured, skipped: carrySkipped,
+      scanOk: true, scanReason: null, scanFetches: 0,
+      universe: tickers.length, divergent: carryDivergent, ranOn: today,
+    });
+  }
 
   console.log(
     `[cron] print-tape ${label} ${today}: ${scan.candidates.length} reporting today of ${tickers.length} `
     + `(${scan.candidates.map(c => `${c.symbol}/${c.session}`).join(', ') || 'none'}) · `
     + `${wanted.length} for this pass · ${measured.length} measured · ${skipped.length} skipped`
-    + (divergentNames.length ? ` · !! DIVERGENT !! ${divergentNames.join(', ')}` : '')
+    + (prevDate ? ` · carry-over from ${prevDate}: ${carryScreened.length} screened, `
+      + `${carryMeasured.length} measured, ${carrySkipped.length} already answered or skipped` : '')
+    + (divergentNames.length || carryDivergent.length
+      ? ` · !! DIVERGENT !! ${[...divergentNames, ...carryDivergent].join(', ')}` : '')
     + (scan.sourceOk ? '' : ` · SCAN INCOMPLETE: ${scan.sourceReason}`)
     + ` · ${JSON.stringify(instrSince(mark, label))}`,
   );
@@ -10864,19 +11434,26 @@ async function handlePrintTape(params, origin, env) {
     if (!seen.has(e.ticker)) { seen.add(e.ticker); eligible.push(e); }
   }
   const measured = [...new Set(passes.flatMap(p => p.measured || []))];
+  /* A PRE-BANKED name has a real record — the consensus half, with the verdict
+     still refused because the report has not happened. It is listed separately
+     from `measured` (nothing has been measured about it) but its record IS
+     served, because a banked consensus nobody can read is a banked consensus
+     that may as well not exist. */
+  const banked = [...new Set(passes.flatMap(p => p.banked || []))];
+  const haveRecords = [...new Set([...measured, ...banked])];
   /* A ticker that was skipped on one pass and measured on a later one is NOT a
      skip — reporting it as one would describe a name whose record is sitting
      right there in `records`. */
   const skipped = [];
   const skipSeen = new Set();
   for (const p of passes) for (const s of (p.skipped || [])) {
-    if (measured.includes(s.ticker) || skipSeen.has(s.ticker)) continue;
+    if (haveRecords.includes(s.ticker) || skipSeen.has(s.ticker)) continue;
     skipSeen.add(s.ticker); skipped.push(s);
   }
 
   const records = [];
   const unreadable = [];
-  for (const t of measured) {
+  for (const t of haveRecords) {
     try {
       const rec = await env?.REC_LOG?.get(printTapeKey(t, date), 'json');
       if (rec && rec.schema === PRINTTAPE_SCHEMA) records.push(rec);
@@ -10897,10 +11474,13 @@ async function handlePrintTape(params, origin, env) {
             + `is older than PRINTTAPE_TTL (${PRINTTAPE_TTL / 86400}d)`),
       eligible,
       measured,
+      banked,
       skipped,
       unreadable,
       passes: passes.map(p => ({ pass: p.pass, ptTs: p.ptTs, wallMs: p.wallMs, universe: p.universe,
-                                 scanOk: p.scanOk, scanReason: p.scanReason, divergent: p.divergent })),
+                                 scanOk: p.scanOk, scanReason: p.scanReason, divergent: p.divergent,
+                                 banked: p.banked ?? null, carryOver: p.carryOver ?? null,
+                                 ranOn: p.ranOn ?? null })),
       divergencePct: PRINTTAPE_DIVERGENCE_PCT,
       schema: PRINTTAPE_SCHEMA,
     },
@@ -10909,6 +11489,68 @@ async function handlePrintTape(params, origin, env) {
       note: day ? `${records.length} record${records.length === 1 ? '' : 's'} over ${passes.length} pass`
                   + `${passes.length === 1 ? '' : 'es'}`
                 : 'no pass index for this date',
+    }),
+  }, 200, origin);
+}
+
+/* ── THE NYSE CALENDAR ──────────────────────────────────────────────────────
+
+   `GET /api/calendar/holidays[?date=YYYY-MM-DD]` — a pure computation over
+   `NYSE_HOLIDAY_TABLE`. ZERO fetches, ZERO binding ops, nothing written and no
+   Claude call anywhere on the path.
+
+   IT EXISTS BECAUSE THE CONSUMER WAS DOING ITS OWN WEEKDAY ARITHMETIC. A
+   `prevTradingDay` that walks back to the previous weekday is right about four
+   days in five and silently wrong on the fifth: over Labor Day 2026-09-07 —
+   the first live case in this table — the session before Tuesday 2026-09-08 is
+   FRIDAY 2026-09-04, and a weekday walk lands on the Monday the exchange was
+   shut. Downstream that reads as "nothing reported", which is indistinguishable
+   from a real quiet day. Two copies of a calendar is how they drift, so there is
+   one copy, here, and it is the same Set `tradingDayStatus` gates the cron with.
+
+   GATED WITH `requireSecret`, NOT `aiGuard`, the same reasoning as
+   `/api/printtape`: both check the same `x-dash-key`, only `aiGuard` DEBITS the
+   Claude-denominated `AI_RATE_GLOBAL_DAY` bucket, and this request cannot spend
+   an Anthropic credit.
+
+   `calendarStale` is not decoration: past `NYSE_HOLIDAYS_THROUGH` every weekday
+   reads as open, so a consumer asking about a date beyond the runway is told the
+   answer is a weekend test and nothing more.                                    */
+function handleCalendarHolidays(params, origin) {
+  const raw = params?.get('date');
+  if (raw != null && !LONGARCH_DATE_RE.test(raw)) {
+    return err(`date must be YYYY-MM-DD; got ${JSON.stringify(raw)}`, 400, origin);
+  }
+  const date = raw || etToday();
+  const status = tradingDayStatus(date, isoDow(date));
+  const prev = prevTradingDay(date);
+  const next = nextTradingDay(date);
+
+  return json({
+    date,
+    isTradingDay: status.open,
+    reason: status.reason,
+    prevTradingDay: prev,
+    nextTradingDay: next,
+    /* Named so a consumer need not re-derive it, and null rather than a guess
+       when the walk found nothing — `x == null` and a real date must never
+       render the same way. */
+    prevTradingDayIsPriorCalendarDay: prev ? prev === isoAddDays(date, -1) : null,
+    holidays: NYSE_HOLIDAY_TABLE,
+    through: NYSE_HOLIDAYS_THROUGH,
+    calendarStale: date > NYSE_HOLIDAYS_THROUGH,
+    calendarStaleNote: date > NYSE_HOLIDAYS_THROUGH
+      ? `${date} is past NYSE_HOLIDAYS_THROUGH (${NYSE_HOLIDAYS_THROUGH}); every weekday beyond that reads `
+        + 'as open, holidays included. Extend NYSE_HOLIDAY_TABLE before relying on this answer.'
+      : null,
+    earlyCloses: null,
+    earlyClosesNote: 'Early closes (1:00pm ET the day after Thanksgiving and on Christmas Eve) are NOT '
+      + 'modelled anywhere in this Worker. They are omitted rather than nulled into a list a consumer '
+      + 'would read as "there are none".',
+    _meta: srcMeta('NYSE Group published holiday calendar (hardcoded, verified two ways)', {
+      ok: true, delayed: false, asOf: date,
+      note: `${NYSE_HOLIDAY_TABLE.length} full-day closures through ${NYSE_HOLIDAYS_THROUGH}; `
+        + 'full-day closures only, early closes not modelled',
     }),
   }, 200, origin);
 }
@@ -14987,6 +15629,20 @@ export default {
           if (g) return g;
           return await handlePrintTape(url.searchParams, origin, env);
         }
+        /* The NYSE trading-day calendar. Pure computation over the hardcoded
+           holiday table — zero fetches, zero binding ops, nothing written — so
+           it takes `requireSecret` for the same reason `printtape` does: it
+           cannot spend an Anthropic credit, and `aiGuard` would debit a ceiling
+           denominated in Claude calls for a request that makes none. */
+        case 'calendar': {
+          if (sub !== 'holidays') {
+            return err(`unknown calendar route ${JSON.stringify(sub ?? null)} — only `
+              + 'GET /api/calendar/holidays exists', 404, origin);
+          }
+          const g = requireSecret(request, env, origin);
+          if (g) return g;
+          return handleCalendarHolidays(url.searchParams, origin);
+        }
         /* Off-watchlist discovery. Origin-gated only — no Claude call anywhere
            on the path, so there is nothing for `aiGuard` to protect, and the
            only write is its own `radar:{PT-date}` day cache. */
@@ -15169,28 +15825,42 @@ export default {
     }
 
     /* ── PRINT vs TAPE — dispatched OUTSIDE the branch chain, deliberately ────
-       Its four passes are 05:30 / 06:15 / 13:30 / 14:30 PT, and three of those
-       fall inside windows the if/else chain below already owns (06:15 in
-       `morning-briefing`'s `h===6 && m<30`, 13:30 in the EOD branch's
-       `m>=15 && m<45`, 05:30 in nothing, 14:30 in nothing since the 2pm branch
-       is `m<30`). A new `else if` would therefore never fire on two of them.
-       Folding the job into those branches instead would tie its schedule to
-       theirs and silently move it the next time one of their windows changes.
+       Its FIVE passes are 13:15 (the pre-bank) / 05:30 / 06:15 / 13:30 / 14:30
+       PT, and three of those fall inside windows the if/else chain below already
+       owns (06:15 in `morning-briefing`'s `h===6 && m<30`, and both 13:15 and
+       13:30 in the EOD branch's `m>=15 && m<45`; 05:30 is in nothing and 14:30
+       is in nothing, since the 2pm branch is `m<30`). A new `else if` would
+       therefore never fire on three of the five. Folding the job into those
+       branches instead would tie its schedule to theirs and silently move it the
+       next time one of their windows changes.
 
        So the pass is decided by its OWN clock test and dispatched here, and the
        decision is appended to the branch name in the log line below so rule #7
-       still holds: every firing says whether a print-tape pass was due.
+       still holds: every firing says whether a print-tape pass was due, and
+       which one.
 
        It shares the invocation's subrequest budget with whatever branch also
-       fires — `ctx.waitUntil` does not get its own — so at 06:15 and 13:30 no
-       per-job `_instr` from it is a measurement. At 05:30 and 14:30 it runs
-       alone and its `_instr` IS one. The cost is small either way: capCost
-       `ceil(N/20) + 4E + 4`, which derives to 18 at the live N=40 with E=3 and
-       was MEASURED at 5 on a firing where nobody reported. */
+       fires — `ctx.waitUntil` does not get its own — so at 06:15, 13:15 and
+       13:30 no per-job `_instr` from it is a measurement. At 05:30 and 14:30 it
+       runs alone and its `_instr` IS one. The cost is small either way: the AMC
+       passes are `ceil(N/20) + 4E + 4`, which derives to 18 at the live N=40
+       with E=3 and was MEASURED at 5 on a firing where nobody reported; the BMO
+       passes add the carry-over's `(S - C) + 1 + (C>0 ? 2 : 0)` binding ops, and
+       the pre-bank is `ceil(N/20) + 3E + 4`. See the cost block on
+       `collectPrintTape`. */
     const ptPass = printTapePassAt(h, m);
+    const ptLabel = ptPass ? (ptPass.kind === 'prebank' ? 'prebank' : `${ptPass.session}-pass${ptPass.pass}`) : null;
     if (ptPass) {
-      dispatchJob(ctx, `print-tape-${ptPass.session}-${ptPass.pass}`,
-        () => collectPrintTape(env, ptPass.session, ptPass.pass));
+      if (ptPass.kind === 'prebank') {
+        /* 13:15 PT — banks the consensus for the NEXT trading session's
+           reporters, a whole session before the report, so the earningsTrend
+           roll-forward can no longer take the revenue consensus with it. It
+           measures nothing and writes no verdict. */
+        dispatchJob(ctx, 'print-tape-prebank', () => collectPrintTapePreBank(env));
+      } else {
+        dispatchJob(ctx, `print-tape-${ptPass.session}-${ptPass.pass}`,
+          () => collectPrintTape(env, ptPass.session, ptPass.pass));
+      }
     }
 
     let branch = 'idle';                        // in-window wakeup with no job due
@@ -15275,7 +15945,7 @@ export default {
 
     console.log(
       `[cron] ${at} · ${via} · trading day · branch=${branch}`
-      + (ptPass ? ` + print-tape=${ptPass.session}-pass${ptPass.pass}` : '') +
+      + (ptLabel ? ` + print-tape=${ptLabel}` : '') +
       (day.calendarStale ? ` · WARN holiday calendar ends ${NYSE_HOLIDAYS_THROUGH}, holidays no longer skipped` : ''),
     );
   },

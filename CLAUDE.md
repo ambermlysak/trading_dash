@@ -89,13 +89,19 @@ attributed to whichever job stamped the payload. On a firing that dispatches mor
 than one job through `ctx.waitUntil`, the per-job figures are **upper bounds on
 that job and lower bounds on the invocation**, not measurements of either.
 
-**Both multi-job branches are now three jobs deep, so this is the normal case on
-the cron path, not an edge one:**
+**Both multi-job branches are three jobs deep or more, so this is the normal case
+on the cron path, not an edge one:**
 
 | branch | PT | jobs |
 |---|---|---|
-| `eod+iv-sweep+macro` | 1:15pm | `eod-summary`, `iv-sweep`, `macro-state` |
+| `eod+iv-sweep+macro` | 1:15pm | `eod-summary`, `iv-sweep`, `macro-state`, `top3`, **and the print-tape PRE-BANK** (dispatched outside the chain, window `m` 15–29) — **five** |
+| `eod+iv-sweep+macro` | 1:30pm | the same four, plus print-tape `amc-pass1` |
 | `forward-returns+moves+mood` | 2:00pm | `forward-returns`, `move-series`, `market-mood` |
+
+The print-tape passes at **05:30 and 14:30 PT own no branch and run alone**, so
+their `_instr` IS a measurement — and that is what the 2026-09-01 cost table for
+that job rests on. The pre-bank at 13:15 can never be isolated, so its figure is a
+DERIVATION, per the `collectMarketMood` rule below.
 
 So: **quote a per-job `_instr` only for a job that ran alone, and say which case
 you are in.** The N=22 sweep figure of `2 / 47 / 49` is trustworthy precisely
@@ -197,7 +203,8 @@ PT hour  →  UTC under PDT (UTC-7)  |  UTC under PST (UTC-8)
  5:00am  →  12:00  ✓               |  13:00  ✓
  5:30am  →  12:30  ✓               |  13:30  ✓
  6:00am  →  13:00  ✓               |  14:00  ✓
- 1:15pm  →  20:15  ✓               |  21:15  ✓
+ 1:15pm  →  20:15  ✓               |  21:15  ✓   (print-tape PRE-BANK)
+ 1:30pm  →  20:30  ✓               |  21:30  ✓
  2:30pm  →  21:30  ✓               |  22:30  ✓
  3:00pm  →  22:00  ✓               |  23:00  ✗ outside
 ```
@@ -469,9 +476,11 @@ distinguish one failed job from a failed branch.
    `movesweep:last`, `moodsweep:last`, `13f:cursor`
 2. a grep for **`!! JOB-FAILED !!`**, which names the job
 
-This now covers all nine dispatch sites in `scheduled()`: `morning-briefing`,
-`midday-pulse`, `eod-summary`, `iv-sweep`, `macro-state`, `forward-returns`,
-`move-series`, `market-mood`, `13f-slice`.
+This now covers all eleven dispatch sites in `scheduled()`: `morning-briefing`,
+`morning-rows`, `midday-pulse`, `eod-summary`, `iv-sweep`, `macro-state`, `top3`,
+`forward-returns`, `move-series`, `market-mood`, `13f-slice` — plus the print-tape
+passes, dispatched outside the branch chain as `print-tape-prebank` and
+`print-tape-{session}-{pass}`.
 
 > ##### THE GREP HALF OF THIS STANDARD HAS NEVER BEEN RUNNABLE — 2026-08-12
 >
@@ -952,7 +961,20 @@ and the quarter mismatch that must carry nothing, the endpoint through the REAL 
 including a fail-closed gate and an absent day distinguished from an empty one, and
 the structural attributions no behavioural test can make — that guidance is reachable
 only from `divergent === true`, that the verdict is re-run AFTER the merge, that the
-read path contains no write, and that the job writes no sibling feature's key).
+read path contains no write, and that the job writes no sibling feature's key;
+**and, since the 2026-09-01 schedule fix**, the PRE-BANKED quarter driven both ways
+with the **-51.22%** miss a gate-free fallback would print shown beside the shipped
+`null`, the tape window PAIR with `usedWindow` re-derived after every merge and the
+freshest-wins rule driven in BOTH orders, the consensus-provenance split where a
+carried `epsActual` must NOT claim `pre-banked` and a quarter mismatch must not
+either, the carry-over test shown to answer a DIFFERENT question from
+`printTapeComplete` on the record where the two disagree, `prevTradingDay` /
+`nextTradingDay` against a second day-of-week derivation with a 120-day sweep proving
+the walkers and the cron gate never disagree, the **MDB REPLAY** of the real
+2026-09-01 record read back out of the deployed Worker — pre-bank → pass 1 → pass 2 →
+carry-over, with the no-pre-bank counterfactual beside it — and
+`GET /api/calendar/holidays` through the real router against a KV stub that THROWS on
+every method, so a single binding touch is a 500 rather than a counter to be trusted).
 All of them extract functions from
 `worker.js` by source, not by import, because every named export in `worker.js`
 must be a function or `workerd` refuses to boot. **`longarch` and `printtape` are the exceptions and
@@ -962,10 +984,10 @@ parse `node --check` cannot perform, and which caught a real syntax error in thi
 very change after `node --check` returned exit 0 on it.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 240 / 183 / 272** for moves /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 240 / 183 / 543** for moves /
 long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
 sweep-universe / macro / mood / swing / earnings-timing / daily-slots /
-analysis-shape / top3 / longarch / printtape — **1,945 comparisons** across the suite.
+analysis-shape / top3 / longarch / printtape — **2,216 comparisons** across the suite.
 `top3` went 173 -> 219 on 2026-08-26 with §10, the serving window, and **219 -> 240 on
 2026-08-31** with the 7d TTL and the 5-day walk; its `minComparisons` floor moved
 130 -> 170 -> **235**.
@@ -975,13 +997,23 @@ LEGITIMATE widening of the UTC hour range read as a regression. It now READS the
 from `wrangler.toml`, pins the three calendar fields as `*`, and re-derives every
 scheduled PT hour against the range in both DST regimes — which is the part that can
 catch a future job being scheduled outside the window.
-`printtape` landed 2026-09-01 at **272**.
+`printtape` landed 2026-09-01 at **272** and went **272 -> 543 the same day** with the
+schedule fix: §12 the pre-banked quarter (driven both ways, with the **-51.22%** miss a
+gate-free fallback would print shown beside the `null` the shipped code prints), §13 the
+trading-day walkers (the Labor Day case with BOTH wrong answers printed beside the right
+one, and a 120-day sweep asserting the walkers and the cron gate never disagree), §14 the
+MDB REPLAY — the real 2026-09-01 record read back out of the DEPLOYED Worker, driven
+through pre-bank -> pass 1 -> pass 2 -> carry-over with the no-pre-bank counterfactual
+beside it — and §15 `GET /api/calendar/holidays` through the real router against a KV stub
+that THROWS on every method, so a single binding touch is a 500 rather than a counter to
+be trusted.
 Both floors are the **exact** count rather than a count minus slack: every section of
 either is deterministic and offline, so unlike `swing` and `earnings-timing` there is no
 observed total to distinguish from a fixed one, and a section that stops running drops
 the count into a NO VERDICT.
-The **1,945** above is the sum of the eighteen FLOORS, not of an observed run. A full
-run on 2026-09-01 observed **1,994, with 0 scripts failing**; the 49-comparison gap is
+The **2,216** above is the sum of the eighteen FLOORS, not of an observed run. A full
+run on 2026-09-01 after the schedule fix observed **2,265, with 0 scripts failing**;
+the 49-comparison gap is
 entirely the two tape-dependent scripts, which observed `swing` **95** against its
 floor of 91 and `earnings-timing` **158** against 113. Their floors are deliberately
 their FIXED counts, so a quiet tape reports a verdict instead of a false NO VERDICT —
@@ -1001,6 +1033,20 @@ quarter-alignment gate from `printTapePrintFrom` makes §5f print the fabricated
 12-22 UTC in both regimes"* — which is the assertion that widening the window was
 necessary at all; putting a day-of-week `2-6` back in reddens the calendar-logic
 assertion; and dropping the post-merge verdict re-run reddens §11a-bis in **2**.
+
+**FOUR MORE FAULTS WERE DRIVEN FOR THE 2026-09-01 SCHEDULE FIX**, each reverting the
+change to the behaviour it replaced:
+
+| fault injected | reddens |
+|---|---|
+| `walkTradingDays` skips weekends only, not holidays | **12** — §13c prints `2026-09-07` against `2026-09-04`, §13g counts 5 disagreements with `tradingDayStatus`, and §15c fails the same case over the wire |
+| the banked-quarter branch removed from `printTapePrintFrom` | **5** — §12b/§12c, the quarter unresolvable and the whole print refusing |
+| the verdict reads `tape.post` directly instead of `tape[tape.usedWindow]` | **8** — §8g on both sides, and §14d judging on `-14.5598` instead of `-14.212` |
+| the tape merges whole-block (the schema-1 rule) | **6** — §9h loses the banked post window, §14d's ">>> the post reading SURVIVED the merge" goes `undefined` |
+
+The last two are the ones worth noting: both leave a record that still LOOKS complete
+and still carries a verdict — it is simply the wrong window's verdict, which is exactly
+the class of failure a per-window `usedWindow` field exists to make visible.
 
 **TWO REAL DEFECTS WERE FOUND BY WRITING THE CHECK, not by reading the code.**
 `mergePrintTapeRecord` mutated its own `next` argument through a shallow spread, so
@@ -1228,7 +1274,37 @@ without ever opening that file.
   half that cannot be matched is `{status:'not-published'}`. Yahoo publishes the
   consensus for the reporting quarter *before* it publishes that quarter's actual,
   so the newest of each are routinely a quarter apart — pairing them prints a
-  confident surprise percentage for a comparison nobody made
+  confident surprise percentage for a comparison nobody made. **The PRE-BANKED
+  quarter is a third way to NAME the quarter, never a way to relax that gate**:
+  `printTapePrintFrom` tries the live consensus, then an actual stamped with this
+  report date, then the bank — and the alignment gate is still string equality
+  against whatever it settles on
+- **`printtape:` `tape` is a PAIR of windows and the verdict reads
+  `tape[tape.usedWindow]`.** `usedWindow` is the freshest readable window by
+  `quoteTime`, **re-derived after every merge and never carried** — a value copied
+  from either side of a merge is a claim about a pair neither side had. Nothing is
+  hoisted to the top level; a duplicated `changePct` is a second field that can
+  disagree with the first. Which windows are attempted is decided by session; which
+  one is stale is decided by the existing `earningsTs` guard, never by a clock
+- **`printtape:` `consensusSource` and `consensusBankedTs` answer DIFFERENT
+  questions.** The timestamp says a bank was TAKEN (a fact about the report, carried
+  forward unconditionally). The source says where THIS record's figures came from,
+  and is `pre-banked` only when the merge actually took `epsEst`/`revEst` or the
+  whole print block from the bank — a pass that read a live consensus of its own
+  says `live-pass` even with a bank beside it, and a quarter mismatch must not claim
+  `pre-banked`
+- **The print-tape carry-over reads YESTERDAY'S DAY INDEX, never a re-scan**, and
+  "yesterday" is `prevTradingDay`. A v7 quote row carries the NEXT earnings date and
+  Yahoo rolls it forward within a day of a report, so a morning re-scan finds
+  yesterday's reporters gone and reports it as "nobody reported". A carried name with
+  no `earningsTs` from either source is REFUSED, because without the report instant
+  the tape staleness guard cannot separate this print's reaction from the previous
+  session's
+- **`prevTradingDay` / `nextTradingDay` skip NYSE holidays, not just weekends**, and
+  read the same `tradingDayStatus` the cron gate reads. `NYSE_HOLIDAYS` is DERIVED
+  from `NYSE_HOLIDAY_TABLE` so the gate and `GET /api/calendar/holidays` cannot
+  disagree. Labor Day 2026-09-07 is the first live case: the session before Tuesday
+  2026-09-08 is Friday 2026-09-04
 - **`printtape:` `divergent` is THREE-VALUED and `null` is a REFUSAL, not a "no".**
   An unknown session, an unpublished actual or a missing consensus means the question
   could not be asked; `refusalReason` always says which. `divergent === true` is the
@@ -1247,19 +1323,22 @@ without ever opening that file.
 
 ### `printtape:` — print vs tape, the earnings-divergence record
 
-**One record per watchlist name per report day, four cron passes, one new read-only
-endpoint, and no change to any existing job.** Added 2026-09-01. It measures the
-PRINT (what was reported against consensus) beside the TAPE (what extended hours did
-with it) and fires on exactly one direction: **a double beat the tape sold.**
+**One record per watchlist name per report day, FIVE cron passes, two read-only
+endpoints, and no change to any existing job.** Added 2026-09-01; rescheduled the
+same day, which is why the schema is already at 2. It measures the PRINT (what was
+reported against consensus) beside the TAPE (what extended hours did with it) and
+fires on exactly one direction: **a double beat the tape sold.**
 
 | constant | value | what it is |
 |---|---|---|
-| `PRINTTAPE_SCHEMA` | 1 | record shape, **strict equality** |
+| `PRINTTAPE_SCHEMA` | **2** | record shape, **strict equality**. Was 1 for one day |
 | `PRINTTAPE_TTL` | **7d** | retention for both the record and the day index — the `TOP3_TTL` / `LONG_ROW_TTL` figure, outliving the weekend and holiday gaps a trading-day writer creates |
 | `PRINTTAPE_DIVERGENCE_PCT` | **-3.0** | the tape gate, read as `changePct <= -3.0` |
 | `PRINTTAPE_QUOTE_CHUNK` | 20 | symbols per v7 quote request, the `yahooSparkCloses` ceiling |
 | `PRINTTAPE_SWEEP_CAP` | 60 | the `sweepUniverse` default |
-| `PRINTTAPE_PASSES` | 05:30 · 06:15 · 13:30 · 14:30 PT | two BMO, two AMC; each a 15-min window admitting exactly one firing |
+| `PRINTTAPE_TAPE_WINDOWS` | `pre` `post` | the two extended sessions one print can be traded in |
+| `PRINTTAPE_CONSENSUS_SOURCES` | `pre-banked` `live-pass` | where a record's consensus figures came from |
+| `PRINTTAPE_PASSES` | **13:15 (pre-bank) · 05:30 · 06:15 · 13:30 · 14:30 PT** | one pre-bank, two BMO, two AMC; each a 15-min window admitting exactly one firing |
 | `PRINTTAPE_GUIDANCE_CLASSES` | `raised` `held` `cut` `not-found` | the only values the guidance field may take |
 
 #### THE MEASUREMENT THE WHOLE FEATURE IS BUILT AROUND — 2026-09-01
@@ -1289,72 +1368,131 @@ mismatch is `{status:'not-published'}` naming the quarter it actually found.
 `printtape.check.mjs` §5f removes that gate from a copy of the function and prints
 the -13.04% appearing, because a check that cannot fail proves nothing.
 
-#### AND THE CONSENSUS EXPIRES — which is why there are TWO passes a session
+#### THE SCHEDULE WAS WRONG, AND THE RECORD THAT PROVED IT — 2026-09-01
 
-Once Yahoo ingests the actual, `earningsTrend.0q` **rolls forward** and the reported
-quarter's consensus is gone. EPS consensus survives on the `earningsChart` entry;
-**revenue consensus survives nowhere.** So the two passes read *different halves*:
-pass 1 banks the consensus, pass 2 catches the actual, and `mergePrintTapeRecord`
-carries banked fields forward **field by field and only within one quarter**.
+Read back out of the DEPLOYED Worker at 22:09 UTC, an hour after the 14:30 PT pass
+wrote it:
 
-The roll is detected by arithmetic, not guessed: a company reports a quarter that has
-already ended, so `0q.endDate <= reportDate` means `0q` still names it and
-`> reportDate` means it has rolled. Verified in both states on the same day.
+```
+MDB  print.epsActual 1.9 vs epsEst 1.60897  ->  epsSurprisePct  18.09  (Yahoo agreed: 18.09)
+     tape  post 370.99 vs regularMarketPrice 434.21  ->  changePct  -14.5598
+     print.revActual null · print.revEst null
+     divergent  null   "2 are absent: revActual, revEst"
+```
 
-**THE VERDICT IS RE-RUN AFTER THE MERGE.** This was a defect found by writing the
-check: the verdict was decided in `printTapeMeasure` from what one pass could read, so
-a record whose merged print reported `revSurprisePct 3.77` still carried
-`divergent: null, "1 is absent: revEst"` — a refusal that had outlived its own cause,
-and one that also made `guidance` unreachable for exactly the names two passes exist
-for.
+**A double-digit sell-off on an 18% EPS beat — the exact shape this feature exists
+to catch — and it could not be judged.** The record was correct. The schedule sat
+between two moving deadlines and missed both:
 
-#### THE RECORD
+- **too early for the actual.** Both AMC passes (13:30 and 14:30 PT) fall inside the
+  ninety minutes after a 20:00Z print, and Yahoo's actuals lag it by hours to days.
+- **too late for the consensus.** `earningsTrend.0q` had ALREADY rolled to
+  `2026-10-31` by 21:30 UTC. This repo's own 20:42 UTC probe read `2026-07-31`.
+  **Forty-eight minutes.** A first pass thirty minutes after the print is a coin toss
+  against that, and revenue consensus survives the roll in no module at all.
 
-`print` · `tape` · `implied` · `divergent` · `guidance` · `baseRate`, each either a
-measurement carrying `source` + `asOf` or a refusal carrying `status` + `reason`.
+Two changes, and neither works without the other. §14 of `printtape.check.mjs`
+replays that record through the new sequence and drives the counterfactual beside it:
+with no pre-bank in the chain the same three payloads still cannot answer.
 
-- **`divergent` is `true` / `false` / `null`, and `null` is a REFUSAL.** All five
-  inputs must be present. An unknown session, an unpublished actual or a missing
-  consensus means the question could not be asked, and `false` would claim it was.
-- **`tape` change% references two DIFFERENT closes** and both are "vs the regular
-  close": post is against `regularMarketPrice` (today's), pre against
-  `regularMarketPreviousClose` (yesterday's). Verified against Yahoo's own
-  `postMarketChange` / `preMarketChange`. A quote stamped earlier than `earningsTs`
-  is **refused** — it is a previous session's and would render as this print's
-  reaction.
-- **EXTENDED-HOURS VOLUME IS OMITTED WITH THE REASON SHIPPED, and costs zero
-  fetches.** No Yahoo field carries it: `quoteSummary.price` and `v7/finance/quote`
-  both have only `regularMarketVolume` plus the two averages. The v8 1m
-  `includePrePost` feed cannot be summed honestly — measured over PANW/DELL/MDB/
-  NVDA/AVGO, **pre-market read 0 on every bar for 5 of 5 names** (111–330 bars each,
-  despite real price movement), and **4 of 5 carried their whole post-window figure
-  on the single 20:00:00Z boundary bar** at 8.7% / 9.6% / 12.6% of that day's regular
-  volume — the closing-auction share, on a day NVDA was not even reporting — while
-  DELL instead put 10,610,858 on one 20:03 bar. `regular + post` reconciles to
-  `regularMarketVolume` for no name. This is the income sleeve's tax-character
-  precedent: omitted with the reason, never nulled and never estimated.
-- **`implied` is the `long:` row's front-expiry `expectedMove`, and is NOT an
-  earnings-isolated move.** It spans every session to that expiry. The `basis` field
-  says so in words and `straddlesReport` says whether the expiry is even past the
-  print — calling it "the implied earnings move" would be the HV30-labelled-as-IV
-  failure.
-- **`guidance` fires ONLY on `divergent === true`**, once per ticker per report
-  (banked on the record and carried forward, so it is structural rather than a rule
-  to remember). Its input is `gatherEarningsFacts`' news window — **there is no 8-K
-  or press-release feed wired to this Worker** and none is invented; `source` names
-  what was read and `not-found` is the honest answer when it said nothing about
-  guidance. It debits the same `AI_RATE_GLOBAL_DAY` bucket via `cronMaySpend`, which
-  **REFUSES on a KV failure** where `aiGuard` proceeds — `aiGuard` has already checked
-  a secret and is serving a user, a cron has no second control at all.
-- **`baseRate` is `{status:'not-measured'}`.** Scoring beat-and-fade outcomes needs a
-  logged history these records only start accumulating now.
+#### 1. THE CONSENSUS IS BANKED A WHOLE TRADING SESSION EARLY — `collectPrintTapePreBank`
+
+A fifth pass at **13:15 PT (16:15 ET)**, on the session BEFORE the report, for every
+watchlist name whose `earningsTimestampStart` lands in **`nextTradingDay(today)`**.
+It writes the consensus half of the print with **`consensusSource: 'pre-banked'`**
+and a **`consensusBankedTs`**, which every later pass merges onto.
+
+**IT MEASURES NOTHING AND IT CANNOT.** The report has not happened: no actual, no
+extended-hours reaction, no verdict. `tape` is `{status: 'not-yet'}` — a status
+distinct from `unavailable`, because "there was nothing to look at yet" is not "we
+looked and Yahoo had nothing". No implied move, no long-row read, no Claude call.
+
+**13:15 PT rather than a new slot**, because it is the nearest existing daily wakeup
+that is post-close (so it cannot race a same-session print) and a whole trading
+session ahead of every pass that reads the bank. Its window is 13:15–13:30, abutting
+`amc-pass1` at 13:30 without overlapping it. 20:15 UTC on PDT and 21:15 on PST —
+inside the trigger window in both regimes (rule #2). **The 1:15pm branch is now FIVE
+jobs deep**, so its `_instr` is an upper bound and the cost below is a derivation.
+
+**A THIRD WAY TO NAME THE QUARTER, AND IT RELAXES NOTHING.**
+`printTapePrintFrom(r, reportDate, bankedQuarter)` tries the live consensus first,
+then an actual stamped with this report date, and only then the banked quarter. The
+alignment gate is still string equality against whatever it settles on, so a
+misaligned actual is refused exactly as before — §12 drives that with a payload where
+removing the gate would print a **-51.22%** miss and the shipped code prints `null`.
+
+**`consensusSource` and `consensusBankedTs` answer DIFFERENT questions**, which is
+why there are two. The timestamp says a bank was *taken* — a fact about the report,
+carried forward unconditionally. The source says where **this record's** figures came
+from, and is `pre-banked` only when the merge actually took `epsEst`/`revEst` (or the
+whole print block) from the bank. A pass that read a live consensus of its own says
+`live-pass` even with a bank sitting beside it, and a quarter mismatch — which
+refuses the bank — must not claim `pre-banked` either.
+
+**If a name reports with no banked consensus** — added to the watchlist that day, or
+the pre-bank did not run — the passes fall back to reading it live, exactly as before,
+and the record says `consensusSource: 'live-pass'`.
+
+#### 2. PRIOR-SESSION AMC NAMES REJOIN THE MORNING PASSES
+
+The 05:30 and 06:15 PT BMO passes now measure **today's BMO names + yesterday's AMC
+names whose record is still unfinished**. By morning Yahoo has had overnight to
+ingest the actual, and the pre-market has traded the same print.
+
+- **The candidate list is YESTERDAY'S OWN DAY INDEX, never a re-scan.** A v7 quote row
+  carries the NEXT earnings date and Yahoo rolls it forward within a day of a report
+  — measured 2026-09-01, PLTR's `earningsTimestampStart` was already 2026-11-02 while
+  `earningsTimestamp` still read 2026-08-03 — so a morning re-scan finds yesterday's
+  reporters have vanished and reports it as "nobody reported". `printtapeday:{prevDate}`
+  costs one read, cannot be wrong about who we measured, and carries the `earningsTs`
+  the staleness guard needs. A name with no `earningsTs` from either source is
+  REFUSED rather than measured: without the report instant the guard cannot separate
+  this print's reaction from the previous session's.
+- **Eligibility is `printTapeNeedsCarryOver`** — any print field still
+  `not-published`, or `divergent` still `null`, or **no readable record at all** (both
+  passes failed to write, which is strictly worse than a refusal). It is a DIFFERENT
+  question from `printTapeComplete`: complete asks "is there anything left for a
+  same-session pass to read", this asks "is there anything a NIGHT could have fixed",
+  and on a record with an answered verdict and a refused revenue half the two give
+  opposite answers.
+- **The carry-over writes under the REPORT date**, merging onto the same key, so the
+  once-per-ticker-per-report guidance rule holds unchanged. The report day's own index
+  is appended to as well — otherwise `/api/printtape?date=<report day>` would assemble
+  that day from a `measured` list the record is not in. Today's index records the
+  carry-over either way, so "it ran and found everything already answered" stays
+  falsifiable.
+
+**THE TAPE IS NOW A PAIR OF WINDOWS.** An AMC print is traded in the post-market of
+its report day AND the pre-market of the next trading day; both are reactions to the
+same release and both are measured against the same regular close (`regularMarketPrice`
+on the report day IS `regularMarketPreviousClose` the next morning). So `tape` carries
+`pre` and `post` side by side, each independently a reading or a refusal, plus
+**`usedWindow`** naming which one the verdict read — **the freshest by `quoteTime`,
+re-derived after every merge and never carried.** Nothing is hoisted to the top level:
+the verdict reads `tape[tape.usedWindow]`, because a duplicated `changePct` beside the
+window it came from is a second field that can disagree with the first.
+
+**WHICH WINDOWS ARE ATTEMPTED IS DECIDED BY SESSION, AND THE REST BY THE EXISTING
+STALENESS GUARD, NOT BY A CLOCK.** `bmo` -> `pre` only (a BMO print's own post-market
+is a whole regular session later, and is refused structurally as `not-applicable`).
+`amc` -> both, unconditionally: the same-evening pass finds that morning's pre-market
+quote is stamped earlier than the print and refuses it on the guard that already
+existed, while the next-morning pass finds a pre quote that is newer and takes it.
+Both windows refusing is a BLOCK-level refusal, so `printTapeComplete` and the merge
+cannot mistake an empty measurement for an answer.
+
+**The merge carries each window independently.** A whole-block rule would discard
+whichever side the pass could not re-read — and Yahoo drops the `postMarket*` fields
+once the pre-market session opens, so the post reading has to survive as a banked
+window rather than be re-fetched.
 
 #### THE PASSES, AND THE CRON WINDOW THAT HAD TO WIDEN
 
 Dispatched **outside the branch chain**, on `printTapePassAt(h, m)` ahead of the
-`if/else`: three of the four windows fall inside branches the chain already owns
-(06:15 in `morning-briefing`, 13:30 in the EOD branch), so a branch arm would
-silently never fire on two of them. The pass is named in the `[cron]` line.
+`if/else`: three of the five windows fall inside branches the chain already owns
+(06:15 in `morning-briefing`, 13:15 and 13:30 in the EOD branch), so a branch arm
+would silently never fire on three of them. The pass is named in the `[cron]` line,
+with the pre-bank labelled distinctly from a measurement pass.
 
 **RULE #2 CHECK, WHICH CAUGHT A REAL PROBLEM.** 05:30 PT is **12:30 UTC under PDT**
 and 13:30 under PST. The trigger's range was `13-22`, which covered the PST reading
@@ -1370,6 +1508,7 @@ widening read as a regression.
 |---|---|---|
 | 05:30 | **12:30** — needed the widening | 13:30 |
 | 06:15 | 13:15 | 14:15 |
+| **13:15 (pre-bank)** | 20:15 | 21:15 |
 | 13:30 | 20:30 | 21:30 |
 | 14:30 | 21:30 | 22:30 |
 
@@ -1377,26 +1516,110 @@ An `unknown`-session name is measured on the **AMC** passes, not dropped: by 13:
 the bell has rung, so a report filed that day has landed whatever session it was
 filed in. Its record carries `divergent: null` with the unknown-session refusal.
 
+#### THE NYSE CALENDAR, AND WHY IT IS NOW AN ENDPOINT
+
+**"Yesterday" is not `−1 day` and it is not `−1 weekday.`** `prevTradingDay` /
+`nextTradingDay` walk through the same `tradingDayStatus` the cron gate uses, so the
+holiday list can never be applied in one place and not the other. **Labor Day
+2026-09-07 is the first live case in the table**: the session before Tuesday
+2026-09-08 is **FRIDAY 2026-09-04**, and a weekday-only walk lands on the Monday the
+exchange was shut — which downstream reads as "nothing reported", indistinguishable
+from a real quiet day. Both walkers return `null` rather than guessing on a malformed
+date or a walk longer than 10 calendar days.
+
+`NYSE_HOLIDAYS` is now DERIVED from **`NYSE_HOLIDAY_TABLE`**, an array of
+`{date, name}` carrying the name as data rather than as a trailing comment, because:
+
+```
+GET /api/calendar/holidays[?date=YYYY-MM-DD]     requireSecret, read-only
+```
+
+serves it to a consumer that would otherwise hardcode its own weekday arithmetic —
+one calendar, one copy. Pure computation: **zero fetches, zero binding ops, nothing
+written**, verified in §15 against a KV stub that THROWS on every method. It returns
+the table, `through`, `calendarStale`, and — for the given ET date — `isTradingDay`,
+`reason` (`weekend` / `nyse-holiday` / `weekday`), `prevTradingDay` and
+`nextTradingDay`. `requireSecret` rather than `aiGuard`, the same reasoning as
+`/api/printtape`: it cannot spend an Anthropic credit. **`earlyCloses` is null WITH
+THE REASON** — early closes are not modelled anywhere in this Worker, and a nulled
+list reads as "there are none".
+
+**NOTE FOR THE CONSUMER SIDE:** neither `dashboard.html` nor `index.html` contains a
+`prevTradingDay` (verified by grep, not assumed) — the frontend the task refers to is
+decision_dash, a separate repo. The endpoint exists for it; nothing in THIS repo
+needed changing.
+
 #### COST, MEASURED
 
-`capCost = ceil(N/20) + 4E + 4`, N the watchlist and E the names reporting that day —
-`ceil(N/20)` batched v7 quotes for eligibility plus one quoteSummary per eligible
-name; 1 watchlist + 1 crumb + 1 day-index read + 1 day-index write, plus 3 bindings
-per eligible name.
+Driven through the real `scheduled()` offline with a counting KV stub and a stubbed
+`fetch` installed before the module loads (so the Worker's own `INSTR` counts it),
+2026-09-01. N=40 watchlist; B names reporting BMO today; S prior-session AMC names
+screened, C of them carried; E = B + C:
 
-| run | measured |
-|---|---|
-| N=6, E=3, cold crumb | ext 4 · bind 13 · **capCost 17** |
-| N=1, E=1, warm crumb | ext 1 · bind 6 · **capCost 7** |
-| N=6, E=0 | ext 1 · bind 4 · **capCost 5** |
+| pass | isolated? | measured | derived |
+|---|---|---|---|
+| `bmo-pass1`, B=1 S=3 C=2 (E=3) | **yes** — `branch=idle` | ext 5 · bind 17 · **capCost 22** | `ceil(40/20) + 4·3 + (3−2) + 5 + 2` = **22** |
+| `bmo-pass1`, B=1 S=3 C=0 (E=1) | yes, warm crumb | ext 3 · bind 10 · **capCost 13** | `2 + 4 + 3 + 5 + 0` = 14, less 1 for the warm in-isolate crumb |
+| `amc-pass2` 14:30, E=3 | **yes** — the 2pm branch is `m < 30` | ext 5 · bind 12 · **capCost 17** | `2 + 4·3 + 4` = 18, less the same 1 |
+| `prebank` 13:15 | **NO** — four EOD siblings | 43 / 82 invocation-wide | `ceil(N/20) + 3E' + 4` = **15** at N=40, E'=3 |
 
-which is the formula exactly. At the live **N=40 with E=3 that derives to ~18**;
-E=10 is 46. **A day nobody reports costs 6**, which is what makes four passes a day
-unremarkable. Zero Claude calls unless a name is divergent.
+So: **`ceil(N/20) + 4E + (S−C) + 5 + (C>0 ? 2 : 0)`** for a BMO pass,
+**`ceil(N/20) + 4E + 4`** for an AMC pass (unchanged from schema 1), and
+**`ceil(N/20) + 3E' + 4`** for the pre-bank. A heavy morning at E=10, S=12, C=8
+derives to **53**. Against this invocation's **10,000** that is under 0.6%, and five
+passes a day remain unremarkable. A day nobody reports and nothing carries over is
+**6**. Zero Claude calls unless a name is divergent.
 
-**THE 05:30 AND 14:30 PASSES RUN ALONE, so their `_instr` IS a measurement.** 06:15
-shares with `morning-briefing` and 13:30 with the four-job EOD branch, where it is an
-upper bound (rule #1).
+**THE PRE-BANK'S FIGURE IS A DERIVATION, NOT A COUNTER, deliberately** — rule #1's
+`collectMarketMood` rule. It can only ever fire beside the four EOD jobs, so its
+`_instr` is an upper bound on the job and a lower bound on the invocation, and
+differencing two runs at different E' does not isolate it either because the siblings
+are not deterministic across runs. What makes the derivation checkable is that the two
+ISOLATED passes above match their own formulae exactly, which validates the
+per-eligible terms the pre-bank's formula shares.
+
+#### THE RECORD
+
+`print` · `tape` · `implied` · `divergent` · `guidance` · `baseRate`, each either a
+measurement carrying `source` + `asOf` or a refusal carrying `status` + `reason`,
+plus `consensusSource` and `consensusBankedTs`.
+
+- **`divergent` is `true` / `false` / `null`, and `null` is a REFUSAL.** All five
+  inputs must be present. An unknown session, an unpublished actual or a missing
+  consensus means the question could not be asked, and `false` would claim it was.
+- **`tape` change% references two DIFFERENT closes** and both are "vs the regular
+  close": post is against `regularMarketPrice` (today's), pre against
+  `regularMarketPreviousClose` (yesterday's). Verified against Yahoo's own
+  `postMarketChange` / `preMarketChange`. A quote stamped earlier than `earningsTs`
+  is **refused** — it is a previous session's and would render as this print's
+  reaction. That guard is also what makes reading both windows unconditionally safe.
+- **EXTENDED-HOURS VOLUME IS OMITTED WITH THE REASON SHIPPED, and costs zero
+  fetches.** No Yahoo field carries it: `quoteSummary.price` and `v7/finance/quote`
+  both have only `regularMarketVolume` plus the two averages. The v8 1m
+  `includePrePost` feed cannot be summed honestly — measured over PANW/DELL/MDB/
+  NVDA/AVGO, **pre-market read 0 on every bar for 5 of 5 names** (111–330 bars each,
+  despite real price movement), and **4 of 5 carried their whole post-window figure
+  on the single 20:00:00Z boundary bar** at 8.7% / 9.6% / 12.6% of that day's regular
+  volume — the closing-auction share, on a day NVDA was not even reporting — while
+  DELL instead put 10,610,858 on one 20:03 bar. `regular + post` reconciles to
+  `regularMarketVolume` for no name. This is the income sleeve's tax-character
+  precedent: omitted with the reason, never nulled and never estimated.
+- **`implied` is the `long:` row's front-expiry `expectedMove`, and is NOT an
+  earnings-isolated move.** It spans every session to that expiry. The `basis` field
+  says so in words and `straddlesReport` says whether the expiry is even past the
+  print — calling it "the implied earnings move" would be the HV30-labelled-as-IV
+  failure. The pre-bank does not attach one at all.
+- **`guidance` fires ONLY on `divergent === true`**, once per ticker per report
+  (banked on the record and carried forward, so it is structural rather than a rule
+  to remember — and it survives the carry-over, which writes the same key). Its input
+  is `gatherEarningsFacts`' news window — **there is no 8-K or press-release feed
+  wired to this Worker** and none is invented; `source` names what was read and
+  `not-found` is the honest answer when it said nothing about guidance. It debits the
+  same `AI_RATE_GLOBAL_DAY` bucket via `cronMaySpend`, which **REFUSES on a KV
+  failure** where `aiGuard` proceeds — `aiGuard` has already checked a secret and is
+  serving a user, a cron has no second control at all.
+- **`baseRate` is `{status:'not-measured'}`.** Scoring beat-and-fade outcomes needs a
+  logged history these records only start accumulating now.
 
 #### THE ENDPOINT
 
@@ -1413,9 +1636,11 @@ crons need.
 `meta.ran` distinguishes **an absent day index from an empty one**: `records: []` with
 `ran: true` means the job ran and nobody on the watchlist reported; `ran: false` means
 it did not run, or the day is past `PRINTTAPE_TTL`. A ticker skipped on one pass and
-measured on a later one is **not** reported as skipped.
+measured on a later one is **not** reported as skipped. **`meta.banked`** lists names
+whose consensus was pre-banked but whose report has not happened — their records ARE
+served, because a banked consensus nobody can read may as well not exist.
 
-Checked by `node printtape.check.mjs` (272 comparisons).
+Checked by `node printtape.check.mjs` (543 comparisons, up from 272).
 
 ### `GET /api/income/*` — the income sleeve
 
