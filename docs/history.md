@@ -1797,6 +1797,74 @@ the code said `30`, and passed on the exact fault it exists to catch. It is now
 anchored to the `} else if (…) {` framing. *An empty comparison is not a pass*, and
 neither is one reading the documentation instead of the code.
 
+#### FIX 5 — the status Yahoo returned was never captured, so it could not be tailed for
+
+Justifies: *a crumb failure must carry what Yahoo said; an uncaptured status cannot be tailed for; a doc's deploy-status column is a claim about the world.*
+
+**Added 2026-09-02, hours after the fixes above, from a request that could not be
+satisfied as asked:** *tail the 13:30 PT AMC pass and report whether the failure
+reproduced and what status Yahoo returned.* The first half was answerable. **The
+second half was not, and no amount of tailing would have changed that.**
+
+**WHAT THE RECORD ALREADY HELD.** `printtapeday:2026-09-02` had banked both BMO
+passes, and both had already failed:
+
+| pass | PT | recorded |
+|---|---|---|
+| `bmo-pass1` | 05:30 (12:30:24Z) | `scanOk: false` · `scanFetches: 0` · `universe: 40` |
+| `bmo-pass2` | 06:15 (13:15:22Z) | `scanOk: false` · `scanFetches: 0` · `universe: 40` |
+
+Both carried the identical `scanReason`: *"Yahoo crumb unavailable — the
+eligibility scan could not run, so NO name was checked. This is not 'nobody
+reported today'."* **`scanFetches: 0` localises the failure precisely** — the scan
+never issued a quote request, so **Yahoo returned no status on the quote endpoint
+at all**; the failure was upstream of it, in crumb acquisition.
+
+**AND THE ACQUISITION STATUS WAS DISCARDED.** Strategy A tested `if (r.ok)` and
+recorded nothing on the else; strategy B wrapped everything in a bare
+`catch (_) {}`. A 401, a 429, a 999 and a socket reset all produced **the same
+sentence**. Worse, the print-tape scan then threw the message itself away —
+`getYahooCrumb(env).catch(() => ({ crumb: null, cookie: '' }))` — so even a
+better message would not have reached KV.
+
+**THE INSTRUMENT WAS MISSING, NOT THE LOG LINE.** This is the whole finding. A
+`wrangler tail` held open across the next failure would have printed *"all
+strategies exhausted"* and stopped there, and it would have read as a completed
+verification. **Before planning to observe a failure live, confirm the value you
+want is CAPTURED** — and prefer a durable record, which answers on every future
+occurrence rather than only the one someone watched.
+
+`attempts`/`note()` now record each strategy's status into **both** the warn and
+the throw, and the scan keeps the message, so `scanReason` carries it into KV.
+Diagnostic only, by construction: every push unconditional, `note` cannot throw,
+nothing reads it back as control flow — *instrumentation may never break what it
+measures*. `no-status` means the response carried no `status` field; **it is not
+a 0.**
+
+**Checked by `node longarch.check.mjs`, 234 → 241** (§9e extended, §9e2 new).
+§9e2 exists because **the `dead` mock cannot reach the bug**: a thrown fetch takes
+the `catch` and never touches `r.status`, which is exactly the branch that was
+dropping statuses. It drives a response that *answers* with a status and no
+crumb. **Two revert directions driven:** stripping the `— upstream:` clause from
+the throw reddens **6** comparisons; dropping strategy A's non-ok capture *alone*
+reddens **2** (`A=429 · B=429` → `B=429`). A 401 and a 429 are asserted to
+produce **different** strings, so the field cannot become decorative.
+
+**THE PREMISE THAT SENT THE SESSION HERE WAS FALSE, AND THE DOC IS WHY.** The
+request was conditioned on *"if the fix cannot be deployed before then"* — but the
+crumb fix had already deployed at **15:09:15Z**, and again at 15:57:20Z.
+ARCHITECTURE.md's build table said **`NOT DEPLOYED`** on rows 6, 7 **and** 8; all
+three were live. The cell is written at build time and nothing updates it at
+deploy time. **A commit date proves a build; only an artifact proves a deploy** —
+and `wrangler deployments list` gives dates, never contents. The artifact is
+whatever the change *writes*:
+
+| key | `expiration − ts` | means | old value |
+|---|---|---|---|
+| `yahoo:crumb` | 1788536260 − 1788363460 = **172800s** | `CRUMB_KV_TTL` 2d — row 8 live | 3600s |
+| `long:AAPL` | 1788965089 − 1788360289 = **604800s** | `LONG_ROW_TTL` 7d — row 7 live | 86400s |
+| `top3:2026-09-01` | **604800s**, record present | `TOP3_TTL` 7d — row 6 live | — |
+
 ---
 
 ## Earnings session timing — Yahoo encodes the session as a fixed UTC anchor

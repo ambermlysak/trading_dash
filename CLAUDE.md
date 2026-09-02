@@ -319,11 +319,11 @@ function or `workerd` refuses to boot. **`longarch` and `printtape` also IMPORT 
 default export**, which is the ES-module parse `node --check` cannot perform.
 
 Floors (each script's `minComparisons`): **138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 /
-144 / 287 / 91 / 113 / 68 / 99 / 240 / 234 / 543** for moves / long-fixtures / cron-gate
+144 / 287 / 91 / 113 / 68 / 99 / 240 / 241 / 543** for moves / long-fixtures / cron-gate
 / instr-bindings / bs-delta / nd2 / lane-e / lane-f / sweep-universe / macro / mood /
 swing / earnings-timing / daily-slots / analysis-shape / top3 / longarch / printtape —
-**2,267**. A full run on 2026-09-02 observed **2,317, 0 failing**; the 50-comparison gap
-is entirely the two scripts that read **live** data (`swing` **96**, `earnings-timing`
+**2,274**. A full run on 2026-09-02 observed **2,326, 0 failing**; the 52-comparison gap
+is entirely the two scripts that read **live** data (`swing` **98**, `earnings-timing`
 **158**), whose floors are deliberately their FIXED counts so a quiet tape reports a
 verdict rather than a false NO VERDICT. **Never raise either to an observed total.**
 `node iv-capture.fixture.mjs` is a nineteenth script, deliberately outside that total.
@@ -420,6 +420,17 @@ endpoints, the KV key/TTL table and the cron schedule are in `worker-internals`.
   self-corrects, a missing one guarantees a cold acquire. Those paths must call
   `getYahooCrumb(env, { force: true })`, which skips both caches and **overwrites** KV;
   `force` must appear **nowhere else**
+- **A CRUMB FAILURE MUST CARRY WHAT YAHOO SAID.** Both acquisition strategies once
+  swallowed their response (`if (r.ok)` plus a bare `catch (_) {}`), so every failure
+  read as the one string *"all strategies exhausted"* and **the HTTP status was never
+  captured anywhere** — not in KV, not in a log, so **not in a `wrangler tail` either.
+  The instrument was missing, not the log line**, and that is why the two 2026-09-02 BMO
+  passes are permanently unanswerable. `attempts`/`note()` now record each strategy's
+  status into the warn **and** the throw, and the print-tape scan keeps the message
+  instead of discarding it with `.catch(() => …)`, so `scanReason` in
+  `printtapeday:{PT-DATE}` answers the question **durably**. It is **diagnostic only** —
+  every push is unconditional, `note` cannot throw, and nothing reads it back as control
+  flow. `no-status` means the response carried no `status`; it is **not** a 0
 - **`TOP3_TTL` (7d) and `TOP3_SERVE_WALKBACK_DAYS` (5) are separate bounds; neither
   works alone.** **`readTop3` serves the NEWEST SURVIVING record**, unmodified and with
   no `served` marker. A KV throw ABORTS the walk; a schema mismatch reads as absent and
@@ -561,10 +572,10 @@ http servers left running between tasks.
 
 ## Named failure modes
 
-Thirteen failure modes are named in this repo, each from a specific incident. **The
+Fifteen failure modes are named in this repo, each from a specific incident. **The
 assertion is here; the narrative and post-mortem are in
 [`docs/failure-modes.md`](docs/failure-modes.md)** under the same heading, except the
-last four, whose evidence is in [`docs/history.md`](docs/history.md).
+last six, whose evidence is in [`docs/history.md`](docs/history.md).
 
 - **No hit rate goes on screen without its base rate**
 - **A single negative probe right after a deploy is UNCONFIRMED, not a failure**
@@ -597,6 +608,24 @@ last four, whose evidence is in [`docs/history.md`](docs/history.md).
   n=12"*. **Check the guard that is already there before adding one.**
 - **A status word that cannot fire is worse than no status word.** `no-leaps` was
   unreachable and blamed the wrong thing; it is now `no-expiries`.
+- **A DOC'S DEPLOY-STATUS COLUMN IS A CLAIM ABOUT THE WORLD, NOT ABOUT THE REPO — verify
+  it against a deployed ARTIFACT before believing it.** ARCHITECTURE.md's build table
+  carried **`NOT DEPLOYED` on three rows that were all live** (6, 7 and 8), because the
+  cell is hand-written at build time and nothing updates it at deploy time. It sent a
+  session — and the prompt that started it — down a plan built on a false premise. **A
+  commit date proves a build; only an artifact proves a deploy**, and the artifact is
+  whatever the change *writes*: `yahoo:crumb` `expiration − ts` = **172800s** vs the old
+  **3600s**, `long:AAPL` = **604800s** vs the old **86400s**. **`wrangler deployments
+  list` dates a deploy but never says WHAT is in it.** Re-verify the cell in the same
+  task that reads it.
+- **AN UNCAPTURED STATUS CANNOT BE TAILED FOR.** *"Tail it and report what the upstream
+  returned"* is unanswerable when the code never recorded it — `if (r.ok)` beside a bare
+  `catch (_) {}` discards the status before any log could carry it, and the failure
+  arrives as one undifferentiated sentence. **Before planning to observe a failure live,
+  confirm the value you want is CAPTURED somewhere** — otherwise the tail runs, the
+  failure reproduces, and it still says nothing. **A durable record beats a live tail**:
+  a status folded into a KV record answers the question on every future occurrence,
+  including the ones nobody is watching.
 
 ## Verification standard
 

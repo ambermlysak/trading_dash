@@ -1241,6 +1241,29 @@ async function getYahooCrumb(env, { force = false } = {}) {
       let crumb = null;
       let cookie = '';
 
+      /* ── WHAT YAHOO ACTUALLY SAID ────────────────────────────────────────────
+         Both strategies below used to swallow their response whole — `if (r.ok)`
+         with a bare `catch (_) {}` — so a crumb failure reached the caller as the
+         single string "all strategies exhausted" and NOTHING, anywhere, recorded
+         whether Yahoo answered 401, 429, 999, or never answered at all.
+
+         That gap has a measured cost. Both BMO passes on 2026-09-02 (05:30 and
+         06:15 PT) banked `scanOk: false` with `scanFetches: 0` in
+         `printtapeday:2026-09-02`, and the status behind them is NOT RECOVERABLE
+         from any record we keep — it was never captured. A `wrangler tail` over
+         the next occurrence would not have produced it either, because the code
+         had nothing to print. THE INSTRUMENT WAS MISSING, NOT THE LOG.
+
+         `attempts` closes that, and it is DIAGNOSTIC ONLY. It must never change
+         which branch runs: every push is unconditional, `note` cannot throw, and
+         no value here is read back as control flow — a failure to record degrades
+         to a thinner message, never to a lost crumb. `no-status` means the
+         response object carried no `status`, which is NOT the same as a 0. */
+      const attempts = [];
+      const note = (strategy, status, detail) => {
+        try { attempts.push(`${strategy}=${status}${detail ? ` (${detail})` : ''}`); } catch (_) {}
+      };
+
       // Strategy A: direct user-agent endpoint
       try {
         const r = await fetch('https://query2.finance.yahoo.com/v1/finance/user-agent', {
@@ -1250,8 +1273,11 @@ async function getYahooCrumb(env, { force = false } = {}) {
           cookie = extractCookie(r.headers.get('set-cookie') || '', 'A1', 'B');
           const txt = (await r.text()).trim();
           if (txt && txt.length < 50 && !txt.startsWith('<')) crumb = txt;
+          note('A', r.status ?? 'no-status', crumb ? 'crumb' : 'ok, no crumb in body');
+        } else {
+          note('A', r.status ?? 'no-status');
         }
-      } catch (_) {}
+      } catch (e) { note('A', 'threw', e?.message || String(e)); }
 
       // Strategy B: scan finance.yahoo.com HTML stream
       if (!crumb) {
@@ -1262,6 +1288,8 @@ async function getYahooCrumb(env, { force = false } = {}) {
           });
           cookie = extractCookie(r.headers.get('set-cookie') || '', 'A1', 'B') || cookie;
           crumb = await scanStream(r, /"crumb"\s*:\s*"([^"\\]{1,30})"/, 200_000);
+          note('B', r.status ?? 'no-status',
+               crumb ? 'crumb' : (cookie ? 'no crumb in HTML, cookie only' : 'no crumb, no cookie'));
 
           if (!crumb && cookie) {
             const r2 = await fetch('https://query2.finance.yahoo.com/v1/finance/user-agent', {
@@ -1271,9 +1299,14 @@ async function getYahooCrumb(env, { force = false } = {}) {
               const txt = (await r2.text()).trim();
               if (txt && txt.length < 50 && !txt.startsWith('<')) crumb = txt;
             }
+            note('B2', r2.status ?? 'no-status', crumb ? 'crumb' : 'no crumb in body');
           }
-        } catch (_) {}
+        } catch (e) { note('B', 'threw', e?.message || String(e)); }
       }
+
+      /* Built once and used by BOTH failure paths below, so the warn and the
+         throw can never describe different upstreams. */
+      const upstream = attempts.length ? attempts.join(' · ') : 'no attempt recorded';
 
       /* COLD ACQUISITION FAILED. This is the exact line the 2026-09-02 incident
          came out of, and it used to throw unconditionally — which took 40
@@ -1295,12 +1328,17 @@ async function getYahooCrumb(env, { force = false } = {}) {
         if (banked && banked.crumb) {
           const ageH = banked.ts ? ((Date.now() - banked.ts) / 3600_000).toFixed(1) : '?';
           console.warn(`[yahoo] crumb acquisition failed (all strategies exhausted${force ? ', forced' : ''}) — `
+            + `upstream: ${upstream} — `
             + `falling back to the BANKED crumb, age ${ageH}h. It may be dead; the 401/403 retry is what `
             + 'corrects that, and a maybe-dead crumb beats a guaranteed failure.');
           if (!force) _crumbCache = banked;
           return banked;
         }
-        throw new Error('Yahoo crumb unavailable (all strategies exhausted)');
+        /* The message is the ONLY carrier of the upstream statuses — every caller
+           either logs it or folds it into a banked record, and nothing parses it.
+           The leading clause is kept verbatim so the existing prose in
+           ARCHITECTURE.md and the incident record still name the same string. */
+        throw new Error(`Yahoo crumb unavailable (all strategies exhausted) — upstream: ${upstream}`);
       }
 
       _crumbCache = { crumb, cookie, ts: Date.now() };
@@ -11029,11 +11067,21 @@ async function printTapeEligible(env, tickers, wantDates) {
      yesterday's own day index instead of re-scanning — see `collectPrintTape`. */
   const want = wantDates instanceof Set ? wantDates : new Set([wantDates]);
   const out = { candidates: [], skipped: [], fetches: 0, sourceOk: true, sourceReason: null };
-  const { crumb, cookie } = await getYahooCrumb(env).catch(() => ({ crumb: null, cookie: '' }));
+  /* THE ERROR WAS BEING DISCARDED HERE, and that is why the 2026-09-02 BMO passes
+     banked a `scanReason` naming the symptom with not one word about the cause:
+     `.catch(() => …)` threw the message away before anything could store it.
+     `getYahooCrumb` now carries the upstream statuses in its message, and keeping
+     them means THE DAY INDEX ITSELF answers "what did Yahoo return" — a durable
+     record, rather than an answer that only exists if someone happens to be
+     holding a log tail open at the moment it fails. */
+  let crumbErr = null;
+  const { crumb, cookie } = await getYahooCrumb(env)
+    .catch((e) => { crumbErr = e?.message || String(e); return { crumb: null, cookie: '' }; });
   if (!crumb) {
     out.sourceOk = false;
     out.sourceReason = 'Yahoo crumb unavailable — the eligibility scan could not run, so NO name was '
-      + 'checked. This is not "nobody reported today".';
+      + 'checked. This is not "nobody reported today".'
+      + (crumbErr ? ` Upstream: ${crumbErr}` : '');
     return out;
   }
 

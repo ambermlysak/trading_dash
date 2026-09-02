@@ -964,8 +964,49 @@ console.log('\n== 9. THE YAHOO CRUMB — retention outlives freshness ==========
                     async list() { return { keys: [] }; } };
     let threw = null;
     try { await C.getYahooCrumb({ REC_LOG: store }); } catch (e) { threw = e.message; }
-    row('9e nothing banked AND acquisition fails -> throws', threw,
+    row('9e nothing banked AND acquisition fails -> throws', (threw ?? '').split(' — upstream: ')[0],
         'Yahoo crumb unavailable (all strategies exhausted)');
+    /* THE QUESTION THE OLD MESSAGE COULD NOT ANSWER. Until 2026-09-02 both crumb
+       strategies swallowed their response (`if (r.ok)` + a bare `catch (_) {}`),
+       so "what did Yahoo return" had no answer in KV, in a log, or in a tail —
+       the instrument was missing, not the log line. Driven on the message text
+       because the message is the only carrier. */
+    row('9e ...and the throw NAMES the upstream rather than only the symptom',
+        / — upstream: /.test(threw ?? ''), true);
+    row('9e ...listing every strategy it tried, in order',
+        ((threw ?? '').match(/\b[AB]2?=/g) || []).join(','), 'A=,B=');
+    row('9e ...and what each one did', threw?.split(' — upstream: ')[1] ?? null,
+        'A=threw (offline by construction) · B=threw (offline by construction)');
+  }
+
+  /* (e2) THE SHAPE THE INCIDENT ACTUALLY HAD: Yahoo ANSWERS, with a status, and
+         the answer carries no crumb. The `dead` mock above cannot reach this —
+         a thrown fetch takes the `catch` and never touches `r.status`, which is
+         precisely the branch that was dropping 401/429/999 on the floor. This is
+         the comparison that would have made the 2026-09-02 BMO failures legible
+         at the time instead of unanswerable afterwards. */
+  {
+    const emptyBody = () => ({ getReader: () => ({ read: async () => ({ done: true }),
+                                                   cancel: async () => {} }) });
+    const statusOnly = (code) => async () => ({ ok: false, status: code,
+                                                headers: { get: () => '' }, body: emptyBody() });
+    C.__reset(statusOnly(429));
+    const store = { async get() { throw new Error('KV blip'); }, async put() {},
+                    async list() { return { keys: [] }; } };
+    let threw = null;
+    try { await C.getYahooCrumb({ REC_LOG: store }); } catch (e) { threw = e.message; }
+    row('9e2 a 429 from Yahoo is CARRIED, where it used to vanish silently',
+        threw?.split(' — upstream: ')[1] ?? null, 'A=429 · B=429 (no crumb, no cookie)');
+    row('9e2 ...the refusal itself is unchanged', (threw ?? '').split(' — upstream: ')[0],
+        'Yahoo crumb unavailable (all strategies exhausted)');
+    /* A DIFFERENT STATUS MUST PRODUCE A DIFFERENT MESSAGE, or the field is
+       decorative — the failure mode where a status word cannot fire. */
+    C.__reset(statusOnly(401));
+    let threw401 = null;
+    try { await C.getYahooCrumb({ REC_LOG: store }); } catch (e) { threw401 = e.message; }
+    row('9e2 ...and a 401 reads as 401, not as a fixed string',
+        threw401?.split(' — upstream: ')[1] ?? null, 'A=401 · B=401 (no crumb, no cookie)');
+    row('9e2 ...so the two statuses are distinguishable', threw === threw401, false);
   }
   {
     C.__reset(dead);
@@ -1028,5 +1069,5 @@ process.exit(reportVerdict({
      distinguish from a fixed one, and the floor is the exact number of
      comparisons the script makes. If a section stops running, the count drops
      and the run reports NO VERDICT rather than a pass over nothing. */
-  minComparisons: 234,
+  minComparisons: 241,
 }));

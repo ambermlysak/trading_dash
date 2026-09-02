@@ -19,3 +19,8 @@ long-tab-prompt.md
 # comparison can be redone offline, but they are per-day measurement data, not
 # source — and they carry the whole watchlist's IV readings.
 iv-capture-out/
+
+# Build output from `wrangler deploy --dry-run --outdir dist-check`. Regenerated on
+# demand and ~1.6MB; it is a STALE COPY of worker.js the moment the source moves, so
+# committing it invites reading a deployment status off the wrong bytes.
+dist-check/
