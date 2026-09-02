@@ -465,6 +465,76 @@ console.log('\n== 5. THE READ ROUTE — /api/long/:ticker?date=&slot= ==========
     row('5f ...and read NO longarch key', store.gets.filter(k => k.startsWith('longarch:')), []);
     row('5f ...and did read the long: row key', store.gets.includes('long:GOOGL'), true);
   }
+
+  /* (g) A FRESH `error` ROW IS NOT A SATISFIED CACHE — added 2026-09-02.
+
+     THE INCIDENT. Both 7:00am PT morning-rows firings failed all 40 tickers on a
+     transient Yahoo crumb outage and banked 40 `status: 'error'` long rows.
+     Banking them is BY DESIGN — a refusal is a finding, and the row carries the
+     reason. What was not by design is that this handler's NO-PARAM path then
+     served all 40 back as `cached: true, stale: false` for the next four hours,
+     so every retry in that window was suppressed by the failure it would have
+     fixed. `top3Sweep`'s own reuse gate has refused fresh error rows since the
+     day it was written; the request path had no such gate, and one gate is not
+     a gate.
+
+     DRIVEN IN BOTH DIRECTIONS, because a check that cannot fail proves nothing:
+     the ok row must STILL be served from cache with zero fetches, and `?cached=1`
+     — a NO-FETCH PROMISE — must STILL serve the error row as-is.
+
+     OFFLINE BY CONSTRUCTION: `globalThis.fetch` is replaced with a counting stub
+     that rejects, so the fall-through is observable without touching Yahoo. The
+     Worker's own INSTR wrapper is bypassed by that replacement, which is why the
+     count below is the stub's and not `_instr`'s. */
+  {
+    const realFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = async () => { fetchCalls++; throw new Error('offline by construction'); };
+
+    const FRESH = (status, ok) => j({ schema: 4, symbol: 'GOOGL', ok, status, ts: Date.now(),
+                                      reason: status === 'error' ? 'options chain fetch failed: Yahoo crumb unavailable (all strategies exhausted)' : null,
+                                      lanes: [] });
+    const okRow  = FRESH('ok', true);
+    const errRow = FRESH('error', false);
+
+    // CONTROL — a fresh OK row is still a cache hit, and still spends no fetch.
+    {
+      fetchCalls = 0;
+      const store = kv({ 'long:GOOGL': okRow });
+      const body = await (await worker.fetch(req('/api/long/GOOGL'), { REC_LOG: store }, ctx())).json();
+      row('5g CONTROL a fresh ok row is still served from cache', body.cached, true);
+      row('5g CONTROL ...and spent no fetch', fetchCalls, 0);
+      row('5g CONTROL ...and wrote nothing', store.puts.length, 0);
+    }
+
+    // THE FIX — a fresh ERROR row on the no-param path is NOT a cache hit.
+    {
+      fetchCalls = 0;
+      const store = kv({ 'long:GOOGL': errRow });
+      const un = quiet();
+      const body = await (await worker.fetch(req('/api/long/GOOGL'), { REC_LOG: store }, ctx())).json();
+      un();
+      row('5g a FRESH error row is NOT served as a satisfied cache', body.cached, false);
+      row('5g ...it fell through to the live path', fetchCalls > 0, true);
+      row('5g ...and the row returned is a NEW computation, not the banked one',
+          body.row.ts !== JSON.parse(errRow).ts, true);
+      row('5g ...whose own status is error too, honestly reported',
+          [body.row.status, body.row.ok], ['error', false]);
+    }
+
+    // THE NO-FETCH PROMISE — `?cached=1` must be untouched by all of the above.
+    {
+      fetchCalls = 0;
+      const store = kv({ 'long:GOOGL': errRow });
+      const body = await (await worker.fetch(req('/api/long/GOOGL?cached=1'), { REC_LOG: store }, ctx())).json();
+      row('5g ?cached=1 STILL serves the error row', body.cached, true);
+      row('5g ...byte-identical, so it renders as the finding it is', j(body.row), errRow);
+      row('5g ...spending no fetch, which is the whole contract', fetchCalls, 0);
+      row('5g ...and reporting it as fresh, because freshness is still pure age', body.stale, false);
+    }
+
+    globalThis.fetch = realFetch;
+  }
 }
 
 console.log('\n== 6. DISPATCH — the real scheduled(), offline ==============================\n');
@@ -505,14 +575,22 @@ console.log('\n== 6. DISPATCH — the real scheduled(), offline ================
   row('6a 07:00 PT branch', at700.branch, 'morning-rows');
   row('6a ...dispatches exactly one job', at700.jobs, 1);
   const at715 = await fire('2026-09-02T07:15:00-07:00');
-  row('6a 07:15 PT is the RETRY firing, same branch', at715.branch, 'morning-rows');
+  row('6a 07:15 PT is the SECOND firing, same branch', at715.branch, 'morning-rows');
+  /* THE THIRD FIRING, added when the window was widened `m < 30` -> `m < 45` on
+     2026-09-02. That morning BOTH firings of the two-firing window hit the same
+     transient Yahoo crumb outage, all 40 tickers failed on both, and the branch
+     was out of retries by 07:20 with the next writer of these rows six hours
+     away. This assertion is the one that goes red if anyone narrows it back. */
+  const at730 = await fire('2026-09-02T07:30:00-07:00');
+  row('6a 07:30 PT is the THIRD firing, same branch', at730.branch, 'morning-rows');
+  row('6a ...and it dispatches the job rather than idling', at730.jobs, 1);
   /* THE EDGES ON BOTH SIDES. 06:45 is idle because the morning-briefing window is
      `h === 6 && m < 30` — so 7:00 is a NEW branch rather than an extension of the
-     briefing's, and 07:30 closes it again. Getting 06:45 wrong on the first run
+     briefing's, and 07:45 closes it again. Getting 06:45 wrong on the first run
      of this section is exactly why the boundary is asserted rather than assumed.
      06:00 itself is deliberately NOT driven: it would dispatch the Claude
      briefing and spend real fetches, so it is pinned from source in (c). */
-  for (const [hh, mm] of [['06', '45'], ['07', '30'], ['07', '45'], ['08', '00']]) {
+  for (const [hh, mm] of [['06', '45'], ['07', '45'], ['08', '00']]) {
     const f = await fire(`2026-09-02T${hh}:${mm}:00-07:00`);
     row(`6a ${hh}:${mm} PT branch`, f.branch, 'idle');
     row(`6a ${hh}:${mm} PT dispatched nothing`, f.jobs, 0);
@@ -620,6 +698,37 @@ console.log('\n== 6. DISPATCH — the real scheduled(), offline ================
     row(`6e ${what} (${p} PT) inside ${lo}-${hi} UTC in both regimes`,
         [a, b].every(h => h >= lo && h <= hi), true);
   }
+
+  /* (f) THE WINDOW WIDTH, RE-DERIVED FROM SOURCE rather than restated back at
+         itself — the `TOP3_TTL` reachability discipline applied to a minute
+         bound. The cron fires on the quarter hour, so the number of retries a
+         branch gets is arithmetic on the bound in worker.js, not a property of
+         the three dispatch assertions in (a). If someone narrows it back, this
+         prints how many retries were lost rather than only that a boundary
+         moved. */
+  /* ANCHORED TO THE DISPATCH LINE, not to the string. A bare
+     /h === 7 && m < (\d+)/ matched the PROSE inside collectMorningRows's own
+     header comment thousands of lines earlier — so it read 45 off the comment
+     while the code said 30, and the assertion passed on the fault it exists to
+     catch. Found by driving the revert, which is the only reason it is not
+     still here. The `} else if (…) {` framing is what makes it the branch. */
+  const mBound = Number((/\} else if \(h === 7 && m < (\d+)\) \{/.exec(src) || [])[1]);
+  row('6f the morning-rows minute bound, read from source', mBound, 45);
+  row('6f ...admits this many quarter-hour firings', Math.ceil(mBound / 15), 3);
+  row('6f ...one MORE than the two-firing window that ran out of retries 2026-09-02',
+      Math.ceil(mBound / 15) - Math.ceil(30 / 15), 1);
+  /* AND IT IS NO LONGER "the same width as the 1:15pm window". The comment in
+     worker.js said that, truthfully, until this change; both halves are pinned
+     here so the claim and the code cannot drift apart again. */
+  const eodM = /\} else if \(h === 13 && m >= (\d+) && m < (\d+)\) \{/.exec(src);
+  row('6f the 1:15pm window bounds, from source', [Number(eodM[1]), Number(eodM[2])], [15, 45]);
+  row('6f ...30 minutes wide, TWO firings', (Number(eodM[2]) - Number(eodM[1])) / 15, 2);
+  row('6f ...so morning-rows is now WIDER than it, not equal',
+      mBound > Number(eodM[2]) - Number(eodM[1]), true);
+  /* The widening is a change to scheduled(), NOT to the cron expression — the
+     trigger already wakes us at :30 (rule #2: no calendar logic in the cron). */
+  row('6f the new 07:30 firing needs no cron change — the minute step already covers it',
+      Number((parts[0] || '').replace('*/', '')) <= 15, true);
 }
 
 console.log('\n== 7. STRUCTURAL — who may write what ======================================\n');
@@ -721,6 +830,194 @@ console.log('\n== 8. THE MODULE LOADS AS AN ES MODULE ==========================
       [typeof worker.fetch, typeof worker.scheduled], ['function', 'function']);
 }
 
+console.log('\n== 9. THE YAHOO CRUMB — retention outlives freshness =======================\n');
+{
+  /* THE ROOT CAUSE OF THE 2026-09-02 INCIDENT, and the same class of fix as §2:
+     a retention window that could not span the gap the writer's own schedule
+     creates. The crumb was held 50 minutes in isolate memory and 1h in KV. The
+     last write of a trading day is the 1:15pm PT sweep, so the 7:00am PT
+     morning-rows sweep could NEVER reuse one — not once, not on any day — and
+     had to acquire cold at 10:00am ET. On 2026-09-02 that acquisition failed and
+     all 40 tickers banked `status: 'error'` rows.
+
+     THE ASYMMETRY IS THE FINDING, and (a) below is where it is measured.
+
+     `YAHOO_HEADERS` is STUBBED rather than grabbed: grabConst scans to the first
+     `;` and the real User-Agent string contains two, so grabbing it would
+     truncate the object and the module would fail to build for a reason that
+     reads as a missing constant. The headers are inert here — nothing in this
+     section depends on their content. `fetch` is shadowed by a module-local
+     binding for the same reason the other sections stub: nothing may touch the
+     network. */
+  const CRUMB_STUBS = [
+    'let _crumbCache = null, _crumbInflight = null;',
+    "const YAHOO_HEADERS = { 'User-Agent': 'stub' };",
+    'let __fetchCalls = [], __fetchImpl = null;',
+    'const fetch = async (url, init) => { __fetchCalls.push(String(url)); return __fetchImpl(url, init); };',
+    'function __reset(impl) { _crumbCache = null; _crumbInflight = null; __fetchCalls = []; __fetchImpl = impl; }',
+    'function __calls() { return __fetchCalls; }',
+    'function __mem() { return _crumbCache; }',
+  ].join('\n');
+
+  const C = new Function([
+    CRUMB_STUBS,
+    grabConst('CRUMB_KV_TTL'),
+    grab('scanStream'), grab('extractCookie'), grab('getYahooCrumb'),
+    'return { getYahooCrumb, CRUMB_KV_TTL, __reset, __calls, __mem };',
+  ].join('\n'))();
+
+  /* A KV stub that records everything, because "did it write, and with what TTL"
+     is half of what is being asserted here. */
+  function kvc(seed = {}) {
+    const store = new Map(Object.entries(seed)), puts = [], gets = [];
+    return { store, puts, gets,
+      async get(k, ty) { gets.push(k); const v = store.get(k); return v == null ? null : (ty === 'json' ? JSON.parse(v) : v); },
+      async put(k, v, o) { puts.push({ k, ttl: o?.expirationTtl, v }); store.set(k, v); },
+      async delete(k) { store.delete(k); },
+      async list() { return { keys: [], list_complete: true }; } };
+  }
+  const dead  = async () => { throw new Error('offline by construction'); };
+  const alive = (c) => async (url) => String(url).includes('user-agent')
+    ? { ok: true, headers: { get: () => 'A1=cookieval; Path=/' }, text: async () => c }
+    : { ok: false, headers: { get: () => '' }, body: null };
+  const banked = (crumb, ageMs) => j({ crumb, cookie: 'A1=old', ts: Date.now() - ageMs });
+
+  // (a) THE ARITHMETIC THAT IS THE FINDING, re-derived from real Date maths and
+  //     compared against BOTH the old value and the new one — §2's instrument.
+  const hoursBetween = (a, b) => (Date.parse(b) - Date.parse(a)) / 3600000;
+  const OLD_KV_TTL_H = 1;                     // the 3600s that shipped until 2026-09-02
+  const gap = hoursBetween('2026-09-01T13:15:00-07:00', '2026-09-02T07:00:00-07:00');
+  row('9a 1:15pm PT sweep -> next 7:00am PT sweep, in hours', gap, 17.75);
+  row('9a the OLD 1h KV TTL could not span it — the 7am sweep was ALWAYS cold',
+      OLD_KV_TTL_H > gap, false);
+  row('9a ...nor could the 50-min in-memory TTL', (50 / 60) > gap, false);
+  row('9a the NEW 2d retention does', C.CRUMB_KV_TTL / 3600 > gap, true);
+  row('9a CRUMB_KV_TTL is 2d, in seconds', C.CRUMB_KV_TTL, 172800);
+  /* THE ASYMMETRY, STATED PRECISELY. The 1:15pm sweep's own nearest predecessor
+     is that morning's 7am sweep, 6.25h earlier — which the OLD ttl could not
+     span either, so 1:15pm acquired cold too. What differed was the HOUR, not
+     the cache. Recorded so the fix is not read as "the 1:15pm path was fine". */
+  const sameDay = hoursBetween('2026-09-02T07:00:00-07:00', '2026-09-02T13:15:00-07:00');
+  row('9a 7:00am -> 1:15pm, in hours', sameDay, 6.25);
+  row('9a the old TTL could not span THAT either — 1:15pm acquired cold as well',
+      OLD_KV_TTL_H > sameDay, false);
+  row('9a ...and the NEW retention spans both', C.CRUMB_KV_TTL / 3600 > Math.max(gap, sameDay), true);
+
+  // (b) A BANKED CRUMB IS REUSED WHATEVER ITS AGE. This is the fix.
+  {
+    C.__reset(dead);
+    const store = kvc({ 'yahoo:crumb': banked('OLDCRUMB', 30 * 24 * 3600000) });   // 30 days
+    const got = await C.getYahooCrumb({ REC_LOG: store });
+    row('9b a 30-DAY-old banked crumb is reused', got.crumb, 'OLDCRUMB');
+    row('9b ...spending ZERO fetches, which is the whole point', C.__calls().length, 0);
+    row('9b ...and it is promoted into isolate memory', C.__mem().crumb, 'OLDCRUMB');
+    row('9b ...and nothing was rewritten', store.puts.length, 0);
+  }
+  {
+    C.__reset(dead);
+    const store = kvc({ 'yahoo:crumb': banked('OLDCRUMB', 30 * 24 * 3600000) });
+    await C.getYahooCrumb({ REC_LOG: store });
+    const again = await C.getYahooCrumb({ REC_LOG: store });
+    row('9b a second call answers from memory, no age test there either', again.crumb, 'OLDCRUMB');
+    row('9b ...and costs no second KV read', store.gets.length, 1);
+  }
+
+  // (c) NOTHING BANKED -> a cold acquisition, banked at the new TTL.
+  {
+    C.__reset(alive('FRESHCRUMB'));
+    const store = kvc({});
+    const got = await C.getYahooCrumb({ REC_LOG: store });
+    row('9c an empty bank acquires cold', got.crumb, 'FRESHCRUMB');
+    row('9c ...and banks it', store.puts.map(p => p.k), ['yahoo:crumb']);
+    row('9c ...at CRUMB_KV_TTL, not the old 3600', store.puts[0].ttl, 172800);
+  }
+
+  /* (d) THE LATENT BUG LONGER RETENTION WOULD HAVE ARMED. The 401/403 paths used
+         to clear `_crumbCache` and call again — which read the SAME dead crumb
+         straight back out of KV and retried with it, so the "re-acquisition"
+         re-acquired nothing. At a 1h KV TTL that was mostly masked; at 2d it
+         would be permanent. Driven in BOTH directions, because a flag whose
+         absence changes nothing is a flag that proves nothing. */
+  {
+    C.__reset(alive('NEWCRUMB'));
+    const store = kvc({ 'yahoo:crumb': banked('DEADCRUMB', 60000) });
+    const noForce = await C.getYahooCrumb({ REC_LOG: store });
+    row('9d WITHOUT force the DEAD banked crumb comes straight back', noForce.crumb, 'DEADCRUMB');
+    row('9d ...which is exactly the no-op the old 401 path performed', C.__calls().length, 0);
+  }
+  {
+    C.__reset(alive('NEWCRUMB'));
+    const store = kvc({ 'yahoo:crumb': banked('DEADCRUMB', 60000) });
+    const forced = await C.getYahooCrumb({ REC_LOG: store }, { force: true });
+    row('9d WITH force the bank is SKIPPED and a real one acquired', forced.crumb, 'NEWCRUMB');
+    row('9d ...it never read the bank at all', store.gets.length, 0);
+    row('9d ...and it OVERWROTE the KV copy, so the next reader cannot pick the dead one up',
+        JSON.parse(store.store.get('yahoo:crumb')).crumb, 'NEWCRUMB');
+  }
+
+  /* (e) COLD ACQUISITION FAILS. With something banked, fall back and WARN; with
+         nothing banked, throw. This is the exact line the incident came out of —
+         it used to throw unconditionally, which took all 40 tickers down. */
+  {
+    C.__reset(dead);
+    const store = { async get() { throw new Error('KV blip'); }, async put() {},
+                    async list() { return { keys: [] }; } };
+    let threw = null;
+    try { await C.getYahooCrumb({ REC_LOG: store }); } catch (e) { threw = e.message; }
+    row('9e nothing banked AND acquisition fails -> throws', threw,
+        'Yahoo crumb unavailable (all strategies exhausted)');
+  }
+  {
+    C.__reset(dead);
+    const inner = kvc({ 'yahoo:crumb': banked('STALECRUMB', 20 * 3600000) });
+    /* The ordinary read short-circuits before acquisition, so the only way to
+       reach the fallback with a bank present is a KV read that FAILS once and
+       then recovers — which is the blip this branch exists for. */
+    let n = 0;
+    const flaky = { store: inner.store, puts: inner.puts, gets: inner.gets,
+      async get(k, ty) { if (n++ === 0) throw new Error('KV blip'); return inner.get(k, ty); },
+      async put(k, v, o) { return inner.put(k, v, o); },
+      async list() { return { keys: [] }; } };
+    const warns = [];
+    const ow = console.warn; console.warn = (...a) => warns.push(a.join(' '));
+    /* CAUGHT, so that reverting the fallback reddens a COMPARISON rather than
+       killing the run. A crashed script is a weaker signal than a failing line:
+       it does not say which assertion was reaching for what. */
+    let got = null, blew = null;
+    try { got = await C.getYahooCrumb({ REC_LOG: flaky }); } catch (e) { blew = e.message; }
+    console.warn = ow;
+    row('9e ...it did NOT throw', blew, null);
+    row('9e a KV blip + a failed acquisition falls back to the BANK, not an exception',
+        got?.crumb ?? null, 'STALECRUMB');
+    row('9e ...and WARNS, naming the age it is asking you to trust',
+        warns.some(w => /BANKED crumb, age 20\.0h/.test(w)), true);
+    row('9e ...so one blip cannot cost 40 tickers their morning', got != null, true);
+  }
+
+  /* (f) STRUCTURAL — every 401/403 re-acquisition site must pass `force`. No
+         behavioural test can see a fourth site added later without it, and a
+         site without it is precisely the no-op (d) just demonstrated. */
+  const reacq = [...src.matchAll(/if \(r\.status === 401 \|\| r\.status === 403\) \{[\s\S]{0,220}?\n\s*\}/g)]
+    .map(m => m[0]);
+  row('9f 401/403 re-acquisition sites found', reacq.length, 3);
+  row('9f ...every one of them forces',
+      reacq.filter(b => /getYahooCrumb\(env, \{ force: true \}\)/.test(b)).length, 3);
+  row('9f ...and none of them calls the plain form',
+      reacq.filter(b => /getYahooCrumb\(env\)[^,]/.test(b)).length, 0);
+  /* The warm-up callers must NOT force: they are the ones the bank exists for. */
+  row('9f the warm-up callers still use the PLAIN form — they are what the bank exists for',
+      [...src.matchAll(/await getYahooCrumb\(env\)\.catch/g)].length >= 6, true);
+  /* NOT a count of warm-up sites, deliberately: that number grows with ordinary
+     feature work and a check that reddens on growth trains people to ignore it.
+     What must hold is that `force` appears ONLY inside a 401/403 block — a
+     warm-up caller that forced would re-acquire on every sweep and undo the fix
+     entirely. */
+  row('9f ...and `force` appears ONLY inside a 401/403 block',
+      [...src.matchAll(/getYahooCrumb\(env, \{ force: true \}\)/g)].length,
+      reacq.filter(b => /force: true/.test(b)).length);
+  row('9f no CRUMB_TTL freshness constant survives', /const CRUMB_TTL\b/.test(src), false);
+}
+
 process.exit(reportVerdict({
   label: 'long-row retention, the 7am sweep and the longarch archive',
   comparisons: t.comparisons,
@@ -731,5 +1028,5 @@ process.exit(reportVerdict({
      distinguish from a fixed one, and the floor is the exact number of
      comparisons the script makes. If a section stops running, the count drops
      and the run reports NO VERDICT rather than a pass over nothing. */
-  minComparisons: 183,
+  minComparisons: 234,
 }));

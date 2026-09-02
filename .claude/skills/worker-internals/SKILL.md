@@ -25,6 +25,14 @@ GET  /api/long/batch?symbols=     Long screen, KV only — no fetches; N+2 KV re
                                     top3 hit path, at most N+7 on the miss
                                     (1/symbol + macro + top3; top3 walks back <=5 days)
 GET  /api/long/:ticker            One ticker (capCost 13 warm, 18-20 cold - cold is a RANGE)
+                                  NO-PARAM: a cached row inside LONG_FRESH_MS is served UNLESS its
+                                  status is `error`. A FRESH ERROR ROW IS NOT A SATISFIED CACHE -
+                                  the gate top3Sweep has always applied, added here 2026-09-02
+                                  after 40 crumb-outage error rows were served as fresh for 4h.
+                                  ?cached=1 is a NO-FETCH PROMISE and still serves the error row,
+                                  which renders as the finding it is; ?refresh=1 and the archive
+                                  read are unaffected. Error rows ARE banked - a refusal is a
+                                  finding - but no path may treat one as a satisfied cache.
 GET  /api/long/:ticker?date=&slot= THE ARCHIVE READ - one banked cron-sweep snapshot from
                                   longarch:{TICKER}:{PT-DATE}:{SLOT}, served VERBATIM. slot is
                                   `open` (7:00am PT sweep) or `eod` (1:15pm PT, the default).
@@ -607,7 +615,17 @@ grown from 22 to 35 during this work, so 41 is not a hypothetical. When quoting 
 spark-backed cost, quote the formula and the N it was evaluated at, never the bare
 number.
 
-**Yahoo crumb auth:** Yahoo v10 requires a session crumb. `getYahooCrumb()` tries two strategies (direct user-agent endpoint, then HTML stream scan), caches in memory + KV (`yahoo:crumb`, 50-min TTL), and deduplicates concurrent fetches via `_crumbInflight` promise. On 401/403 it invalidates and retries once.
+**Yahoo crumb auth:** Yahoo v10 requires a session crumb. `getYahooCrumb(env, { force })` tries two strategies (direct user-agent endpoint, then HTML stream scan) and deduplicates concurrent fetches via the `_crumbInflight` promise. **RETENTION, NO FRESHNESS TERM — changed 2026-09-02.** The crumb is banked in KV (`yahoo:crumb`) for **`CRUMB_KV_TTL` = 2d** and **a banked crumb is reused whatever its age**, in isolate memory and in KV alike. There is no `CRUMB_TTL` any more.
+
+Why that is safe rather than optimistic: `yahooAuth` and both screener callers already **re-acquire on a 401/403**, so a stale crumb self-corrects on first use at the cost of one fetch, while a *missing* crumb has no recovery at all and guarantees a cold acquisition.
+
+**The incident that produced it, 2026-09-02.** At the old 50-min in-memory / 1h KV pair, the last crumb write of a trading day is the 1:15pm PT sweep — so the 7:00am PT `morning-rows` sweep, **17.75h downstream, could never reuse one on any day** and had to acquire cold at 10:00am ET, the peak of Yahoo's anti-bot pressure on datacenter IPs. That acquisition failed, all 40 watchlist tickers banked `status: 'error'` long rows, and both firings burned. **The asymmetry is the finding, and it is NOT "1:15pm was fine"**: 1:15pm's own nearest predecessor is 6.25h back, which the 1h TTL could not span either, so it acquired cold too — what differed was the **hour**.
+
+Three behaviours to know:
+
+- **`force: true` skips BOTH caches, acquires fresh, and OVERWRITES the KV copy.** Every 401/403 path must use it (`yahooAuth` and the two screener callers — three sites). Clearing `_crumbCache` alone read the same dead crumb straight back out of KV, so the "re-acquisition" re-acquired nothing. Longer retention would have made that permanent.
+- **`force` must appear NOWHERE ELSE.** A warm-up caller that forced would re-acquire on every sweep and undo the whole fix. `longarch.check.mjs` §9f asserts it.
+- **A failed cold acquisition falls back to the bank**, warning with its age in hours; it throws only when there is **nothing** banked at all.
 
 **Alpaca integration:** Optional — if `ALPACA_KEY`/`ALPACA_SECRET` are set, Alpaca overlays real-time prices on quote results and provides the news feed. Yahoo is always the fallback.
 
@@ -660,7 +678,7 @@ differs from its retention, both are given and the reason is in the notes.
 
 | Key | TTL | What it holds |
 |---|---|---|
-| `yahoo:crumb` | 1h | Yahoo session crumb. In-memory `CRUMB_TTL` treats it as good for 50 min; KV keeps it an hour. |
+| `yahoo:crumb` | **2d** (`CRUMB_KV_TTL`) | Yahoo session crumb + cookie. **NO freshness term at all — reused whatever its age**, in memory and in KV. Was 1h with a 50-min in-memory `CRUMB_TTL` until 2026-09-02, which made the 7:00am PT sweep permanently cold (17.75h downstream of the 1:15pm writer) and cost 40 tickers their morning. Safe because every 401/403 path re-acquires with `force: true`, which skips both caches and overwrites this key. |
 | `daily:snapshot` | 2d | 6:00am PT Claude morning briefing. Carries `ptDate` (2026-08-20+) |
 | `daily:midday` | 2d | 11:30am PT midday pulse (narrative, topics, tomorrow, trades, bigMovers). Carries `ptDate` |
 | `daily:eod` | 2d | 1:15pm PT end-of-day summary. Carries `ptDate`, on the placeholder too |
@@ -780,7 +798,7 @@ their own `const TTL = <number>`, which shadowed it silently and turned
 the badge. They are now **`CRUMB_TTL`, `SCAN_TTL`, `GOLDEN_TTL`, `IPO_TTL`**. Any
 new local cache window needs its own name.
 
-**Cron trigger:** a single `*/15 12-22 * * *` UTC cron (the hour range widened from `13-22` on 2026-09-01 so the 05:30 PT print-tape BMO pass, which is 12:30 UTC under PDT, is covered in both regimes — rule #2) — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), the **`morning-rows`** branch (**7:00am PT — added 2026-08-31**: one job, `collectMorningRows`, running the same sequential watchlist sweep the 1:15pm top-3 job runs so every name has a fresh `long:{TICKER}` row for the trading morning, plus the `open` slot of the sweep archive. **It RANKS NOTHING** — no `collectTop3`, no `top3:{PT-date}`, no `top3sweep:last`, because that dedup is a PT-date compare and a 7am stamp would make the 1:15pm firing skip and replace the day's post-close ranking with one priced off opening spreads. Own key `morningrows:last`; `m < 30` admits two firings, 7:00 and 7:15. **One job on the branch, so its `_instr` IS a measurement.** ~20 capCost a name all-cold, ~800 at N≈40, zero Claude calls. 14:00 UTC on PDT / 15:00 UTC on PST — inside the trigger window in both regimes), midday pulse (11:30am PT), the **`eod+iv-sweep+macro`** branch (1:15pm PT — EOD summary, IV sample sweep, the macro-regime collection, **and, dispatched after the macro bank, the daily top-3 options ranking**), the **`forward-returns+moves+mood`** branch (2pm PT — the forward-return fill, the move-series sweep, *and* the Market Mood collection), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
+**Cron trigger:** a single `*/15 12-22 * * *` UTC cron (the hour range widened from `13-22` on 2026-09-01 so the 05:30 PT print-tape BMO pass, which is 12:30 UTC under PDT, is covered in both regimes — rule #2) — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), the **`morning-rows`** branch (**7:00am PT — added 2026-08-31**: one job, `collectMorningRows`, running the same sequential watchlist sweep the 1:15pm top-3 job runs so every name has a fresh `long:{TICKER}` row for the trading morning, plus the `open` slot of the sweep archive. **It RANKS NOTHING** — no `collectTop3`, no `top3:{PT-date}`, no `top3sweep:last`, because that dedup is a PT-date compare and a 7am stamp would make the 1:15pm firing skip and replace the day's post-close ranking with one priced off opening spreads. Own key `morningrows:last`; **`m < 45` admits three firings — 7:00, 7:15 and 7:30**, widened from `m < 30` on 2026-09-02 after both firings of the two-firing window burned on one transient crumb outage. That is a change to `scheduled()`, not to the cron expression, and it is **no longer the same width as the 1:15pm window** (`m >= 15 && m < 45`: 30 min, two firings). **One job on the branch, so its `_instr` IS a measurement.** ~20 capCost a name all-cold, ~800 at N≈40, zero Claude calls. 14:00 UTC on PDT / 15:00 UTC on PST — inside the trigger window in both regimes), midday pulse (11:30am PT), the **`eod+iv-sweep+macro`** branch (1:15pm PT — EOD summary, IV sample sweep, the macro-regime collection, **and, dispatched after the macro bank, the daily top-3 options ranking**), the **`forward-returns+moves+mood`** branch (2pm PT — the forward-return fill, the move-series sweep, *and* the Market Mood collection), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
 
 **`collectPrintTape` is dispatched OUTSIDE the branch chain** (added 2026-09-01), on its own clock
 test `printTapePassAt(h, m)` placed ahead of the `if/else`. **FIVE passes since 2026-09-01: a

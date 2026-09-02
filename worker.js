@@ -1141,9 +1141,54 @@ async function yahoo(path, search = '') {
   return r.json();
 }
 
-/* ── Yahoo crumb authentication ── */
+/* ── Yahoo crumb authentication ─────────────────────────────────────────────
+   RETENTION OUTLIVES FRESHNESS, AND HERE THERE IS NO FRESHNESS TERM AT ALL.
+
+   THE INCIDENT, 2026-09-02 ~07:05 PT. Both `morning-rows` firings failed ALL 40
+   watchlist tickers with `Yahoo crumb unavailable (all strategies exhausted)`,
+   banked 40 `status: 'error'` long rows, and every read path then served those
+   rows as fresh for four hours. The root cause was in THIS function, and it is
+   ARITHMETIC rather than a race: the crumb was held 50 minutes in isolate memory
+   and the KV copy expired at 3600s. The last write of the previous day is the
+   1:15pm PT sweep, so by 7:00am PT the newest crumb that could possibly exist
+   had been dead for ~16 hours. THE 7:00am SWEEP COULD NEVER REUSE A CRUMB — not
+   once, not on any day — and had to acquire COLD at 10:00am ET, the peak of
+   Yahoo's anti-bot pressure on datacenter IPs.
+
+   THAT ASYMMETRY IS THE FINDING. The 1:15pm sweep runs the SAME code down to the
+   line and has never hit this, because it acquires post-close when Yahoo is
+   quiet. Same function, same watchlist, different hour.
+
+   SO THE CRUMB IS BANKED FOR 2 DAYS AND A BANKED CRUMB IS REUSED WHATEVER ITS
+   AGE. There is no age test on the read, in memory or in KV, and that is safe
+   for a structural reason rather than an optimistic one: `yahooAuth` (and the
+   two screener callers) already RE-ACQUIRE on a 401/403, so a stale crumb
+   SELF-CORRECTS on its first use at the cost of one extra fetch. A MISSING crumb
+   has no such recovery — it guarantees a cold acquisition, and the incident is
+   what a cold acquisition at 10:00am ET does. A maybe-dead crumb with a retry
+   behind it strictly beats a guaranteed cold acquire.
+
+   After this the 1:15pm sweep's crumb carries the next morning's 7:00am sweep,
+   and cold acquisition migrates to the post-close hour where it has always
+   succeeded. `CRUMB_KV_TTL` is 2d rather than longer so a Worker idle across a
+   long weekend still re-acquires eventually rather than carrying a month-old
+   cookie; 2d is longer than any gap the cron's own trading-day schedule creates
+   between two consecutive firings, which is the `LONG_ROW_TTL` / `TOP3_TTL`
+   reasoning applied to a different key.
+
+   THE `force` OPTION EXISTS BECAUSE LONGER RETENTION ARMS A LATENT BUG. The
+   401/403 paths used to clear `_crumbCache` and call this function again — which
+   read the SAME dead crumb straight back out of KV and retried with it, so the
+   "re-acquisition" re-acquired nothing. At a 50-minute memory TTL and a 1h KV TTL
+   that was mostly masked; at 2d it would be permanent. `force: true` skips BOTH
+   caches, acquires fresh, and OVERWRITES the KV copy. Every 401/403 path in this
+   file uses it. */
 let _crumbCache = null;
 let _crumbInflight = null; // dedup concurrent fetches
+
+/* Retention only. There is deliberately no freshness constant beside it: a crumb
+   is either present (use it) or absent (acquire one). */
+const CRUMB_KV_TTL = 172_800;   // 2 days
 
 async function scanStream(response, regex, limitBytes = 150_000) {
   const reader = response.body.getReader();
@@ -1170,23 +1215,28 @@ function extractCookie(rawSetCookie, ...names) {
   return '';
 }
 
-async function getYahooCrumb(env) {
-  const now = Date.now();
-  const CRUMB_TTL = 3_000_000; // 50 minutes
+async function getYahooCrumb(env, { force = false } = {}) {
+  // Fast path — no await needed. NO AGE TEST: see the note above. A banked crumb
+  // is used whatever its age because the 401/403 retry is what corrects a dead
+  // one, and nothing corrects a missing one.
+  if (!force) {
+    if (_crumbCache) return _crumbCache;
+    // Dedup: if another concurrent call is already fetching, piggyback on it.
+    if (_crumbInflight) return _crumbInflight;
+  }
 
-  // Fast path — no await needed
-  if (_crumbCache && _crumbCache.ts > now - CRUMB_TTL) return _crumbCache;
-
-  // Dedup: if another concurrent call is already fetching, piggyback on it
-  if (_crumbInflight) return _crumbInflight;
-
-  _crumbInflight = (async () => {
+  const run = (async () => {
     try {
-      // KV cache
-      try {
-        const kv = await env?.REC_LOG?.get('yahoo:crumb', 'json');
-        if (kv && kv.ts > Date.now() - CRUMB_TTL) { _crumbCache = kv; return _crumbCache; }
-      } catch (_) {}
+      // KV cache. SKIPPED ENTIRELY ON `force`, which is the whole point of the
+      // flag: the caller is here because the crumb it just used got a 401, and
+      // reading that same crumb back out of KV is what made the old
+      // "re-acquisition" a no-op.
+      if (!force) {
+        try {
+          const kv = await env?.REC_LOG?.get('yahoo:crumb', 'json');
+          if (kv && kv.crumb) { _crumbCache = kv; return _crumbCache; }
+        } catch (_) {}
+      }
 
       let crumb = null;
       let cookie = '';
@@ -1225,17 +1275,46 @@ async function getYahooCrumb(env) {
         } catch (_) {}
       }
 
-      if (!crumb) throw new Error('Yahoo crumb unavailable (all strategies exhausted)');
+      /* COLD ACQUISITION FAILED. This is the exact line the 2026-09-02 incident
+         came out of, and it used to throw unconditionally — which took 40
+         tickers down and banked 40 `error` rows.
+
+         If ANYTHING is banked, use it and say so. On the ordinary path a bank
+         can only be here because the read above threw (a KV blip), and a KV blip
+         must not cost the sweep its whole morning. On the `force` path the bank
+         may well be the dead crumb we are replacing — but it may equally have
+         been re-acquired by another isolate or another invocation since our
+         request failed, and KV is the only place that would show. Either way the
+         caller retries once more against a real crumb-shaped value instead of
+         getting nothing at all.
+
+         THROW ONLY WHEN THERE IS NOTHING BANKED AT ALL. */
+      if (!crumb) {
+        let banked = null;
+        try { banked = await env?.REC_LOG?.get('yahoo:crumb', 'json'); } catch (_) {}
+        if (banked && banked.crumb) {
+          const ageH = banked.ts ? ((Date.now() - banked.ts) / 3600_000).toFixed(1) : '?';
+          console.warn(`[yahoo] crumb acquisition failed (all strategies exhausted${force ? ', forced' : ''}) — `
+            + `falling back to the BANKED crumb, age ${ageH}h. It may be dead; the 401/403 retry is what `
+            + 'corrects that, and a maybe-dead crumb beats a guaranteed failure.');
+          if (!force) _crumbCache = banked;
+          return banked;
+        }
+        throw new Error('Yahoo crumb unavailable (all strategies exhausted)');
+      }
 
       _crumbCache = { crumb, cookie, ts: Date.now() };
-      env?.REC_LOG?.put('yahoo:crumb', JSON.stringify(_crumbCache), { expirationTtl: 3600 }).catch(() => {});
+      // OVERWRITES the KV copy, `force` included — that overwrite is what stops
+      // the next reader picking the dead crumb back up.
+      env?.REC_LOG?.put('yahoo:crumb', JSON.stringify(_crumbCache), { expirationTtl: CRUMB_KV_TTL }).catch(() => {});
       return _crumbCache;
     } finally {
-      _crumbInflight = null;
+      if (!force) _crumbInflight = null;
     }
   })();
 
-  return _crumbInflight;
+  if (!force) _crumbInflight = run;
+  return run;
 }
 
 async function yahooAuth(path, search, env) {
@@ -1250,9 +1329,13 @@ async function yahooAuth(path, search, env) {
   let { crumb, cookie } = await getYahooCrumb(env);
   let r = await make(crumb, cookie);
 
+  /* FORCED re-acquisition. Clearing `_crumbCache` alone was never enough: the
+     next call read the SAME dead crumb straight back out of KV and retried with
+     it, so this branch spent a fetch to change nothing. `force: true` skips both
+     caches and overwrites the KV copy. */
   if (r.status === 401 || r.status === 403) {
     _crumbCache = null;
-    ({ crumb, cookie } = await getYahooCrumb(env));
+    ({ crumb, cookie } = await getYahooCrumb(env, { force: true }));
     r = await make(crumb, cookie);
   }
 
@@ -4766,9 +4849,10 @@ async function handleLongArchive(sym, date, slotParam, origin, env) {
 
 /* ── GET /api/long/:ticker ───────────────────────────────────────────────────
    The only path in this screen that spends subrequests.
-     (no param)   cached row if inside LONG_FRESH_MS, else refetch
+     (no param)   cached row if inside LONG_FRESH_MS AND not `status: error`,
+                  else refetch — a fresh error row is not a satisfied cache
      ?refresh=1   always refetch
-     ?cached=1    never fetch
+     ?cached=1    never fetch, error rows included (the row renders as a finding)
      ?date=&slot= ARCHIVE READ — a banked sweep snapshot, never a fetch */
 async function handleLongTicker(ticker, params, origin, env) {
   const sym = String(ticker || '').toUpperCase();
@@ -4793,7 +4877,32 @@ async function handleLongTicker(ticker, params, origin, env) {
   const cachedOnly = params.get('cached')  === '1';
   const cached = force ? null : await readLongRow(sym, env);
   const age    = cached?.ts ? Date.now() - cached.ts : null;
-  const fresh  = age != null && age < LONG_FRESH_MS;
+
+  /* A FRESH `error` ROW IS NOT A SATISFIED CACHE — `top3Sweep`'s own reuse gate,
+     applied to the request path it was missing from.
+
+     2026-09-02: both 7:00am PT sweep firings failed every one of 40 tickers on a
+     crumb outage and banked 40 `status: 'error'` rows (banking them is BY DESIGN
+     — a refusal is a finding and the row carries its reason). This path then
+     served all 40 back as `cached: true, stale: false` for the next four hours,
+     so a transient Yahoo failure at 07:05 bricked the whole Options surface until
+     11:05 even though every retry in between would have succeeded. `top3Sweep`
+     has refused fresh error rows since the day it was written
+     (`age < LONG_FRESH_MS && cached.status !== 'error'`); this handler did not,
+     and one gate is not a gate.
+
+     SCOPED TO THE NO-PARAM PATH ONLY, and the two exclusions are deliberate:
+       · `?cached=1` is a NO-FETCH PROMISE and must keep serving the error row
+         as-is. That row renders as a finding — the reason, the timestamp — which
+         is the correct answer to "what is banked", and falling through would
+         break the contract the whole `/api/long/batch` + expand flow rests on.
+       · `?refresh=1` never reads the cache at all, and the archive read returned
+         several branches above.
+     `stale` is unaffected: freshness is still a pure age question, and this is a
+     separate reason not to serve. */
+  const errorRow = cached?.status === 'error';
+  const fresh    = age != null && age < LONG_FRESH_MS;
+  const serveCached = cached && (cachedOnly || (fresh && !errorRow));
 
   /* ENVELOPE, not the row — the same rule as `/api/long/batch`. One extra KV
      read of the ~640-byte `macro:state` key on every path, cache hits included,
@@ -4801,7 +4910,7 @@ async function handleLongTicker(ticker, params, origin, env) {
      `macro:series` is never read here. */
   const macro = await readMacroState(env);
 
-  if (cached && (fresh || cachedOnly)) {
+  if (serveCached) {
     return json({ row: cached, cached: true, stale: !fresh, ageMs: age, macro,
                   _instr: stamp('cache-hit'), _meta: longRowMeta(cached) }, 200, origin);
   }
@@ -9824,10 +9933,18 @@ async function archiveSweptRows(env, swept, todayPt, slot) {
    COMPLETENESS, following `top3Sweep`'s own split. An `error` row is an
    INFRASTRUCTURE failure, ours to retry, and it blocks the stamp; `no-options` /
    `no-iv` / `no-expiries` are complete DOMAIN outcomes about the ticker and must
-   not block it forever. An unstamped run means the 7:15 firing retries — and it
-   costs only the names that failed, because every row the 7:00 run banked is
-   inside `LONG_FRESH_MS` and gets reused. A run where EVERY name failed writes no
-   stamp and says so.
+   not block it forever. An unstamped run means the NEXT firing in the window
+   retries — and it costs only the names that failed, because every row an earlier
+   run banked is inside `LONG_FRESH_MS` and gets reused. A run where EVERY name
+   failed writes no stamp and says so.
+
+   THE WINDOW IS THREE FIRINGS — 7:00, 7:15, 7:30 (`h === 7 && m < 45`), widened
+   from two on 2026-09-02. That morning both firings of the two-firing window hit
+   the SAME transient Yahoo crumb outage, all 40 tickers failed on both, and the
+   branch was out of retries by 07:20 with the next writer of these rows six hours
+   away at 1:15pm. A transient fault that outlives the retry budget is
+   indistinguishable from a permanent one, and one extra firing is the cheapest
+   part of the fix.
 
    KNOWN INTERACTION WITH THE IV SERIES, DOCUMENTED RATHER THAN FIXED. The cold
    long path banks the day's `iv:{TICKER}:{DATE}` sample unconditionally (the
@@ -9885,8 +10002,9 @@ async function collectMorningRows(env) {
   } else {
     console.error(`[cron] !! MORNING-ROWS-INCOMPLETE !! ${swept.failed}/${tickers.length} tickers hit an `
       + `INFRASTRUCTURE failure (${swept.failures.map(f => `${f.symbol} [${f.via}]`).join(', ')}). The rows `
-      + `that DID compute are banked; ${MORNING_ROWS_KEY} was NOT stamped, so the 7:15 firing retries and `
-      + 'costs only the names that failed — the rest are inside LONG_FRESH_MS and get reused.');
+      + `that DID compute are banked; ${MORNING_ROWS_KEY} was NOT stamped, so the next firing in the `
+      + '7:00/7:15/7:30 window retries and costs only the names that failed — the rest are inside '
+      + 'LONG_FRESH_MS and get reused.');
   }
 }
 
@@ -11773,9 +11891,10 @@ async function yahooScreenerPOST(cfg, env) {
   try {
     let { crumb, cookie } = await getYahooCrumb(env);
     let r = await make(crumb, cookie);
+    // Forced — same reason as yahooAuth's: without it this re-reads the dead crumb.
     if (r.status === 401 || r.status === 403) {
       _crumbCache = null;
-      ({ crumb, cookie } = await getYahooCrumb(env));
+      ({ crumb, cookie } = await getYahooCrumb(env, { force: true }));
       r = await make(crumb, cookie);
     }
     if (!r.ok) return [];
@@ -12008,9 +12127,10 @@ async function goldenCrossUniverse(env) {
     };
     let { crumb, cookie } = await getYahooCrumb(env);
     let r = await make(crumb, cookie);
+    // Forced — same reason as yahooAuth's: without it this re-reads the dead crumb.
     if (r.status === 401 || r.status === 403) {
       _crumbCache = null;
-      ({ crumb, cookie } = await getYahooCrumb(env));
+      ({ crumb, cookie } = await getYahooCrumb(env, { force: true }));
       r = await make(crumb, cookie);
     }
     if (r.ok) {
@@ -15867,7 +15987,7 @@ export default {
     if (h === 6 && m < 30) {
       branch = 'morning-briefing';
       dispatchJob(ctx, 'morning-briefing', () => generateDailySnapshot(env));   // 6:00am PT
-    } else if (h === 7 && m < 30) {
+    } else if (h === 7 && m < 45) {
       /* 7:00am PT — SWEEP ONLY. Writes a fresh `long:{TICKER}` row for every
          watchlist name and banks the `open` slot of the sweep archive. It
          RANKS NOTHING: no `collectTop3`, no `top3:{PT-date}`, no
@@ -15875,11 +15995,22 @@ export default {
          skip and replace the day's post-close ranking with one priced off
          opening spreads — see the constraint written out on collectMorningRows.
 
-         `m < 30` admits exactly two firings, 7:00 and 7:15, the same bound the
-         1:15pm window uses: a persistently failing name costs one extra pass a
-         day and no more. Own dedup key (`morningrows:last`), stamped only on a
-         run with zero INFRASTRUCTURE failures, so the 7:15 retry costs only the
-         names that failed — the rest are inside LONG_FRESH_MS and get reused.
+         `m < 45` admits THREE firings — 7:00, 7:15 and 7:30. WIDENED FROM
+         `m < 30` ON 2026-09-02: on that morning both firings of the two-firing
+         window burned on the same transient crumb outage, all 40 tickers failed
+         twice, and the branch was out of retries by 07:20 with the next writer
+         six hours away. One more firing is the cheapest part of that incident's
+         fix. It is not free of cost but it is nearly so: the dedup key means a
+         successful run makes every later firing in the window a single KV read,
+         and an unsuccessful one only re-fetches the names that actually failed —
+         the rest are inside LONG_FRESH_MS and get reused. Own dedup key
+         (`morningrows:last`), stamped only on a run with zero INFRASTRUCTURE
+         failures.
+
+         NOTE, because the old comment claimed otherwise and it was true then:
+         this is NO LONGER "the same bound the 1:15pm window uses". That window
+         is `m >= 15 && m < 45` — 30 minutes wide, two firings. This one is now
+         45 minutes wide with three.
 
          THIS BRANCH CARRIES ONE JOB, so its `_instr` IS a measurement rather
          than an upper bound: nothing else shares the invocation. ~20 capCost a

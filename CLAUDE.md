@@ -984,19 +984,25 @@ parse `node --check` cannot perform, and which caught a real syntax error in thi
 very change after `node --check` returned exit 0 on it.
 
 Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 240 / 183 / 543** for moves /
+**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 240 / 234 / 543** for moves /
 long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
 sweep-universe / macro / mood / swing / earnings-timing / daily-slots /
-analysis-shape / top3 / longarch / printtape — **2,216 comparisons** across the suite.
+analysis-shape / top3 / longarch / printtape — **2,267 comparisons** across the suite.
 `top3` went 173 -> 219 on 2026-08-26 with §10, the serving window, and **219 -> 240 on
 2026-08-31** with the 7d TTL and the 5-day walk; its `minComparisons` floor moved
 130 -> 170 -> **235**.
-`longarch` landed 2026-08-31 at **166** and went **166 -> 183 on 2026-09-01**, when its
+`longarch` landed 2026-08-31 at **166**, went **166 -> 183 on 2026-09-01**, when its
 §6e cron assertion was rewritten: it had pinned the whole literal expression, so the
 LEGITIMATE widening of the UTC hour range read as a regression. It now READS the range
 from `wrangler.toml`, pins the three calendar fields as `*`, and re-derives every
 scheduled PT hour against the range in both DST regimes — which is the part that can
 catch a future job being scheduled outside the window.
+It went **183 -> 234 on 2026-09-02** with the crumb-retention incident: §5g the
+fresh-`error`-row serve rule (both directions — the ok row must still be a cache hit
+and `?cached=1` must still serve the error row), §6f the morning-rows window width
+re-derived from the DISPATCH LINES in source, and **§9 the Yahoo crumb**, which is a
+retention section of exactly §2's kind and belongs beside it. §9 is also where a check
+was caught reading a COMMENT instead of the code — see the incident section below.
 `printtape` landed 2026-09-01 at **272** and went **272 -> 543 the same day** with the
 schedule fix: §12 the pre-banked quarter (driven both ways, with the **-51.22%** miss a
 gate-free fallback would print shown beside the `null` the shipped code prints), §13 the
@@ -1011,10 +1017,10 @@ Both floors are the **exact** count rather than a count minus slack: every secti
 either is deterministic and offline, so unlike `swing` and `earnings-timing` there is no
 observed total to distinguish from a fixed one, and a section that stops running drops
 the count into a NO VERDICT.
-The **2,216** above is the sum of the eighteen FLOORS, not of an observed run. A full
-run on 2026-09-01 after the schedule fix observed **2,265, with 0 scripts failing**;
-the 49-comparison gap is
-entirely the two tape-dependent scripts, which observed `swing` **95** against its
+The **2,267** above is the sum of the eighteen FLOORS, not of an observed run. A full
+run on 2026-09-02 after the crumb fix observed **2,317, with 0 scripts failing**;
+the 50-comparison gap is
+entirely the two tape-dependent scripts, which observed `swing` **96** against its
 floor of 91 and `earnings-timing` **158** against 113. Their floors are deliberately
 their FIXED counts, so a quiet tape reports a verdict instead of a false NO VERDICT —
 never raise either to an observed total.
@@ -1025,6 +1031,13 @@ turns §2 red in **7** comparisons; making `collectMorningRows` stamp
 `TOP3_SWEEP_KEY` instead of its own key turns §7 red in **5**, naming the function
 in the output; and raising the floor above the observed count produces NO VERDICT
 rather than a pass.
+
+**SIX MORE WERE DRIVEN FOR THE 2026-09-02 CRUMB INCIDENT** — the full table is in
+*"The Yahoo crumb, the fresh-error-row cache, and the third morning firing"*
+below. Two of them are worth knowing here, because both are about the
+INSTRUMENT rather than the code: §9b's crumb-value assertion **passes under its
+own fault** and only the fetch count catches it, and §6f was **reading a comment
+instead of the dispatch line** until the revert was driven against it.
 
 **AND BEFORE `printtape` WAS BELIEVED, for the same reason.** Removing the
 quarter-alignment gate from `printTapePrintFrom` makes §5f print the fabricated
@@ -1264,11 +1277,30 @@ without ever opening that file.
   `top3Sweep` reuses only inside `LONG_FRESH_MS` and only a non-`error` row,
   `top3Rank` drops any row whose own PT date is not today, and `readLongRow`
   retires any row whose schema is not `LONG_SCHEMA`
+- **A `status: 'error'` long row IS banked — a refusal is a finding — but NO PATH
+  MAY TREAT ONE AS A SATISFIED CACHE.** `top3Sweep`'s reuse gate has always
+  refused them; `handleLongTicker`'s no-param path did not, and on 2026-09-02 it
+  served 40 of them as `cached: true, stale: false` for four hours after a
+  transient crumb outage. The no-param path now falls through to the refetch.
+  **`?cached=1` is the one exception and must stay one** — it is a no-fetch
+  promise and the row renders as the finding it is. Same class as *"not loaded
+  must not render like no trade here"*
+- **THE YAHOO CRUMB HAS RETENTION AND NO FRESHNESS TERM.** `CRUMB_KV_TTL` is 2d
+  and a banked crumb is reused **whatever its age**, in memory and in KV, because
+  `yahooAuth` and both screener callers re-acquire on a 401/403 — a stale crumb
+  self-corrects, a missing one guarantees a cold acquire. At the old 50-min/1h
+  pair the 7:00am PT sweep, **17.75h downstream of the 1:15pm writer, could never
+  reuse one on any day**. Every 401/403 path must call
+  `getYahooCrumb(env, { force: true })`, which skips both caches and **overwrites**
+  KV; without it the "re-acquisition" reads the same dead crumb back. `force` must
+  appear **nowhere else** — a warm-up caller that forced would undo the fix
 - **The 7:00am PT `collectMorningRows` job RANKS NOTHING.** It must never call
   `collectTop3`, write `top3:{PT-date}`, or stamp `top3sweep:last` — that dedup
   is a PT-date compare, so a 7am stamp would make the 1:15pm firing skip and
   replace the day's post-close ranking with one priced off opening spreads. Its
-  own stamp is `morningrows:last`, outside any scanned prefix
+  own stamp is `morningrows:last`, outside any scanned prefix. Its window is
+  `h === 7 && m < 45` — **three** firings (7:00 / 7:15 / 7:30), widened from two
+  on 2026-09-02 after both burned on one transient fault
 - **`printtape:` NEVER COMPARES AN ACTUAL AGAINST A CONSENSUS FROM A DIFFERENT
   QUARTER.** The two must carry the same period-end date, by string equality, or the
   half that cannot be matched is `{status:'not-published'}`. Yahoo publishes the
@@ -2051,7 +2083,7 @@ Neither frontend reads `LONG_ROW_TTL`; the stale badge is driven by
 
 #### The 7:00am PT branch — `collectMorningRows`, which RANKS NOTHING
 
-`h === 7 && m < 30` dispatches one job, `collectMorningRows(env)`. It runs the
+`h === 7 && m < 45` dispatches one job, `collectMorningRows(env)`. It runs the
 same sequential `sweepUniverse()` → `top3Sweep()` path the 1:15pm job runs, so
 every watchlist name has a fresh row for the trading morning rather than only
 after 1:15pm. **7:00am PT is 10:00am ET, 30 minutes after the open: the earliest
@@ -2069,15 +2101,21 @@ The constraint is written out on the function so nobody "simplifies" it later.
 - **Own dedup stamp**, `morningrows:last`, outside any scanned prefix — the
   `ivsweep:last` rule. Stamped only when **zero** tickers hit an INFRASTRUCTURE
   failure; `no-options` / `no-iv` / `no-expiries` are complete domain outcomes
-  and do not block it. `m < 30` admits exactly two firings (7:00 and 7:15), the
-  same bound the 1:15pm window uses, so a persistently failing name costs one
-  extra pass a day and no more — and the 7:15 retry costs **only** the names
-  that failed, because the rest are inside `LONG_FRESH_MS` and get reused.
+  and do not block it. **`m < 45` admits three firings — 7:00, 7:15 and 7:30**
+  (widened from `m < 30` on 2026-09-02, when both firings of the two-firing
+  window burned on one transient crumb outage), so a persistently failing name
+  costs two extra passes a day and no more — and each retry costs **only** the
+  names that failed, because the rest are inside `LONG_FRESH_MS` and get reused.
+  **This is no longer the same width as the 1:15pm window**, which is
+  `m >= 15 && m < 45`: 30 minutes and two firings.
 - **No calendar logic was added.** `scheduled()` gates on the Pacific trading day
   upstream of branch dispatch, so weekends and NYSE holidays are already handled.
-- **7:00am PT is inside the 13–22 UTC window in BOTH regimes** — 14:00 UTC on
+- **7:00am PT is inside the 12–22 UTC window in BOTH regimes** — 14:00 UTC on
   PDT, 15:00 UTC on PST — which rule #2 requires be checked before scheduling
-  any new Pacific hour. **The cron expression itself does not change.**
+  any new Pacific hour. **The cron expression itself does not change**, not for
+  this branch and not for the 2026-09-02 widening either: the trigger already
+  wakes us at `:30`. (The range was `13-22` when this was written and became
+  `12-22` on 2026-09-01 for the print-tape BMO pass; 7:00am PT is inside both.)
 - **Budget, derived not estimated:** ~8–9 external fetches per name cold
   (`refreshLongTicker`'s measured figure), and **7am is always cold** — the
   shared `premium:{TICKER}` header banked by yesterday's 1:15pm sweep is long
@@ -2152,7 +2190,9 @@ in the reason — never an empty 200.** A bad `date` or an unknown `slot` is a 4
 runs forward — it cannot recover anything from before its first deploy**, which
 is why the 2026-08-31 GOOGL discrepancy itself stays undiagnosable.
 
-**Checked by `node longarch.check.mjs` (166 comparisons).** It is the only script
+**Checked by `node longarch.check.mjs` (234 comparisons — 166 at this change,
+183 after the 2026-09-01 cron rewrite, 234 after the 2026-09-02 crumb
+incident).** It is the only script
 in the suite that both extracts by source *and* imports the module, because half
 of what is at stake here is structural (who may write which key) and half is
 routed behaviour (the archive read must not fall through to a live refetch). Its
@@ -2160,6 +2200,156 @@ floor is the exact count — every section is deterministic and offline. Both
 failure directions were driven before it was believed: reverting `LONG_ROW_TTL`
 to 24h reddens 7 comparisons, and making the 7am job stamp `TOP3_SWEEP_KEY`
 reddens 5 and names the function.
+
+### The Yahoo crumb, the fresh-error-row cache, and the third morning firing
+
+**Three fixes from one measured incident, 2026-09-02 ~07:05 PT — a root cause and
+two amplifiers.** It is the `LONG_ROW_TTL` lesson again on a different key, and
+the section above is its precedent: retention that could not span the gap the
+writer's own schedule creates.
+
+**WHAT HAPPENED.** Both `morning-rows` firings failed **all 40** watchlist tickers
+with `Yahoo crumb unavailable (all strategies exhausted)`, banked 40
+`status: 'error'` long rows — banking them **is by design**, a refusal is a
+finding — and every read path then served those rows back as **fresh** for four
+hours. One transient Yahoo failure at 07:05 took the whole Options surface out
+until 11:05, and every retry in that window was suppressed by the failure it
+would have fixed.
+
+#### FIX 1 — the crumb was banked for one hour, and the 7am sweep is 17.75 hours downstream
+
+`CRUMB_TTL` was 50 minutes in isolate memory and the `yahoo:crumb` KV copy
+expired at **3600s**. The last writer of a trading day is the 1:15pm PT sweep, so
+by 7:00am PT the newest crumb that could possibly exist had been dead for ~16
+hours.
+
+**THE 7:00am SWEEP COULD NEVER REUSE A CRUMB — not once, not on any day.** It had
+to acquire **cold at 10:00am ET**, the peak of Yahoo's anti-bot pressure on
+datacenter IPs.
+
+**THE ASYMMETRY IS THE FINDING, and it is not "the 1:15pm path was fine".** The
+1:15pm sweep runs the same function down to the line. Its own nearest predecessor
+is that morning's 7am sweep, **6.25h** earlier — which the 1h TTL could not span
+either, so 1:15pm acquired cold too. What differed was the **hour**, not the
+cache. Same code, same watchlist, one succeeds and one does not.
+
+| | before | after |
+|---|---|---|
+| in-memory hold | 50 min (`CRUMB_TTL`) | **no age test at all** |
+| KV retention | 3600s | **`CRUMB_KV_TTL` = 172800 (2d)** |
+| KV read | rejected anything older than 50 min | **reused whatever its age** |
+| failed cold acquisition | threw, always | **falls back to the bank; throws only with nothing banked** |
+| 401/403 re-acquisition | cleared `_crumbCache` only | **`getYahooCrumb(env, { force: true })`** |
+
+**REUSING ANY AGE IS SAFE FOR A STRUCTURAL REASON, NOT AN OPTIMISTIC ONE.**
+`yahooAuth` and both screener callers already re-acquire on a **401/403**, so a
+stale crumb **self-corrects on first use** at the cost of one extra fetch. A
+*missing* crumb has no such recovery — it guarantees a cold acquisition, and the
+incident is what a cold acquisition at 10:00am ET does. A maybe-dead crumb with a
+retry behind it strictly beats a guaranteed cold acquire. **2d rather than
+longer** so a Worker idle across a long weekend still re-acquires eventually
+rather than carrying a month-old cookie.
+
+**THE LONGER RETENTION ARMED A LATENT BUG, FIXED IN THE SAME COMMIT.** The
+401/403 paths cleared `_crumbCache` and called `getYahooCrumb` again — which read
+**the same dead crumb straight back out of KV** and retried with it, so the
+"re-acquisition" re-acquired nothing and spent a fetch to change nothing. At a 1h
+KV TTL that was mostly masked by expiry; at 2d it would be permanent.
+**`force: true` skips both caches, acquires fresh, and OVERWRITES the KV copy.**
+All **three** 401/403 sites use it (`yahooAuth` and the two screener callers) —
+`longarch.check.mjs` §9f asserts the count and that `force` appears **nowhere
+else**, because a warm-up caller that forced would re-acquire on every sweep and
+undo the whole fix.
+
+**A FAILED COLD ACQUISITION NO LONGER THROWS IF ANYTHING IS BANKED.** It warns,
+naming the bank's age in hours, and returns it. That is the line the incident came
+out of. Throw only when there is **nothing** banked at all.
+
+**After this the 1:15pm sweep's crumb carries the next morning's 7:00am sweep**,
+and cold acquisition migrates to the post-close hour where it has always
+succeeded.
+
+#### FIX 2 — a fresh `error` row is not a satisfied cache
+
+`top3Sweep`'s reuse gate has refused fresh error rows since the day it was
+written (`age < LONG_FRESH_MS && cached.status !== 'error'`). `handleLongTicker`'s
+**no-param** path did not: `if (cached && (fresh || cachedOnly))` served all 40
+error rows as `cached: true, stale: false`. **One gate is not a gate.**
+
+The no-param path now computes
+`serveCached = cached && (cachedOnly || (fresh && !errorRow))`. Two exclusions,
+both deliberate:
+
+- **`?cached=1` is a NO-FETCH PROMISE and still serves the error row as-is.** That
+  row renders as a *finding* — the reason and the timestamp — which is the correct
+  answer to "what is banked", and falling through would break the contract the
+  whole `/api/long/batch` + expand flow rests on.
+- **`?refresh=1` and the archive read are unaffected** — neither consults the cache
+  on this branch at all.
+
+`stale` is untouched: freshness stays a pure age question, and this is a *separate*
+reason not to serve.
+
+**The general rule, and it belongs beside the long-row facts:** error rows **ARE**
+banked, because a refusal is a finding — but **no path may treat one as a
+satisfied cache.** Same class as *"not loaded must not render like no trade
+here"*.
+
+#### FIX 3 — one more morning retry
+
+The window was `h === 7 && m < 30`: two firings, 7:00 and 7:15. Both burned on the
+same transient fault and the branch was out of retries by 07:20, with the next
+writer of those rows **six hours away** at 1:15pm. A transient fault that outlives
+the retry budget is indistinguishable from a permanent one.
+
+Widened to **`h === 7 && m < 45`** — **three firings, 7:00 / 7:15 / 7:30.** The
+dedup stamp makes the extra firing nearly free: a successful run reduces every
+later firing to a single KV read, and an unsuccessful one re-fetches **only** the
+names that failed, because the rest are inside `LONG_FRESH_MS` and get reused.
+
+**IT IS NO LONGER "the same width as the 1:15pm window", and the old comment said
+it was.** That window is `m >= 15 && m < 45` — 30 minutes, **two** firings. This
+one is now 45 minutes and **three**. Both halves are pinned in `longarch.check.mjs`
+§6f, re-derived from the dispatch lines in source, so the claim and the code
+cannot drift apart again.
+
+**THIS IS A CHANGE TO `scheduled()`, NOT TO THE CRON EXPRESSION** (rule #2). The
+trigger already wakes us at `:30`; no day, date or month goes anywhere near it,
+and 7:00am PT was already inside the UTC window in both regimes.
+
+#### Checked
+
+`node longarch.check.mjs` went **183 → 234**, and its `minComparisons` floor with
+it — the floor is the exact count, since every section is deterministic and
+offline. §5g is the serve rule (driven in both directions: the ok row must still
+be a cache hit and `?cached=1` must still serve the error row), §6f the window
+width re-derived from source, and **§9 the crumb**, which is a retention section
+of exactly §2's kind and lives here for that reason.
+
+**Six failure directions were driven before any of it was believed:**
+
+| fault injected | reddens |
+|---|---|
+| the 50-min age test back on the KV crumb read | **2** — §9b, 2 fetches where 0 were wanted |
+| `expirationTtl` back to 3600 | **1** — §9c |
+| `force` dropped from `yahooAuth`'s 401/403 path | **2** — §9f, both directions |
+| the unconditional throw restored on a failed acquisition | **4** — §9e |
+| `serveCached` back to `(cachedOnly \|\| fresh)` | **3** — §5g |
+| the window narrowed back to `m < 30` | **6** — §6a (2 dispatch) + §6f (4 arithmetic) |
+
+**§9b's value assertion passes under its own fault and the FETCH COUNT is what
+catches it** — with the age test restored, the 30-day crumb is rejected, the
+acquisition fails offline, and the new fallback hands the *same* crumb back. The
+returned value is identical; only `0 fetches` vs `2` says the cache was bypassed.
+A check that had asserted only the crumb string would have been green on the root
+cause.
+
+**AND §6f WAS ITSELF WRONG UNTIL THE REVERT WAS DRIVEN.** A bare
+`/h === 7 && m < (\d+)/` matched the **prose inside `collectMorningRows`'s own
+header comment** thousands of lines earlier — so it read `45` off a comment while
+the code said `30`, and passed on the exact fault it exists to catch. It is now
+anchored to the `} else if (…) {` framing. *An empty comparison is not a pass*, and
+neither is one reading the documentation instead of the code.
 
 ### Worker endpoints, data sources, KV and cron → the `worker-internals` skill
 

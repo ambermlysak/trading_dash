@@ -45,7 +45,21 @@ binding = "REC_LOG"
 id = "6e2feae8a08c4db0b564e5bce18d2b01"
 
 # KV keys used:
-#   yahoo:crumb         — Yahoo session crumb (50-min TTL)
+#   yahoo:crumb         — Yahoo session crumb + cookie. 2d retention
+#                         (CRUMB_KV_TTL), and NO FRESHNESS TERM AT ALL: a banked
+#                         crumb is reused WHATEVER ITS AGE, in memory and in KV.
+#                         WAS 1h (with a 50-min in-memory TTL) UNTIL 2026-09-02.
+#                         The last writer of a trading day is the 1:15pm PT sweep,
+#                         so at 1h the 7:00am PT morning-rows sweep could NEVER
+#                         reuse a crumb — the newest one possible had been dead
+#                         ~16h — and had to acquire cold at 10:00am ET, the peak
+#                         of Yahoo's anti-bot pressure. On 2026-09-02 that failed
+#                         and all 40 tickers banked `status: 'error'` rows twice.
+#                         The 1:15pm sweep runs the same code and never sees it,
+#                         because it acquires post-close. Reusing any age is safe
+#                         because yahooAuth and both screener callers RE-ACQUIRE
+#                         on a 401/403, so a stale crumb self-corrects on first
+#                         use; a MISSING crumb has no recovery at all.
 #   daily:snapshot      — 6am Claude synthesis (headline, newsCards, opportunity, avoid)
 #   daily:midday        — 11:30am PT midday pulse (narrative, topics, tomorrow, trades, bigMovers)
 #   daily:eod           — 1:15pm PT end-of-day summary (headline, body)
@@ -342,9 +356,19 @@ id = "6e2feae8a08c4db0b564e5bce18d2b01"
 #                      ONE JOB ON THIS BRANCH, so its _instr IS a measurement
 #                      rather than an upper bound. ~20 capCost a name all-cold,
 #                      ~800 at N≈40, zero Claude calls. Own daily dedup key
-#                      (morningrows:last); `m < 30` admits exactly two firings,
-#                      7:00 and 7:15, and the retry costs only the names that
+#                      (morningrows:last); `m < 45` admits THREE firings — 7:00,
+#                      7:15 and 7:30 — and the retry costs only the names that
 #                      failed.
+#                      WIDENED FROM `m < 30` ON 2026-09-02. Both firings of the
+#                      old two-firing window burned on the SAME transient Yahoo
+#                      crumb outage; all 40 tickers failed twice and the branch
+#                      was out of retries by 07:20 with the next writer of those
+#                      rows six hours away. This is a change to scheduled(), NOT
+#                      to the cron expression — the expression already wakes us
+#                      at :30, and rule #2 keeps every calendar decision in code.
+#                      It is no longer "the same width as the 1:15pm window":
+#                      that one is `m >= 15 && m < 45`, 30 minutes and two
+#                      firings; this one is 45 minutes and three.
 #   Midday pulse     — 11:30am PT  (18:30 UTC PDT / 19:30 UTC PST)
 #   EOD summary      — 1:15pm PT   (20:15 UTC PDT / 21:15 UTC PST)
 #   IV history sweep — 1:15pm PT   (runs alongside the EOD job; own daily dedup key)
