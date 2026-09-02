@@ -934,8 +934,10 @@ not for the whole system.** The record is six files, and this is one of them:
 `ARCHITECTURE.md` (this file), `.claude/skills/worker-internals/SKILL.md` (Worker
 endpoints, KV keys and TTLs, cron, external data sources),
 `.claude/skills/long-screen/SKILL.md` (Lanes A–F, move coverage, macro regime),
-`docs/rules-evidence.md` (the measured runs behind rules 1–7), and
-`docs/failure-modes.md` (the incident record behind the nine named failure modes).
+**`docs/history.md` (the incident narratives, superseded values and measurement
+write-ups moved out of `CLAUDE.md` on 2026-09-02, when it reached 178 KB and was past
+what a session loads whole)**, `docs/rules-evidence.md` (the measured runs behind rules
+1–7), and `docs/failure-modes.md` (the incident record behind the named failure modes).
 The two skills load on demand, not every session.
 
 | step | what it was | status |
@@ -976,8 +978,8 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    **Done:** `/api/watchlist/batch` now ships `earningsIsEstimate` (boolean, or
    null when Yahoo omits it) alongside `earningsTs` and `earningsSession`
    (`bmo`/`amc`/`unknown`), at zero added subrequest cost — `calendarEvents` was
-   already in that handler's module list. See CLAUDE.md's *Earnings session
-   timing* block for the classification rule. Measured on live data: AAPL, PLTR
+   already in that handler's module list. See CLAUDE.md's `### Frontends` section for
+   the classification rule (the anchor measurement is in `docs/history.md`). Measured on live data: AAPL, PLTR
    and VST all return `earningsIsEstimate: true`; HD, NVDA, TSM and UNH return
    `false`; SPY returns `null`.
 
@@ -992,7 +994,7 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    HOOD ARM SMR KTOS), and the watchlist reads **bmo 11 · amc 28 · unknown 0**
    against 11 / 18 / 10 before. Pinned by `node earnings-timing.check.mjs`; the
    measured distribution and the residual (an anchor is a convention, not an
-   observation) are in CLAUDE.md.
+   observation) are in `docs/history.md`.
 
    **Still outstanding:** nothing *consumes* the flag yet. The catalyst card, the
    watchlist Earnings column and the Long screen still present every date with
@@ -1172,13 +1174,15 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
 
 15. ~~**FIVE CRON JOBS STAMP THEIR DEDUP KEY ON A FAILED RUN**~~ — **FIXED
    2026-08-12.** Each of the five now guards its stamp on the run having
-   accomplished something, with the threshold and the before/after measurement in
-   CLAUDE.md rule #7. Item 16 below is the part that remains. Original text:
+   accomplished something. **The thresholds are in CLAUDE.md rule #7; the before/after
+   measurement moved to `docs/history.md` on 2026-09-02** (*"Rule 7 — `dispatchJob`, the
+   dedup-stamp guards…"*). Item 16 below is the part that remains. Original text:
    `eod-summary`, `iv-sweep`, `forward-returns`,
    `move-series` and `13f-slice` all stamp after a run that accomplished nothing,
    because each swallows its own per-item failures. The full measured table, the
-   forcing method and the per-job verdicts are in **CLAUDE.md rule #7**, under
-   *"KNOWN DEFECT, NOT FIXED"*. Three things make this worth its own item:
+   forcing method and the per-job verdicts are in **`docs/history.md`**, under
+   *"Rule 7 — `dispatchJob`, the dedup-stamp guards…"* (they were in CLAUDE.md rule #7
+   until the 2026-09-02 compaction). Three things make this worth its own item:
 
    - **The IV sweep is the one that costs data.** A 0-of-33 sweep stamps
      `ivsweep:last` and dedups itself out for the PT day; `ivRank` needs an
@@ -1205,9 +1209,10 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
 
 16. **THE IV SWEEP HAS DELIVERED ONE COMPLETE RUN IN SEVEN TRADING DAYS — and this
    is NOT the same defect as #15.** Measured 2026-08-12 across the whole 123-key
-   `iv:` history; the per-date table is in CLAUDE.md rule #7 under *"`iv:` SAMPLE
-   COUNT DOES NOT MEASURE SWEEP SUCCESS"*. Three distinct problems, none of which
-   #15's stamp fix would touch:
+   `iv:` history; **the per-date table moved to `docs/history.md` on 2026-09-02**, under
+   *"Rule 7 — `dispatchJob`, the dedup-stamp guards…"*, and the rule it justifies stays
+   in CLAUDE.md rule #7. Three distinct problems, none of which #15's stamp fix would
+   touch:
 
    - **Four dates recorded no sweep at all** (08-04, 08-07, 08-10, 08-11) — and
      **the cron fired on every one of them.** Established from Workers Analytics:
@@ -1252,8 +1257,9 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    discriminator loses the same information — nothing stored survives to say those
    four writes happened.
 
-   **The general form, the two candidate fixes and the readings they invalidate are
-   in CLAUDE.md rule #7, *"`src` IS LAST-WRITER-WINS"*.** Recorded there rather than
+   **The rule is in CLAUDE.md rule #7 (*"`iv:` `src` IS LAST-WRITER-WINS"*); the general
+   form, the two candidate fixes and the readings they invalidate are in
+   `docs/history.md`.** Recorded there rather than
    here because it applies to every provenance scalar, not just this key. Neither
    fix is done. Historical keys stay unprovenanced on purpose — absent `src` means
    pre-2026-08-12 and must never be read as `'api'`.
@@ -1647,9 +1653,9 @@ ladder on `/api/iv/:ticker`, and `1 − |Δ|` on the cards. What remains:
    *"dedup key is OUTSIDE the mood: prefix"*. A regression would fail the check
    suite rather than needing to be rediscovered in production.
 
-   **The premise that it skipped the audit was wrong** — CLAUDE.md rule #7's stamp
-   table already carries a `market-mood` row reading *"built to the pattern above,
-   never had the defect"*. Recorded here anyway, because "we checked and it is fine"
+   **The premise that it skipped the audit was wrong** — the stamp-guard table (in
+   `docs/history.md` since the 2026-09-02 compaction) already carries a `market-mood`
+   row reading *"built to the pattern above, never had the defect"*. Recorded here anyway, because "we checked and it is fine"
    is worth more written down than an open question that keeps getting re-raised.
 
    **Nothing was changed.** No fix was needed and none was made.

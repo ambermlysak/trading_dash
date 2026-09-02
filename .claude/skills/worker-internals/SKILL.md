@@ -7,7 +7,8 @@ description: Reference for worker.js internals and data plumbing — the /api en
 
 Extracted from `CLAUDE.md` so it loads only when this work is being done. The
 short list of contracts a session can violate in a single edit stayed resident as
-`### Worker invariants` in `CLAUDE.md`; **this file is the detail behind them.**
+`### Worker invariants` in `CLAUDE.md`; **this file is the detail behind them**, and
+`docs/history.md` holds the incident narrative behind each.
 
 Nothing here was reworded. `CLAUDE.md` and `ARCHITECTURE.md` still apply on top of this.
 

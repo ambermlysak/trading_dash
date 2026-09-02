@@ -1,6 +1,6 @@
 # Failure modes — the incident record
 
-Nine named failure modes, moved out of `CLAUDE.md` so the narratives, post-mortems
+Named failure modes, moved out of `CLAUDE.md` so the narratives, post-mortems
 and harness details stop loading into every session. **The headline assertion of each
 one stays resident** in `CLAUDE.md` under `## Named failure modes`, which links here.
 

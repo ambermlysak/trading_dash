@@ -1,334 +1,173 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code (claude.ai/code) working in this repository.
 
 ## What this is
 
-Two-page equity research terminal: a macro landing dashboard (`dashboard.html`) and a per-ticker deep-dive (`index.html`). A single Cloudflare Worker (`worker.js`) handles all API proxying, Claude calls, and KV persistence.
+A two-page equity research terminal — a macro landing dashboard (`dashboard.html`) and a
+per-ticker deep-dive (`index.html`) — with a single Cloudflare Worker (`worker.js`)
+handling all API proxying, Claude calls and KV persistence.
+
+## Where everything is
+
+**This file is the rules, and it is deliberately small so it loads whole.** It reached
+178 KB on 2026-09-02 — past what a session loads, so every session was working from a
+silently truncated copy of its own rules. **Nothing was deleted**; the narratives moved
+to `docs/history.md`.
+
+| file | holds |
+|---|---|
+| **`CLAUDE.md`** (every session) | **the rules, the Worker invariants, the active gotchas, the commands** |
+| `ARCHITECTURE.md` | data sources, design decisions, the two pages, build position |
+| `worker-internals` skill | endpoints, the **KV key + TTL table**, cron, data sources |
+| `long-screen` skill | Lanes A–F, move coverage, the macro regime |
+| **`docs/history.md`** | **incident narratives, superseded values with their dates, and the measurement write-ups behind the rules below** |
+| `docs/rules-evidence.md` · `docs/failure-modes.md` | rules 1–7 · the named failure modes |
+| `worker.js` | **every constant, threshold, weight and anchor — the source of truth** |
 
 ---
 
 ## ⚠ Read this before writing any code
 
-**These rules in `CLAUDE.md` take precedence over any general platform or skill
-documentation where the two conflict.** General guidance does not know about this
-account's plan limits or this Worker's history. Where it disagrees with what is
-below, what is below wins.
+**These rules take precedence over any general platform or skill documentation where the
+two conflict** — general guidance does not know this account's plan limits or this
+Worker's history. **Each has already caused a failure here**, the first three *silently*.
 
-Each constraint here has already caused a failure in this codebase. The first
-three were *silent* — code that returned normally and rendered plausible output
-while being wrong. The fourth was the opposite: total, immediate, and invisible
-in the Worker logs, because the browser never sent the requests.
+### 1. Subrequest budget: 10,000 per invocation, one pool
 
-### 1. Subrequest budget: 10,000 per invocation, one pool — and the cap is no longer the constraint
+Workers Paid: **10,000 subrequests per invocation** (`limits.subrequests` raises it),
+**per invocation, not per chunk** — chunking inside one handler has never bought
+anything. **IT IS ONE POOL, and this rule has been wrong in BOTH directions:** external
+`fetch()` **and** `env.REC_LOG.get/put/delete` and every R2 / D1 / DO binding count
+against the same 10,000. **Do not restore the two-bucket table, and do not write a
+comment claiming KV reads are free of the cap.**
 
-This account moved to **Workers Paid on 2026-08-07**. Since Cloudflare's
-**2026-02-11** change the paid default is **10,000 subrequests per invocation**,
-raisable to 10 million via `limits.subrequests` in `wrangler.toml`. The **50**
-that used to sit in this slot is the Free-plan figure and no longer applies
-(Free also carries a separate 1,000 ceiling on calls to Cloudflare services;
-that split is Free-only). The cap is still **per invocation, not per chunk** —
-chunking inside one handler has never bought anything.
+**THE CAP IS NOT WHAT STOPS FAN-OUT. YAHOO IS.** Firing 22 tickers at once gets the
+**Yahoo crumb rate-limited**, which the plan change did not touch. So `/api/long/batch`
+and `/api/premium/batch` stay **KV reads that make no outbound fetch**, "Load all" stays
+**strictly sequential**, and the deleted KV queue that drained the premium sweep **stays
+deleted**. A per-item `catch` that cannot tell "this item failed" from "the budget is
+gone and every remaining item will fail" reports partial data as complete at any
+ceiling. **`ctx.waitUntil` gets no budget of its own.**
 
-**It is ONE pool, and this rule has now been wrong in both directions.**
+**MEASURE, DO NOT ESTIMATE, AND QUOTE `capCost`.** `INSTR` wraps `globalThis.fetch` and
+`instrWrapBindings(env)` wraps every binding; `instrMark()`/`instrSince()` bracket a job
+and the result rides as `_instr`. **`capCost` = `extFetches` + `bindingOps`** is the
+figure the 10,000 meters — `extFetches` alone understates the batch paths, which cost
+**one KV read per symbol** (22 names = 22, not 0).
 
-| call | counts against the 10,000? |
-|---|---|
-| external `fetch()` — Yahoo, SEC EDGAR, FINRA, FRED, Alpaca, Anthropic | **yes** |
-| `env.REC_LOG.get/put/delete`, and any R2 / D1 / Durable Object binding | **yes — same pool** |
+**`_instr` IS A COUNTER DELTA, NOT A PER-JOB TOTAL — concurrent jobs contaminate each
+other.** On a firing dispatching more than one job (the normal case on the cron path) a
+per-job figure is an **upper bound on the job and a lower bound on the invocation**.
+**Quote a per-job `_instr` only for a job that ran ALONE, and say which case you are
+in**; otherwise quote `invocationCapCost`, or **quote the DERIVATION instead of the
+counter** (`collectMarketMood`: 16 ext + 3 bindings = **capCost 19**).
 
-Do not restore the two-bucket table, and do not write a comment claiming KV reads
-are free of the cap.
+**KNOWN GAP — the Cache API** counts against the cap and travels over neither counter;
+nothing uses it today (verified by grep) and `cacheApiCounted: false` says so. **Any new
+binding, or the first use of the Cache API, must be checked against the
+instrumentation's coverage in the same commit**, and **a zero count with
+`measured: false` means "not instrumented", not "made no calls"**. **Instrumentation may
+never break what it measures**: a failure degrades to a missing `_instr`, never a
+missing briefing.
 
-#### The cap is not what stops fan-out. Yahoo is.
-
-**Read this before treating 10,000 as permission to fan out.** Every structure in
-this codebase that avoids fan-out stays exactly as it is:
-
-- `/api/long/batch` remains a **KV read that makes no
-  outbound fetch** (they still cost one KV read per symbol — cheap, not free);
-  `/api/long/:ticker` remains the only path that touches Yahoo.
-- **Load all is strictly sequential** on both tabs, one awaited request at a time.
-- The deleted KV queue that once drained the premium sweep across cron firings
-  **stays deleted**.
-
-The binding constraint is **Yahoo crumb rate-limiting**, which the plan change did
-not touch. Firing 22 tickers concurrently puts 22 invocations against Yahoo at
-once and gets the crumb rate-limited — a different failure from the cap and just
-as effective. The screen is also used one or two names at a time, so fetching all
-22 solves a problem nobody has.
-
-**A per-item `catch` that cannot tell "this item failed" from "we exhausted a
-budget and every remaining item will fail" still reports partial data as
-complete, at any ceiling.**
-
-**`ctx.waitUntil` does not get its own budget.** It shares the invocation's, so
-two jobs dispatched on the same cron firing share one ceiling.
-
-**Measure, do not estimate.** `worker.js` counts **both** halves of the pool:
-`INSTR` wraps `globalThis.fetch` at module load, and `instrWrapBindings(env)` runs
-at the top of `fetch()` and `scheduled()` to wrap every binding. `instrMark()` /
-`instrSince()` bracket a job and the result rides along as `_instr`:
-
-| field | what it is |
-|---|---|
-| `extFetches` | external `fetch()` calls |
-| `bindingOps` | KV / R2 / D1 / DO calls |
-| **`capCost`** | **extFetches + bindingOps — the figure the 10,000 meters** |
-| `bindingsWrapped` / `bindingsSkipped` | the counter's own coverage |
-| `cacheApiCounted` | always `false` — see the gap below |
-
-**Quote `capCost`, never `extFetches`.** The `/api/long/batch` and
-`/api/premium/batch` endpoints cost **exactly one KV read per symbol**, so a
-22-name watchlist paints for **22** against the cap, not 0.
-
-**`_instr` IS A COUNTER DELTA, NOT A PER-JOB TOTAL — concurrent jobs contaminate
-each other.** `instrMark()` / `instrSince()` bracket a span of *time* and
-subtract invocation-wide counters. Anything else running inside that bracket is
-attributed to whichever job stamped the payload. On a firing that dispatches more
-than one job through `ctx.waitUntil`, the per-job figures are **upper bounds on
-that job and lower bounds on the invocation**, not measurements of either.
-
-**Both multi-job branches are three jobs deep or more, so this is the normal case
-on the cron path, not an edge one:**
-
-| branch | PT | jobs |
-|---|---|---|
-| `eod+iv-sweep+macro` | 1:15pm | `eod-summary`, `iv-sweep`, `macro-state`, `top3`, **and the print-tape PRE-BANK** (dispatched outside the chain, window `m` 15–29) — **five** |
-| `eod+iv-sweep+macro` | 1:30pm | the same four, plus print-tape `amc-pass1` |
-| `forward-returns+moves+mood` | 2:00pm | `forward-returns`, `move-series`, `market-mood` |
-
-The print-tape passes at **05:30 and 14:30 PT own no branch and run alone**, so
-their `_instr` IS a measurement — and that is what the 2026-09-01 cost table for
-that job rests on. The pre-bank at 13:15 can never be isolated, so its figure is a
-DERIVATION, per the `collectMarketMood` rule below.
-
-So: **quote a per-job `_instr` only for a job that ran alone, and say which case
-you are in.** The N=22 sweep figure of `2 / 47 / 49` is trustworthy precisely
-because it was measured in isolation and matches `2N + 3` exactly. When jobs
-share a firing, `invocationCapCost` is the honest number and the per-job split is
-an inference. This is not a defect to fix — a per-job counter would need
-async-context tracking the runtime does not offer — but an unlabelled per-job
-figure from a shared firing is a measurement that is quietly wrong, which is the
-failure this whole section exists to prevent.
-
-**When a job can only ever run alongside siblings, QUOTE THE DERIVATION, NOT THE
-COUNTER.** `collectMarketMood` is the worked example, because it has no isolated
-firing to be measured in: **15 chart fetches + 1 Anthropic call = 16 ext; 1 dedup
-get + 1 `mood:state` put + 1 dedup put = 3 bindings; capCost 19.** The structure
-is what makes that number checkable; the counter on that branch cannot be. A
-local run with no `ANTHROPIC_API_KEY` (so no Claude call) reported `extFetches
-15, bindingOps 3, capCost 18` against `invocationCapCost 20` on the same firing —
-the derivation and the contamination both visible in one line. `mood.check.mjs`
-§9 asserts the 15 / 1 / 3 / 19 split against stub bindings, which is isolated by
-construction in a way the runtime is not.
-
-**KNOWN GAP — the Cache API.** `caches.default.match/put` and `caches.open()`
-count against the cap and travel over neither `globalThis.fetch` nor `env`, so
-**neither counter can see them**. Nothing in the Worker uses the Cache API today
-(verified by grep, not assumed), and `cacheApiCounted: false` says so in every
-payload.
-
-> **Rule: any new binding, or the first use of the Cache API, must be checked
-> against the instrumentation's coverage in the same commit.** For a binding that
-> means confirming it appears in `bindingsWrapped` at runtime — shape detection
-> should handle it, but "should" is what this codebase keeps getting caught by.
-> For the Cache API it means extending `INSTR` to count it and flipping
-> `cacheApiCounted`, because a gap that lives only in a JSON payload is invisible
-> to the person adding the call. `node instr-bindings.check.mjs` covers the
-> detection and the failure paths.
-
-**A zero count with `measured: false` means "not instrumented", not "made no
-calls."**
-
-**Instrumentation may never break what it measures.** A measuring device that can
-take out the morning briefing is worse than no measuring device.
-
-The contract is: **instrumentation failure degrades to a missing or
-`measured:false` `_instr` field, never to a missing briefing.** `node
-cron-gate.check.mjs` proves it with forced faults — a null baseline and a
-rejection whose `reason` throws on property access.
-
-> **Evidence for this rule** — the measured runs, cost tables and incident
-> write-ups behind it — is in [`docs/rules-evidence.md`](docs/rules-evidence.md),
-> section *"1. Subrequest budget: 10,000 per invocation, one pool — and the cap is no longer the constraint"*.
+> [`docs/history.md`](docs/history.md) · [`docs/rules-evidence.md`](docs/rules-evidence.md)
 
 ### 2. The cron expression is a coarse wakeup — put no calendar logic in it
 
-The trigger is `*/15 12-22 * * *`: every 15 minutes, UTC hours 12–22, **every
-day**. It decides *how often we wake up* and nothing else. Which day, which date,
-which job — all of that is decided in `scheduled()`, in code, against Pacific
-wall-clock time.
+The trigger is `*/15 12-22 * * *`: every 15 minutes, UTC hours 12–22, **every day**. It
+decides *how often we wake up* and nothing else — which day, date and job is decided in
+`scheduled()`, in code, against Pacific wall-clock time. **Do not put a day-of-week,
+day-of-month or month back into the expression.** It once ended in `1-5`, and
+**Cloudflare's day-of-week field is 1-indexed with 1 = Sunday**, so that meant Sun–Thu:
+no job ran on a Friday and a Claude briefing burned every Sunday, unnoticed for weeks
+because a cron that does not fire logs nothing. **`2-6` would be correct today and is
+still the wrong fix** — a cron expression's semantics are not testable from this repo
+and `scheduled()`'s are (`node cron-gate.check.mjs`).
 
-**Do not put a day-of-week, day-of-month or month back into the expression.**
+**The gate skips NYSE holidays, not just weekends.** `NYSE_HOLIDAYS` is derived from
+`NYSE_HOLIDAY_TABLE`, so the gate and `GET /api/calendar/holidays` cannot disagree, and
+runs through `NYSE_HOLIDAYS_THROUGH` = **`2027-12-31`**. **Extend it before the runway
+runs out** — past that date every weekday reads as open and the dispatcher logs a
+`WARN`. **Early closes are NOT modelled — a known, deliberate gap**: the NYSE closes
+10:00am PT the day after Thanksgiving and on Christmas Eve, so the 11:30am PT midday
+pulse runs post-close and describes a finished session as live.
 
-The expression used to end in `1-5`, which reads as Mon–Fri under standard cron
-(`0` = Sunday). **Cloudflare's day-of-week field is 1-indexed with 1 = Sunday**, so
-`1-5` actually meant **Sun–Thu**.
-
-**`2-6` would have been correct and is still the wrong fix.** The lesson is not
-which magic numbers to type. It is that a cron expression's semantics are not
-testable from this repo, and `scheduled()`'s are: `node cron-gate.check.mjs` runs
-the real gate over Fridays, weekends, holidays and both DST regimes and prints
-computed against expected. Anything the dispatcher decides can be tested before
-deploy. Anything the expression decides cannot.
-
-**The gate skips NYSE holidays, not just weekends.** `NYSE_HOLIDAYS` in
-`worker.js` holds full-day closures through `NYSE_HOLIDAYS_THROUGH`
-(`2027-12-31`), verified two independent ways — NYSE Group's published calendar
-and a re-derivation from the observance rules (Easter computus for Good Friday;
-Saturday holidays observed the preceding Friday, Sunday holidays the following
-Monday; New Year's Day exempt from the Saturday rule). Extend it before the
-runway runs out; past `NYSE_HOLIDAYS_THROUGH` every weekday reads as open and the
-dispatcher logs a `WARN`.
-
-**Early closes are not modelled, and that is a known gap.** The NYSE closes at
-1:00pm ET / **10:00am PT** the day after Thanksgiving and on Christmas Eve
-(2026-11-27, 2026-12-24, 2027-11-26 in the current table). On those days the
-11:30am PT midday pulse runs **post-close** and describes a finished session as
-though it were live, and the 1:15pm PT EOD job runs 3h15m after the bell instead
-of 15 minutes after it. Flagged deliberately; not fixed.
-
-The **UTC hour range is still load-bearing**, for the original reason:
-`scheduled()` dispatches on **Pacific wall-clock time**, but the trigger is
-expressed in **UTC**, and a Pacific hour maps to two different UTC hours across
-the year. A job whose UTC hour falls outside the window **silently does not run
-for half the year**. `12-22` covers **5:00am–3:00pm PDT** and **4:00am–2:00pm
-PST**. Before scheduling anything, check the target Pacific hour in *both*
-regimes:
+**A job whose UTC hour falls outside the window silently does not run for half the
+year**, because `scheduled()` dispatches on **Pacific** time while the trigger is
+**UTC**. **Before scheduling anything, check the target Pacific hour in BOTH regimes:**
 
 ```
-PT hour  →  UTC under PDT (UTC-7)  |  UTC under PST (UTC-8)
- 4:00am  →  11:00  ✗ outside       |  12:00  ✓
- 5:00am  →  12:00  ✓               |  13:00  ✓
- 5:30am  →  12:30  ✓               |  13:30  ✓
- 6:00am  →  13:00  ✓               |  14:00  ✓
- 1:15pm  →  20:15  ✓               |  21:15  ✓   (print-tape PRE-BANK)
- 1:30pm  →  20:30  ✓               |  21:30  ✓
- 2:30pm  →  21:30  ✓               |  22:30  ✓
- 3:00pm  →  22:00  ✓               |  23:00  ✗ outside
+PT hour  →  UTC under PDT (-7)  |  UTC under PST (-8)     the window is 12-22
+ 4:00am  →  11:00  ✗ OUTSIDE    |  12:00  ✓   <- the early edge
+ 5:00am  →  12:00  ✓            |  13:00  ✓
+ 5:30am  →  12:30  ✓            |  13:30  ✓   print-tape BMO pass 1
+ 2:30pm  →  21:30  ✓            |  22:30  ✓   print-tape AMC pass 2 — the last job
+ 3:00pm  →  22:00  ✓            |  23:00  ✗ OUTSIDE  <- the late edge
 ```
 
-**THE RANGE WIDENED 13-22 → 12-22 ON 2026-09-01, AND THE REASON IS THIS EXACT
-CHECK.** The print-vs-tape BMO first pass is **05:30 PT**, which is 12:30 UTC under
-PDT and 13:30 under PST. Under `13-22` the PST reading was covered and the PDT one
-was not, so that pass **would have silently not run for the summer half of the
-year** — the 13F failure, caught this time by running the table above before
-scheduling rather than after. The four extra wakeups a day are idle under PST and
-carry one job under PDT.
-
-**This is the ONE thing in the expression that is allowed to change**, because it is
-the only part that decides *how often we wake up* rather than *when a job is due*.
-`longarch.check.mjs` §6e used to pin the whole literal expression, which made this
-legitimate widening read as a regression; it now READS the range from
-`wrangler.toml`, asserts the three calendar fields are still `*`, and re-derives
-**every** scheduled PT hour against the range in both regimes — which is the half
-that can actually catch a job scheduled outside the window.
-
-> **Evidence for this rule** — the measured runs, cost tables and incident
-> write-ups behind it — is in [`docs/rules-evidence.md`](docs/rules-evidence.md),
-> section *"2. The cron expression is a coarse wakeup — put no calendar logic in it"*.
+**The hour range is the ONE thing in this expression allowed to change.** It widened
+`13-22` → `12-22` on 2026-09-01 for the 05:30 PT print-tape pass, which is 12:30 UTC
+under PDT and would otherwise have silently not run all summer. `longarch.check.mjs`
+§6e READS the range from `wrangler.toml`, asserts the three calendar fields are `*`, and
+re-derives every scheduled PT hour against it in both regimes.
 
 ### 3. Encoding: declare `charset=utf-8` on every JSON response
 
-The Worker emits UTF-8, and plenty of its strings carry `–`, `—`, `·`, `≥`, `×` —
-the FOMC label `Jul 28–29` among them. Served as bare `application/json` the
-charset is unstated, and anything falling back to Latin-1 renders those three
-bytes (`E2 80 93`) as `â` — which is exactly the mojibake that appeared in the
-econ-calendar notes.
-
-`json()` now sends `JSON_CT` (`application/json; charset=utf-8`), and so does
-every hand-built `new Response(JSON.stringify(...))`. **The bytes were always
-correct; only the declaration was missing.** Never "fix" this by replacing the
-characters with ASCII — that hides the fault and loses the typography.
+The Worker emits UTF-8 and its strings carry `–`, `—`, `·`, `≥`, `×`. Served as bare
+`application/json` the charset is unstated, and a Latin-1 fallback renders `E2 80 93` as
+`â` — the mojibake that appeared in the econ-calendar notes. `json()` sends `JSON_CT`
+(`application/json; charset=utf-8`), and so must every hand-built
+`new Response(JSON.stringify(...))`. **The bytes were always correct; only the
+declaration was missing** — never "fix" it by replacing the characters with ASCII.
 
 ### 4. CORS preflight: any custom request header must be allowlisted
 
-**Adding a custom request header to either frontend is a two-file change.** The
-browser CORS-safelists exactly four request headers — `Accept`,
-`Accept-Language`, `Content-Language`, `Content-Type`. Anything else makes the
-request "non-simple": the browser first sends an `OPTIONS` preflight, and it will
-**not send the real request** unless the preflight response names that header in
-`Access-Control-Allow-Headers`.
+**Adding a custom request header to either frontend is a two-file change.** The browser
+CORS-safelists exactly four request headers (`Accept`, `Accept-Language`,
+`Content-Language`, `Content-Type`); anything else makes the request "non-simple" and
+the browser **will not send the real request** unless the preflight response names that
+header in `Access-Control-Allow-Headers`. `CORS_ALLOW_HEADERS` is declared next to
+`ALLOWED_ORIGINS`, built from `AI_SECRET_HEADER` so the check and the advertisement
+cannot drift. **Add any new header there in the same commit that adds it to the client.**
 
-So: `CORS_ALLOW_HEADERS` is declared next to `ALLOWED_ORIGINS`, built from
-`AI_SECRET_HEADER` so the check and the advertisement cannot drift. Add any new
-header there in the same commit that adds it to the client.
+Two ordering rules in `fetch()`: **`OPTIONS` is answered before the origin 403 and
+before any gate** (a preflight carries no custom headers by definition, so a gate
+running first would reject its own preflight — **never move a check above that block**),
+and **the preflight response must carry `Access-Control-Allow-Origin`, `-Methods`,
+`-Headers`, `-Max-Age` and `Vary: Origin`**. A disallowed origin gets a bare 403.
 
-Two ordering rules in `fetch()`, both load-bearing:
-
-- **`OPTIONS` is answered before the origin 403 and before any gate.** A preflight
-  carries no custom headers *by definition* — the browser sends
-  `Access-Control-Request-Headers` naming them, not the headers themselves. If the
-  gate ran first it would reject its own preflight for want of the very header the
-  preflight exists to request permission for, and nothing could ever succeed.
-  **Never move a check above that block.**
-- **The preflight response must carry `Access-Control-Allow-Origin`,
-  `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers` and
-  `Access-Control-Max-Age`**, and `Vary: Origin` so a cache cannot serve one
-  origin's ACAO to another. A disallowed origin gets a bare 403 with no CORS
-  headers at all.
-
-**curl cannot catch this class of bug, and neither can I without a browser.**
-
-Two things now exist for it:
-
-- `cors-check.html` — open it **in a browser** from an allowlisted origin. It
-  issues real cross-origin requests, so real preflights, and reports pass/fail.
-  A 401 or 429 there is a **pass**: it means the browser let the request through
-  and the Worker answered. Only a `TypeError` with no status is a CORS block.
-- A curl-based simulation of the Fetch spec's preflight algorithm is useful for a
-  quick check, but it is a *model* of the browser, not the browser. When they
-  disagree, the browser is right.
-
-> **Evidence for this rule** — the measured runs, cost tables and incident
-> write-ups behind it — is in [`docs/rules-evidence.md`](docs/rules-evidence.md),
-> section *"4. CORS preflight: any custom request header must be allowlisted"*.
+**curl cannot catch this class of bug, and neither can I without a browser.** Open
+`cors-check.html` **in a browser** from an allowlisted origin. There a **401 or 429 is a
+PASS**; only a `TypeError` with no status is a CORS block.
 
 ### 5. The spend gate: `/api/claude` is gone
 
-**Never reintroduce a path where the caller supplies prompt text.** Rate limiting
-does not help: the value of an open LLM proxy is per-request, and one request is
-already worth stealing. The structural fix is that a caller can only name a *task*
-and a *ticker*:
+**Never reintroduce a path where the caller supplies prompt text.** Rate limiting does
+not help: one request at an open LLM proxy is already worth stealing. A caller may name
+only a *task* and a *ticker* — `POST /api/ai/:type/:ticker`, types in `AI_TASKS`, whose
+`build()` gathers its own data and assembles the prompt from a template in `worker.js`.
+The ticker is regex-constrained because it is the only caller-controlled value reaching
+the prompt. **If a task needs caller input, constrain it to an enum in the Worker.**
 
-```
-POST /api/ai/:type/:ticker      types: see AI_TASKS in worker.js
-```
+**Seven request paths could reach `workerClaude()`, and all are gated.**
 
-`AI_TASKS.synthesis.build()` gathers its own data (chart, quote, IV, news,
-insider, short interest) and assembles the prompt from a template in `worker.js`.
-The ticker is regex-constrained (`/^[A-Z][A-Z.\-]{0,9}$/`) because it is the only
-caller-controlled value that reaches the prompt. Adding a task means adding an
-`AI_TASKS` entry with its own `build()`; if a task needs caller input, constrain
-it to an enum in the Worker rather than passing text through.
+| gate | paths |
+|---|---|
+| `aiGuard` — **reject** | `POST /api/ai/:type/:ticker` · `GET /api/earnings/:ticker` · `GET /api/market/week-ahead` · `GET /api/market/sectors?refresh=1` (a warm read stays ungated so the tab still paints) |
+| `maySpend` — **degrade** | `GET /api/market/scanner` · `GET /api/daily` (**BOTH** regeneration paths) · `GET /api/watchlist/batch` |
+| `requireSecret` — KV writes | `POST`/`DELETE /api/analysis/:ticker` · `POST /api/watchlist/save` · `POST /api/log-rec` |
 
-**`/api/claude` was never the only exposure.** Seven request paths could reach
-`workerClaude()`. All are now gated:
+The `maySpend` paths degrade rather than reject **on purpose**: their *data* must reach
+the page regardless. **The gate FAILS CLOSED** — with `AI_GATE_SECRET` unset every AI
+path 503s, so **AI features stay dark until you set the secret after deploying.**
 
-| Path | Gate | Why that gate |
-|---|---|---|
-| `POST /api/ai/:type/:ticker` | `aiGuard` — reject | the endpoint exists to spend |
-| `GET /api/earnings/:ticker` | `aiGuard` — reject | button-triggered, ~1800 tokens on a miss |
-| `GET /api/market/week-ahead` | `aiGuard` — reject | ~2000 tokens on a cold cache |
-| `GET /api/market/sectors?refresh=1` | `aiGuard` — reject | ~3500 tokens; a warm read stays ungated so the tab still paints |
-| `GET /api/market/scanner` | `maySpend` — degrade | the ranked list is served either way; only catalyst tagging is skipped |
-| `GET /api/daily` | `maySpend` — degrade | the cached briefing is served; only regeneration is gated. **BOTH regeneration paths, since 2026-08-20** — the snapshot self-heal was gated and the EOD self-heal was not, and this row said otherwise for months |
-| `GET /api/watchlist/batch` | `maySpend` — degrade | **was the second-worst hole**: 30 uncached symbols in one request fanned out to 30 Claude calls |
-
-The `maySpend` paths degrade rather than reject on purpose — their *data* must
-reach the page regardless, and rejecting the endpoint would break the dashboard
-for no security gain.
-
-Three KV-write routes also took `requireSecret` (secret, no rate limit):
-`POST /api/analysis/:ticker` and its `DELETE` (anyone could store text that then
-rendered as a ticker's analysis), `POST /api/watchlist/save` (seeds what the crons
-spend on), and `POST /api/log-rec` (poisoning it corrupts the Brier score silently).
-
-**The gate fails closed.** With `AI_GATE_SECRET` unset, every AI path 503s with a
-message naming the missing secret. A security control that disables itself on a
-missing config is not a control — but it does mean **AI features stay dark until
-you set the secret after deploying**.
+**Ceilings are denominated in CLAUDE CALLS, not requests, and the difference is 30×.**
+`AI_RATE_PER_IP_HOUR` (40) and `AI_RATE_GLOBAL_DAY` (60) — **the global one bounds the
+bill**, since rotating IPs defeats the per-IP one. `aiGuard` takes a `cost`;
+`/api/watchlist/batch` passes the number of analyses it will queue, and a request whose
+cost would breach a ceiling is refused **entirely**. **`maySpend()` INCREMENTS**, so call
+it only once the handler knows it will spend. **None of this is authentication.**
 
 ```bash
 # generate one, then set it on the Worker
@@ -336,437 +175,96 @@ node -e "console.log(crypto.randomUUID().replace(/-/g,'') + crypto.randomUUID().
 npx wrangler secret put AI_GATE_SECRET
 ```
 
-Then paste the same value into `DASH_KEY` at the top of the script block in
-**both** `index.html` and `dashboard.html`. It is sent as `x-dash-key`.
-
-Ceilings live next to the gate: `AI_RATE_PER_IP_HOUR` (40) and
-`AI_RATE_GLOBAL_DAY` (60). The **global** one is what bounds the bill, because
-rotating IPs defeats the per-IP one for free.
-
-**They are denominated in Claude calls, not requests, and the difference is 30×.**
-`aiGuard` takes a `cost`, and `/api/watchlist/batch` passes the number of
-analyses it is about to queue. Counting requests would have let a 60/day ceiling
-authorise ~1,800 calls, because one batch request fans out to up to 30. A request
-whose cost would breach a ceiling is refused **entirely** — never partially
-charged and never partially served.
-
-Order matters at the call site: `maySpend()` *increments*, so it must be called
-only once the handler knows it will actually spend. Asking before checking
-`needsAnalysis.length` charged ordinary cached page loads against the ceiling.
-
-**None of this is authentication.** Read the residual-risk section in
-`ARCHITECTURE.md` before assuming any of it stops a motivated attacker.
-
-> **Evidence for this rule** — the measured runs, cost tables and incident
-> write-ups behind it — is in [`docs/rules-evidence.md`](docs/rules-evidence.md),
-> section *"5. The spend gate: `/api/claude` is gone"*.
+Then paste the same value into `DASH_KEY` at the top of the script block in **both**
+`index.html` and `dashboard.html`. It is sent as `x-dash-key`.
 
 ### 6. `DASH_KEY` is only live once it is pushed to GitHub Pages
 
-Editing `DASH_KEY` in the working tree changes nothing the browser sees. The
-pages are served by **GitHub Pages from the last pushed commit**, so the fix is
-`git push`, not the edit. This has produced the same dead end twice:
-
-So when a gate failure survives a `DASH_KEY` edit, **check the deployed bytes
-before re-checking the value**:
-
-```bash
-curl -s https://ambermlysak.github.io/trading_dash/index.html | grep -m1 '^const DASH_KEY'
-```
-
-Separate the two questions, because they have different fixes and the symptom is
-one 401 either way:
+Editing `DASH_KEY` in the working tree changes nothing the browser sees: the pages are
+served by **GitHub Pages from the last pushed commit**, so the fix is `git push`, not
+the edit. This has produced the same dead end twice. **Both frontends carry their own
+copy and must be updated together.** Separate the two questions — the symptom is one
+401 either way:
 
 | Question | Test | Fix |
 |---|---|---|
 | Does the key match `AI_GATE_SECRET`? | `curl -H 'x-dash-key: …' …/api/earnings/AAPL?facts=1` → 200 vs 401 | repaste / rotate the secret |
-| Are the right bytes deployed? | curl the live Pages HTML, grep `DASH_KEY` | `git push` |
+| Are the right bytes deployed? | `curl -s <pages URL>/index.html \| grep -m1 '^const DASH_KEY'` | `git push` |
 
-`?facts=1` is the probe to use: it passes the gate in the router **before**
-`handleEarningsAnalysis` decides not to call Claude, so it tests the gate at
-**zero Anthropic spend**. It still costs one unit of `AI_RATE_GLOBAL_DAY`. Never
-probe the gate with `POST /api/analysis/:ticker` or `/api/watchlist/save` — they
-pass the gate by *writing KV*, so a successful test corrupts a card or reseeds
-what the crons spend on.
+**`?facts=1` is the probe to use**: it passes the gate *before* `handleEarningsAnalysis`
+decides not to call Claude, so it tests the gate at **zero Anthropic spend** (it still
+costs one unit of `AI_RATE_GLOBAL_DAY`). **Never probe with `POST /api/analysis/:ticker`
+or `/api/watchlist/save`** — they pass the gate by *writing KV*, so a successful test
+corrupts a card or reseeds what the crons spend on. **A 503 rather than a 401 means
+`AI_GATE_SECRET` is unset on the Worker** — a config fault, not a key fault.
 
-Both frontends carry their own copy of the constant (`index.html`,
-`dashboard.html`) and both must be updated together — `index.html` alone leaves
-the whole dashboard 401ing.
-
-Compare the served bytes to the file on disk before trusting anything about the
-page:
-
-```bash
-curl -s http://localhost:8123/index.html | wc -c;  wc -c < index.html
-curl -s http://localhost:8123/index.html | grep -c x-dash-key   # 0 == pre-gate copy
-```
-
-A byte-count mismatch means you are debugging a different file. Line endings do
-not explain a large gap — CRLF→LF on this file is ~3.5KB, not 33KB.
-
-Symptom→cause, since three different faults produce the same 401:
-
-| Symptom | Cause |
-|---|---|
-| 401, page sends **no** `x-dash-key` | serving a pre-gate copy — wrong directory |
-| 401, header sent but value is `YOUR_STRING_HERE` | placeholder never replaced, or Pages not rebuilt |
-| 401, header sent with a real 64-char key | genuine mismatch with `AI_GATE_SECRET` |
-| **503**, not 401 | `AI_GATE_SECRET` unset on the Worker — a config fault, not a key fault |
-
-Start `http-server` with an explicit path, never `.`, and confirm the port is
-serving this repo before concluding anything about the key.
-
-> **Evidence for this rule** — the measured runs, cost tables and incident
-> write-ups behind it — is in [`docs/rules-evidence.md`](docs/rules-evidence.md),
-> section *"6. `DASH_KEY` is only live once it is pushed to GitHub Pages"*.
+> The symptom → cause table: [`docs/history.md`](docs/history.md)
 
 ### 7. A job that never runs produces no evidence — log every dispatch decision
 
-`scheduled()` therefore logs on **every** invocation, skips included:
+`scheduled()` logs on **every** invocation, skips included, with the PT date, PT weekday,
+holiday verdict and branch taken (`[cron] 2026-09-07 Mon 06:00 PT · not a trading day
+(nyse-holiday) · branch=none`) — **a no-op that logs "Sat — skipped" is falsifiable;
+silence is not.**
 
-```
-[cron] 2026-08-07 Fri 06:00 PT · trading day · branch=morning-briefing
-[cron] 2026-08-08 Sat 06:00 PT · not a trading day (weekend) · branch=none
-[cron] 2026-09-07 Mon 06:00 PT · not a trading day (nyse-holiday) · branch=none
-```
+**`Promise.allSettled` discards rejections**, so a truncated run reports `errors: 0`
+while dropping a third of its work — that is how `build13FIndex` shipped 16 of 20
+managers. Fan-out goes through `allSettledCounted(promises, label)`. **When adding a
+scheduled job or a fan-out: give it a branch name in the log line and a counted
+`allSettled`.**
 
-Every line carries the PT date, the PT weekday, the holiday verdict and the
-branch taken. **A no-op that logs "Sat — skipped" is falsifiable; silence is
-not.** `wrangler tail` on a Friday morning is now a one-line check.
+**Every cron job goes through `dispatchJob(ctx, name, () => job(env))`**, which catches
+and logs `!! JOB-FAILED !!` naming the job — **never write a bare
+`ctx.waitUntil(job(env))` in `scheduled()`.** The cost: **invocation status and
+`errors: 0` are NOT evidence that any cron job succeeded**, only that nothing escaped
+uncaught. The evidence is the job's own **per-job KV stamp** plus a grep for
+`!! JOB-FAILED !!` — which **only fires when a job REJECTS**, so it is a **positive
+signal, never a negative one**.
 
-The same principle applies inside the jobs. `Promise.allSettled` discards
-rejections, so a truncated run reports `errors: 0` while dropping a third of its
-work — that is how `build13FIndex` shipped 16 of 20 managers and how the IV sweep
-banked 16 of 22 tickers. Fan-out in the cron generators goes through
-`allSettledCounted(promises, label)`, which logs the rejections and totals them
-into `_instr.settledRejected` on the stored payload (rule #1).
+> **THE GREP HALF HAS NEVER BEEN RUNNABLE.** Workers Observability returns **403 with a
+> valid token** and no Observability-Read token is provisioned. **Do not write a
+> verification step that greps for `JOB-FAILED` until one exists** — a standard nobody
+> can execute reads, at a glance, as one that was.
 
-**When adding a scheduled job or a fan-out: give it a branch name in the log line
-and a counted `allSettled`.** A job whose only evidence of running is its own
-success is a job you cannot debug when it stops.
+**EVERY DEDUP STAMP IS GUARDED ON THE RUN HAVING ACCOMPLISHED SOMETHING.** Five jobs used
+to stamp after a run that did nothing — a clean 200, no `JOB-FAILED`, **and** dedupped
+out of the day. The key → guard table is in [`docs/history.md`](docs/history.md); the
+four non-obvious thresholds are **`ok === N`, not `ok > 0`** (IV sweep — per-ticker
+writes are idempotent, so a retry fills gaps), **NOT `filled > 0`** (forward-returns —
+most days 0 filled is correct *and* complete; the incomplete signal is an unreadable
+chart), **`written + skipped === N`** (move-series — `skipped` is a complete outcome,
+`absent` is not), and **an infrastructure `error` blocks the stamp while a DOMAIN status
+does not** (`no-options`/`no-iv`/`no-expiries` are facts about the ticker).
 
-#### Every cron job goes through `dispatchJob()` — a sibling must not be able to kill it
+**A PARTIAL RUN WRITES BUT DOES NOT STAMP** (`market-mood`, `top3`): a finding over the
+readable names is still a finding, and the key is rewritten whole so a retry replaces
+rather than duplicates. A run where **every** item failed writes nothing.
 
-`dispatchJob(ctx, name, () => job(env))` makes it a property of the dispatcher.
+**`data.eod.complete === false` IS A THIRD RENDER STATE, and the test is never
+`!data.eod.complete`** — a record with no `complete` field predates 2026-08-12 and is a
+**REAL** summary. Its timestamp assignment must be **unconditional**: skipping it left
+the previous render's line in place, so a failed generation appeared as a timestamped
+market-close report. **A stale value is a worse lie than a blank one.**
 
-**It also removes an ambiguity that matters when reading telemetry.** An
-unhandled `waitUntil` rejection marks the whole invocation as an exception, so one
-failed job and a failed branch look identical from the outside. `dispatchJob`
-catches, and logs `!! JOB-FAILED !!` naming the job instead.
+Three telemetry facts, each of which has already been misread as evidence:
 
-**That is a deliberate trade against rule #7's own warning** that `errors: 0` is
-not evidence of success: catching does clean the invocation. What replaces it is a
-greppable ERROR line naming the job — the same trade `allSettledCounted` already
-makes.
+- **`iv:` `src` IS LAST-WRITER-WINS.** Four writers share `iv:{TICKER}:{DATE}` and
+  `recordIvSample` rewrites the body whole, so **an absent `src` means pre-2026-08-12,
+  not `'api'`** and counting `src: 'sweep'` is not sweep coverage. **Sweep completeness
+  cannot be measured retroactively and a raw `iv:` count is actively misleading** —
+  2026-08-10 showed 35 samples against a 33-name watchlist on a day it never ran.
+- **There is no cron execution history unless `[observability] enabled = true` is in
+  `wrangler.toml`**, and **absence of cron lines in a tail is not evidence** — it is an
+  unreadable instrument, read as evidence for two hours. It must be in the file, not the
+  dashboard (`wrangler deploy` overwrites dashboard-set values), and the top-level
+  `enabled` **seeds** `logs.enabled`.
+- **`workersInvocationsAdaptive` IS SAMPLED — NEVER ARGUE FROM ABSENCE.**
+  `sampleInterval` took the values 1, 1.6, 1.667, 2, 2.5, 2.8 and 10 inside one two-hour
+  window. **A present row (with `sampleInterval` 1) proves that invocation happened; an
+  absent row proves NOTHING, ever.** Always select `avg { sampleInterval }` beside what
+  you count. Its `subrequests` field **excludes KV binding ops**, so it is not `capCost`.
 
-**Never write a bare `ctx.waitUntil(job(env))` in `scheduled()` again.**
-
-##### What the trade costs: invocation status is no longer evidential on the cron path
-
-**Invocation status and `errors: 0` do not indicate that any cron job succeeded.**
-Since `dispatchJob` catches, a failed job reads as a clean **200** and `errors: 0`
-means only *"nothing escaped uncaught"*. Before it, a failed job at least made the
-invocation look wrong — that signal is gone, deliberately, because it could not
-distinguish one failed job from a failed branch.
-
-**The evidence is two things, neither of which is the invocation:**
-
-1. the job's own **per-job KV stamp** — `daily:snapshot`, `daily:midday`,
-   `daily:eod`, `ivsweep:last`, `macrosweep:last`, `recfwd:last`,
-   `movesweep:last`, `moodsweep:last`, `13f:cursor`
-2. a grep for **`!! JOB-FAILED !!`**, which names the job
-
-This now covers all eleven dispatch sites in `scheduled()`: `morning-briefing`,
-`morning-rows`, `midday-pulse`, `eod-summary`, `iv-sweep`, `macro-state`, `top3`,
-`forward-returns`, `move-series`, `market-mood`, `13f-slice` — plus the print-tape
-passes, dispatched outside the branch chain as `print-tape-prebank` and
-`print-tape-{session}-{pass}`.
-
-> ##### THE GREP HALF OF THIS STANDARD HAS NEVER BEEN RUNNABLE — 2026-08-12
->
-> Reading `!! JOB-FAILED !!` means querying Workers Logs, and the Observability
-> telemetry endpoint
-> (`POST /accounts/{id}/workers/observability/telemetry/query`) returns **403
-> with a valid, freshly-refreshed token**. Wrangler's OAuth scope set —
-> `account:read user:read workers:write workers_kv:write workers_routes:write
-> workers_scripts:write workers_tail:read d1:write pages:write zone:read …` —
-> contains nothing that authorises it; `workers_tail:read` does not.
->
-> **It requires a Cloudflare API token with Observability Read, and no such token
-> is provisioned.** Until one is, this evidence channel does not exist and
-> everything above rests on the KV stamp alone — which the next section shows is
-> not sufficient either. `wrangler tail` is not a substitute: it streams live
-> events only, so it cannot be pointed at a firing that already happened.
->
-> **Do not write a verification step that greps for `JOB-FAILED` until the token
-> exists.** A standard nobody can execute reads, at a glance, as one that was.
-
-**`!! JOB-FAILED !!` only fires when a job REJECTS.** A job that catches its own
-failure internally resolves normally, so it prints no line and the grep comes back
-empty on a run that did nothing. The grep is a positive signal, never a negative
-one: a silent grep plus a stamped key is *not* proof of success, and the five jobs
-in the table below can produce exactly that.
-
-##### EVERY DEDUP STAMP IS GUARDED ON THE RUN HAVING ACCOMPLISHED SOMETHING
-
-Five of the eight used to stamp after a run that did nothing. Fixed 2026-08-12;
-before and after both measured by forcing each failure locally and reading KV
-through the Worker's own binding (logs are unusable here — wrangler dev surfaces
-only `warn`/`error` from `waitUntil`). It interacted badly with the trade above:
-such a run was a clean 200, printed no `JOB-FAILED`, **and** dedupped itself out
-of the day's remaining firings.
-
-| job | key | guard | before → after |
-|---|---|---|---|
-| `morning-briefing` | `daily:snapshot` | `ts: 0` + `isComplete` in the dedup | was already safe; **the pattern the other four copied** |
-| `midday-pulse` | `daily:midday` | returns before the put | was already safe |
-| `macro-state` | `macrosweep:last` | four refusal paths, all returning before the stamp | was already safe |
-| `eod-summary` | `daily:eod` | `ts: 0` + `complete` term in the dedup | stamped `ts: Date.now()` on a Claude failure → **placeholder `ts: 0`, `complete: false`, retries** |
-| `iv-sweep` | `ivsweep:last` | `ok === tickers.length` | 0 samples written, key stamped → **key ABSENT** |
-| `forward-returns` | `recfwd:last` | `chartFailures === 0` | per-ticker chart failures `continue`d and it stamped → **key ABSENT** |
-| `move-series` | `movesweep:last` | `written + skipped === tickers.length` | same `allSettled` shape → **key ABSENT** |
-| `market-mood` | `moodsweep:last` | `fetched === MOOD_SYMBOLS.length` | built to the pattern above, never had the defect |
-| `13f-slice` | `13f:cursor`, `lastFullPass` | cursor holds on a wholly-failed batch; `lastFullPass` needs `managersOk > 0` | advanced 4→8→12→16→0, set `lastFullPass`, then idled 7 days → **cursor held at 0 across 5 slices, `lastFullPass: null`** |
-
-**The thresholds, and why each is what it is:**
-
-- **`ok === N`, not `ok > 0`, for the IV sweep.** Per-ticker writes are idempotent
-  (one key per ticker per PT day), so a retry fills the gaps rather than
-  duplicating work. `ok > 0` would have accepted 2026-08-06's 7-of-N.
-- **`written + skipped === N` for move-series.** `skipped` means "already current",
-  which is a complete outcome; `absent` (spark did not return the name) is not.
-- **NOT `filled > 0` for forward-returns.** Most days nothing is pending and 0
-  filled is correct and complete. The incomplete signal is a ticker whose chart
-  could not be read at all.
-- **`fetched === 15` for market-mood, and a partial run still WRITES.** The two
-  are separate decisions and both are deliberate: a readable sector board with an
-  unavailable verdict is a finding worth rendering, so the payload is stored; but
-  the run is not done, so it does not stamp. The write is one key rewritten
-  whole, so a retry replaces rather than duplicates. A run where **every** fetch
-  failed writes nothing at all — a board of 15 unavailable rows is not a finding.
-
-**Cost, bounded and stated:** the 1:15pm window admits exactly two firings, so a
-persistently failing name costs one extra pass per day and no more.
-
-**Verified both directions.** Forced failures leave every key absent; clean runs
-still stamp — 13F cursor advanced 0→4 with the index at 16,237 B against 4,829 B
-when every manager failed, forward-returns and move-series both stamped, and the
-IV sweep stamped on a real 14-name local run, so `ok === N` does not block a
-genuinely complete pass.
-
-**A note on the instrument, because it changed under the fix.** The old test
-compared stored bytes across two firings: the pre-fix EOD placeholder carried
-`ts: Date.now()`, so identical bytes proved a skip. The fix makes the payload
-deterministic (`ts: 0`), so identical bytes prove nothing. The working
-discriminator is the **KV expiration**, which moves on every write: 1786666522 →
-1786666570 across the second firing, i.e. rewritten, i.e. retried. **When a fix
-makes an instrument degenerate, replace the instrument.**
-
-**Blind spot:** `morning-briefing` and `midday-pulse` cannot have their
-post-Claude paths exercised locally — with no `ANTHROPIC_API_KEY` in `.dev.vars`
-neither is reached. Those two rows are measured on the *failure* path only.
-
-**Not changed, and worth knowing:** `handleDailyGet` triggers request-path
-regeneration on `!eod`, not on `!eod.complete`, so a page visit will not
-regenerate a placeholder. The impact is bounded because the next cron firing now
-does retry. Changing it would add a Claude-spend path to ordinary page loads, which
-is its own decision.
-
-##### THE PLACEHOLDER IS A THIRD RENDER STATE — and it rendered as a real report
-
-`daily:eod` can now hold `complete: false, ts: 0`, which is a state the EOD card
-had never seen. Rendered before the fix, with a stale timestamp seeded as a
-re-render would leave it:
-
-```
-─── PLACEHOLDER (complete:false, ts:0)      BEFORE
-   badge     : "Market Close"
-   headline  : "Market closed Wednesday, August 12, 2026"
-   body      : "Market data unavailable."
-   timestamp : "As of 01:15 PM PDT"          <- the PREVIOUS render's line
-```
-
-`if (data.eod.ts) { … }` skipped the assignment rather than clearing it, so a
-failed generation appeared as a **timestamped market-close report**. That branch
-was unreachable until the guard started writing `ts: 0`. After:
-
-```
-─── PLACEHOLDER                              AFTER
-   badge     : "Market Close · unavailable"
-   headline  : "End-of-day summary could not be generated"
-   body      : "The 1:15pm PT job did not get a usable summary back. It retries…"
-   timestamp : "no summary for today yet — retrying"
-```
-
-**The test is `data.eod.complete === false`, never `!data.eod.complete`.** A record
-with no `complete` field came from a Worker predating 2026-08-12 and is a REAL
-summary — the frontend ships ahead of the Worker routinely, and treating absent as
-false would relabel every genuine record as failed. Verified against all three
-states; the old-Worker record still renders normally.
-
-**A stale value is a worse lie than a blank one.** Both `eod-ts` assignments are
-now unconditional, including the `data.open` branch, which shares the element.
-
-##### `iv:` SAMPLE COUNT DOES NOT MEASURE SWEEP SUCCESS — and never has
-
-**Four writers share `iv:{TICKER}:{DATE}`. Until 2026-08-12 the stored record only
-told two of them apart.** `recordIvSample` puts provenance in the body via
-`...(src ? { src } : {})`:
-
-| caller | `src` |
-|---|---|
-| `longRow` live path | `'long-live'` |
-| `longRow` warm path | `'long-warm'` (+ `skipIfPresent`) |
-| `/api/iv/:ticker` handler | `'api'` — **added 2026-08-12** |
-| `recordWatchlistIv` (the cron) | `'sweep'` — **added 2026-08-12** |
-
-**AN ABSENT `src` MEANS PRE-2026-08-12, NOT `'api'`.** Historical keys are
-deliberately not backfilled — the gaps and their provenance are the evidence for
-how biased the series is. Anything reading `src` must treat absent as UNKNOWN.
-
-###### `src` IS LAST-WRITER-WINS — it proves who wrote LAST, never who wrote
-
-**The general form, recorded once and applying to every provenance scalar in this
-codebase: a single last-writer-wins field cannot represent a key with more than one
-writer.** `src` lives in the key body and `recordIvSample` rewrites the record
-whole, so each write erases the previous writer's mark. Four writers share
-`iv:{TICKER}:{DATE}` and the field has room for one.
-
-Two readings that look safe and are not:
-
-| reading | why it fails |
-|---|---|
-| count keys with `src: 'sweep'` → sweep coverage | earlier same-day writes the sweep overwrote are counted as sweep; later non-sweep writes hide a sweep that did run |
-| a key reading `'api'` → the sweep missed that name | **indistinguishable** from a name the sweep wrote and a page view then overwrote |
-
-Measured 2026-08-13. Four keys existed before that day's sweep — AMD `api` 07:08
-PT, TWLO `api` 08:09, TSM `api` 08:18, PLTR `long-live` 08:40 — and **all four read
-`src: 'sweep'` at 13:15:16–17 afterwards**, with the values genuinely moved (AMD
-54.47 → 51.22, TWLO 50.10 → 53.69, TSM 28.96 → 33.85, PLTR 43.13 → 44.56). Nothing
-in the stored record survives to say those writes happened. **The `ts` is
-overwritten too, so the behavioural timing discriminator loses exactly the same
-information** — this is a property of the record, not of the field, and no reader
-can recover it after the fact.
-
-**The honest measures of sweep coverage are the per-ticker write count inside the
-13:15 PT window and the sweep's own `ok/N`.** Neither depends on `src`.
-
-The two fixes are **recording all writers** (an append-only list on the key) or **a
-distinct key for sweep samples**. Both are schema changes; neither is done. Until
-one lands, `src` is corroboration and never evidence — relevant to the provenance
-term ARCHITECTURE #16 wants in `ivRank` before the 60-day floor is crossed.
-
-For everything written before that, a sample with no `src` is the cron **or** an
-ordinary page view, and nothing stored separates them. The only separator for the
-historical record is behavioural — the sweep writes the whole watchlist within
-seconds of 1:15pm PT, a page view writes one at an arbitrary time. **That is an
-inference from clustering, not a field**, and it misclassifies any page view
-landing inside the window.
-
-**Consequence: sweep completeness cannot be measured retroactively, and a raw
-`iv:` count is actively misleading.** Measured 2026-08-12 over the whole 123-key
-history — the naive count and the timing-classified count disagree on five of nine
-dates, and in one case by 35:
-
-| PT date | dow | `iv:` keys | writes in the 1:15pm window | what it actually was |
-|---|---|---|---|---|
-| PT date | dow | `iv:` keys | 1:15pm-window writes | cron fired? (analytics) | verdict |
-|---|---|---|---|---|---|
-| 2026-08-04 | Tue | 1 | 0 | **yes** 20:15:55, 13 sub | job-level failure |
-| 2026-08-05 | Wed | 20 | 15 (13:15:17–19) | series at :14, **no 20:15 row** | anomalous, see below |
-| 2026-08-06 | Thu | 16 | 7 (13:15:25–27) | **yes** 20:15:23, 50 sub | job-level, partial |
-| 2026-08-07 | Fri | 5 | 0 | **yes** 20:15:42, 11 sub | job-level failure |
-| 2026-08-08 | Sat | 5 | 0 | yes, 0 sub | market closed, correct |
-| 2026-08-09 | Sun | 6 | 0 | yes, 0 sub | market closed, correct |
-| 2026-08-10 | Mon | **35** | **0** | **yes** 20:15:35, **105 sub** | job-level failure |
-| 2026-08-11 | Tue | 3 | 0 | **yes** 20:15:31, 41 sub | job-level failure |
-| 2026-08-12 | Wed | 32 | 32 (13:15:07–18) | **yes** 20:15:05, 113 sub | full sweep, 32/33 |
-
-**One full sweep in seven trading days**, and `2026-08-10` is the trap: 35 samples
-against a 33-name watchlist reads as a complete sweep and is a sweep that never
-ran — every one of the 35 was `long-live` or traffic.
-
-**THE CRON FIRED ON EVERY TRADING DAY.** Established from Workers Analytics
-(`workersInvocationsAdaptive`, which needs no observability token) by matching the
-cron's stable per-day second-offset at quarter-hour minutes. So **these are
-job-level failures, not schedule failures** — which is what makes the stamp guards
-above the right fix rather than a schedule change.
-
-**2026-08-07 was NOT a Sun–Thu casualty** — an earlier revision of this table said
-it was and that was wrong. The expression fix (`f313c04`, 2026-08-07 11:23 PT)
-predates that day's 1:15pm branch, and the cron did fire at 20:15:42.
-
-**2026-08-05, where the sampling rule above was found.** 15 samples were written at
-13:15:17–19 PT with **no invocation recorded** at that minute, though the cron
-series is plainly present at `:14` seconds on either side (20:00:14, 20:30:14,
-20:45:14). It is a dropped row, not a missing firing: `20:30:14` shows **0
-subrequests**, which under the pre-fix code means all three jobs dedupped, which
-requires the 20:15 firing to have run and stamped.
-
-**Every quarter-hour row the table above rests on carried `sampleInterval = 1`, and
-the claim is "the cron fired", never "the cron did not."** That is the safe
-direction of the asymmetry. Do not invert it.
-
-#### None of that logging exists unless observability is on
-
-`[observability] enabled = true` in `wrangler.toml` is a **prerequisite for cron
-execution history existing at all**. With it off, the log lines above are emitted
-into nothing and are not retained anywhere.
-
-**Absence of cron lines in a tail is not evidence.** It is an unreadable
-instrument, and it was read as evidence for two hours.
-
-Know which of the two telemetry systems you are querying, because they are
-independent and only one of them needs observability:
-
-| system | needs `observability.enabled`? | what it gives you |
-|---|---|---|
-| **Workers Logs** (`wrangler tail`, dashboard log search) | **yes** — for anything retained | your own `console.log` lines, e.g. `branch=morning-briefing` |
-| **Workers Analytics** (GraphQL `workersInvocationsAdaptive`) | **no** | invocation counts, errors, subrequest totals, timestamps |
-
-> ##### `workersInvocationsAdaptive` IS SAMPLED — NEVER ARGUE FROM ABSENCE
->
-> The **Adaptive** in the name is load-bearing. Measured 2026-08-12 across three
-> single-day queries, `sampleInterval` took the values **1, 1.6, 1.588…, 1.667, 2,
-> 2.5, 2.8 and 10** — within a single two-hour window. Rows are dropped.
->
-> **The asymmetry is the whole rule:**
->
-> | reading | valid? |
-> |---|---|
-> | a row is present (check `sampleInterval` is 1) → that invocation happened | **YES** |
-> | no row at that time → the invocation did not happen | **NO. Never.** |
->
-> This applies to every question asked of this dataset — "did the cron fire", "was
-> there traffic", "did anything run at all" — not just the one it was found on.
-> **Always select `avg { sampleInterval }` alongside whatever you are counting**,
-> and say which rows carried 1. A count taken without it is a lower bound wearing
-> the costume of a measurement.
->
-> `subrequests` from this dataset also **excludes KV binding operations** — see
-> ARCHITECTURE #18 — so it is not `capCost` and must never be quoted as one.
->
-> Second, smaller bound on the same method: the cron's second-offset drifts across
-> days (**`:05` to `:55` observed**), so attributing firings by quarter-hour minute
-> misclassifies whenever drift crosses a minute boundary.
-
-**Observability set in the dashboard does not survive a deploy.** `wrangler
-deploy` sends the whole config and overwrites dashboard-set values — the same
-drift that produced the cron-trigger divergence warning. Wrangler's own
-`normalizeRemoteConfigAsResolvedLocal()` skips `observability` when diffing local
-against remote, noting it "has a remote default behavior different from that of
-wrangler". So it must be in `wrangler.toml`, and it now is. Note also that
-top-level `observability.enabled` is **not** redundant with
-`observability.logs.enabled`: `normalizeObservability()` computes
-`const enabled = obs?.enabled === true ? true : false` and uses that as the
-default for `logs.enabled`.
-
-> **Evidence for this rule** — the measured runs, cost tables and incident
-> write-ups behind it — is in [`docs/rules-evidence.md`](docs/rules-evidence.md),
-> section *"7. A job that never runs produces no evidence — log every dispatch decision"*.
-
-
----
+> The stamp-guard and 9-day `iv:` tables: [`docs/history.md`](docs/history.md)
 
 ## Deploy & develop
 
@@ -775,17 +273,17 @@ npm install
 
 # First-time setup
 npx wrangler login
-npx wrangler kv namespace create REC_LOG   # NOT `kv:namespace` — that syntax is
-                                           # deprecated. Copy the id into wrangler.toml
+npx wrangler kv namespace create REC_LOG   # NOT `kv:namespace` (deprecated).
+                                           # Copy the id into wrangler.toml
 
 # Secrets (deployed environment)
-npx wrangler secret put AI_GATE_SECRET      # REQUIRED — gates every AI + KV-write path;
-                                            #   without it those endpoints 503 (fail closed)
+npx wrangler secret put AI_GATE_SECRET      # REQUIRED — gates every AI + KV-write
+                                            #   path; without it they 503 (fail closed)
 npx wrangler secret put ANTHROPIC_API_KEY   # required — all Claude synthesis
-npx wrangler secret put FRED_API_KEY        # macro release dates AND the DGS3MO risk-free rate
+npx wrangler secret put FRED_API_KEY        # macro release dates + DGS3MO risk-free rate
 npx wrangler secret put FINRA_CLIENT_ID     # official short interest
 npx wrangler secret put FINRA_CLIENT_SECRET
-npx wrangler secret put ALPACA_KEY          # optional — real-time prices + news archive
+npx wrangler secret put ALPACA_KEY          # optional — real-time prices, news archive
 npx wrangler secret put ALPACA_SECRET
 
 npx wrangler deploy
@@ -793,1871 +291,257 @@ npx wrangler dev      # local, port 8787 by default
 npx wrangler tail     # live logs from the deployed Worker
 ```
 
-**`wrangler dev` cannot see deployed secrets.** It reads `.dev.vars` in the repo
-root instead, which is **gitignored** and therefore absent on a fresh clone. This
-is not a bug and it is the single most common source of confusion when testing
-locally — a local run with no `.dev.vars` shows:
+**`wrangler dev` cannot see deployed secrets.** It reads `.dev.vars`, **gitignored**
+and so absent on a fresh clone — the most common source of confusion when testing
+locally. Without it: **no premium candidate strikes at all** (no `FRED_API_KEY` →
+`riskFreeRate()` null → every BS delta **suppressed rather than computed at `r = 0`**),
+**econ calendar FOMC-only**, **short interest on the labelled Yahoo estimate**, **every
+Claude-backed card empty**, and **Market Mood rendering its house TEMPLATE sentence
+rather than an empty card** (the verdict is rules-decided, so only the phrasing
+degrades and `sentenceSource` reads `template` — the fallback working, and why the
+Claude half of that job cannot be exercised locally).
 
-- **no premium candidate strikes at all** — `riskFreeRate()` returns null without
-  `FRED_API_KEY`, and every Black-Scholes delta is then suppressed rather than
-  computed at `r = 0` (see the honesty rules)
-- **econ calendar degraded to FOMC-only**, reporting `dataReleases.ok: false`
-- **short interest falling back to the labelled Yahoo estimate** instead of FINRA
-- **every Claude-backed card empty**, since `/api/claude` 500s with no key
-- **Market Mood renders its house TEMPLATE sentence, not an empty card** — the
-  whole verdict is rules-decided, so only the phrasing degrades. `sentenceSource`
-  reads `template` and the note names `ANTHROPIC_API_KEY not set`. That is the
-  fallback working, not a failure, and it is why the Claude half of that job
-  cannot be exercised locally without a key
+To test those paths locally, create `.dev.vars` with the same key names as the secrets
+above (`AI_GATE_SECRET`, `ANTHROPIC_API_KEY`, `FRED_API_KEY`, `FINRA_CLIENT_ID`,
+`FINRA_CLIENT_SECRET`), one `NAME="value"` per line. FINRA credentials are also read as
+`FINRA_API_KEY`/`FINRA_API_SECRET`, a `finraToken()` fallback for the older names.
 
-To test those paths locally, create `.dev.vars` with the same keys:
+After deploying, set `API_BASE` near the top of both HTML files to the Worker URL. The
+HTML is hosted on GitHub Pages, and **opening it from `file://` no longer works** — that
+sends `Origin: null`, which the Worker rejects along with every other absent origin.
+Serve over http locally (`npx http-server -p 8123`); `http://localhost:*` and
+`http://127.0.0.1:*` are allowlisted.
 
-```
-AI_GATE_SECRET="..."
-ANTHROPIC_API_KEY="..."
-FRED_API_KEY="..."
-FINRA_CLIENT_ID="..."
-FINRA_CLIENT_SECRET="..."
-```
+There is no build step. **Eighteen check scripts** (`*.check.mjs`) cover `worker.js`.
+Every one **prints computed vs expected** rather than asserting, and extracts what it
+tests **from `worker.js` by source**, because every named export there must be a
+function or `workerd` refuses to boot. **`longarch` and `printtape` also IMPORT the
+default export**, which is the ES-module parse `node --check` cannot perform.
 
-FINRA credentials are also read as `FINRA_API_KEY` / `FINRA_API_SECRET` — a
-fallback in `finraToken()` for the older names. Either pair works.
+Floors (each script's `minComparisons`): **138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 /
+144 / 287 / 91 / 113 / 68 / 99 / 240 / 234 / 543** for moves / long-fixtures / cron-gate
+/ instr-bindings / bs-delta / nd2 / lane-e / lane-f / sweep-universe / macro / mood /
+swing / earnings-timing / daily-slots / analysis-shape / top3 / longarch / printtape —
+**2,267**. A full run on 2026-09-02 observed **2,317, 0 failing**; the 50-comparison gap
+is entirely the two scripts that read **live** data (`swing` **96**, `earnings-timing`
+**158**), whose floors are deliberately their FIXED counts so a quiet tape reports a
+verdict rather than a false NO VERDICT. **Never raise either to an observed total.**
+`node iv-capture.fixture.mjs` is a nineteenth script, deliberately outside that total.
 
-After deploying, set `API_BASE` near the top of both HTML files to your Worker URL:
-```js
-const API_BASE = 'https://stock-research-worker.you.workers.dev/api';
-```
-
-The HTML files are hosted on GitHub Pages. **Opening them from `file://` no longer works** — that sends `Origin: null`, which the Worker now rejects along with every other absent origin. For local testing serve them over http (`npx http-server -p 8123`); `http://localhost:*` and `http://127.0.0.1:*` are allowlisted.
-
-There is no build step. Eighteen checks exist, all of which print computed vs
-expected rather than asserting: `node cron-gate.check.mjs` (the cron trading-day
-gate, over weekends / NYSE holidays / both DST regimes), `node bs-delta.check.mjs`
-(Black-Scholes delta), `node moves.check.mjs` (ten sections over the Long tab's
-measured half: coverage against a brute-force reference, all eight payoff
-structures at five prices each, the two expectancy guards, the independent-window
-floor, and de-clustered episode concentration tested in **both** directions —
-one move must report 1 *and* separated moves must report more, since a test that
-only proves collapsing passes on code that always answers 1),
-`node instr-bindings.check.mjs` (the binding counter:
-shape detection across bindings/secrets/vars, automatic pickup of a second
-binding, `this`-binding through the proxy, and the failure paths that must return
-a working `env`), `node long-fixtures.check.mjs` (the three Long-screen paths
-live data cannot reach: `buyableFrom()`'s `rank` branch, which stays unreachable
-until 60 days of IV history exist; Lane A with **two** listed Januaries; and the
-shared `ivPlausible()` guard at its boundaries), `node lane-e.check.mjs` (Lane E's two-sided half:
-two-sided coverage against brute force including a zero-contribution tail, two-sided pBe against a
-series-erf reference, both payoff functions across all four breakevens, and the drift split across
-trending / range-bound / downtrending regimes), `node nd2.check.mjs` (the Long tab's `P(BE)@exp`,
-theta and vega — N(d2) against a reference series-erf **and** against
-e^{rT}·(−∂C/∂K) by central difference, which is a structurally different
-derivation and so catches "right arithmetic, wrong quantity"; greeks against
-numerical differentiation), and `node macro.check.mjs` (macroRegime phase 1: the
-term-structure SIGN convention, both classification boundaries as strict
-inequalities, `hostileVia`, date alignment against a brute-force intersection,
-`unavailable` with each of the four inputs missing in turn, the trailing mean, the
-two trend derivations agreeing, and `collectMacroState`'s exact cost and every
-refusal path driven with stub bindings), and `node mood.check.mjs` (Market Mood:
-every candlestick predicate firing **and** at a non-firing boundary value, the
-trend-context reclassification — one geometry reading `hammer` / `hanging-man` /
-direction-neutral — both sides of every emotion cut, the macro classifier across
-all seven states with stub reads, the stance table, the template for every
-(macroState, breadth qualifier) pair, the sentence guard that stops a rephrase
-becoming a reclassification, `collectMarketMood`'s exact cost and every
-refusal path with stub bindings, and `moodMetaOk` — which of the five
-missing-record causes are actual faults, asserted against **both** the Worker and
-the page so the badge and the chip cannot tone the same state differently again),
-and `node swing.check.mjs` (the Watchlist Swing column: the regression against two
-independent fits — the centered normal equations *and* a numerical SSR minimiser
-seeded away from the answer, which is what proves the line is the least-squares
-one rather than the same algebra written twice — the residual σ against the σ of
-the closes on three live names, the forming-bar drop with the clock that decided
-it, the x=29/x=30 rule in both settlement regimes, the sub-30-bar null path, both
-sides of the threshold at ±0.01σ, and the 15-wide colgroup / header / row
-alignment), and `node earnings-timing.check.mjs` (the BMO/AMC/unknown classifier:
-both fixed UTC anchors under **both** DST regimes and one second either side of
-each, all six ET wall-clock boundaries in both regimes — **each printed with the
-branch that decided it**, because two of those boundaries *are* anchors and a
-test that does not say which branch answered proves nothing about either — the
-midnight-UTC placeholder guard *and its ordering ahead of the anchors*, the
-multi-entry range branch and its inverse, every absent-date shape, the
-`isEarningsDateEstimate` field name, and a live re-probe of the watchlist's
-anchor distribution).
-and `node daily-slots.check.mjs` (the `/api/daily` slot-merge contract: the
-`dailySlotPtDate` classifier over every record shape including the `ts: 0` EOD
-placeholder and a timestamp straddling UTC midnight, sibling survival on
-**raw stored bytes** rather than a parsed object, the rollover, the **mixed**
-case that proves the purge is a per-key date test rather than an all-or-nothing
-switch, the same-slot re-run the spec allows, a failed KV read never deleting,
-and a source-level attribution of **every** `daily:` mutation site to the
-function it lives in — because no behavioural test can see an unconditional
-delete added somewhere else later, plus the `/api/daily` request-path spend gate),
-and `node analysis-shape.check.mjs` (the canonical `analysis:{TICKER}` record:
-`readAnalysisRecord` across all four eras that can be in KV, the `action` ->
-`recommendation` rename with `drivers` deliberately NOT manufactured from
-`factors`, both schemas' required arrays agreeing on the core, the optional half
-omitted rather than nulled, and **the spend leak driven through BOTH the old and
-the new gate** with the `needsAnalysis` predicate lifted from source — a test that
-cannot reproduce the bug cannot prove the fix),
-and `node top3.check.mjs` (the daily top-3 options ranking: the constant table
-cross-checked against the SPEC's own literals rather than restated back at itself,
-`top3Subscores` against a hand-computed 59.5, clipping at **both** bounds plus the
-boundary values where it must NOT fire, the whole-score extremes 0 and 100, the
-min-of-coverage rule shown against the average it is not, **every gate firing AND
-at a non-firing boundary** — including all seven score inputs nulled in turn — the
-sweep's classification with stub bindings covering the `status: 'error'` row that
-does NOT throw, the domain statuses that are complete outcomes, the reuse refusal
-on a cached error row and the consecutive-failure run, then `top3Rank` end to end
-on synthetic rows for both directions, HOLD, a stale verdict, one-slot-per-ticker,
-the top-3 cut, tie-break determinism and the zero-qualifying case that must
-publish `[]`, `readTop3`'s strict schema equality, and the SERVING WINDOW — the
-walk back from today's key to the newest one that still exists, driven with a
-PINNED clock and a key-aware KV stub over raw bytes, including the byte compare
-proving the served record is not rewritten, the two calendar gaps the 7d
-`TOP3_TTL` exists for — **Monday morning finding Friday's** at `-3` and **the
-Tuesday after a Fri+Mon closure finding Thursday's** at `-5`, the ceiling case —
-the nothing-within-five-days null, a `-6` record that exists and is still refused
-because the walk's cap and the TTL are separate bounds, and a re-derivation of
-the reachable walk-back depth from `TOP3_TTL` that prints the count of
-unreachable probe depths — **1 at the old 36h, 0 at 7d** — rather than letting a
-dead branch ship in silence),
-and `node longarch.check.mjs` (long-row RETENTION, the 7:00am PT row sweep and the
-`longarch:` sweep archive: the key shape with the `longarch:`/`long:` prefix
-disjointness asserted in **both** directions, `LONG_ROW_TTL` **re-derived from
-real Date arithmetic** — the 66.75h weekend that caused the incident and the
-114.75h Thu→Tue binding case, each compared against the OLD 24h *and* the new 7d,
-because a test that only shows 7d clears the gap would pass on any large number —
-the three guards that make longer retention safe driven **behaviourally** (the
-sweep's reuse gate at ±5s of `LONG_FRESH_MS`, a 6-day-old row still refetched, a
-fresh `error` row never reused, `readLongRow` retiring `LONG_SCHEMA ± 1`) **and**
-at source, `archiveSweptRows` against stub bindings including a reused row keeping
-its own `ts` and a KV throw reported rather than propagated, the read route through
-the REAL module — byte-identical service, zero writes, exactly one key read, no
-`macro`, and the miss that must NOT fall through to a live refetch — the dispatch
-edges through the REAL `scheduled()` at 06:45 / 07:00 / 07:15 / 07:30 / 08:00 plus
-both closure kinds, the whole branch→jobs table lifted from source so "the 1:15pm
-branch gained nothing" is pinned without spending a fetch, the 7am hour checked
-against the cron's UTC window in **both** DST regimes, and a **structural
-attribution** proving `collectMorningRows` contains no reference to `collectTop3`,
-`top3Key` or `TOP3_SWEEP_KEY` — the one thing no behavioural test can see being
-added later, and the thing that would silently replace the day's post-close
-ranking with one priced off opening spreads),
-and `node printtape.check.mjs` (PRINT vs TAPE: the key-shape prefix disjointness in
-**both** directions, the report date including the midnight-UTC placeholder — the one
-shape where a UTC and an ET reading differ by a whole day — all four pass windows plus
-ten non-firing boundaries and a proof that each admits exactly ONE firing, the four PT
-hours re-derived against the cron range in both DST regimes with the range READ from
-`wrangler.toml`, the null-before-arithmetic surprise guard including a zero and a
-negative consensus, **the quarter-alignment gate driven from REAL captured Yahoo
-payloads in both directions** — the shipped code's `null` against the fabricated
-**-13.04%** PANW miss that appears the moment the gate is removed — the consensus-roll
-test at and either side of its boundary, both tape windows checked against the two
-DIFFERENT regular closes they reference with the change cross-checked against
-price-minus-close, the staleness refusal at one second either side, the unconditional
-volume refusal, the implied move and the fact that nothing in it calls itself an
-earnings move, every divergence refusal path with `null` shown to be a different value
-from `false`, the threshold at -2.99 / -3.00 / -3.01, the field-level cross-pass merge
-and the quarter mismatch that must carry nothing, the endpoint through the REAL router
-including a fail-closed gate and an absent day distinguished from an empty one, and
-the structural attributions no behavioural test can make — that guidance is reachable
-only from `divergent === true`, that the verdict is re-run AFTER the merge, that the
-read path contains no write, and that the job writes no sibling feature's key;
-**and, since the 2026-09-01 schedule fix**, the PRE-BANKED quarter driven both ways
-with the **-51.22%** miss a gate-free fallback would print shown beside the shipped
-`null`, the tape window PAIR with `usedWindow` re-derived after every merge and the
-freshest-wins rule driven in BOTH orders, the consensus-provenance split where a
-carried `epsActual` must NOT claim `pre-banked` and a quarter mismatch must not
-either, the carry-over test shown to answer a DIFFERENT question from
-`printTapeComplete` on the record where the two disagree, `prevTradingDay` /
-`nextTradingDay` against a second day-of-week derivation with a 120-day sweep proving
-the walkers and the cron gate never disagree, the **MDB REPLAY** of the real
-2026-09-01 record read back out of the deployed Worker — pre-bank → pass 1 → pass 2 →
-carry-over, with the no-pre-bank counterfactual beside it — and
-`GET /api/calendar/holidays` through the real router against a KV stub that THROWS on
-every method, so a single binding touch is a 500 rather than a counter to be trusted).
-All of them extract functions from
-`worker.js` by source, not by import, because every named export in `worker.js`
-must be a function or `workerd` refuses to boot. **`longarch` and `printtape` are the exceptions and
-deliberately do both**: they extract by source for the unit half *and* import the
-default export to drive the real router and dispatcher — which is also the ES-module
-parse `node --check` cannot perform, and which caught a real syntax error in this
-very change after `node --check` returned exit 0 on it.
-
-Observed comparison counts, which are also each script's `minComparisons` floor:
-**138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 / 144 / 287 / 91 / 113 / 68 / 99 / 240 / 234 / 543** for moves /
-long-fixtures / cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f /
-sweep-universe / macro / mood / swing / earnings-timing / daily-slots /
-analysis-shape / top3 / longarch / printtape — **2,267 comparisons** across the suite.
-`top3` went 173 -> 219 on 2026-08-26 with §10, the serving window, and **219 -> 240 on
-2026-08-31** with the 7d TTL and the 5-day walk; its `minComparisons` floor moved
-130 -> 170 -> **235**.
-`longarch` landed 2026-08-31 at **166**, went **166 -> 183 on 2026-09-01**, when its
-§6e cron assertion was rewritten: it had pinned the whole literal expression, so the
-LEGITIMATE widening of the UTC hour range read as a regression. It now READS the range
-from `wrangler.toml`, pins the three calendar fields as `*`, and re-derives every
-scheduled PT hour against the range in both DST regimes — which is the part that can
-catch a future job being scheduled outside the window.
-It went **183 -> 234 on 2026-09-02** with the crumb-retention incident: §5g the
-fresh-`error`-row serve rule (both directions — the ok row must still be a cache hit
-and `?cached=1` must still serve the error row), §6f the morning-rows window width
-re-derived from the DISPATCH LINES in source, and **§9 the Yahoo crumb**, which is a
-retention section of exactly §2's kind and belongs beside it. §9 is also where a check
-was caught reading a COMMENT instead of the code — see the incident section below.
-`printtape` landed 2026-09-01 at **272** and went **272 -> 543 the same day** with the
-schedule fix: §12 the pre-banked quarter (driven both ways, with the **-51.22%** miss a
-gate-free fallback would print shown beside the `null` the shipped code prints), §13 the
-trading-day walkers (the Labor Day case with BOTH wrong answers printed beside the right
-one, and a 120-day sweep asserting the walkers and the cron gate never disagree), §14 the
-MDB REPLAY — the real 2026-09-01 record read back out of the DEPLOYED Worker, driven
-through pre-bank -> pass 1 -> pass 2 -> carry-over with the no-pre-bank counterfactual
-beside it — and §15 `GET /api/calendar/holidays` through the real router against a KV stub
-that THROWS on every method, so a single binding touch is a 500 rather than a counter to
-be trusted.
-Both floors are the **exact** count rather than a count minus slack: every section of
-either is deterministic and offline, so unlike `swing` and `earnings-timing` there is no
-observed total to distinguish from a fixed one, and a section that stops running drops
-the count into a NO VERDICT.
-The **2,267** above is the sum of the eighteen FLOORS, not of an observed run. A full
-run on 2026-09-02 after the crumb fix observed **2,317, with 0 scripts failing**;
-the 50-comparison gap is
-entirely the two tape-dependent scripts, which observed `swing` **96** against its
-floor of 91 and `earnings-timing` **158** against 113. Their floors are deliberately
-their FIXED counts, so a quiet tape reports a verdict instead of a false NO VERDICT —
-never raise either to an observed total.
-
-**BOTH DIRECTIONS WERE DRIVEN BEFORE `longarch` WAS BELIEVED**, because a check
-that cannot fail is a check that proves nothing. Reverting `LONG_ROW_TTL` to 24h
-turns §2 red in **7** comparisons; making `collectMorningRows` stamp
-`TOP3_SWEEP_KEY` instead of its own key turns §7 red in **5**, naming the function
-in the output; and raising the floor above the observed count produces NO VERDICT
-rather than a pass.
-
-**SIX MORE WERE DRIVEN FOR THE 2026-09-02 CRUMB INCIDENT** — the full table is in
-*"The Yahoo crumb, the fresh-error-row cache, and the third morning firing"*
-below. Two of them are worth knowing here, because both are about the
-INSTRUMENT rather than the code: §9b's crumb-value assertion **passes under its
-own fault** and only the fetch count catches it, and §6f was **reading a comment
-instead of the dispatch line** until the revert was driven against it.
-
-**AND BEFORE `printtape` WAS BELIEVED, for the same reason.** Removing the
-quarter-alignment gate from `printTapePrintFrom` makes §5f print the fabricated
-**-13.04%** PANW miss beside the shipped code's `null`; reverting the cron range to
-`13-22` reddens exactly one comparison — *"print-tape BMO pass 1 (05:30 PT) inside
-12-22 UTC in both regimes"* — which is the assertion that widening the window was
-necessary at all; putting a day-of-week `2-6` back in reddens the calendar-logic
-assertion; and dropping the post-merge verdict re-run reddens §11a-bis in **2**.
-
-**FOUR MORE FAULTS WERE DRIVEN FOR THE 2026-09-01 SCHEDULE FIX**, each reverting the
-change to the behaviour it replaced:
-
-| fault injected | reddens |
-|---|---|
-| `walkTradingDays` skips weekends only, not holidays | **12** — §13c prints `2026-09-07` against `2026-09-04`, §13g counts 5 disagreements with `tradingDayStatus`, and §15c fails the same case over the wire |
-| the banked-quarter branch removed from `printTapePrintFrom` | **5** — §12b/§12c, the quarter unresolvable and the whole print refusing |
-| the verdict reads `tape.post` directly instead of `tape[tape.usedWindow]` | **8** — §8g on both sides, and §14d judging on `-14.5598` instead of `-14.212` |
-| the tape merges whole-block (the schema-1 rule) | **6** — §9h loses the banked post window, §14d's ">>> the post reading SURVIVED the merge" goes `undefined` |
-
-The last two are the ones worth noting: both leave a record that still LOOKS complete
-and still carries a verdict — it is simply the wrong window's verdict, which is exactly
-the class of failure a per-window `usedWindow` field exists to make visible.
-
-**TWO REAL DEFECTS WERE FOUND BY WRITING THE CHECK, not by reading the code.**
-`mergePrintTapeRecord` mutated its own `next` argument through a shallow spread, so
-§9's later assertions were driven against a fixture the earlier ones had silently
-rewritten. And the divergence verdict was computed in `printTapeMeasure`, i.e.
-**before** the merge — so a record whose merged print reported `revSurprisePct 3.77`
-still carried `divergent: null, "1 is absent: revEst"`, a refusal that had outlived
-its own cause and that also made `guidance` unreachable for exactly the names the two
-passes exist for.
-
-##### A FIXTURE TIMESTAMP MUST BE RELATIVE TO NOW — 2026-08-25
-
-`analysis-shape.check.mjs` §3 went red on the calendar rather than on the code.
-Its four record fixtures were stamped `Date.parse('2026-08-20T14:00:00Z')`, and §3
-rebuilds the `stocks` map exactly as `handleWatchlistBatch` does — which means
-`usable = r.ok && Date.now() - r.ts < 172_800_000`, the `analysis:` 2-day TTL. From
-**2026-08-22** onward every fixture aged past that window, every record read as
-unusable, and all four names queued a Claude call. Four assertions failed,
-including *"canonical record does NOT queue a call"* and *"exactly two names
-queued"* — **reporting the spend leak of rule #5 as OPEN while the source gate was
-fine.** `TS` is now `Date.now() - 3600_000`; §3's own stale case builds its
-timestamp explicitly, so the stale-path assertions are unaffected.
-
-**A check that goes red on the calendar is worse than no check**, because it trains
-the next reader to ignore a failing spend-gate assertion. Any fixture whose value
-is compared against a freshness window gets a relative timestamp.
-
-**TWO scripts now read live data, and both floors are the FIXED count rather than
-the observed total.** `swing.check.mjs` (below) and `earnings-timing.check.mjs`,
-whose §7 re-probes the watchlist: that section contributed **44** of a 157-run on
-2026-08-19 — 5 aggregate rows plus one per name probed (39) — all of it
-contingent on the network and on a watchlist whose length changes. The floor is
-**113**, the deterministic half, so an offline run still has to clear everything
-that does not depend on the tape while §7 announces its own emptiness through
-`populated()`. Never raise either floor to an observed total.
-
-**`swing.check.mjs`'s count is TAPE-DEPENDENT**, and the 91 above is its *fixed*
-count, not its observed total. §7a asserts once per watchlist name that actually
-breached ±1.5σ, so a run costs 91 + however many fired. Against the old fixed
-count of 88, two runs an hour apart on 2026-08-14 reported **95** (7 names) and
-**96** (8); on 2026-08-19 nothing reached ±1.5σ (max |z| 1.16, TSLA) and the run
-reported exactly **91** — the fixed count with zero breaches, which is precisely
-the case the floor exists for. The floor is the fixed count minus slack (**87**),
-never the observed total — a quiet day must report a verdict rather than a false
-NO VERDICT. It reads **live** data through the deployed Worker's
-`/api/chart/:ticker` proxy, because Yahoo 429s a direct request from a laptop.
-
-##### A FIXTURE MUST REBUILD THE CALL'S CLOCK, NOT JUST ITS BARS — 2026-08-19
-
-**§5 of `swing.check.mjs` failed on all three tickers for five days and only
-after 4:00pm ET**, which is why it shipped green. The section drives
-`swingChannel` at a pre-close hour (10 ET) and a post-close hour (17 ET), then
-rebuilds the window independently to check the returned fit. It rebuilt that
-window with the **live** `etHourNow()` instead of the hour it had passed in. Run
-before the close the two clocks agree and it passes; run after, the live window
-keeps today's settled bar while the hour-10 call drops it, so the comparison was
-against a **different window** — NVDA off by 0.43, AMD by 1.84, SPCX by 3.50.
-
-**The tell was already written in the file.** The comment immediately above warns
-that the pre and post calls use different windows and that differencing their
-fits measures the window shift as well. The code then took the window from a
-third clock again. **The hour is an INPUT**: `PRE_HOUR` / `POST_HOUR` are now
-declared once and every reconstruction reads the same constant the call did.
-
-Fixing it exposed that the section titled *"in BOTH settlement regimes"* only
-ever asserted **one** of them — the x=30 pre-close fit. The x=29 post-close fit,
-on its own window, is now checked too (+3 comparisons, hence 88 → 91), and it is
-the assertion that would have made this a permanent failure instead of a
-clock-dependent one. **When a check's heading claims a symmetry, count the
-assertions on each side before believing it.**
-
-**`mood.check.mjs` uses a brace-matching `grabConst`, not the scan-to-semicolon
-one the other scripts share.** `MOOD_STANCE`'s sentences contain semicolons, and
-a `[^;]+` grab truncates the table mid-string — the generated module then fails
-to parse, which reads as a missing constant rather than as a harness bug. Copy
-that version, not the older one, for any table holding prose.
-
-**`node iv-capture.fixture.mjs` is a nineteenth script and is deliberately NOT in
-that total**, because it tests `iv-capture.mjs` — an operational capture tool —
-rather than anything in `worker.js`, and the 592 has always meant "comparisons
-against the Worker". It contributes **15** of its own. It exists because
-`iv-capture.mjs`'s first live run exercised only the no-change branch
-(`rewritten: 0`), and **an empty comparison is not a pass**: the rewrite detection,
-the per-ticker delta arithmetic, the `ts` gap and the only-in-pass-1 /
-only-in-pass-2 buckets had never executed against changed data. It synthesises that
-data from a real snapshot and checks the arithmetic against hand-computed values.
-
-**`node --check` IS NOT A SUFFICIENT PRE-DEPLOY PARSE, and it gave a false pass on
-this commit.** `worker.js` is an ES module; `node --check` parses it as a CommonJS
-script, where a duplicate `let`/`const` in one scope is **not** an error. A
-`const { head, series }` destructuring shadowing an existing `let series` in
-`collectMacroState` passed `node --check` with exit 0 and threw
-`SyntaxError: Identifier 'series' has already been declared` the moment anything
-loaded it as a module. Reproduced minimally, both ways. That is the same class as
-the non-function named export that once stopped `workerd` from booting — a total
-outage with no partial failure — so the check has to be one that actually parses
-it as a module:
+**`node --check` IS NOT A SUFFICIENT PRE-DEPLOY PARSE.** `worker.js` is an ES module
+and `node --check` parses it as CommonJS, so it has returned exit 0 twice on a file
+`workerd` would refuse to boot.
 
 ```bash
-node --check worker.js                      # NOT sufficient on its own
-node cron-gate.check.mjs                    # imports worker.js as an ES module
-npx wrangler dev                            # the real workerd startup validation
+node --check worker.js         # NOT sufficient on its own
+node cron-gate.check.mjs       # imports worker.js as an ES module — the cheap one
+npx wrangler dev               # the real workerd startup validation
 ```
 
-`cron-gate.check.mjs` is the cheap one and it caught this; run it, or a real
-`wrangler dev` boot, before believing a syntax check.
+Three rules for the checks themselves: **a check that goes red on the calendar is worse
+than no check** (any fixture compared against a freshness window gets a **relative**
+timestamp); **a fixture must rebuild the CALL'S clock, not just its bars** (the hour is
+an *input*, and when a heading claims a symmetry, count the assertions on each side
+before believing it); and **`mood.check.mjs` uses a brace-matching `grabConst`** — copy
+that version for any table holding prose.
+
+> Per-script detail and the fixture incidents: [`docs/history.md`](docs/history.md)
 
 ## Architecture
 
 ### Worker invariants
 
-The detail behind every line here is in
-[`.claude/skills/worker-internals/SKILL.md`](.claude/skills/worker-internals/SKILL.md).
-These stay resident because each is a contract a session can violate in a single edit
-without ever opening that file.
+**Every line here is a contract a session can violate in a single edit.** The annotated
+originals, with the incident behind each, are in [`docs/history.md`](docs/history.md);
+endpoints, the KV key/TTL table and the cron schedule are in `worker-internals`.
 
-- `capCost` = `extFetches` + `bindingOps`; quoting `extFetches` alone understates
-  the long-screen path
-- `yahooSparkCloses` takes 20 symbols per request; fetches are `ceil(N/20)`
-- Never read `content[0].text` — Opus 5 thinks by default and slot 0 is a
-  `thinking` block
-- `claudeText()` **cannot tell a complete answer from a truncated one** — both
-  arrive as text, and the truncated one parses or renders as though it were
-  whole. `workerClaude(prompt, env, maxTokens, schema, { raw: true })` returns
-  `{ text, stopReason }` instead of the bare string so a caller can check
-  `stopReason === 'max_tokens'`. Every existing caller keeps the string by
-  omitting the flag; use `raw` wherever a cut-off answer would be stored or
-  rendered as finished prose (`collectMarketMood` is the only user today)
+**Cost and Claude calls**
+
+- `capCost` = `extFetches` + `bindingOps`; `extFetches` alone understates the long
+  screen. `yahooSparkCloses` takes 20 symbols/request — `ceil(N/20)` fetches
+- Never read `content[0].text` — Opus 5 thinks by default and slot 0 is `thinking`
+- **`claudeText()` cannot tell a complete answer from a truncated one.** Use
+  `workerClaude(…, { raw: true })` and check `stopReason === 'max_tokens'` wherever a
+  cut-off answer would be stored or rendered as finished prose
 - `max_tokens` caps thinking + answer together, not the answer alone
-- IV is carried through this codebase as **percent**; `bsDelta` takes **decimals**
+
+**Data honesty**
+
+- IV is carried as **percent**; `bsDelta` takes **decimals**
 - `ivRank` is null until 60 days of history exist, and nothing stands in for it
-- Risk-free rate comes from FRED `DGS3MO` and is **suppressed, never defaulted**
-- SEC EDGAR requires a real contact email in `SEC_UA` or it 403s everything
-- Verify every CIK against EDGAR before adding it to `SUPER_INVESTORS`
-- Option-strategy gates are relative, never absolute
-- Provenance badges are derived by `setBadge()`, never authored
+- The risk-free rate is FRED `DGS3MO`, **suppressed and never defaulted**
+- SEC EDGAR needs a real contact email in `SEC_UA` or it 403s everything; verify every
+  CIK against EDGAR before adding it to `SUPER_INVESTORS`
+- Option-strategy gates are relative, never absolute; provenance badges are derived by
+  `setBadge()`, never authored
+- **Market Mood's states are decided by rules**; Claude may only rephrase the verdict,
+  and `sentenceSource` says which the reader is seeing
+
+**KV records**
+
 - Do not declare a local `const TTL` — `TTL` is a module-level table
-- The `/api/daily` object is **three keys merged at read time**, not one stored
-  object. A briefing run writes its own slot and may clear a sibling **only** on a
-  PT-date rollover, through `purgeStaleDailySlots()`. Never restore an
-  unconditional `delete('daily:eod'/'daily:midday')`
-- All three `daily:` records carry `ptDate`, placeholders included; an absent
-  `ptDate` **and** an unusable `ts` means STALE, which is the direction that
-  regenerates
-- `analysis:{TICKER}` has **one canonical shape and two writers**. Required core
-  `rating · confidence · recommendation · drivers[] · summary`; `factors{}` and
-  `thesis` are synthesis-only and **omitted, never nulled**; `trend`/`pattern`/
-  `action` are gone. **Never read the key directly — go through
-  `readAnalysisRecord()`**, or a legacy record reads as unanalysed and re-spends
-- `premium:{TICKER}` freshness and retention must not be equal
-- The IV sweep's unconditional overwrite **is the sampling design**, not a missing
-  optimisation: one sample per name per day at a fixed 13:15 PT. **Never add
-  `skipIfPresent` to the cron path** — it would make the series first-writer-wins
-  and biased toward morning-viewed names (ARCHITECTURE #16, *"THE OVERWRITE IS THE
-  SAMPLING DESIGN"*)
-- `moves:{TICKER}` schema check stays strict equality
-- `mood:state` schema check stays strict equality; its freshness (26h, from
-  `TTL.mood`) and retention (7d) must not be equal, same reason as `premium:`
-- Market Mood's states are decided by rules; Claude may only rephrase the
-  verdict, never change it, and `sentenceSource` says which the reader is seeing
-- `calib:pooled` lives in the cron and must never move
+- **`/api/daily` is THREE KEYS merged at read time.** A run writes its own slot and may
+  clear a sibling **only** on a PT-date rollover, via `purgeStaleDailySlots()` — never
+  restore an unconditional `delete('daily:eod'/'daily:midday')`. All three carry
+  `ptDate`; absent `ptDate` **and** unusable `ts` means STALE, which regenerates
+- **`analysis:{TICKER}`: never read the key directly — go through
+  `readAnalysisRecord()`**, or a legacy record reads as unanalysed and re-spends. Core
+  `rating · confidence · recommendation · drivers[] · summary`; `factors{}`/`thesis` are
+  synthesis-only and **omitted, never nulled**
+- `moves:`, `mood:state`, `radar:`, `top3:`, `incomerow:`, `printtape:` schema checks
+  stay **strict equality**; `calib:pooled` lives in the cron and must never move
+- **A REFUSAL IS A DISTINCT STATE FROM AN EMPTY RESULT**: radar returns
+  `candidates: null` and **never caches a refusal**, `top3`'s `entries: []` means the
+  gates ran and nothing survived while absent means it did not run, and income returns
+  `entries: null`
+
+**Prefix discipline — a scanned prefix must not read a sibling as a ticker**
+
+- `ivsweep:last` outside `iv:`, `top3sweep:last` outside `top3:`, `morningrows:last`
+  outside every scanned prefix, `printtapeday:` outside `printtape:`
+- Income rows are **`incomerow:`**, never `income:`; `longarch:` and `long:` are
+  **disjoint**, which is why the archive is not `long:{TICKER}:{DATE}`
+- **`income:tickers` is NOT a sweep universe** — `sweepUniverse()` reads
+  `watchlist:tickers` and nothing else; folding the sleeve in enlarges three cron sweeps
+
+**Freshness vs retention — always two different questions**
+
+- **`LONG_ROW_TTL` 7d vs `LONG_FRESH_MS` 4h. Never raise freshness to "match"
+  retention.** Retention outlives the weekend/holiday gaps the writer's own schedule
+  creates; freshness decides the stale badge, the cache hit and the sweep's reuse gate.
+  Three guards keep an aged row out of anything that ranks or scores: `top3Sweep`'s 4h
+  non-`error` reuse gate, `top3Rank` dropping any row whose PT date is not today, and
+  `readLongRow` retiring any row whose schema is not `LONG_SCHEMA`
+- **A `status: 'error'` long row IS banked — a refusal is a finding — but NO PATH MAY
+  TREAT ONE AS A SATISFIED CACHE.** The no-param path falls through to the refetch;
+  **`?cached=1` is the one exception and must stay one**, being a no-fetch promise
+- **THE YAHOO CRUMB HAS RETENTION AND NO FRESHNESS TERM.** `CRUMB_KV_TTL` 2d, reused
+  **whatever its age**, because every 401/403 path re-acquires — a stale crumb
+  self-corrects, a missing one guarantees a cold acquire. Those paths must call
+  `getYahooCrumb(env, { force: true })`, which skips both caches and **overwrites** KV;
+  `force` must appear **nowhere else**
+- **`TOP3_TTL` (7d) and `TOP3_SERVE_WALKBACK_DAYS` (5) are separate bounds; neither
+  works alone.** **`readTop3` serves the NEWEST SURVIVING record**, unmodified and with
+  no `served` marker. A KV throw ABORTS the walk; a schema mismatch reads as absent and
+  the walk CONTINUES
+- `premium:` and `mood:state` freshness and retention must not be equal either
+- `/api/long/batch` is **`N + 2`** binding ops on the top3 hit path, at most **`N + 7`**
+  on the miss — macro and `top3` are read in the envelope, never per row
+
+**Sweeps and the cron**
+
 - `scheduled()` gates on the Pacific trading day before dispatching
-- `radar:{PT-DATE}` schema check stays strict equality; a radar **refusal is never
-  cached** and returns `candidates: null`, never `[]`
-- `income:tickers` is **NOT** a sweep universe — `sweepUniverse()` reads
-  `watchlist:tickers` and nothing else, and folding the sleeve in would silently
-  enlarge three cron sweeps
-- income rows live under **`incomerow:`**, never `income:` — `TICKERS` and `PREV`
-  both pass `REC_SYMBOL_RE`, so sharing the prefix would let a row scan read the
-  sleeve list as a ticker
-- `top3:{PT-DATE}` schema check stays strict equality. **`entries: []` and an
-  ABSENT key are different states**: `[]` means the gates ran and nothing survived
-  (a valid published result), absent means the job has not run or refused
-- `top3sweep:last` lives **outside** the `top3:` prefix, same rule as `ivsweep:last`
-- The top-3 sweep is **strictly sequential** and must stay so — Yahoo crumb
-  rate-limiting, not the cap. A row's `status: 'error'` is a FAILURE that blocks
-  the dedup stamp; `no-options` / `no-iv` / `no-expiries` are complete outcomes
-  about the ticker and must not block it. **`refreshLongTicker` does not throw on a
-  Yahoo failure** — it returns `{ok: false, status: 'error'}`, so a `try/catch`
-  alone would stamp a broken run out of the day
-- `/api/long/batch` is **`N + 2`** binding ops on the top3 HIT path and at most
-  **`N + 7`** on the miss — one macro read plus one `top3` read, both in the
-  envelope, never per row. `readTop3` serves today's key when it exists and
-  otherwise walks back up to `TOP3_SERVE_WALKBACK_DAYS` (5) calendar days, so a
-  miss costs at most 5 further reads. Measured at N=2 on 2026-08-31: hit **4**,
-  `-3` hop **7**, full miss **9**, `extFetches 0` on all three
-- **`readTop3` serves the NEWEST SURVIVING record, not only today's.** The record
-  is written by the 1:15pm PT cron, so reading only `top3:{today}` served `null`
-  through every trading morning while yesterday's sat in KV inside its TTL —
-  the feature's own design (an EOD-banked ranking rendered next morning under its
-  real as-of) was unreachable in production. **The record is served UNMODIFIED and
-  carries no `served` marker**: its own `ptDate` / `asOf` date it, and a second
-  field claiming the same fact is a second field that can disagree. A KV throw
-  ABORTS the walk; a schema mismatch reads as absent and the walk CONTINUES
-- **`TOP3_TTL` is 7d and `TOP3_SERVE_WALKBACK_DAYS` is 5, and NEITHER WORKS
-  ALONE.** A deeper walk over an evicted key finds nothing; a longer TTL nothing
-  walks back to is unreadable. At the old 36h a Friday record was already gone by
-  Monday, so **every Monday morning — and every morning after a market holiday —
-  served `null`** even though the walk was already reaching for it. Reachability
-  is arithmetic: `back=k` fires only while `(k−1)×24h < TOP3_TTL`, so 7d admits
-  `k ≤ 7` and every declared depth can fire; `top3.check.mjs` §10g re-derives that
-  bound from the constant and prints the count of unreachable depths (**0**, from
-  1 at 36h). **`TOP3_SWEEP_STAMP_TTL` = `TOP3_TTL`** so the dedup stamp and the
-  record it dedups age together — the dedup does not care (an absent stamp just
-  permits a run), but "stamp expired, record still present" is a third state that
-  has to be reasoned away every time it is read
-- `incomerow:{TICKER}` schema check stays strict equality, and its freshness (6h)
-  and retention (36h) must not be equal
-- **`LONG_ROW_TTL` is 7d and `LONG_FRESH_MS` is 4h, and they are different
-  questions.** Retention outlives the weekend/holiday gaps the writer's own
-  trading-day schedule creates (24h evicted every Friday row before Monday and
-  the whole Options surface read "not loaded"); freshness still decides the stale
-  badge, the cache hit and the sweep's reuse gate. Never raise freshness to
-  "match" retention. Nothing that ranks or scores can reach an aged row —
-  `top3Sweep` reuses only inside `LONG_FRESH_MS` and only a non-`error` row,
-  `top3Rank` drops any row whose own PT date is not today, and `readLongRow`
-  retires any row whose schema is not `LONG_SCHEMA`
-- **A `status: 'error'` long row IS banked — a refusal is a finding — but NO PATH
-  MAY TREAT ONE AS A SATISFIED CACHE.** `top3Sweep`'s reuse gate has always
-  refused them; `handleLongTicker`'s no-param path did not, and on 2026-09-02 it
-  served 40 of them as `cached: true, stale: false` for four hours after a
-  transient crumb outage. The no-param path now falls through to the refetch.
-  **`?cached=1` is the one exception and must stay one** — it is a no-fetch
-  promise and the row renders as the finding it is. Same class as *"not loaded
-  must not render like no trade here"*
-- **THE YAHOO CRUMB HAS RETENTION AND NO FRESHNESS TERM.** `CRUMB_KV_TTL` is 2d
-  and a banked crumb is reused **whatever its age**, in memory and in KV, because
-  `yahooAuth` and both screener callers re-acquire on a 401/403 — a stale crumb
-  self-corrects, a missing one guarantees a cold acquire. At the old 50-min/1h
-  pair the 7:00am PT sweep, **17.75h downstream of the 1:15pm writer, could never
-  reuse one on any day**. Every 401/403 path must call
-  `getYahooCrumb(env, { force: true })`, which skips both caches and **overwrites**
-  KV; without it the "re-acquisition" reads the same dead crumb back. `force` must
-  appear **nowhere else** — a warm-up caller that forced would undo the fix
-- **The 7:00am PT `collectMorningRows` job RANKS NOTHING.** It must never call
-  `collectTop3`, write `top3:{PT-date}`, or stamp `top3sweep:last` — that dedup
-  is a PT-date compare, so a 7am stamp would make the 1:15pm firing skip and
-  replace the day's post-close ranking with one priced off opening spreads. Its
-  own stamp is `morningrows:last`, outside any scanned prefix. Its window is
-  `h === 7 && m < 45` — **three** firings (7:00 / 7:15 / 7:30), widened from two
-  on 2026-09-02 after both burned on one transient fault
-- **`printtape:` NEVER COMPARES AN ACTUAL AGAINST A CONSENSUS FROM A DIFFERENT
-  QUARTER.** The two must carry the same period-end date, by string equality, or the
-  half that cannot be matched is `{status:'not-published'}`. Yahoo publishes the
-  consensus for the reporting quarter *before* it publishes that quarter's actual,
-  so the newest of each are routinely a quarter apart — pairing them prints a
-  confident surprise percentage for a comparison nobody made. **The PRE-BANKED
-  quarter is a third way to NAME the quarter, never a way to relax that gate**:
-  `printTapePrintFrom` tries the live consensus, then an actual stamped with this
-  report date, then the bank — and the alignment gate is still string equality
-  against whatever it settles on
-- **`printtape:` `tape` is a PAIR of windows and the verdict reads
-  `tape[tape.usedWindow]`.** `usedWindow` is the freshest readable window by
-  `quoteTime`, **re-derived after every merge and never carried** — a value copied
-  from either side of a merge is a claim about a pair neither side had. Nothing is
-  hoisted to the top level; a duplicated `changePct` is a second field that can
-  disagree with the first. Which windows are attempted is decided by session; which
-  one is stale is decided by the existing `earningsTs` guard, never by a clock
-- **`printtape:` `consensusSource` and `consensusBankedTs` answer DIFFERENT
-  questions.** The timestamp says a bank was TAKEN (a fact about the report, carried
-  forward unconditionally). The source says where THIS record's figures came from,
-  and is `pre-banked` only when the merge actually took `epsEst`/`revEst` or the
-  whole print block from the bank — a pass that read a live consensus of its own
-  says `live-pass` even with a bank beside it, and a quarter mismatch must not claim
-  `pre-banked`
-- **The print-tape carry-over reads YESTERDAY'S DAY INDEX, never a re-scan**, and
-  "yesterday" is `prevTradingDay`. A v7 quote row carries the NEXT earnings date and
-  Yahoo rolls it forward within a day of a report, so a morning re-scan finds
-  yesterday's reporters gone and reports it as "nobody reported". A carried name with
-  no `earningsTs` from either source is REFUSED, because without the report instant
-  the tape staleness guard cannot separate this print's reaction from the previous
-  session's
-- **`prevTradingDay` / `nextTradingDay` skip NYSE holidays, not just weekends**, and
-  read the same `tradingDayStatus` the cron gate reads. `NYSE_HOLIDAYS` is DERIVED
-  from `NYSE_HOLIDAY_TABLE` so the gate and `GET /api/calendar/holidays` cannot
-  disagree. Labor Day 2026-09-07 is the first live case: the session before Tuesday
-  2026-09-08 is Friday 2026-09-04
-- **`printtape:` `divergent` is THREE-VALUED and `null` is a REFUSAL, not a "no".**
-  An unknown session, an unpublished actual or a missing consensus means the question
-  could not be asked; `refusalReason` always says which. `divergent === true` is the
-  ONLY thing that may reach the Claude guidance call, by strict equality
-- **The print-tape verdict is re-run AFTER `mergePrintTapeRecord`.** One pass cannot
-  see both halves — that is why there are two — so a verdict decided pre-merge
-  outlives its own cause and makes guidance unreachable for exactly those names
-- `printtapeday:{ET-DATE}` is written on **every** pass, a zero-eligible one included:
-  it is this job's only dispatch evidence, and it sits outside the `printtape:` prefix
-- `longarch:{TICKER}:{PT-DATE}:{SLOT}` is written by the **cron sweeps only**,
-  never by an on-demand `/api/long/:ticker` refresh — a fixed-clock write is a
-  daily series, an on-demand one is a record of what someone opened. The SLOT
-  names when the snapshot was taken; the row's own `ts` names when its data was
-  computed, and a reused row legitimately disagrees with its slot. Served
-  verbatim by `?date=&slot=`, never recomputed, and it only runs forward
-
-### `printtape:` — print vs tape, the earnings-divergence record
-
-**One record per watchlist name per report day, FIVE cron passes, two read-only
-endpoints, and no change to any existing job.** Added 2026-09-01; rescheduled the
-same day, which is why the schema is already at 2. It measures the PRINT (what was
-reported against consensus) beside the TAPE (what extended hours did with it) and
-fires on exactly one direction: **a double beat the tape sold.**
-
-| constant | value | what it is |
-|---|---|---|
-| `PRINTTAPE_SCHEMA` | **2** | record shape, **strict equality**. Was 1 for one day |
-| `PRINTTAPE_TTL` | **7d** | retention for both the record and the day index — the `TOP3_TTL` / `LONG_ROW_TTL` figure, outliving the weekend and holiday gaps a trading-day writer creates |
-| `PRINTTAPE_DIVERGENCE_PCT` | **-3.0** | the tape gate, read as `changePct <= -3.0` |
-| `PRINTTAPE_QUOTE_CHUNK` | 20 | symbols per v7 quote request, the `yahooSparkCloses` ceiling |
-| `PRINTTAPE_SWEEP_CAP` | 60 | the `sweepUniverse` default |
-| `PRINTTAPE_TAPE_WINDOWS` | `pre` `post` | the two extended sessions one print can be traded in |
-| `PRINTTAPE_CONSENSUS_SOURCES` | `pre-banked` `live-pass` | where a record's consensus figures came from |
-| `PRINTTAPE_PASSES` | **13:15 (pre-bank) · 05:30 · 06:15 · 13:30 · 14:30 PT** | one pre-bank, two BMO, two AMC; each a 15-min window admitting exactly one firing |
-| `PRINTTAPE_GUIDANCE_CLASSES` | `raised` `held` `cut` `not-found` | the only values the guidance field may take |
-
-#### THE MEASUREMENT THE WHOLE FEATURE IS BUILT AROUND — 2026-09-01
-
-Probed live at **20:42 UTC, 42 minutes after PANW, DELL and MDB all reported AMC**:
-
-```
-earningsTrend 0q           endDate 2026-07-31   <- the quarter reported TODAY, consensus PRESENT
-calendarEvents averages    same figures, same quarter
-earningsHistory[-1]        quarter 2026-04-30   <- the PREVIOUS quarter
-earnings.earningsChart[-1] periodEnd 2026-04-30, reportedDate 2026-06-02
-```
-
-**The consensus for today's quarter is published and the actuals are not.** Yahoo's
-actuals lag by days — NVDA reported 2026-08-26 and six days later `earningsChart`
-carried the quarter while `financialsChart` still had no revenue for it.
-
-Taking `earningsHistory[-1]` as "the actual" compares **EPS 0.85 for the quarter
-ending 2026-04-30 against the 0.97745 consensus for the quarter ending 2026-07-31**
-and prints PANW at a confident **13.04% MISS that never happened** — arithmetically
-correct, completely fabricated, and indistinguishable on screen from a real one. The
-divergence flag downstream of it would have looked entirely ordinary.
-
-**SO: AN ACTUAL AND A CONSENSUS ARE COMPARED ONLY WITHIN ONE QUARTER, by string
-equality on the period-end date.** No fallback, no nearest match, no inference. A
-mismatch is `{status:'not-published'}` naming the quarter it actually found.
-`printtape.check.mjs` §5f removes that gate from a copy of the function and prints
-the -13.04% appearing, because a check that cannot fail proves nothing.
-
-#### THE SCHEDULE WAS WRONG, AND THE RECORD THAT PROVED IT — 2026-09-01
-
-Read back out of the DEPLOYED Worker at 22:09 UTC, an hour after the 14:30 PT pass
-wrote it:
-
-```
-MDB  print.epsActual 1.9 vs epsEst 1.60897  ->  epsSurprisePct  18.09  (Yahoo agreed: 18.09)
-     tape  post 370.99 vs regularMarketPrice 434.21  ->  changePct  -14.5598
-     print.revActual null · print.revEst null
-     divergent  null   "2 are absent: revActual, revEst"
-```
-
-**A double-digit sell-off on an 18% EPS beat — the exact shape this feature exists
-to catch — and it could not be judged.** The record was correct. The schedule sat
-between two moving deadlines and missed both:
-
-- **too early for the actual.** Both AMC passes (13:30 and 14:30 PT) fall inside the
-  ninety minutes after a 20:00Z print, and Yahoo's actuals lag it by hours to days.
-- **too late for the consensus.** `earningsTrend.0q` had ALREADY rolled to
-  `2026-10-31` by 21:30 UTC. This repo's own 20:42 UTC probe read `2026-07-31`.
-  **Forty-eight minutes.** A first pass thirty minutes after the print is a coin toss
-  against that, and revenue consensus survives the roll in no module at all.
-
-Two changes, and neither works without the other. §14 of `printtape.check.mjs`
-replays that record through the new sequence and drives the counterfactual beside it:
-with no pre-bank in the chain the same three payloads still cannot answer.
-
-#### 1. THE CONSENSUS IS BANKED A WHOLE TRADING SESSION EARLY — `collectPrintTapePreBank`
-
-A fifth pass at **13:15 PT (16:15 ET)**, on the session BEFORE the report, for every
-watchlist name whose `earningsTimestampStart` lands in **`nextTradingDay(today)`**.
-It writes the consensus half of the print with **`consensusSource: 'pre-banked'`**
-and a **`consensusBankedTs`**, which every later pass merges onto.
-
-**IT MEASURES NOTHING AND IT CANNOT.** The report has not happened: no actual, no
-extended-hours reaction, no verdict. `tape` is `{status: 'not-yet'}` — a status
-distinct from `unavailable`, because "there was nothing to look at yet" is not "we
-looked and Yahoo had nothing". No implied move, no long-row read, no Claude call.
-
-**13:15 PT rather than a new slot**, because it is the nearest existing daily wakeup
-that is post-close (so it cannot race a same-session print) and a whole trading
-session ahead of every pass that reads the bank. Its window is 13:15–13:30, abutting
-`amc-pass1` at 13:30 without overlapping it. 20:15 UTC on PDT and 21:15 on PST —
-inside the trigger window in both regimes (rule #2). **The 1:15pm branch is now FIVE
-jobs deep**, so its `_instr` is an upper bound and the cost below is a derivation.
-
-**A THIRD WAY TO NAME THE QUARTER, AND IT RELAXES NOTHING.**
-`printTapePrintFrom(r, reportDate, bankedQuarter)` tries the live consensus first,
-then an actual stamped with this report date, and only then the banked quarter. The
-alignment gate is still string equality against whatever it settles on, so a
-misaligned actual is refused exactly as before — §12 drives that with a payload where
-removing the gate would print a **-51.22%** miss and the shipped code prints `null`.
-
-**`consensusSource` and `consensusBankedTs` answer DIFFERENT questions**, which is
-why there are two. The timestamp says a bank was *taken* — a fact about the report,
-carried forward unconditionally. The source says where **this record's** figures came
-from, and is `pre-banked` only when the merge actually took `epsEst`/`revEst` (or the
-whole print block) from the bank. A pass that read a live consensus of its own says
-`live-pass` even with a bank sitting beside it, and a quarter mismatch — which
-refuses the bank — must not claim `pre-banked` either.
-
-**If a name reports with no banked consensus** — added to the watchlist that day, or
-the pre-bank did not run — the passes fall back to reading it live, exactly as before,
-and the record says `consensusSource: 'live-pass'`.
-
-#### 2. PRIOR-SESSION AMC NAMES REJOIN THE MORNING PASSES
-
-The 05:30 and 06:15 PT BMO passes now measure **today's BMO names + yesterday's AMC
-names whose record is still unfinished**. By morning Yahoo has had overnight to
-ingest the actual, and the pre-market has traded the same print.
-
-- **The candidate list is YESTERDAY'S OWN DAY INDEX, never a re-scan.** A v7 quote row
-  carries the NEXT earnings date and Yahoo rolls it forward within a day of a report
-  — measured 2026-09-01, PLTR's `earningsTimestampStart` was already 2026-11-02 while
-  `earningsTimestamp` still read 2026-08-03 — so a morning re-scan finds yesterday's
-  reporters have vanished and reports it as "nobody reported". `printtapeday:{prevDate}`
-  costs one read, cannot be wrong about who we measured, and carries the `earningsTs`
-  the staleness guard needs. A name with no `earningsTs` from either source is
-  REFUSED rather than measured: without the report instant the guard cannot separate
-  this print's reaction from the previous session's.
-- **Eligibility is `printTapeNeedsCarryOver`** — any print field still
-  `not-published`, or `divergent` still `null`, or **no readable record at all** (both
-  passes failed to write, which is strictly worse than a refusal). It is a DIFFERENT
-  question from `printTapeComplete`: complete asks "is there anything left for a
-  same-session pass to read", this asks "is there anything a NIGHT could have fixed",
-  and on a record with an answered verdict and a refused revenue half the two give
-  opposite answers.
-- **The carry-over writes under the REPORT date**, merging onto the same key, so the
-  once-per-ticker-per-report guidance rule holds unchanged. The report day's own index
-  is appended to as well — otherwise `/api/printtape?date=<report day>` would assemble
-  that day from a `measured` list the record is not in. Today's index records the
-  carry-over either way, so "it ran and found everything already answered" stays
-  falsifiable.
-
-**THE TAPE IS NOW A PAIR OF WINDOWS.** An AMC print is traded in the post-market of
-its report day AND the pre-market of the next trading day; both are reactions to the
-same release and both are measured against the same regular close (`regularMarketPrice`
-on the report day IS `regularMarketPreviousClose` the next morning). So `tape` carries
-`pre` and `post` side by side, each independently a reading or a refusal, plus
-**`usedWindow`** naming which one the verdict read — **the freshest by `quoteTime`,
-re-derived after every merge and never carried.** Nothing is hoisted to the top level:
-the verdict reads `tape[tape.usedWindow]`, because a duplicated `changePct` beside the
-window it came from is a second field that can disagree with the first.
-
-**WHICH WINDOWS ARE ATTEMPTED IS DECIDED BY SESSION, AND THE REST BY THE EXISTING
-STALENESS GUARD, NOT BY A CLOCK.** `bmo` -> `pre` only (a BMO print's own post-market
-is a whole regular session later, and is refused structurally as `not-applicable`).
-`amc` -> both, unconditionally: the same-evening pass finds that morning's pre-market
-quote is stamped earlier than the print and refuses it on the guard that already
-existed, while the next-morning pass finds a pre quote that is newer and takes it.
-Both windows refusing is a BLOCK-level refusal, so `printTapeComplete` and the merge
-cannot mistake an empty measurement for an answer.
-
-**The merge carries each window independently.** A whole-block rule would discard
-whichever side the pass could not re-read — and Yahoo drops the `postMarket*` fields
-once the pre-market session opens, so the post reading has to survive as a banked
-window rather than be re-fetched.
-
-#### THE PASSES, AND THE CRON WINDOW THAT HAD TO WIDEN
-
-Dispatched **outside the branch chain**, on `printTapePassAt(h, m)` ahead of the
-`if/else`: three of the five windows fall inside branches the chain already owns
-(06:15 in `morning-briefing`, 13:15 and 13:30 in the EOD branch), so a branch arm
-would silently never fire on three of them. The pass is named in the `[cron]` line,
-with the pre-bank labelled distinctly from a measurement pass.
-
-**RULE #2 CHECK, WHICH CAUGHT A REAL PROBLEM.** 05:30 PT is **12:30 UTC under PDT**
-and 13:30 under PST. The trigger's range was `13-22`, which covered the PST reading
-and not the PDT one — the BMO first pass **would have silently not run for the summer
-half of the year**, the 13F failure exactly. The range is widened to **`12-22`**.
-That is a change to *how often we wake up* and nothing else; no day, date or month
-goes into the expression. `longarch.check.mjs` §6e now READS the range from
-`wrangler.toml` and re-derives every scheduled PT hour against it in both regimes,
-rather than pinning the literal expression — pinning the literal made this legitimate
-widening read as a regression.
-
-| PT | UTC under PDT | UTC under PST |
-|---|---|---|
-| 05:30 | **12:30** — needed the widening | 13:30 |
-| 06:15 | 13:15 | 14:15 |
-| **13:15 (pre-bank)** | 20:15 | 21:15 |
-| 13:30 | 20:30 | 21:30 |
-| 14:30 | 21:30 | 22:30 |
-
-An `unknown`-session name is measured on the **AMC** passes, not dropped: by 13:30 PT
-the bell has rung, so a report filed that day has landed whatever session it was
-filed in. Its record carries `divergent: null` with the unknown-session refusal.
-
-#### THE NYSE CALENDAR, AND WHY IT IS NOW AN ENDPOINT
-
-**"Yesterday" is not `−1 day` and it is not `−1 weekday.`** `prevTradingDay` /
-`nextTradingDay` walk through the same `tradingDayStatus` the cron gate uses, so the
-holiday list can never be applied in one place and not the other. **Labor Day
-2026-09-07 is the first live case in the table**: the session before Tuesday
-2026-09-08 is **FRIDAY 2026-09-04**, and a weekday-only walk lands on the Monday the
-exchange was shut — which downstream reads as "nothing reported", indistinguishable
-from a real quiet day. Both walkers return `null` rather than guessing on a malformed
-date or a walk longer than 10 calendar days.
-
-`NYSE_HOLIDAYS` is now DERIVED from **`NYSE_HOLIDAY_TABLE`**, an array of
-`{date, name}` carrying the name as data rather than as a trailing comment, because:
-
-```
-GET /api/calendar/holidays[?date=YYYY-MM-DD]     requireSecret, read-only
-```
-
-serves it to a consumer that would otherwise hardcode its own weekday arithmetic —
-one calendar, one copy. Pure computation: **zero fetches, zero binding ops, nothing
-written**, verified in §15 against a KV stub that THROWS on every method. It returns
-the table, `through`, `calendarStale`, and — for the given ET date — `isTradingDay`,
-`reason` (`weekend` / `nyse-holiday` / `weekday`), `prevTradingDay` and
-`nextTradingDay`. `requireSecret` rather than `aiGuard`, the same reasoning as
-`/api/printtape`: it cannot spend an Anthropic credit. **`earlyCloses` is null WITH
-THE REASON** — early closes are not modelled anywhere in this Worker, and a nulled
-list reads as "there are none".
-
-**NOTE FOR THE CONSUMER SIDE:** neither `dashboard.html` nor `index.html` contains a
-`prevTradingDay` (verified by grep, not assumed) — the frontend the task refers to is
-decision_dash, a separate repo. The endpoint exists for it; nothing in THIS repo
-needed changing.
-
-#### COST, MEASURED
-
-Driven through the real `scheduled()` offline with a counting KV stub and a stubbed
-`fetch` installed before the module loads (so the Worker's own `INSTR` counts it),
-2026-09-01. N=40 watchlist; B names reporting BMO today; S prior-session AMC names
-screened, C of them carried; E = B + C:
-
-| pass | isolated? | measured | derived |
-|---|---|---|---|
-| `bmo-pass1`, B=1 S=3 C=2 (E=3) | **yes** — `branch=idle` | ext 5 · bind 17 · **capCost 22** | `ceil(40/20) + 4·3 + (3−2) + 5 + 2` = **22** |
-| `bmo-pass1`, B=1 S=3 C=0 (E=1) | yes, warm crumb | ext 3 · bind 10 · **capCost 13** | `2 + 4 + 3 + 5 + 0` = 14, less 1 for the warm in-isolate crumb |
-| `amc-pass2` 14:30, E=3 | **yes** — the 2pm branch is `m < 30` | ext 5 · bind 12 · **capCost 17** | `2 + 4·3 + 4` = 18, less the same 1 |
-| `prebank` 13:15 | **NO** — four EOD siblings | 43 / 82 invocation-wide | `ceil(N/20) + 3E' + 4` = **15** at N=40, E'=3 |
-
-So: **`ceil(N/20) + 4E + (S−C) + 5 + (C>0 ? 2 : 0)`** for a BMO pass,
-**`ceil(N/20) + 4E + 4`** for an AMC pass (unchanged from schema 1), and
-**`ceil(N/20) + 3E' + 4`** for the pre-bank. A heavy morning at E=10, S=12, C=8
-derives to **53**. Against this invocation's **10,000** that is under 0.6%, and five
-passes a day remain unremarkable. A day nobody reports and nothing carries over is
-**6**. Zero Claude calls unless a name is divergent.
-
-**THE PRE-BANK'S FIGURE IS A DERIVATION, NOT A COUNTER, deliberately** — rule #1's
-`collectMarketMood` rule. It can only ever fire beside the four EOD jobs, so its
-`_instr` is an upper bound on the job and a lower bound on the invocation, and
-differencing two runs at different E' does not isolate it either because the siblings
-are not deterministic across runs. What makes the derivation checkable is that the two
-ISOLATED passes above match their own formulae exactly, which validates the
-per-eligible terms the pre-bank's formula shares.
-
-#### THE RECORD
-
-`print` · `tape` · `implied` · `divergent` · `guidance` · `baseRate`, each either a
-measurement carrying `source` + `asOf` or a refusal carrying `status` + `reason`,
-plus `consensusSource` and `consensusBankedTs`.
-
-- **`divergent` is `true` / `false` / `null`, and `null` is a REFUSAL.** All five
-  inputs must be present. An unknown session, an unpublished actual or a missing
-  consensus means the question could not be asked, and `false` would claim it was.
-- **`tape` change% references two DIFFERENT closes** and both are "vs the regular
-  close": post is against `regularMarketPrice` (today's), pre against
-  `regularMarketPreviousClose` (yesterday's). Verified against Yahoo's own
-  `postMarketChange` / `preMarketChange`. A quote stamped earlier than `earningsTs`
-  is **refused** — it is a previous session's and would render as this print's
-  reaction. That guard is also what makes reading both windows unconditionally safe.
-- **EXTENDED-HOURS VOLUME IS OMITTED WITH THE REASON SHIPPED, and costs zero
-  fetches.** No Yahoo field carries it: `quoteSummary.price` and `v7/finance/quote`
-  both have only `regularMarketVolume` plus the two averages. The v8 1m
-  `includePrePost` feed cannot be summed honestly — measured over PANW/DELL/MDB/
-  NVDA/AVGO, **pre-market read 0 on every bar for 5 of 5 names** (111–330 bars each,
-  despite real price movement), and **4 of 5 carried their whole post-window figure
-  on the single 20:00:00Z boundary bar** at 8.7% / 9.6% / 12.6% of that day's regular
-  volume — the closing-auction share, on a day NVDA was not even reporting — while
-  DELL instead put 10,610,858 on one 20:03 bar. `regular + post` reconciles to
-  `regularMarketVolume` for no name. This is the income sleeve's tax-character
-  precedent: omitted with the reason, never nulled and never estimated.
-- **`implied` is the `long:` row's front-expiry `expectedMove`, and is NOT an
-  earnings-isolated move.** It spans every session to that expiry. The `basis` field
-  says so in words and `straddlesReport` says whether the expiry is even past the
-  print — calling it "the implied earnings move" would be the HV30-labelled-as-IV
-  failure. The pre-bank does not attach one at all.
-- **`guidance` fires ONLY on `divergent === true`**, once per ticker per report
-  (banked on the record and carried forward, so it is structural rather than a rule
-  to remember — and it survives the carry-over, which writes the same key). Its input
-  is `gatherEarningsFacts`' news window — **there is no 8-K or press-release feed
-  wired to this Worker** and none is invented; `source` names what was read and
-  `not-found` is the honest answer when it said nothing about guidance. It debits the
-  same `AI_RATE_GLOBAL_DAY` bucket via `cronMaySpend`, which **REFUSES on a KV
-  failure** where `aiGuard` proceeds — `aiGuard` has already checked a secret and is
-  serving a user, a cron has no second control at all.
-- **`baseRate` is `{status:'not-measured'}`.** Scoring beat-and-fade outcomes needs a
-  logged history these records only start accumulating now.
-
-#### THE ENDPOINT
-
-```
-GET /api/printtape?date=YYYY-MM-DD      default: ET today
-```
-
-KV assembly only — **zero fetches, zero writes, nothing recomputed**. Gated with
-**`requireSecret`, not `aiGuard`**: both check the same `x-dash-key`, but only
-`aiGuard` debits `AI_RATE_GLOBAL_DAY`, and charging a ceiling denominated in Claude
-calls for a request that makes none would let a page poll exhaust the budget the
-crons need.
-
-`meta.ran` distinguishes **an absent day index from an empty one**: `records: []` with
-`ran: true` means the job ran and nobody on the watchlist reported; `ran: false` means
-it did not run, or the day is past `PRINTTAPE_TTL`. A ticker skipped on one pass and
-measured on a later one is **not** reported as skipped. **`meta.banked`** lists names
-whose consensus was pre-banked but whose report has not happened — their records ARE
-served, because a banked consensus nobody can read may as well not exist.
-
-Checked by `node printtape.check.mjs` (543 comparisons, up from 272).
-
-### `GET /api/income/*` — the income sleeve
-
-The dividend half of decision_dash: three endpoints, one saved list, **no Claude
-call anywhere in the feature and no cron change**. Added 2026-08-19.
-
-```
-GET  /api/income/list            origin-gated read of income:tickers
-POST /api/income/save            requireSecret — it is a KV write
-GET  /api/income/batch?symbols=  one mechanical row per name
-```
-
-| constant | value | what it gates |
-|---|---|---|
-| `INCOME_SCHEMA` | 1 | row shape, checked by **strict equality** |
-| `INCOME_FRESH_MS` / `INCOME_ROW_TTL` | **6h / 36h** | the row's slow half — freshness ≠ retention, same reason as `premium:` |
-| `INCOME_MAX_SYMBOLS` / `INCOME_MAX_SLEEVE` | 30 / 60 | per batch request / per saved list; over-cap names are reported as `dropped`, never silently |
-| `INCOME_DIV_RANGE` / `INCOME_DIV_INTERVAL` | `6y` / `1mo` | the dividend-history pull. `1mo` carries the **identical** event set at 10,255 bytes against 164,899 for `1d` |
-| `INCOME_DIST_WINDOW` / `INCOME_FIXED_RATE_MIN_REPEAT` / `INCOME_DIST_MIN_CHANGES` | 12 / **0.5** / 4 | the fixed-rate vs variable classifier |
-| `INCOME_GROWTH_YEARS` / `INCOME_GROWTH_MATCH_DAYS` | 5 / 45 | the 5y growth anchor and how near a payment must sit to it |
-| `INCOME_EXDIV_UPCOMING_DAYS` / `INCOME_PAYOUT_HIGH_PCT` | 7 / **90** | the `exDivUpcoming` and `payoutHigh` events |
-| `INCOME_SHRINK_WARN_PCT` | 0.30 | WARN on save, **never blocks** — same guard as the watchlist |
-| `INCOME_ENTRY_FIELDS` | `ticker`, `addBelow`, `category` | the saved-entry **allowlist**; anything else is stripped and named |
-| `INCOME_CATEGORIES` | `income` \| `cyclical` \| `value` \| `defensive` | the `category` enum, default `null`, matched case-insensitively |
-
-**`income:tickers` is a SEPARATE list from `watchlist:tickers`.** Different purpose,
-different cadence, and — the load-bearing part — `sweepUniverse()` reads the watchlist
-and nothing else, so folding the sleeve in would silently enlarge the IV sweep, the
-move-series sweep and the analysis refresh. There is **no server-side default
-seeding**: an absent key means the user has not built a sleeve, and the reader returns
-**`entries: null`, never `[]`** with one of four distinguishable reasons — `[]` would
-mean "a sleeve exists and is empty", a different state. `POST` snapshots `income:prev`
-before every overwrite.
-
-**THE ENTRY IS A THREE-FIELD ALLOWLIST AND IT REPORTS ITSELF.** Entries are objects,
-`{ ticker, addBelow, category }`. The stored shape is fixed rather than whatever JSON
-arrived, because reflecting arbitrary caller fields into a value that later renders is
-the shape of the unauthenticated `/api/analysis/:ticker` write rule #5 closes. That
-decision stands; what does not is applying it in silence:
-
-| kind | what happens | reported as |
-|---|---|---|
-| a field not on `INCOME_ENTRY_FIELDS` | **stripped** | `droppedFields: ['notes','sector']` + WARN |
-| an allowlisted field whose value fails | **coerced to `null`** | `invalidValues: [{ticker, field, value, reason}]` + WARN |
-
-**Neither ever rejects the entry** — a bad `category` must not cost you the ticker —
-and **both arrays are always present on the save response, empty included**, so a
-consumer checking `.length` need not distinguish "nothing was dropped" from "this
-Worker predates the reporting". `rejected` still counts only entries whose *ticker*
-failed, which is what made the old silence possible.
-
-**`category` is the Diversify tab's storage**: a user-assigned classification the
-consumer renders groups from, designed in decision_dash's DESIGN.md. It is
-`INCOME_CATEGORIES` (`income` / `cyclical` / `value` / `defensive`) or `null`, matched
-case-insensitively. An **enum rather than free text** is what keeps the reflection
-concern satisfied — still an allowlist, now with one constrained field. **The READ
-normalises through the same allowlist**, so `category` round-trips and a hand-written
-KV value carrying junk surfaces as `storedDroppedFields` / `storedInvalidValues` on
-`/api/income/list` instead of being flattened. `category` also rides every
-`/api/income/batch` row beside `addBelow`, with `categorySource` distinguishing "the
-sleeve was read and this name is not in it" from "the sleeve is unreadable".
-
-**THE FIXED-RATE vs VARIABLE CLASSIFIER IS MEASURED, AND TWO OBVIOUS ALTERNATIVES
-WERE FALSIFIED.** A declared-dividend equity holds the same amount for several
-periods then raises; a fund passes through what it collected. So the discriminator is
-`zeroFrac` — the fraction of consecutive payments that are **exactly equal** — not how
-much the amount varies. Measured over 30 names, 2026-08-19:
-
-| discriminator | variable funds | steady quarterly ETFs | equities | verdict |
-|---|---|---|---|---|
-| coefficient of variation | 1.3–85.4% | 7.2–22.1% | 3.2–5.6% | **overlaps** — QYLD/RYLD/SPYI are *steadier* than SCHD/VYM/DGRO |
-| down-moves ÷ periods | 0.18–0.55 | 0.45–0.55 | 0.00 | **overlaps** |
-| **`zeroFrac`** | **0–18%** | **0–9%** | **73–100%** | **separates, with a 55-point gap** |
-
-It also gets **`O` right**: Realty Income pays *monthly* and scores 82%, so its growth
-rate and cut flag stay meaningful where a "monthly ⇒ variable" rule would have
-suppressed both. **Consequence the caller must know: SCHD, VYM, DGRO, VIG, SPYD, HDV
-and DVY all classify VARIABLE**, and suppressing `cut` for them is the point rather
-than a side effect — SCHD's latest distribution is −1.56% on the prior, which is a
-fluctuation and not a dividend cut.
-
-**`ttmRate` takes one year's worth of payments at the observed cadence, NEVER a
-365-day date window.** Four quarterly gaps span ~364 days, so a date window counts
-five quarters: before the fix JNJ read 6.54 against Yahoo's own 5.24 and O read 3.513
-against 3.235, both exactly one payment too many.
-
-**The ex-dividend gotcha, quantified.** `summaryDetail.exDividendDate` is routinely
-the most recent **past** date — the catalyst-card defect again. Measured over 15
-payers: **9 published a past date** (XOM PG MO ABBV HD T VZ IBM O), 6 a future one,
-and all 3 ETFs published nothing at all. The date ships as published with
-`exDivIsPast` against **ET today**, and **the next one is never estimated from
-cadence** — a projected date renders identically to a declared one.
-
-**Tax character (qualified vs ordinary) is OMITTED, not nulled.** Nothing in any
-Yahoo module carries it and it is not derivable: it depends on the issuer's 1099-DIV
-allocation and on the holder's own holding period. Only `taxCharacterNote` ships, so
-a consumer reaching for the value finds the reason rather than a field to fill.
-
-**Cost, measured** (`wrangler dev --remote` against production KV, N=10, crumb warm):
-**cold capCost 42** (21 ext + 21 bindings) · **warm 12** (1 ext + 11 bindings). The
-model is `4N + ceil(N/20) + 1` cold and `N + ceil(N/20) + 1` warm, plus 4 for a cold
-crumb. **The price half is live on every request** — one spark per 20 names — because
-a 6-hour-old price would make `inAddZone` a fiction, and that event is the whole
-reason `addBelow` exists.
-
-**KNOWN CAVEAT — `payoutHigh` fires on REITs and it is not a false reading.** `O`
-reports a published payout ratio of **236%** and ABBV **190%**, both genuine >90%
-values on Yahoo's GAAP-earnings denominator. A REIT pays out of FFO, so a GAAP payout
-ratio over 100% is ordinary for the structure rather than distress. The event is left
-firing as specified and the ratio itself ships on the row, so a consumer can render
-the number rather than only the flag; suppressing it would need an industry read this
-endpoint does not fetch.
-
-### `GET /api/radar` — off-watchlist discovery
-
-Answers one question: **which quality names NOT on `watchlist:tickers` deserve
-attention today.** At most `RADAR_MAX` (5), never padded — a thin day returns two,
-or zero, and says which it was. **No Claude call anywhere on the path**, so it is
-origin-gated like the other market reads and takes **no `x-dash-key`**; the only
-write is its own `radar:{PT-date}` day cache. Added 2026-08-19 for the
-decision_dash rebuild.
-
-The gates, as named constants in `worker.js`, applied to every candidate from
-every source:
-
-| gate | constant | value |
-|---|---|---|
-| market cap > | `RADAR_MIN_MARKET_CAP` | **$10B** |
-| price > | `RADAR_MIN_PRICE` | **$20** |
-| avg daily $-volume ≥ | `RADAR_MIN_DOLLAR_VOL` | **$50M** — `price × averageDailyVolume3Month` |
-| front-chain open interest ≥ | `RADAR_MIN_CHAIN_OI` | **1,000** — calls + puts, nearest listed expiry |
-| returned / mover slots / sector slots | `RADAR_MAX` / `RADAR_MOVER_SLOTS` / `RADAR_SECTOR_SLOTS` | **5 / 3 / 2** |
-| sector picks priced in one call | `RADAR_SECTOR_PROBE_MAX` | 20 (11 today, so it does not bite — and it logs and reports if it ever does) |
-| day cache | `RADAR_TTL` / `RADAR_RETRY_MS` | 36h retention / 10 min before an **incomplete** build is rebuilt |
-
-Sources are the Yahoo predefined screeners in `RADAR_SCREENERS` (`day_gainers`,
-`most_actives` — their rows already carry every field the gates need, so **zero
-extra fetches**) and the `opportunity` picks banked in `market:sectors`, priced by
-**one batched** `/v7/finance/quote` call rather than one per name. **An S&P 500
-golden-cross sweep is deliberately out of v1**: no verified constituent source is
-wired, and a hand-typed 500-name list is the unverifiable constant honesty rule 18
-exists to kill. v2 needs a constituent list fetched from a checkable source — the
-sweep itself is then cheap, since `yahooSparkCloses` takes 20 symbols a request and
-`smaCrossState()` already exists (~25 fetches for 500 names).
-
-**`watchlist:tickers` unreadable REFUSES**, the same contract as `sweepUniverse()`:
-radar is *defined* as "not on the watchlist", so with no exclusion set it answers a
-different question under the first one's label. A refusal returns
-**`candidates: null`, never `[]`** — `[]` means the gates ran and nothing survived —
-and **is never cached**, because it is a fact about our own config rather than about
-the day. A failing *source* is named instead of silently narrowing discovery:
-`sources: [{name, ok, reason, rows}]`, with `complete` true only when every source
-reported `ok`.
-
-**Ranking is `rvol` (today's volume ÷ 3-month average), tie-broken on `|chgPct|`,
-with RESERVED SLOTS per lane.** Ranked in one pool the sector picks could never
-surface — a large cap on an ordinary day sits at ~0.3× while a gainer sits at 3–15× —
-which would make that source a branch that cannot fire (honesty rule 23). Unused
-slots spill to the other lane, and spilling only ever promotes a name that already
-cleared every gate. **Optionability is checked ONLY on the final ≤5 and there is no
-backfill**: a name that fails it reduces the count rather than promoting the next one
-behind an unchecked chain.
-
-`?trail=1` emits the full elimination trail — every row considered, the gate that
-removed it, and its numbers. The trail is *stored* either way so a cached record can
-answer for it; `funnel` (counts per gate) ships unconditionally.
-
-**Cost, measured** (`wrangler dev --remote` against production KV, 2026-08-19):
-**warm 1** · **cold 13** with a warm crumb (8 ext + 5 bindings) · **cold 16** with a
-cold crumb (10 ext + 6 bindings) · **refusal 2**, writing nothing.
-
-**`RADAR_MIN_DOLLAR_VOL` is a BACKSTOP on this universe, not a binding gate, and
-that is measured rather than assumed.** Over the 111 rows considered on 2026-08-19
-it eliminated **zero**: of the 53 that had cleared price + market-cap, the minimum
-average dollar volume was **$76M** (p10 $245M, median $1.2B, max $46.1B). That is
-structural — `most_actives` selects for volume by definition and `day_gainers`
-requires a move — so the earlier gates catch the thin names first. **The gate is
-reachable and was driven to prove it**: raised to $2B on the same data it eliminated
-**29** rows and changed every survivor, and 11 rows in the raw screener output really
-did sit below $50M (DRD $9M, ALMR $11M, OGC $13M …) but were removed by price or
-market-cap ahead of it. So this is not the `no-leaps` failure.
-
-### `top3:{PT-DATE}` — the daily top-3 options ranking
-
-**Three parts, one cron job, no new endpoint and no new page-load fetch.** Added
-2026-08-25. A fourth job on the 1:15pm PT branch sweeps the watchlist through the
-same computation path `/api/long/:ticker` uses, ranks the result, and writes one
-record that rides on the existing `/api/long/batch` envelope beside `macro`.
-
-| constant | value | what it is |
-|---|---|---|
-| `TOP3_SCHEMA` | 1 | record shape, checked by **strict equality** |
-| `TOP3_MAX` | 3 | slots published, never padded |
-| `TOP3_TTL` | **7d** | retention outlives the PT day the key names **and the weekend / holiday gaps the writer's trading-day schedule creates**. Was 36h until 2026-08-31 |
-| `TOP3_SWEEP_KEY` | `top3sweep:last` | dedup, **outside** the `top3:` prefix |
-| `TOP3_SWEEP_STAMP_TTL` | **= `TOP3_TTL`** | the dedup stamp ages *with* the record it dedups. Was a bare `172800` literal at the put site |
-| `TOP3_LANES` | `B`, `C` | the eligible pool: single-leg longs and debit verticals |
-| `TOP3_MIN_EPISODES_TO_50` | **2** | `expectancyEpisodesTo50` floor. **Missing FAILS** |
-| `TOP3_ANCHORS` | 0.50 / 0.60 / 0.80 / 0.70 / 1.20 ± 0.90 / 5000 | pBe · min-coverage · sharpe · winRate · BE/EM ceiling and span · expected dollars |
-| `TOP3_WEIGHTS` | 20 / 15 / 25 / 15 / 15 / 10 | probMarket · probMeasured · sharpe · win · beEm · dollars, summing to 100 |
-| `TOP3_SWEEP_WALL_WARN_MS` | 150s | the sweep REPORTS past this; it never truncates |
-| `TOP3_SYSTEMIC_FAIL_RUN` | 5 | consecutive failures at which one systemic fault is named |
-| `TOP3_MAX_EXCLUDED` | 60 | stored `excluded[]` cap, with `excludedTotal` beside it |
-| `TOP3_SERVE_WALKBACK_DAYS` | **5** | how far `readTop3` probes back when today's key is absent — a **key-existence probe, not a validity judgment**; `TOP3_TTL` decides what still exists. 5 is the deepest gap the NYSE calendar produces around one missed run: a Fri+Mon closure read on the Tuesday |
-
-**THE SWEEP IS STRICTLY SEQUENTIAL AND THAT IS NOT ABOUT THE CAP.** The whole job
-costs well under a tenth of the 10,000. The binding constraint is **Yahoo crumb
-rate-limiting** — the same reason the client's "Load all" is one awaited request at
-a time. Measured cold on the request path 2026-08-25 (isolated by construction,
-three tickers, identical): `/api/long/:ticker` **8 ext / 11 bind / capCost 19**.
-The sweep's per-ticker term is that minus the endpoint's macro read, plus one
-`readLongRow` probe and one `analysis:` verdict read: **≈ 20 per name.** At the
-live 40-name watchlist, all cold, that derives to **≈ 803 capCost**, ~8% of the
-ceiling.
-
-**THE SERVING WINDOW IS "THE NEWEST RECORD THAT STILL EXISTS", NOT "TODAY'S".**
-Fixed 2026-08-26. `readTop3` reads `top3:{today}` and, on a miss, walks back
-calendar days. The write happens at 1:15pm PT, so today-only reading returned
-`top3: null` on every trading morning while a valid record sat in KV. Nothing
-about the writer, the stamp, the schema or the ranking changed — only which key
-is read.
-
-##### THE TTL WAS THE OTHER HALF OF THE SAME DEFECT — 2026-08-31
-
-**The walk-back reader cannot recover an evicted key.** At `TOP3_TTL` 36h a
-Friday 13:15 PT record expired ~01:15 PT Sunday, so **every Monday morning — and
-every morning after a market holiday — had no servable record at all**, and the
-walk that had just been built to find it was probing keys that no longer existed.
-The check suite had already printed the number that says so: one unreachable
-probe depth, `back=3`, which is *exactly* the Monday-finds-Friday hop.
-
-That contradicts the aged-not-suppressed rule this repo applies everywhere else.
-A Friday-banked ranking read on Monday is **valid, just old**, and belongs on
-screen under its own `ptDate`. **The in-repo precedent is the `macro:state` rider
-on this very same `/api/long/batch` envelope** — 90d retention against a 26h
-freshness window, so an aged read is *labelled*, never blanked. (Noted as
-precedent only; macro is not refactored here.) Blanking is the worse lie: the
-reader cannot tell "the job never ran" from "the answer expired underneath you".
-
-| | before | after |
-|---|---|---|
-| `TOP3_TTL` | 36h | **7d** (`7 * 24 * 3600`) |
-| `TOP3_SERVE_WALKBACK_DAYS` | 3 | **5** |
-| `top3sweep:last` TTL | bare `172800` (2d) literal | **`TOP3_SWEEP_STAMP_TTL` = `TOP3_TTL` = 7d** |
-| unreachable probe depths | 1 (`back=3`) | **0** |
-
-**7d rather than no TTL:** a three-day holiday weekend plus one missed cron is
-four calendar days, so 7d clears the gap with margin while the key stays bounded.
-Footprint is ~7 records at the ~15 KB measured at N=11 — negligible. **The
-record's own `ptDate` is the honesty mechanism, not eviction.**
-
-**The stamp TTL is stated rather than left implicit.** `top3sweep:last` was
-evicted over a weekend at 2d, which is *harmless for its dedup purpose* — an
-absent stamp simply permits the run, which then rebuilds the day it is asked for.
-It is changed anyway so the two keys age together: "the stamp says Friday and
-Friday's record is present" is one coherent weekend reading, while "the stamp
-expired but the record did not" is a third state that means nothing and has to be
-reasoned away every time it is seen.
-
-**The five depths, and what each is for:** `back=1` every trading morning ·
-`back=2` Sunday, or the Monday after a one-day gap · **`back=3` Monday morning
-reading Friday's — the ordinary weekend, and the case that returned `null` for
-the whole of every Monday** · `back=4` the Tuesday after a Monday holiday ·
-`back=5` the Tuesday after a Fri+Mon closure, reading Thursday's.
-
-| path | `top3` reads | `/api/long/batch` capCost at N=2, measured 2026-08-31 |
-|---|---|---|
-| today present | 1 | **4** — `N + 2`, unchanged |
-| today absent, `-3` hit (Monday morning) | 4 | **7** |
-| nothing in the window | 6 | **9** — the ceiling, `N + 7` |
-
-`extFetches 0` on all three. **The hit path costs nothing extra**; the five extra
-reads are paid only when today's key is genuinely absent.
-
-The record is **served unmodified and carries no `served` marker** — `ptDate` and
-`asOf` are already on every record from every writer, and the consumer compares
-`ptDate` against its own today. Verified byte-identical against the stored value
-on the hit path. **A KV throw aborts the walk** rather than spending five more
-reads against a binding that just failed, which keeps the pre-fix behaviour on
-that path exactly. **A schema mismatch reads as absent and the walk continues**,
-which is what absent means everywhere else in the file.
-
-**REACHABILITY IS ARITHMETIC AND IS RE-DERIVED, NEVER RESTATED.** A record read k
-calendar days back is at least `(k−1)×24h` old, so `back=k` is reachable only
-while `(k−1)×24h < TOP3_TTL`: at 36h that was **k ≤ 2**, and at 7d it is
-**k ≤ 7**. `top3.check.mjs` §10g computes that bound from `TOP3_TTL` itself and
-prints the count of unreachable depths, so if either number moves again a dead
-branch is a stated figure rather than a silent one.
-
-**THE WALK'S CAP AND THE TTL ARE SEPARATE BOUNDS.** A record six days back is
-inside the 7d TTL and is still not served, because the walk stops at 5 — pinned
-by §10h so raising one and forgetting the other is a failing comparison rather
-than a surprise.
-
-**A CACHED ROW INSIDE `LONG_FRESH_MS` IS REUSED, and an `error` row never is.**
-Reusing a fresh error row would freeze a transient Yahoo failure for four hours.
-
-**`refreshLongTicker` DOES NOT THROW ON A YAHOO FAILURE — it returns
-`{ok: false, status: 'error'}`**, so a `try/catch` alone sees a clean result. That
-would have counted a broken run as complete and dedupped it out of the day, which
-is the `iv-sweep` defect exactly. Classification is therefore on the row's own
-status, and it separates two things one `ok: false` runs together (honesty rule 17):
-
-| status | counted as | blocks the stamp? |
-|---|---|---|
-| `error`, or a thrown exception | **failed** — infrastructure, ours to retry | **yes** |
-| `no-options` / `no-iv` / `no-expiries` | **skipped** — a domain fact about the name | no |
-
-Same split, same reason, as `collectMoveSeries`'s `written + skipped === N`.
-
-**The ranking pass ranks rows held IN MEMORY rather than re-reading KV**, and that
-is a correctness choice rather than a shortcut: KV is eventually consistent
-(measured elsewhere in this repo — 404 at +60ms, 200 at +839ms after a write) and
-the sweep takes minutes, so a read-back of the last names written could return the
-previous day's row. It makes **zero** outbound fetches; its only KV traffic is one
-`analysis:{TICKER}` verdict read per ticker, **through `readAnalysisRecord()`**.
-
-**Direction comes from the verdict and HOLD excludes the ticker entirely.**
-BUY → CALL-type only, SELL → PUT-type only, HOLD or no verdict *for today's PT
-date* → excluded. `rating` is taken regardless of the record's `ok`, the same call
-`directionalRead` makes and for the same reason — this uses the record for a
-DIRECTION, not to render a call — and the record's `era` rides on the entry.
-
-**The score is 0–100 against FIXED anchors, never percentiles of the day's pool.**
-A percentile would make today's score incomparable with yesterday's and would
-guarantee a top 3 exists however bad the day is. Every component is clipped to
-[0,1] and **every subscore is stored** — input, anchor, raw ratio, whether it
-clipped, the clipped component, its weight and the points it contributed. The score
-must be decomposable, never a bare number.
-
-**`probMeasured` takes the MIN of `coverage1y` and `coverage3y`, deliberately.**
-The min makes the worse regime the binding one, so a PLTR-style 1y collapse drags
-the score even where 3y is strong. The two are never averaged — their disagreement
-*is* the regime warning. Measured on the fixture at 1y 0.20 / 3y 0.90 the min gives
-component 0.3333 against an average's 0.9167: **8.75 points** of difference.
-
-**`beEm` is the one INVERTED component**: `(1.20 − beEm) / 0.90`, so 1.20 scores 0
-and 0.30 or lower scores 1.
-
-**ONE SLOT PER TICKER.** A name is represented by its single highest-scoring gated
-candidate and can never fill more than one slot. Ties break score desc → sharpe
-desc → symbol asc, so two runs over the same rows publish the same order.
-
-**A PARTIAL RUN WRITES BUT DOES NOT STAMP** — the `collectMarketMood` split. A
-ranking over 36 of 39 readable names is a finding; the run is not done, so the next
-firing retries and rewrites the key whole, reusing the rows already banked. A run
-where **every** ticker failed writes nothing. An empty universe **refuses before
-stamping**, same contract as `recordWatchlistIv` / `collectMoveSeries` /
-`collectMacroState`.
-
-Measured end to end on a local `wrangler dev` with KV seeded from production,
-2026-08-25 (11 names, all cold): sweep **11 fetched / 0 reused / 0 failed in 8.9s**,
-statuses `{"ok":10,"no-options":1}`; pool 42 in / 25 gated in / 17 out with the
-funnel `{direction 42, liquidity 0, vol 12, episodes 5, inputs 0}`; **3 of 3
-published**. A second firing reported `top3 already built today, skipping`; with the
-stamp cleared it re-ran **0 fetched / 11 reused in 0.1s** and published byte-identical
-entries. Checked by `node top3.check.mjs` (240 comparisons).
-
-### `long:{TICKER}` retention, the 7:00am row sweep, and the `longarch:` archive
-
-**One class of fix, from two findings on Monday 2026-08-31 at 8am PT: retention
-that survives the writer's own schedule gaps, and snapshots that survive their
-own overwrites.** It sits beside the `TOP3_TTL` entry above because it is the
-same failure wearing a different key.
-
-| constant | before | after | what it is |
-|---|---|---|---|
-| `LONG_ROW_TTL` | 24h | **7d** | KV retention for `long:{TICKER}` |
-| `LONG_FRESH_MS` | 4h | **4h — unchanged** | the freshness horizon. NOT touched |
-| `LONGARCH_TTL` | — | **7d** | retention for one banked sweep snapshot |
-| `LONGARCH_SLOTS` | — | `open` \| `eod` | 7:00am PT sweep / 1:15pm PT sweep |
-| `MORNING_ROWS_KEY` | — | `morningrows:last` | the 7am job's own daily dedup stamp |
-| `MORNING_ROWS_STAMP_TTL` | — | **172800** (2d) | matching `ivsweep:last` and the other siblings |
-
-#### FINDING 1 — the whole Options surface read "not loaded", and 24h is why
-
-Friday's 1:15pm PT top-3 sweep had written a `long:{TICKER}` row for every
-watchlist name. The cron gate skips weekends, so nothing rewrote them; at 24h
-every one of those keys was **evicted on the Saturday afternoon**, and the tab
-had no rows at all until Monday's own 1:15pm sweep — the writer's own
-trading-day schedule opened a gap its retention could not span.
-
-**THE DERIVATION, WHICH IS A CALENDAR FACT AND NOT A ROUND NUMBER.** The binding
-case is a **Thursday 1:15pm PT write read on the Tuesday morning after a
-Friday+Monday market closure**: Thu 13:15 → Tue 08:00 is **~115h ≈ 4.8d**. Add
-headroom for one missed cron and 7d clears it. That is the same figure, for the
-same class of gap, as `TOP3_TTL` and `MOVES_TTL` — *"the weekend / holiday gaps
-the writer's trading-day schedule creates"*.
-
-**`LONG_FRESH_MS` STAYS 4h. THIS CHANGES RETENTION ONLY.** The stale badge, the
-`/api/long/:ticker` cache-hit test and the sweep's reuse gate all read freshness
-and are untouched. **Verified, not assumed, that longer retention cannot reach
-anything that ranks or scores** — a row that merely renders older is a labelled
-read, while a row that silently enters a ranking is a fabricated one:
-
-| guard | where | holds? |
-|---|---|---|
-| `age < LONG_FRESH_MS && cached.status !== 'error'` — the sweep's reuse gate | `top3Sweep`, `worker.js` | **yes**, a 4h gate, untouched |
-| a row whose own PT date is not `todayPt` is dropped | `top3Rank`, `worker.js` | **yes** — a banked row can never ride into a published ranking under a later day's key |
-| `row.schema === LONG_SCHEMA`, strict equality | `readLongRow`, `worker.js` | **yes** — a longer-lived row cannot outlive its own shape |
-
-Neither frontend reads `LONG_ROW_TTL`; the stale badge is driven by
-`_meta.ttlSeconds`, which is `LONG_FRESH_MS`.
-
-**`premium:{TICKER}` is deliberately NOT raised alongside it.**
-`refreshLongTicker` gates the warm path on `PREMIUM_FRESH_MS` (4h) and reuses a
-**fresh** header only, so a longer retention there would never be read.
-
-#### The 7:00am PT branch — `collectMorningRows`, which RANKS NOTHING
-
-`h === 7 && m < 45` dispatches one job, `collectMorningRows(env)`. It runs the
-same sequential `sweepUniverse()` → `top3Sweep()` path the 1:15pm job runs, so
-every watchlist name has a fresh row for the trading morning rather than only
-after 1:15pm. **7:00am PT is 10:00am ET, 30 minutes after the open: the earliest
-firing that reads today's chain rather than yesterday's.**
-
-**IT MUST NEVER RANK, AND THIS IS THE WHOLE CONSTRAINT.** It does not call
-`collectTop3`, does not write `top3:{PT-date}`, and **does not touch
-`top3sweep:last`**. `collectTop3`'s dedup is a **PT-date compare** — a 7am stamp
-would make the 1:15pm firing log *"top3 already built today, skipping"* and
-silently replace the day's official post-close top-3 with one **priced off
-opening spreads**, under the same key and the same label. Populating rows and
-publishing a ranking are two different acts; only the second belongs to 1:15pm.
-The constraint is written out on the function so nobody "simplifies" it later.
-
-- **Own dedup stamp**, `morningrows:last`, outside any scanned prefix — the
-  `ivsweep:last` rule. Stamped only when **zero** tickers hit an INFRASTRUCTURE
-  failure; `no-options` / `no-iv` / `no-expiries` are complete domain outcomes
-  and do not block it. **`m < 45` admits three firings — 7:00, 7:15 and 7:30**
-  (widened from `m < 30` on 2026-09-02, when both firings of the two-firing
-  window burned on one transient crumb outage), so a persistently failing name
-  costs two extra passes a day and no more — and each retry costs **only** the
-  names that failed, because the rest are inside `LONG_FRESH_MS` and get reused.
-  **This is no longer the same width as the 1:15pm window**, which is
-  `m >= 15 && m < 45`: 30 minutes and two firings.
-- **No calendar logic was added.** `scheduled()` gates on the Pacific trading day
-  upstream of branch dispatch, so weekends and NYSE holidays are already handled.
-- **7:00am PT is inside the 12–22 UTC window in BOTH regimes** — 14:00 UTC on
-  PDT, 15:00 UTC on PST — which rule #2 requires be checked before scheduling
-  any new Pacific hour. **The cron expression itself does not change**, not for
-  this branch and not for the 2026-09-02 widening either: the trigger already
-  wakes us at `:30`. (The range was `13-22` when this was written and became
-  `12-22` on 2026-09-01 for the print-tape BMO pass; 7:00am PT is inside both.)
-- **Budget, derived not estimated:** ~8–9 external fetches per name cold
-  (`refreshLongTicker`'s measured figure), and **7am is always cold** — the
-  shared `premium:{TICKER}` header banked by yesterday's 1:15pm sweep is long
-  past `PREMIUM_FRESH_MS`, so the warm branch cannot fire. With the per-name KV
-  traffic that is ~20 capCost a name, **~800 at N≈40**, zero Claude calls,
-  strictly sequential because the Yahoo crumb is the binding constraint.
-  **This branch carries ONE job**, so unlike the 1:15pm and 2:00pm branches its
-  `_instr` *is* a measurement rather than an upper bound.
-
-**KNOWN INTERACTION, DOCUMENTED RATHER THAN FIXED.** The cold long path banks
-the day's `iv:{TICKER}:{DATE}` sample unconditionally (`src: 'long-live'`, no
-`skipIfPresent`), so this job now writes an **opening** IV reading every trading
-morning. Ordinarily harmless: the dedicated 1:15pm iv-sweep overwrites the same
-key unconditionally — *that overwrite is the sampling design* — so the series
-stays post-close-based. **Residual: on a day the 1:15pm iv-sweep fails, that
-date's sample is silently an opening reading in a post-close series**, and `src`
-is last-writer-wins so nothing stored says which it was. Noted beside
-`recordIvSample`'s provenance comment. Not suppressed, because the `long-live`
-write is what collects history for **off-watchlist** names.
-
-#### FINDING 2 — every computation destroys the evidence of the last one
-
-Friday's GOOGL row carried a **Lane B Oct 360 call at E[R] 165%**; Monday's
-recompute put the same expiry at **14–19%**. An order-of-magnitude disagreement,
-and **undiagnosable**, because `long:{TICKER}` is one key per ticker overwritten
-in place and the Friday row was gone.
-
-So both cron sweeps now bank every swept row, verbatim, to
-
-```
-longarch:{TICKER}:{PT-date}:{slot}      slot = 'open' (7am) | 'eod' (1:15pm)
-```
-
-with `LONGARCH_TTL` 7d. The rules, each with its reason:
-
-- **Own prefix, NOT `long:{TICKER}:{date}`.** `longarch:` and `long:` are
-  **disjoint string prefixes** — after `long` comes `a`, not `:` — so a
-  `list({prefix:'long:'})` can never read an archive record as a ticker. Same
-  rule the KV table records for `ivsweep:last` outside `iv:` and for
-  `incomerow:` not being `income:`. (Confirmed: nothing in `worker.js` lists
-  over `long:` today; the prefix discipline holds regardless.)
-- **Cron sweeps ONLY — never an on-demand `/api/long/:ticker` refresh.**
-  `recordIvSample`'s provenance note already states the principle: a fixed-clock
-  write is a **daily series**, an on-demand write is a **record of what someone
-  opened**. Two stable snapshots a day at the same two clock points is what makes
-  a Monday-vs-Friday diff like-for-like.
-- **Reused rows are archived too.** The 1:15pm sweep may reuse a row expanded at
-  11am (inside `LONG_FRESH_MS`). That is not a defect to correct: **the SLOT
-  names when the snapshot was taken, the row's own `ts` names when its data was
-  computed**, and neither is rewritten to agree with the other.
-- **A retry firing overwrites the same slot** — newest per slot wins, the
-  session-brief precedent.
-- **The write is fully swallowed per key and never gates anything.** The archive
-  is a diagnostic artifact; the sweeps' products are the `long:` rows and the
-  `top3:` record. A run whose data landed and whose archive did not is a
-  **complete** run with a reported gap — the counts ride on `sweep.archive` of
-  the `top3:` record and on the 7am job's log line.
-
-**Read path:** `GET /api/long/:ticker?date=YYYY-MM-DD&slot=eod` (slot optional,
-default `eod`). Serves the archived row **verbatim** — no Yahoo touch, no cache
-write, no promotion into `long:{TICKER}`, nothing recomputed or backfilled. It is
-answered **before** the crumb, the cache probe and the macro read, so a miss can
-never fall through to a live refetch and answer today's question under a past
-date's URL. **`macro` is deliberately not attached**: every live path puts today's
-`macro:state` in the envelope so the row and the chip describe the same moment,
-and on an archive read that guarantee inverts. **A miss is a 404 carrying the
-standard `{ row: null, missing: {...} }` refusal shape with the probed key named
-in the reason — never an empty 200.** A bad `date` or an unknown `slot` is a 400.
-
-**Cost, for the record:** ~78 extra KV writes/day (39 names × 2 slots); storage
-≈ 39 × 2 × 7 × ~25 KB ≈ **15 MB** against the included 1 GB. **The archive only
-runs forward — it cannot recover anything from before its first deploy**, which
-is why the 2026-08-31 GOOGL discrepancy itself stays undiagnosable.
-
-**Checked by `node longarch.check.mjs` (234 comparisons — 166 at this change,
-183 after the 2026-09-01 cron rewrite, 234 after the 2026-09-02 crumb
-incident).** It is the only script
-in the suite that both extracts by source *and* imports the module, because half
-of what is at stake here is structural (who may write which key) and half is
-routed behaviour (the archive read must not fall through to a live refetch). Its
-floor is the exact count — every section is deterministic and offline. Both
-failure directions were driven before it was believed: reverting `LONG_ROW_TTL`
-to 24h reddens 7 comparisons, and making the 7am job stamp `TOP3_SWEEP_KEY`
-reddens 5 and names the function.
-
-### The Yahoo crumb, the fresh-error-row cache, and the third morning firing
-
-**Three fixes from one measured incident, 2026-09-02 ~07:05 PT — a root cause and
-two amplifiers.** It is the `LONG_ROW_TTL` lesson again on a different key, and
-the section above is its precedent: retention that could not span the gap the
-writer's own schedule creates.
-
-**WHAT HAPPENED.** Both `morning-rows` firings failed **all 40** watchlist tickers
-with `Yahoo crumb unavailable (all strategies exhausted)`, banked 40
-`status: 'error'` long rows — banking them **is by design**, a refusal is a
-finding — and every read path then served those rows back as **fresh** for four
-hours. One transient Yahoo failure at 07:05 took the whole Options surface out
-until 11:05, and every retry in that window was suppressed by the failure it
-would have fixed.
-
-#### FIX 1 — the crumb was banked for one hour, and the 7am sweep is 17.75 hours downstream
-
-`CRUMB_TTL` was 50 minutes in isolate memory and the `yahoo:crumb` KV copy
-expired at **3600s**. The last writer of a trading day is the 1:15pm PT sweep, so
-by 7:00am PT the newest crumb that could possibly exist had been dead for ~16
-hours.
-
-**THE 7:00am SWEEP COULD NEVER REUSE A CRUMB — not once, not on any day.** It had
-to acquire **cold at 10:00am ET**, the peak of Yahoo's anti-bot pressure on
-datacenter IPs.
-
-**THE ASYMMETRY IS THE FINDING, and it is not "the 1:15pm path was fine".** The
-1:15pm sweep runs the same function down to the line. Its own nearest predecessor
-is that morning's 7am sweep, **6.25h** earlier — which the 1h TTL could not span
-either, so 1:15pm acquired cold too. What differed was the **hour**, not the
-cache. Same code, same watchlist, one succeeds and one does not.
-
-| | before | after |
-|---|---|---|
-| in-memory hold | 50 min (`CRUMB_TTL`) | **no age test at all** |
-| KV retention | 3600s | **`CRUMB_KV_TTL` = 172800 (2d)** |
-| KV read | rejected anything older than 50 min | **reused whatever its age** |
-| failed cold acquisition | threw, always | **falls back to the bank; throws only with nothing banked** |
-| 401/403 re-acquisition | cleared `_crumbCache` only | **`getYahooCrumb(env, { force: true })`** |
-
-**REUSING ANY AGE IS SAFE FOR A STRUCTURAL REASON, NOT AN OPTIMISTIC ONE.**
-`yahooAuth` and both screener callers already re-acquire on a **401/403**, so a
-stale crumb **self-corrects on first use** at the cost of one extra fetch. A
-*missing* crumb has no such recovery — it guarantees a cold acquisition, and the
-incident is what a cold acquisition at 10:00am ET does. A maybe-dead crumb with a
-retry behind it strictly beats a guaranteed cold acquire. **2d rather than
-longer** so a Worker idle across a long weekend still re-acquires eventually
-rather than carrying a month-old cookie.
-
-**THE LONGER RETENTION ARMED A LATENT BUG, FIXED IN THE SAME COMMIT.** The
-401/403 paths cleared `_crumbCache` and called `getYahooCrumb` again — which read
-**the same dead crumb straight back out of KV** and retried with it, so the
-"re-acquisition" re-acquired nothing and spent a fetch to change nothing. At a 1h
-KV TTL that was mostly masked by expiry; at 2d it would be permanent.
-**`force: true` skips both caches, acquires fresh, and OVERWRITES the KV copy.**
-All **three** 401/403 sites use it (`yahooAuth` and the two screener callers) —
-`longarch.check.mjs` §9f asserts the count and that `force` appears **nowhere
-else**, because a warm-up caller that forced would re-acquire on every sweep and
-undo the whole fix.
-
-**A FAILED COLD ACQUISITION NO LONGER THROWS IF ANYTHING IS BANKED.** It warns,
-naming the bank's age in hours, and returns it. That is the line the incident came
-out of. Throw only when there is **nothing** banked at all.
-
-**After this the 1:15pm sweep's crumb carries the next morning's 7:00am sweep**,
-and cold acquisition migrates to the post-close hour where it has always
-succeeded.
-
-#### FIX 2 — a fresh `error` row is not a satisfied cache
-
-`top3Sweep`'s reuse gate has refused fresh error rows since the day it was
-written (`age < LONG_FRESH_MS && cached.status !== 'error'`). `handleLongTicker`'s
-**no-param** path did not: `if (cached && (fresh || cachedOnly))` served all 40
-error rows as `cached: true, stale: false`. **One gate is not a gate.**
-
-The no-param path now computes
-`serveCached = cached && (cachedOnly || (fresh && !errorRow))`. Two exclusions,
-both deliberate:
-
-- **`?cached=1` is a NO-FETCH PROMISE and still serves the error row as-is.** That
-  row renders as a *finding* — the reason and the timestamp — which is the correct
-  answer to "what is banked", and falling through would break the contract the
-  whole `/api/long/batch` + expand flow rests on.
-- **`?refresh=1` and the archive read are unaffected** — neither consults the cache
-  on this branch at all.
-
-`stale` is untouched: freshness stays a pure age question, and this is a *separate*
-reason not to serve.
-
-**The general rule, and it belongs beside the long-row facts:** error rows **ARE**
-banked, because a refusal is a finding — but **no path may treat one as a
-satisfied cache.** Same class as *"not loaded must not render like no trade
-here"*.
-
-#### FIX 3 — one more morning retry
-
-The window was `h === 7 && m < 30`: two firings, 7:00 and 7:15. Both burned on the
-same transient fault and the branch was out of retries by 07:20, with the next
-writer of those rows **six hours away** at 1:15pm. A transient fault that outlives
-the retry budget is indistinguishable from a permanent one.
-
-Widened to **`h === 7 && m < 45`** — **three firings, 7:00 / 7:15 / 7:30.** The
-dedup stamp makes the extra firing nearly free: a successful run reduces every
-later firing to a single KV read, and an unsuccessful one re-fetches **only** the
-names that failed, because the rest are inside `LONG_FRESH_MS` and get reused.
-
-**IT IS NO LONGER "the same width as the 1:15pm window", and the old comment said
-it was.** That window is `m >= 15 && m < 45` — 30 minutes, **two** firings. This
-one is now 45 minutes and **three**. Both halves are pinned in `longarch.check.mjs`
-§6f, re-derived from the dispatch lines in source, so the claim and the code
-cannot drift apart again.
-
-**THIS IS A CHANGE TO `scheduled()`, NOT TO THE CRON EXPRESSION** (rule #2). The
-trigger already wakes us at `:30`; no day, date or month goes anywhere near it,
-and 7:00am PT was already inside the UTC window in both regimes.
-
-#### Checked
-
-`node longarch.check.mjs` went **183 → 234**, and its `minComparisons` floor with
-it — the floor is the exact count, since every section is deterministic and
-offline. §5g is the serve rule (driven in both directions: the ok row must still
-be a cache hit and `?cached=1` must still serve the error row), §6f the window
-width re-derived from source, and **§9 the crumb**, which is a retention section
-of exactly §2's kind and lives here for that reason.
-
-**Six failure directions were driven before any of it was believed:**
-
-| fault injected | reddens |
-|---|---|
-| the 50-min age test back on the KV crumb read | **2** — §9b, 2 fetches where 0 were wanted |
-| `expirationTtl` back to 3600 | **1** — §9c |
-| `force` dropped from `yahooAuth`'s 401/403 path | **2** — §9f, both directions |
-| the unconditional throw restored on a failed acquisition | **4** — §9e |
-| `serveCached` back to `(cachedOnly \|\| fresh)` | **3** — §5g |
-| the window narrowed back to `m < 30` | **6** — §6a (2 dispatch) + §6f (4 arithmetic) |
-
-**§9b's value assertion passes under its own fault and the FETCH COUNT is what
-catches it** — with the age test restored, the 30-day crumb is rejected, the
-acquisition fails offline, and the new fallback hands the *same* crumb back. The
-returned value is identical; only `0 fetches` vs `2` says the cache was bypassed.
-A check that had asserted only the crumb string would have been green on the root
-cause.
-
-**AND §6f WAS ITSELF WRONG UNTIL THE REVERT WAS DRIVEN.** A bare
-`/h === 7 && m < (\d+)/` matched the **prose inside `collectMorningRows`'s own
-header comment** thousands of lines earlier — so it read `45` off a comment while
-the code said `30`, and passed on the exact fault it exists to catch. It is now
-anchored to the `} else if (…) {` framing. *An empty comparison is not a pass*, and
-neither is one reading the documentation instead of the code.
-
-### Worker endpoints, data sources, KV and cron → the `worker-internals` skill
-
-**Editing any `/api` endpoint, KV key, cron job, sweep, or external data source? Load
-the `worker-internals` skill first.** It holds the endpoint list, Yahoo crumb auth,
-`bsDelta` and the FRED risk-free rate, SEC EDGAR insider and 13F indexing, FINRA short
-interest, the full KV key and TTL table, the cron dispatch schedule, `primeTabs()` cost,
-and the sweep universe's refusal contract — including
-*"The sweep universe has ONE source, and an empty one REFUSES"*.
-
-It was moved out of this file because it is ~53 KB of reference that was loading into
-every session. The rules in it are not softer for living there.
+- **The IV sweep's unconditional overwrite IS the sampling design** — one sample per
+  name per day at 13:15 PT. **Never add `skipIfPresent` to the cron path**
+- The top-3 and 7am sweeps are **strictly sequential** — Yahoo crumb rate-limiting, not
+  the cap. **`refreshLongTicker` does not throw on a Yahoo failure**; it returns
+  `{ok:false, status:'error'}`, so a `try/catch` alone would stamp a broken run out of
+  the day
+- **The 7:00am PT `collectMorningRows` job RANKS NOTHING** — never `collectTop3`,
+  `top3:{PT-date}` or `top3sweep:last`. That dedup is a PT-date compare, so a 7am stamp
+  would make the 1:15pm firing skip and replace the day's post-close ranking with one
+  priced off opening spreads. Own stamp `morningrows:last`; `h === 7 && m < 45`
+- `longarch:{TICKER}:{PT-DATE}:{SLOT}` is written by the **cron sweeps only** — a
+  fixed-clock write is a daily series, an on-demand one a record of what someone opened.
+  The SLOT names when the snapshot was taken, the row's `ts` when its data was computed,
+  and a reused row legitimately disagrees. Served verbatim, forward only
+
+**`printtape:` — the four rules that make the record honest**
+
+- **NEVER COMPARE AN ACTUAL AGAINST A CONSENSUS FROM A DIFFERENT QUARTER** — same
+  period-end date by **string equality**, or the unmatched half is
+  `{status:'not-published'}`. The PRE-BANKED quarter NAMES the quarter; it does not
+  relax the gate
+- **`tape` is a PAIR of windows and the verdict reads `tape[tape.usedWindow]`** — the
+  freshest by `quoteTime`, **re-derived after every merge, never carried**, nothing
+  hoisted to the top level. **`consensusSource` and `consensusBankedTs` answer DIFFERENT
+  questions**: a bank was *taken* vs where **this record's** figures came from
+- **`divergent` is THREE-VALUED and `null` is a REFUSAL, not a "no."** `=== true` is the
+  only thing that may reach the guidance call, and **the verdict is re-run AFTER
+  `mergePrintTapeRecord`**
+- **The carry-over reads YESTERDAY'S DAY INDEX, never a re-scan** (Yahoo rolls
+  `earningsTimestampStart` forward within a day); a carried name with no `earningsTs` is
+  REFUSED, and **`prevTradingDay`/`nextTradingDay` skip NYSE holidays**
+
+### Feature records and the two skills
+
+**`printtape:` · `GET /api/income/*` · `GET /api/radar` · `top3:{PT-DATE}` ·
+`long:`/`longarch:` · the Yahoo crumb** each have their own constants and gates, and
+**the invariants above carry every rule from them a session can break in one edit.**
+TTLs, schemas, endpoint gates and the cron schedule are in **`worker-internals`** —
+**load it before editing any `/api` endpoint, KV key, cron job, sweep or external data
+source**; it also holds Yahoo crumb auth, `bsDelta` and the FRED risk-free rate, SEC
+EDGAR insider and 13F indexing, FINRA short interest, `primeTabs()` cost and the sweep
+universe's refusal contract. **Load `long-screen` before touching `longRow()`, any lane
+builder, `attachCoverage`, `expectancyFrom`, `probBeyondBreakeven`, `collectMoveSeries`,
+`collectMacroState`, or the Long tab rendering** — it holds Lane F's direction inversion
+(coverage is the probability of the WIN, the opposite of every other lane), Lane E's four
+gates and tail split, Lane A's coverage refusal, the `moves:` schema-2 pair shape and
+`macroRegime`'s sign convention.
+
+Every threshold, weight and anchor (`TOP3_ANCHORS`, `TOP3_WEIGHTS`, `PRINTTAPE_PASSES`,
+`RADAR_MIN_*`, `INCOME_*`) is declared at the top of its feature's block in
+**`worker.js`**, the source of truth; the why is in
+[`docs/history.md`](docs/history.md). **Do not restate a constant here** — a number
+copied into this file can disagree with the Worker.
 
 ### Frontends
 
-`dashboard.html` — macro landing view with **six tabs**. Every tab is deep-linkable
-by hash (`dashboard.html#long`; `#premium` redirects to `#long`), and `switchTab()` only lazy-loads a tab whose
-data is still empty — `primeTabs()` has usually painted it already.
+**Tab contents and the per-ticker card map are in `ARCHITECTURE.md` (*"The two
+pages"*)**; below is only what a session can break in one edit.
 
-| Tab | `#hash` | What it is |
-|---|---|---|
-| **Market** | `#market` | Default. Index/futures/commodities strip, the 6am Claude briefing headline, **Market Mood** (candlestick emotion read, directly under the brief), EOD card, Friday week-ahead, news cards, pre/post-market movers (≥ ±10%), IPO calendar, watchlist signals. |
-| **Midday** | `#midday` | The 11:30am PT midday pulse — session narrative, topics, next-day events, short-term trade ideas, big movers. |
-| **Scanner** | `#scanner` | Four presets. Three (Momentum / HOD, Pre-Market Gappers, All Movers) hit `/api/market/scanner` and share `renderScanner()`; **Golden Cross Setup** hits `/api/market/golden-cross` and uses `renderGoldenCross()`. `loadScanner()` branches on the preset for endpoint, renderer, header copy and legend. |
-| **Watchlist** | `#watchlist` | The 15-column table, sortable, with expandable rows and the consolidated Recommendation column. |
+`dashboard.html` has **six tabs**, deep-linkable by hash (`#market` default · `#midday` ·
+`#scanner` · `#watchlist` · `#sectors` · `#long`; `#premium` → `#long`). `switchTab()`
+only lazy-loads a tab whose data is still empty, and Sectors and Scanner use
+stale-while-revalidate, so **no tab requires a click to show data**. **The Long tab is
+the only one that fetches on interaction: expanding a row spends the subrequests.**
 
-**The Swing column** is an informational linear-regression channel read, mirroring
-thinkorswim's: an OLS fit over the last `SWING_REG_BARS` (30) **completed** daily
-closes, with σ the **standard error of the regression** — the spread of the closes
-about the fitted line, not the stdev of the closes. `Buy` at `SWING_Z_THRESHOLD`
-(1.5) residual σ or more below the line, `Sell` at 1.5σ or more above, otherwise
-the signed σ distance as an informational value. **The Worker decides the signal**
-and ships `swingThreshold` / `swingBars` on the `/api/watchlist/batch` envelope so
-the header tooltip can name the gate; the page never compares `swingZ` to a number
-of its own. Today's **forming bar is excluded** until the 4:00pm ET close
-(`SWING_SETTLE_ET_HOUR`), and the line is then read at x = 30 (extrapolated one bar,
-because the live quote belongs to today) rather than x = 29. Computed inside the
-`?range=3mo&interval=1d` chart fetch `handleWatchlistBatch` already makes — **zero
-added subrequest cost**. Fewer than 30 completed bars leaves all four fields null,
-which renders `—`. Checked by `node swing.check.mjs`.
+**The Swing column** is an OLS channel over the last `SWING_REG_BARS` (30) **completed**
+daily closes, σ being the **standard error of the regression** — the spread of the closes
+about the fitted line, *not* the stdev of the closes. **The Worker decides the signal**
+and ships `swingThreshold`/`swingBars`; **the page never compares `swingZ` to a number of
+its own.** Today's forming bar is excluded until the 4:00pm ET close and the line is then
+read at x = 30, at **zero added subrequest cost**.
 
-**Earnings session timing** ships on every `/api/watchlist/batch` row as three
-fields, added 2026-08-18 for the decision_dash rebuild's deadline logic and
-partially closing ARCHITECTURE "Not yet done" #2:
+**Earnings session timing** (`earningsTs`, `earningsSession` — `bmo`|`amc`|`unknown`,
+**never null** — and `earningsIsEstimate`) **decides a DEADLINE, not a label**: a wrong
+answer moves a deadline by a whole session. The order in `earningsTimingFrom` is
+**range → midnight guard → anchors → wall clock**, every step load-bearing. A second
+*distinct* `earningsDate` entry means `unknown` (`new Set(raws).size > 1`, so a duplicate
+must not trip it); a date-only placeholder is rejected on `utcSec === 0` **before any ET
+reading**; then the fixed UTC anchors by **exact** equality (`12:30:00Z` → `bmo`,
+`20:00:00Z` → `amc` — **Yahoo publishes a session flag encoded as a constant, so the ET
+wall clock is the derived fiction**); then the ET windows. **`unknown` with a real date
+is a valid answer**, `etMinutesOfDay` uses `hourCycle: 'h23'`, and **THE YAHOO FIELD IS
+`isEarningsDateEstimate`** — the name in ARCHITECTURE #2 is not in the live payload.
 
-| field | value |
-|---|---|
-| `earningsTs` | the next-earnings instant as **ISO 8601 UTC**, or `null` |
-| `earningsSession` | `'bmo'` \| `'amc'` \| `'unknown'` — **never null** |
-| `earningsIsEstimate` | Yahoo's flag as a boolean, or `null` when Yahoo omits it |
-
-Source is `calendarEvents.earnings`, already in the batch's quoteSummary module
-list — **zero added subrequest cost**, same pattern as the Swing column.
-
-**This decides a DEADLINE, not a label.** BMO means the hold/exit decision was
-the *prior* session's close and the report day is reaction-only; AMC means the
-deadline is that day's own close. A wrong answer moves a deadline by a whole
-session, so the classification is deliberately conservative:
-
-The decision order in `earningsTimingFrom` is **range → midnight guard → anchors
-→ wall clock**, and every step of it is load-bearing:
-
-- A second, **distinct** `earningsDate` entry (Yahoo's start/end pair) means
-  "sometime that day" and is `unknown` regardless of the first entry's clock. A
-  *duplicated* entry is one instant, not a range, and must not trip it —
-  the test is `new Set(raws).size > 1`.
-- **A date-only placeholder is rejected on the UTC instant, before any ET
-  reading.** Midnight UTC read as ET is 19:00/20:00 the *previous* day — past the
-  16:00 cut — so a naive ET conversion would stamp a confident AMC on the wrong
-  day for every date-only row. Guarded by `utcSec === 0`, which must stay
-  **ahead of the anchor tests**: `00:00:00Z` is not an anchor and nothing may try
-  to read a session out of it.
-- **The fixed UTC anchors, by exact equality** — see the measurement below.
-  `12:30:00Z` → `bmo`, `20:00:00Z` → `amc`.
-- **The ET wall-clock windows, as the fallback** for any non-anchor time:
-  **`bmo`** — 04:00 ≤ ET < 09:30 · **`amc`** — ET ≥ 16:00 · **`unknown`** —
-  everything else.
-- **`unknown` with a real date is a valid answer**, not a failure — though on the
-  current watchlist it is now a rare one (0 of 39).
-- `etMinutesOfDay` uses `hourCycle: 'h23'`, not `hour12: false`: the latter
-  renders midnight as `"24"` under some ICU builds, putting a midnight ET value
-  at 1440 and past every cut.
-
-Pinned by `node earnings-timing.check.mjs` — both anchors under both DST regimes,
-all six wall-clock boundaries in both regimes each printed with the branch that
-decided it, the placeholder guard and its ordering, the range branch and its
-inverse, every absent-date shape, and a live re-probe of the watchlist.
-
-**THE YAHOO FIELD IS `isEarningsDateEstimate`.** ARCHITECTURE #2 calls it
-`earningsDateIsEstimate`; that name is not in the live payload and reading it
-returns undefined for every ticker — which ships a permanently-null flag looking
-exactly like "Yahoo never sends it". Verified against the live response, whose
-`calendarEvents.earnings` keys are `earningsDate`, `earningsCallDate`,
-`isEarningsDateEstimate`, `earningsAverage/Low/High`, `revenueAverage/Low/High`.
-The documented name is still read as a fallback. **This is the FINRA field-name
-lesson again: check the live response, not the doc.**
-
-##### YAHOO ENCODES THE SESSION AS A FIXED UTC ANCHOR — the ET wall clock is the fiction
-
-**Measured 2026-08-19, all 39 watchlist names, one probe each through
-`/api/quote`.** Every name resolved, and the whole population took **exactly two
-distinct UTC times of day**:
-
-| UTC time-of-day | n | ET under EDT | ET under EST |
-|---|---|---|---|
-| `20:00:00Z` | **28** | 16:00 — on the bell | **15:00 — mid-session** |
-| `12:30:00Z` | **11** | 08:30 | 07:30 |
-
-**0 names with no entry · 0 with a second distinct entry · 0 at midnight UTC.**
-
-Both values are **DST-invariant**, and that is the finding: Yahoo is not
-publishing a *time*, it is publishing a **session flag encoded as a constant**.
-So the anchor is the datum and the ET reading is a derived fiction.
-
-This supersedes the *"KNOWN CONSERVATIVE MISS — post-DST AMC reads as
-`unknown`"* note that stood here, which recorded the symptom (`20:00Z` is 15:00
-ET under EST, mid-session, so it failed the ≥16:00 cut) and declined to fix it on
-the grounds that widening the cut to 15:00 would be guessing at Yahoo's intent.
-**That reasoning was right and the conclusion was wrong**: the fix is not to
-widen a wall-clock cut, it is to stop reading a wall clock off a constant.
-Decoding the anchor makes no claim about 15:00 ET at all.
-
-**What changed, measured before → after over the same 39 names:** ten names moved
-`unknown` → `amc` — **PLTR, AMD, QUBT, APP, CRWV, CAVA, HOOD, ARM, SMR, KTOS** —
-all genuine AMC reporters, all dated in November, i.e. all under EST. The
-watchlist now classifies **bmo 11 · amc 28 · unknown 0**, against 11 / 18 / 10
-before. BMO was never affected, because `12:30Z` sits inside 04:00–09:30 ET in
-both regimes.
-
-**Anchors are decoded first and the wall-clock windows stay as the fallback.**
-That ordering is what keeps this honest if Yahoo changes: a genuinely published
-time is not *exactly* `12:30:00Z` or `20:00:00Z`, so it falls straight through to
-the windows; a re-anchoring to some third constant is decided by the windows and
-degrades to `unknown` if it lands outside them, which is the safe direction.
-Equality is **exact** — `19:59:59Z` and `20:00:01Z` are not the flag, and
-`earnings-timing.check.mjs` §2 drives both.
-
-**RESIDUAL, and it cannot be closed from the payload:** an anchor is a
-*convention*, so a report genuinely scheduled at exactly `20:00:00Z` that really
-was mid-session under EST would read `amc`. Nothing in `calendarEvents`
-distinguishes the two. At 39/39 on two values the convention is overwhelmingly
-the better reading, but it is an inference about an encoding, not an observation
-of a time — the same class as the `iv:` timing-clustering inference above.
-**`earnings-timing.check.mjs` §7 re-probes the live watchlist and prints the
-distribution; run it if the encoding is ever suspected of having moved.**
-| **Sectors** | `#sectors` | All 11 SPDR sectors, ETF % change plus a Claude-picked opportunity and avoid per sector. |
-| **Long** | `#long` | The only options screen. **Six lanes** (LEAPS / swing / debit verticals / calendars / straddle+strangle / defined-risk credit spreads). The standalone Premium tab was merged in as Lane F on 2026-08-10 — short premium is secondary and now sits as one lane among six, ranked by the same expectancy as everything else. |
-
-Note the Long tab is the only one that fetches on interaction rather than on
-load: expanding a row is what spends the subrequests. Sectors and Scanner use
-stale-while-revalidate (`?cached=1` paints the KV snapshot, then the normal
-endpoint revalidates behind it), so **no tab requires a click to show data**.
-
-The `index.html` "Options Volume · V/OI Screen" card is a *different thing* and
-still exists — real Yahoo chain volume and open interest, on the per-ticker page.
-
-### The Long tab, its six lanes, coverage and the macro chip → the `long-screen` skill
-
-**Working on the Long tab (Lanes A–F), move coverage / drift / expectancy, or the
-macro-regime chip? Load the `long-screen` skill before touching that code.** It holds
-Lane F's direction inversion (coverage is the probability of the WIN, the opposite of
-every other lane), Lane E's four gates and its two-sided tail split, Lane A's structural
-coverage refusal, the `moves:` schema-2 pair shape, and `macroRegime`’s sign convention.
-
-It was moved out of this file because it is ~36 KB of reference for one screen and was
-loading into every session. The rules in it are not softer for living there — a change
-to `longRow()`, any lane builder, `attachCoverage`, `expectancyFrom`,
-`probBeyondBreakeven`, `collectMoveSeries`, `collectMacroState`, or the Long tab
-rendering in `dashboard.html` should load it first.
-
-### Adding a rule: two failure modes found building the Long tab
-
-**1. Yahoo quotes junk implied vol on deep untraded strikes, and it corrupts strike SELECTION —
-on BOTH screens.** Observed on AAPL 2026-08-08: the 2026-09-18 **420 put quoted IV 195.72% against an
-expiry ATM IV of 24.54%** — an 8× outlier on a strike with open interest 0. Delta from that quote is
-0.544, which beat the real near-the-money put for the long screen's 0.55 target. The screen would have
-printed a confident, fully-priced "0.55Δ swing put" struck **34% above spot** with a 272.9% annualised
-cost of carry, and every downstream number would have been arithmetically correct and completely
-meaningless.
-
-**The first fix was scoped to the long screen and that was wrong.** `pickCandidates()` (premium) and
-`nearestDelta()` (long) are *separate* functions selecting from the *same* chains with the *same* delta
-arithmetic, and only one of them got the guard. Delta is monotonic in sigma for an OTM option, so
-inflated quotes drag apparent delta up toward 0.5 — which is why the long screen's 0.55/0.40 targets
-were hit first and the premium screen's 0.30/0.16 were not. That is a difference in *exposure*, not in
-*correctness*. Measured on a real AAPL chain (spot 313.33, 41 DTE, ATM 24%):
-
-| strike | % OTM | true delta at ATM IV | delta at 4× IV | wins premium target |
-|---|---|---|---|---|
-| 400 | 27.7% | **0.0017** | **0.280** | 0.30 |
-| 470 | 50.0% | 0.0000 | 0.139 | 0.16 |
-
-And the junk strikes are demonstrably sitting in premium's selectable pool right now: turning the guard
-on excluded **43 strikes on AAPL and 32 on NVDA** (one quoting **973.63%**) from the *nearest* expiry
-alone, while changing zero live selections. They were not winning today; they were waiting for a day
-when the genuine strike sat marginally further from the target.
-
-The guard is therefore `ivPlausible()` / `IV_OUTLIER_MULT` (4), declared **above both callers** and
-passed each expiry's *own* ATM IV — not the row's front IV, which is the wrong comparator for a 104-day
-leg. Both screens report the exclusions on the card via `ivOutlierNote()`. **RESIDUAL, not fixed:** a
-2–3× inflated quote still wins a target and is deliberately not excluded, because 2–3× is inside
-genuine far-strike skew. This catches broken quotes, not merely optimistic ones.
-
-**When a metric SELECTS using a vendor-supplied number, validate that number against its own peers
-first — and then check every other selector fed by the same source.** A bad input to a display is one
-wrong cell; a bad input to a selection is invisible, because the output looks like an ordinary row.
-
-**2. A null rendered through arithmetic becomes a fabricated measurement.** The legend printed
-**"hit rate 0% over n=12"**. Calibration was genuinely resolved (n=12 ≥ 10) but `hitRate` was `null`,
-because a hit rate belongs to a *rating* and that ticker had no stored rating — and
-`(null * 100).toFixed(0)` is `"0"`. A missing number silently became a measured 0% accuracy, which is
-exactly what §6b forbids. **Guard the null before the arithmetic, not after: `x == null` and `x === 0`
-must never render the same way.** The state count was two (resolved / unresolved) and the truth was
-three.
-
-An audit of every `.toFixed` and `× 100` site in both HTML files followed. The only *fabricated number*
-was that one; the rest were already guarded by an early return, a ternary, or an upstream `.filter()`.
-One further site of the same class was found and fixed — `gapBar()` on the golden-cross tab, where a
-null gap divided to 0 and clamped to the 2% floor, **drawing a real bar for a missing measurement**.
-A bar is a rendered number. Note also what the audit got *wrong*: the fundamentals grid looked
-unguarded (`${v}` on a `?.raw?.toFixed()`) but line 2439 already filters with `.filter(r => r[1] != null)`,
-and `undefined != null` is false — **check the guard that is already there before adding one**, or the
-"fix" is noise and the comment beside it is a lie.
-
-**3. A status word that cannot fire is worse than no status word.** The long screen shipped a
-`no-leaps` row status whose condition required no January past 365 DTE **and** no monthly at either
-swing horizon — effectively unreachable, and if it ever had fired it would have said "no LEAPS" about a
-chain whose actual problem was having no usable expiries at all (honesty rule 17). It also implied a
-row-level coverage check the screen does not perform. It is now `no-expiries`, accurately named, and the
-LEAPS signal it was reaching for lives where it belongs: the Lane A entry's `not-listed` reason, and
-`leapsListed: 0` on the row driving a chip. **A row status must not fail three working lanes to report
-a fact about the fourth.**
-
-The Scanner tab hosts four presets. Three (Momentum, Pre-Market Gappers, All Movers) hit
-`/api/market/scanner` and share `renderScanner()`; the Golden Cross Setup preset hits
-`/api/market/golden-cross` and uses `renderGoldenCross()`. `loadScanner()` branches on the preset
-to pick the endpoint, renderer, header copy, and legend.
-
-`index.html` — per-ticker research page. A hero strip (price, change, market cap,
-P/E, sector, exchange, AI rating + confidence ring) above numbered cards:
-
-```
-01 Price & Performance          09 Analyst Opinion
-02 Catalysts & Earnings         10 Super-Investor Holdings
-03 Short Interest               11 Technical Analysis
-04 Insider Trades               12 Sentiment Analysis
-05 Options Volume · V/OI Screen 13 Fundamentals & Valuation
-06 Recommended Option Strategies   (14 AI Synthesis — the hero card, not numbered inline)
-07 Swing Setups · EMA Crossover  15 Recommendation History
-                                   News Flow
-```
-
-Numbers 08 (dark pool) is **absent by design** — the card was fabricated and was
-deleted, not renumbered, so the gap is a deliberate scar. Card element ids are
-`card-perf`, `card-catalysts`, `card-short`, `card-insider`, `card-unusual`,
-`card-strategies`, `card-trade`, `card-analyst`, `card-13f`, `card-chart`,
-`card-sentiment`, `card-fundamentals`, `card-news`, `card-track`.
-
-The Catalysts card carries an "Analyze Earnings" button that expands an inline panel
-(`renderEarnings()`, backed by `/api/earnings/:ticker`). It fetches once per ticker and then just
-toggles, and `resetEarnings()` clears it on ticker change. That panel is deliberately retrospective —
-it analyses the *last* report — which is separate from the catalyst list above it.
-
-**The catalyst list shows only events dated today or later.** `renderCatalysts()` filters on
-`iso >= today`, where `today` is the `asOf` field returned by `/api/market/econ-calendar` (the
-Worker's ET today, and the same reference the macro events are already filtered against server-side;
-falls back to a local ET computation if that call fails). This is not belt-and-braces: Yahoo's
-`calendarEvents.exDividendDate` and `dividendDate` are routinely the *most recent past* ones rather
-than the next, and `earningsDate` can lag a report that already happened — unfiltered, the card
-advertised settled events as upcoming catalysts (an NVDA quote in August still listed a June
-ex-dividend). Today itself is kept, and `isoOf`/`fmt.dateLong` both work in UTC, so item dates and
-their rendered labels stay consistent with each other.
-
-All technical indicators (RSI, MACD, Bollinger, EMA crossovers, support/resistance, HV30) are computed client-side from Yahoo OHLCV. Chart rendering uses TradingView Lightweight Charts. Implied vol is the exception and comes from `/api/iv` — it cannot be derived from OHLCV.
-
-**Section 07 is swing-only, deliberately.** It used to carry an opening-range-breakout block and a
-VWAP line computed from *daily* bars. ORB needs the first N minutes of a session and VWAP needs
-intraday prints weighted by intraday volume; on a one-bar-per-day series both were fabrications —
-"ORB High" was just yesterday's high, and "VWAP" was a cumulative typical-price average over the
-whole visible range. Both were deleted. The EMA crossover kept its place because it is genuinely a
-daily-bar signal. Do not re-add either without an intraday feed.
+Three deletions that must not be undone: **card 08 (dark pool) is absent BY DESIGN**,
+deleted rather than renumbered so the gap is a deliberate scar; **section 07 is
+swing-only**, because an ORB block and a VWAP line computed from *daily* bars were both
+fabrications (**do not re-add either without an intraday feed**); and **the catalyst list
+shows only events dated today or later**, because Yahoo's `exDividendDate`/`dividendDate`
+are routinely the most recent *past* ones. Indicators are computed client-side from Yahoo
+OHLCV; **implied vol is the exception**, from `/api/iv`.
 
 ### Data: real vs. stubbed
 
-**Nothing is stubbed.** This section used to describe a violet "Sample · upgrade: X" badge and four
-mock sections; the badge system is gone, the dark-pool card was deleted outright (fabricated, no free
-source), and short interest / insider / 13F run on FINRA and SEC EDGAR. Provenance now comes from
-`_meta` on every response — see the badge notes above. `ARCHITECTURE.md` holds the paid upgrade path
-and the section-by-section source map.
-
-**POP on the strategy cards** is 1 − |Δ| of the short strike (both short deltas for the condor),
-against the `pop` strike ladder `/api/iv` returns: real listed strikes, each delta from that strike's
-own IV, at the listed expiry nearest 35 DTE. `renderStrategies()` snaps its legs to those strikes, so
-the card prints a strike you can actually trade with a probability that belongs to it. It is labelled
-on the card as a **delta-derived approximation under a lognormal assumption, not a backtested
-frequency** — that caption is load-bearing, because "Hist Win" sits right beside it and is exactly the
-measured thing POP is not. Debit structures (both verticals, the straddle) render **n/a**: their
-break-even is not the short strike, so 1 − |Δ| would be a plausible number measuring nothing. Hist Win
-stays suppressed pending a real backtest.
+**Nothing is stubbed** — the dark-pool card was deleted outright rather than mocked, and
+provenance comes from `_meta` on every response. **POP on the strategy cards** is
+1 − |Δ| of the short strike, labelled a **delta-derived approximation under a lognormal
+assumption, not a backtested frequency** — load-bearing, because "Hist Win" sits beside
+it and is exactly the measured thing POP is not. **Debit structures render n/a** (their
+break-even is not the short strike), and Hist Win stays suppressed pending a backtest.
 
 ## Design system
 
-CSS custom properties in `:root`. Never hardcode colors or font stacks — use the
-variables. The full token list is the `:root` block at the top of `dashboard.html`.
+CSS custom properties in `:root` — **never hardcode colors or font stacks.** The token
+list is the `:root` block at the top of `dashboard.html`.
 
 ## Git workflow
 
-Commit and push automatically at the end of each completed task, without being asked. One commit per logical task, not per file. Message format: short imperative summary line, then a blank line, then 2-4 bullets on what changed and why.
+Commit and push automatically at the end of each completed task, without being asked.
+One commit per logical task, not per file. Message format: short imperative summary
+line, a blank line, then 2-4 bullets on what changed and why.
 
 Do not commit:
 - Mid-task, or when a task ended with something broken or unverified
@@ -2672,124 +556,99 @@ If a push fails, report the error rather than working around it.
 
 Deployment requires approval — do not run npx wrangler deploy without asking for approval.
 
-Kill background processes when a task completes. Don't leave wrangler dev, wrangler tail, or http servers running between tasks.
+Kill background processes when a task completes — no wrangler dev, wrangler tail or
+http servers left running between tasks.
 
 ## Named failure modes
 
-Ten failure modes have been named in this repo, each from a specific incident. The
-assertion is here; the incident narrative, post-mortem and harness detail behind each
-one is in [`docs/failure-modes.md`](docs/failure-modes.md) under the same heading —
-except the tenth, whose narrative is inline below because it is new.
+Thirteen failure modes are named in this repo, each from a specific incident. **The
+assertion is here; the narrative and post-mortem are in
+[`docs/failure-modes.md`](docs/failure-modes.md)** under the same heading, except the
+last four, whose evidence is in [`docs/history.md`](docs/history.md).
 
-- **No hit rate goes on screen without its base rate** — [evidence](docs/failure-modes.md)
-- **A single negative probe right after a deploy is UNCONFIRMED, not a failure** — [evidence](docs/failure-modes.md)
-- **Name the population a distribution was measured over** — [evidence](docs/failure-modes.md)
-- **A workaround adopted to make a test safe is evidence about production** — [evidence](docs/failure-modes.md)
-- **When you remove a fallback, audit what it was BOUNDING — not just what reads it** — [evidence](docs/failure-modes.md)
-- **The frontend is ALWAYS newer than the Worker for a while — render that state** — [evidence](docs/failure-modes.md)
-- **`return ''` in a render helper is where this hides — audit them all** — discipline retained below; [evidence](docs/failure-modes.md)
-- **A newly rendered figure gets eyes on it before the commit is done** — [evidence](docs/failure-modes.md)
-- **An empty comparison is not a pass** — [evidence](docs/failure-modes.md)
-- **A whole-object rewrite is a DELETE of every slot the writer does not own** — below
-
-### A whole-object rewrite is a DELETE of every slot the writer does not own
-
-`/api/daily` looks like one object and is three KV keys — `daily:snapshot` (which
-carries the top-level headline **and** the `open` slot), `daily:midday`,
-`daily:eod` — merged at read time by `handleDailyGet`. Each generator writes only
-its own key, so the slots are structurally independent and there is no cross-slot
-read-modify-write to lose a race in.
-
-`generateDailySnapshot` then deleted the other two on **every** successful write.
-That is correct for the 6:00am firing, where the new pre-market briefing exists to
-replace yesterday's recap, and destructive for every other run on the same PT day.
-Measured from the decision_dash side 2026-08-19: all three records present at
-17:56 PT (open 06:02, midday 11:31, eod 13:13); at 18:11 open and eod were
-restamped 18:11 and **midday was gone**.
-
-**The trigger was a request, not a cron.** `handleDailyGet` regenerates the
-briefing when it is more than 12h old, so a 06:02 snapshot went stale at 18:02 and
-the next page poll rebuilt it in the evening. `daily:eod` came back seconds later
-through the `!eod` self-heal — which is why it *looked* like a restamp rather than
-a loss — and `daily:midday`, which deliberately has no self-heal, did not.
-
-Two things generalise:
-
-- **"Deletes yesterday's" and "deletes on every run" are the same line of code
-  until a date is in the record.** The fix is not a smaller delete, it is
-  `ptDate` on every slot and a purge that must positively read an *earlier* day
-  before it removes anything. Unknowable day → treated as stale, because that
-  direction regenerates and the other renders an old recap under today's date.
-- **A slot with a self-heal and a slot without look identical the moment they are
-  both deleted.** The blast radius of a wholesale rewrite is not what it deletes,
-  it is what cannot come back — and that is a property of the *other* slots, which
-  the writer never consults.
-
-Pinned by `node daily-slots.check.mjs`, which asserts sibling survival on raw
-stored bytes, and by a source-level attribution of every `daily:` mutation site to
-its enclosing function — a behavioural test cannot see an unconditional delete
-added elsewhere six months from now.
-
-### `return ''` in a render helper is where this hides — audit them all
-
-Fixing `macroChip` prompted an audit of every early empty-string return in
-`dashboard.html`, and **two of the four were the same bug**. The distinguishing
-question is one line: **is this withholding a CONTROL, or a FACT?**
-
-| site | returns `''` when | verdict |
-|---|---|---|
-| `alignChip` | `align` is absent | **BUG — fixed.** Its own comment says *"Renders ALWAYS"* and it did not. A blank made "no alignment field exists" identical to "the tag was never built", on a tag whose entire status is *informational and disabled by measurement*. Now renders `no tag`, distinct from `no read` (which means the rating store was consulted and held nothing). |
-| `candDetail` | `coverage1y`, `coverage3y` and `expectancyMean` are all null | **BUG — fixed.** `COVERAGE_MIN_INDEPENDENT` nulls coverage **deliberately**, and the Worker computes the exact reason. **Measured against production: 66 of 757 candidates hit this branch and ALL 66 carried a reason.** Sixty-six computed refusals, none on screen. See below — the 66 are structural, not a thin sample. |
-| `laneSortLine` | lane is D or E | **CORRECT.** A sort control, not a finding. An absent control makes no claim about data, so there is no state to mistake for another. |
-| `longDetail`'s lane map | a lane has no entries | **CORRECT, for a structural reason.** A lane that finds nothing still emits an entry with its own status and reason, and `readLongRow()` guards `row.schema === LONG_SCHEMA` by strict equality — so a row with a different lane set is rejected whole and renders `not-loaded`. Measured: 0 lanes absent across 33 rows × 6. |
-
-**A REFUSED MEASUREMENT IS A FINDING, NOT AN ABSENCE.** That is the whole of it.
-
-The worked audit behind the `candDetail` row — why all 66 Lane A refusals are
-arithmetic rather than a thin sample, and so evidence for the line above rather than
-a caveat on it — is in
-[`docs/failure-modes.md`](docs/failure-modes.md), *"The 66 are ARITHMETIC, not a thin sample"*.
+- **No hit rate goes on screen without its base rate**
+- **A single negative probe right after a deploy is UNCONFIRMED, not a failure**
+- **Name the population a distribution was measured over**
+- **A workaround adopted to make a test safe is evidence about production**
+- **When you remove a fallback, audit what it was BOUNDING — not just what reads it**
+- **The frontend is ALWAYS newer than the Worker for a while — render that state**
+- **A newly rendered figure gets eyes on it before the commit is done**
+- **An empty comparison is not a pass**
+- **`return ''` in a render helper is where this hides — audit them all.** The question
+  is one line: **is this withholding a CONTROL, or a FACT?** A control may vanish; a fact
+  may not. `alignChip` and `candDetail` both returned `''` on a **computed refusal**, and
+  `candDetail`'s branch hid **66 of 757 candidates, all carrying a reason**.
+  **A REFUSED MEASUREMENT IS A FINDING, NOT AN ABSENCE.**
+- **A whole-object rewrite is a DELETE of every slot the writer does not own.**
+  `/api/daily` is **three KV keys merged at read time**, and `generateDailySnapshot`
+  deleted the other two on **every** write — triggered by a *request*, not a cron.
+  **"Deletes yesterday's" and "deletes on every run" are the same line of code until a
+  date is in the record**, and **a slot with a self-heal and a slot without look
+  identical the moment they are both deleted**: the blast radius is what cannot come
+  back, a property of the *other* slots the writer never consults.
+- **When a metric SELECTS using a vendor-supplied number, validate it against its own
+  peers first — then check every other selector fed by the same source.** Yahoo quotes
+  junk IV on deep untraded strikes (an AAPL 420 put at **195.72%** against an expiry ATM
+  IV of 24.54%), and delta from it wins a delta target 34% above spot. `ivPlausible()` /
+  `IV_OUTLIER_MULT` (4) is declared **above both callers** and passed each expiry's *own*
+  ATM IV — the first fix was scoped to one screen and that was wrong.
+- **Guard the null before the arithmetic: `x == null` and `x === 0` must never render
+  the same way.** `(null * 100).toFixed(0)` is `"0"`, which printed *"hit rate 0% over
+  n=12"*. **Check the guard that is already there before adding one.**
+- **A status word that cannot fire is worse than no status word.** `no-leaps` was
+  unreachable and blamed the wrong thing; it is now `no-expiries`.
 
 ## Verification standard
 
-Before reporting a task complete, state which checks were run and print the actual values. "Verified" without a number is not verification. This applies to every numeric output, every identifier taken from an external source, and every calculation.
+Before reporting a task complete, state which checks were run and **print the actual
+values** — "verified" without a number is not verification, for every numeric output,
+every identifier taken from an external source and every calculation.
 
-Print, don't assert. Show computed values alongside expected values, with deviations. The Black-Scholes check was trustworthy because it printed 0.52160473 against 0.52200000; a claim that it passed would not have been.
+**Print, don't assert** — computed alongside expected, with deviations. The
+Black-Scholes check was trustworthy because it printed 0.52160473 against 0.52200000.
 
-Check against a different source than the one being tested. Cross-check a formula against a different algorithm, an identifier against the live API, a field name against the live response. Documentation consensus is not verification — three sources agreed on the wrong FINRA field name while the live API had the right one in our own code.
+**Check against a different source than the one being tested** — a formula against a
+different algorithm, an identifier against the live API, a field name against the live
+response. Documentation consensus is not verification: three sources agreed on the wrong
+FINRA field name while the live API had the right one in our code.
 
-Name the verification method's blind spot. curl cannot catch CORS preflight failures. A DOM shim cannot catch CSS layout problems. Local dev without .dev.vars cannot exercise live-credential paths. When the available method can't reach the failure mode, say so explicitly rather than reporting a pass — a bug shipped this session because preflight was modeled by hand instead of observed in a browser.
+**Name the verification method's blind spot.** curl cannot catch CORS preflight
+failures; a DOM shim cannot catch CSS layout problems; local dev without `.dev.vars`
+cannot exercise live-credential paths. When the method cannot reach the failure mode,
+say so rather than reporting a pass.
 
-Verify against a second case before declaring success. One passing ticker is a coincidence; three is a pattern.
+**Verify against a second case.** One passing ticker is a coincidence; three is a
+pattern.
 
 ## Before every task
 
-Read CLAUDE.md and ARCHITECTURE.md first. Do not work from assumptions carried over from earlier in a session or from my prompt — I have been wrong about what exists in this codebase multiple times (a 13F override map that doesn't exist, a cached risk-free rate that wasn't there, mock generators that were dead code, the term-structure sign). If my instruction contradicts the code, say so before acting.
+Read CLAUDE.md first, and `ARCHITECTURE.md` or the relevant skill for anything it points
+at — the record is spread across the files in *"Where everything is"* above and no one of
+them is complete alone. **Do not work from assumptions carried over from earlier in a
+session or from my prompt** — I have been wrong about what exists in this codebase
+multiple times (a 13F override map that doesn't exist, a cached risk-free rate that
+wasn't there, mock generators that were dead code, the term-structure sign). **If my
+instruction contradicts the code, say so before acting.**
 
-**The authoritative record is six files, not two.** No one of them is complete on its
-own, and the two skills load on demand rather than every session:
-
-| file | holds | loaded |
-|---|---|---|
-| `CLAUDE.md` | the rules, the Worker invariants, workflow | every session |
-| `ARCHITECTURE.md` | data sources, design decisions, build position | on request |
-| `.claude/skills/worker-internals/SKILL.md` | Worker endpoints, KV keys and TTLs, cron, external data sources | on demand |
-| `.claude/skills/long-screen/SKILL.md` | Lanes A–F, move coverage, macro regime | on demand |
-| `docs/rules-evidence.md` | the measured runs behind rules 1–7 | on request |
-| `docs/failure-modes.md` | the incident record behind the nine named failure modes | on request |
-
-Check any change against the subrequest budget (rule #1 — 10,000 per invocation, **one pool**: external `fetch()` and KV/binding calls both count against it) and against rule #2: no calendar logic in the cron expression, and any new Pacific hour must fall inside the UTC window under **both** PST and PDT. Both have caused silent failures.
+Check any change against **rule #1** (10,000 subrequests per invocation, **one pool** —
+external `fetch()` and KV/binding calls both count) and **rule #2** (no calendar logic in
+the cron expression, and any new Pacific hour must fall inside the UTC window under
+**both** PST and PDT). Both have caused silent failures.
 
 ## After every task
 
-Update the docs in the same task, not later. Any new KV key, constant, secret, endpoint, or threshold goes into CLAUDE.md as it is created. Docs that lag the code are how a session starts by acting on false premises.
+**Update the docs in the same task, not later** — a new KV key, constant, secret,
+endpoint or threshold goes into its file (see *"Where everything is"*) as it is created.
+Docs that lag the code are how a session starts on false premises.
 
-Report what you could not verify, separately and explicitly. That section has been the most useful part of every report this session.
+**Report what you could not verify, separately and explicitly** — that section has been
+the most useful part of every report.
 
-Kill background processes. No wrangler dev, wrangler tail, or http servers left running between tasks.
+**Kill background processes** — no `wrangler dev`, `wrangler tail` or http servers.
 
 ## Adding a new failure mode
 
-When a bug is found, add a rule naming the specific failure that produced it. Rules tied to a concrete incident are followed; abstract ones are not.
-
-cron execution history doesn't exist unless observability logs are enabled, and observability.enabled seeds logs.enabled in wrangler's normalization — writing only the nested table silently disables both.
+When a bug is found, add a rule naming the specific failure that produced it — **rules
+tied to a concrete incident are followed; abstract ones are not.** The assertion goes
+here; the narrative and the measurement go in [`docs/history.md`](docs/history.md) or
+[`docs/failure-modes.md`](docs/failure-modes.md), so this file stays loadable.
