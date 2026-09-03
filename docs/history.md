@@ -32,6 +32,7 @@ Where to look for the other halves of the record:
 - [Rule 7 — `dispatchJob`, the dedup-stamp guards, the placeholder render state, and `iv:` provenance](#rule-7-dispatchjob-the-dedup-stamp-guards-the-placeholder-render-state-and-iv-provenance)
 - [The check suite — what each of the eighteen scripts covers, and the fixture incidents](#the-check-suite-what-each-of-the-eighteen-scripts-covers-and-the-fixture-incidents)
 - [`printtape:` — the quarter-alignment measurement and the 2026-09-01 schedule fix](#printtape-the-quarter-alignment-measurement-and-the-2026-09-01-schedule-fix)
+- [`printtape:` — the two-gate restructure, 2026-09-03 (schema 3)](#printtape-the-two-gate-restructure-2026-09-03-schema-3)
 - [The income sleeve — the measured classifier, the ex-div gotcha and the caveats](#the-income-sleeve-the-measured-classifier-the-ex-div-gotcha-and-the-caveats)
 - [`GET /api/radar` — the refusal contract, the reserved slots and the measured gate reachability](#get-apiradar-the-refusal-contract-the-reserved-slots-and-the-measured-gate-reachability)
 - [`top3:` — the sequential sweep, the scoring design, and the 2026-08-31 TTL defect](#top3-the-sequential-sweep-the-scoring-design-and-the-2026-08-31-ttl-defect)
@@ -677,9 +678,11 @@ earnings move, every divergence refusal path with `null` shown to be a different
 from `false`, the threshold at -2.99 / -3.00 / -3.01, the field-level cross-pass merge
 and the quarter mismatch that must carry nothing, the endpoint through the REAL router
 including a fail-closed gate and an absent day distinguished from an empty one, and
-the structural attributions no behavioural test can make — that guidance is reachable
-only from `divergent === true`, that the verdict is re-run AFTER the merge, that the
-read path contains no write, and that the job writes no sibling feature's key;
+the structural attributions no behavioural test can make — that the release read is
+reachable only from a `candidate` or a `divergent` stage AND an unset `releaseRead`
+stamp, that the stage is re-decided AFTER the merge **and again after the release
+read**, that `applyStage` is the only writer of the four stage-dependent fields, that
+the read path contains no write, and that the job writes no sibling feature's key;
 **and, since the 2026-09-01 schedule fix**, the PRE-BANKED quarter driven both ways
 with the **-51.22%** miss a gate-free fallback would print shown beside the shipped
 `null`, the tape window PAIR with `usedWindow` re-derived after every merge and the
@@ -692,7 +695,22 @@ the walkers and the cron gate never disagree, the **MDB REPLAY** of the real
 2026-09-01 record read back out of the deployed Worker — pre-bank → pass 1 → pass 2 →
 carry-over, with the no-pre-bank counterfactual beside it — and
 `GET /api/calendar/holidays` through the real router against a KV stub that THROWS on
-every method, so a single binding touch is a 500 rather than a counter to be trusted).
+every method, so a single binding touch is a 500 rather than a counter to be trusted;
+**and, since the 2026-09-03 two-gate restructure**, the five stages with the boolean
+shown to be DERIVED from them in every case built, the gate-1 short circuit driven both
+ways, the **AVGO REPLAY** of the real 2026-09-02 record reproducing every stored field
+from the payload that produced it — with the live `divergent: null` printed beside the
+`stage: 'agree'` the same inputs now give, the **0.0129pp** margin that decided it, and
+a 0.0258pp nudge that flips the gate with nothing else moved — four stubbed release
+answers driven through the job's own application lines (a beating figure flipping to
+`divergent`, the 15.95B figure the task named producing `agree` against the REAL 29.43B
+consensus, a not-found leaving the candidate standing, and a ceiling refusal leaving the
+call retryable), the Yahoo-later cross-check in both the conflicting and the agreeing
+direction plus the one-way gap-fill, the release read's three validation gates including
+a raw `15.95` refused by the plausibility band while a real 45.8% MISS is accepted, the
+citation resolved by INDEX with six unresolvable indices driven, the KV budget
+re-derived against BOTH ceilings, and **§16y, which strips the short circuit out of the
+shipped function's own source and reproduces the live `null`**).
 All of them extract functions from
 `worker.js` by source, not by import, because every named export in `worker.js`
 must be a function or `workerd` refuses to boot. **`longarch` and `printtape` are the exceptions and
@@ -1159,12 +1177,15 @@ plus `consensusSource` and `consensusBankedTs`.
   says so in words and `straddlesReport` says whether the expiry is even past the
   print — calling it "the implied earnings move" would be the HV30-labelled-as-IV
   failure. The pre-bank does not attach one at all.
-- **`guidance` fires ONLY on `divergent === true`**, once per ticker per report
-  (banked on the record and carried forward, so it is structural rather than a rule
-  to remember — and it survives the carry-over, which writes the same key). Its input
-  is `gatherEarningsFacts`' news window — **there is no 8-K or press-release feed
-  wired to this Worker** and none is invented; `source` names what was read and
-  `not-found` is the honest answer when it said nothing about guidance. It debits the
+- **`guidance` fires ONLY on `divergent === true`** — *superseded 2026-09-03: since
+  schema 3 it is one half of the RELEASE READ, which fires on a `candidate` OR a
+  `divergent` and is gated on the `releaseRead` stamp. See "the two-gate restructure"
+  above.* Still once per ticker per report (banked on the record and carried forward,
+  so it is structural rather than a rule to remember — and it survives the carry-over,
+  which writes the same key). Its input is `gatherEarningsFacts`' news window —
+  **there is no 8-K or press-release feed wired to this Worker** and none is invented;
+  `source` names what was read and `not-found` is the honest answer when it said
+  nothing about guidance. It debits the
   same `AI_RATE_GLOBAL_DAY` bucket via `cronMaySpend`, which **REFUSES on a KV
   failure** where `aiGuard` proceeds — `aiGuard` has already checked a secret and is
   serving a user, a cron has no second control at all.
@@ -1190,9 +1211,195 @@ measured on a later one is **not** reported as skipped. **`meta.banked`** lists 
 whose consensus was pre-banked but whose report has not happened — their records ARE
 served, because a banked consensus nobody can read may as well not exist.
 
-Checked by `node printtape.check.mjs` (543 comparisons, up from 272).
+Checked by `node printtape.check.mjs` (543 comparisons, up from 272; **862** since the 2026-09-03 two-gate restructure).
 
 ---
+
+---
+
+## `printtape:` — the two-gate restructure, 2026-09-03 (schema 3)
+
+Justifies: *the test is two gates and `stage` is the answer; a `candidate` is a finding,
+not an absence; the release read supplies gate 2 and runs for candidates; Yahoo is the
+later cross-check and never an overwrite; the carry-over appends its own entry to the
+report day's index.*
+
+### THE MEASUREMENT — AVGO, 2026-09-02 AMC, read back out of the deployed Worker
+
+`GET /api/printtape?date=2026-09-02` on 2026-09-03, plus `printtapeday:2026-09-02`, plus a
+cross-check against a **second** endpoint (`/api/earnings/AVGO?facts=1`) the same day.
+
+```
+print.epsActual        3.32          print.quarter    2026-07-31 (2Q2026, reported 2026-09-02)
+print.epsEst           3.238         print.quarterVia "consensus has rolled forward"
+print.epsSurprisePct   2.53          (Yahoo's own figure agreed: 2.53)
+print.revEst           29,434,507,200   carried forward across passes
+print.revActual        null          <- STILL null at the 06:15 PT carry-over, 14h after a 20:00Z print
+tape.post.changePct    -0.8205       price 364.2268 vs regularMarketPrice 367.24
+tape.pre.changePct     -2.9871       price 356.27, quoted 2026-09-03T13:15:10Z
+tape.usedWindow        pre
+divergent              null          "the test needs all five inputs and 1 is absent: revActual"
+```
+
+**THE REVENUE HALF IS NOT OBTAINABLE FROM YAHOO INSIDE THIS FEATURE'S WINDOW.** Not late —
+*absent*. `earnings.financialsChart.quarterly` still had no 2Q2026 entry fourteen hours
+after the print, and NVDA's was absent **six days** after its own on 2026-08-26. Every
+other input was there: the EPS pair by the 14:30 PT pass, both tape windows read, the
+quarter established, the consensus banked. A single five-input test on that record can
+only ever return `null`, and the refusal — correct, well-reasoned, carrying its reason —
+tells a reader nothing at all about a report whose EPS and tape were fully measured.
+
+Cross-check on the revenue **scale**, from the second endpoint, because a 29.43B consensus
+is the number every later comparison hangs off: AVGO's `financialsChart` carried 3Q2025
+**18.015B**, 4Q2025 **19.311B**, 1Q2026 **22.187B**, and the next-quarter consensus was
+**37.16B**. So 29.43B is the right order of magnitude for a 2Q2026 consensus, confirmed
+against a different module from the one the record read it out of.
+
+### THE SPLIT
+
+**Gate 1 is free and structured**: EPS actual > EPS consensus (same quarter, same string
+equality, nothing relaxed) AND the used tape window's `changePct <= PRINTTAPE_DIVERGENCE_PCT`.
+Both halves come out of the `quoteSummary` response the pass already fetched, so gate 1
+costs nothing beyond what a pass already spends. **Gate 2 is the revenue beat.**
+
+`stage` ∈ `not-run` · `refused` · `agree` · `candidate` · `divergent`, with `stageReason`.
+`divergent` is kept for schema continuity and **derived**: `true` at `divergent`, `false`
+at `agree`, `null` elsewhere. `printTapeStage` is the only decider and the job's local
+`applyStage` the only assigner — every field that depends on the stage is written in one
+place, so no two of them can disagree.
+
+**THE GATE-1 SHORT CIRCUIT IS A LOGICAL ONE, NOT A GUESS**, and it is where the AVGO
+record's answer changes. When gate 1 is *fully readable* and comes back negative, the test
+is an AND, so no revenue figure could rescue it: the record says `agree`. AVGO's does, and
+by a hair — the pre-market sold **2.9871%** against a **3.00%** gate, **0.0129 percentage
+points short**. `printtape.check.mjs` §16c prints that margin and then nudges the reading
+0.0258pp past the gate with nothing else changed, so the assertion is about the gate rather
+than about the fixture. §16y drives the revert: the shipped function's own source with the
+short circuit removed refuses the same record, reproducing the live `null`.
+
+**A `candidate` IS A FINDING, NOT AN ABSENCE.** An EPS beat the tape sold is exactly the
+shape this feature exists to surface, and it is now on the record within ninety minutes of
+the print with the revenue half open beside it, rather than hidden behind a `null` that
+would not resolve for days. It is not `printTapeComplete` and it does carry over, for a
+reason `printTapeNeedsCarryOver` names separately from a refusal.
+
+Replaying the MDB 2026-09-01 record through the new gates says the same thing from the
+other direction: pass 1, which read `divergent: null` live, is now a **candidate** — EPS
++18.09% with the post-market down 14.5598% — and it stays one **even with no pre-bank
+behind it**, because gate 1 never depended on the bank.
+
+### THE RELEASE READ
+
+When gate 1 fires, **one** Claude call reads the coverage window once and extracts **both**
+the revenue actual for the reported quarter and the guidance class with its quote.
+
+Before this, the call fired only on `divergent === true`. On the measured evidence that was
+almost never reachable: the revenue actual Yahoo needs days to publish was the very input
+the verdict was waiting on, so the name that most deserved a guidance read was the one that
+could never get one. Running it for candidates costs **nothing extra** — it is the same
+call, and a candidate the call turns into a divergent has spent one in total.
+
+`releaseRead` makes "one call per ticker per report" structural. It is stamped **only when
+the model ANSWERED**, and carried forward unconditionally by the merge like
+`consensusBankedTs`. A ceiling rejection, a missing key, a failed gather or a truncated
+answer leaves it null and stays retryable; an answer that found nothing still stamps it,
+because asking the same window again buys the same nothing — and that empty case is
+precisely the one where nothing else on the record would show that the call had happened.
+
+**THREE GATES BEFORE A MODEL-EXTRACTED FIGURE IS BELIEVED**, and the third has a named
+precedent here:
+
+1. **the null guard** — a non-number, a zero or a negative is refused before any
+   arithmetic. `(null * 100).toFixed(0)` is `"0"`, which this repo has already shipped once.
+2. **the units cross-check** — the model states the figure twice, as `revenueValue` in
+   absolute units and as `revenueValueText` exactly as the coverage wrote it. The Worker
+   re-derives the text and refuses the pair when the two are more than
+   `PRINTTAPE_REVENUE_CONFLICT_PCT` (1%) apart. **"15.95" for $15.95 billion is a
+   nine-order-of-magnitude error that reads downstream as an ordinary catastrophic miss**,
+   and nothing else would catch it. A text that cannot be parsed does *not* refuse — it is
+   a cross-check, not a requirement, and the failure to re-derive is recorded.
+3. **the plausibility band** — the figure must sit within `PRINTTAPE_REVENUE_SANITY_MULT`
+   (4) of the consensus for the same quarter, its own nearest peer. This is
+   `ivPlausible` / `IV_OUTLIER_MULT` applied to a model-extracted number: *when a metric
+   SELECTS using a supplied number, validate it against its own peers first.* The band is
+   deliberately wide — a real 46% miss or a real 3× beat has to survive it, because
+   refusing a real surprise is the opposite failure.
+
+**The citation is resolved BY INDEX.** The coverage block is numbered, the model names
+which numbered item its quoted sentence came from, and the Worker maps that index to the
+item's own title, publisher, date and URL. A URL is never in the prompt: a model asked for
+one has no way to know it and every incentive to invent it. An out-of-range index cites
+nothing and says so, rather than citing a neighbouring headline; the figure still stands.
+
+### YAHOO IS THE LATER CROSS-CHECK, NEVER AN OVERWRITE
+
+The merge's ordinary rule is "a later measurement REPLACES". This is the one place it must
+not, and the reason is provenance rather than freshness: the release figure is the
+company's own words, quoted, read within hours of the print; Yahoo's is an aggregator's
+transcription arriving days later. So the release figure **stands**, Yahoo's becomes
+`print.revenueCrosscheck`, and past 1% it is promoted to **`print.revenueConflict`**
+carrying both numbers. A conflict is a finding: one of the two is describing a different
+quarter, a restatement or a different revenue line, and which is not decidable from here.
+
+The gap-fill runs **one way only** — a Yahoo actual already on the record is never
+displaced by a release read. Yahoo's structured reading wins whenever it exists; the
+release read is what makes the answer reachable at all in the window where Yahoo has
+published nothing.
+
+### THE CARRY-OVER'S OWN PASS ENTRY
+
+`printtapeday:2026-09-02`, real: both morning passes on the report day logged
+`scanOk: false` — *"Yahoo crumb unavailable — the eligibility scan could not run, so NO
+name was checked"* — and the record that eventually answered the day was written the **next
+morning** by the carry-over. Read without a carry-over entry, that index describes a day
+whose scans failed, with no way to see that the work was finished later.
+
+So the append to the report day's index now fires whenever the carry-over **SCREENED**
+anything, not only when it wrote something, and the entry carries `written: [tickers]`
+beside `measured`, plus `ranOn` naming the morning it ran. It is still conditional on
+having screened at least one name, which implies the prior day's index was readable —
+creating an index for a day that has none would make `/api/printtape?date=` report
+`ran: true` for a day this job never ran on.
+
+**`scanOk` on that entry is the prior-index read, not an eligibility scan.** The carry-over
+runs none — that is the whole point of reading the index instead, since Yahoo rolls
+`earningsTimestampStart` forward within a day of a report. Hardcoding `scanOk: true` there
+claimed a scan that never happened.
+
+### THE COST, RE-DERIVED
+
+`printtape.check.mjs` §18. Two changes: the prior-day append moves from `C > 0` to `S > 0`,
+and each release read costs **6** — 4 external (`gatherEarningsFacts` issues one
+quoteSummary and one v8 chart concurrently plus one news request, then one Anthropic call)
+and 2 bindings (`cronMaySpend`'s get and put). Nothing else; the figure folds into the
+record the pass was going to write anyway.
+
+```
+AMC pass     : ceil(N/20) + 4E + 4 + 6R
+BMO pass     : ceil(N/20) + 4E + (S-C) + 5 + (S>0 ? 2 : 0) + 6R
+pre-bank     : ceil(N/20) + 3E' + 4          (no release read, ever)
+```
+
+The heavy morning at E=10, S=12, C=8 is **53** with no candidate, **65** with two, and
+**113** with all ten — **1.13%** of the invocation's 10,000. A whole worst-case day across
+all five passes is 354, but each pass is its own invocation and none sees the sum. **The
+Claude ceiling binds first and by a wide margin**: `AI_RATE_GLOBAL_DAY` is **60 CALLS** a
+day across every path, so twenty release reads is a third of the day's budget. Rule #5's
+denomination, not rule #1's, is the constraint here. The only figure that moved with no
+release read at all is a morning that screens and carries nothing: **14 → 16**.
+
+### A FIELD THAT DOES NOT RECONCILE — found, not fixed
+
+Transcribing the AVGO record turned up something out of scope and worth recording. Its
+`tape.pre.referenceClose` is **369.68** (`regularMarketPreviousClose`, the 2026-09-01
+close) while Yahoo's own `preMarketChangePercent` of **-2.9871%** implies **367.24** — the
+2026-09-02 close, which is `regularMarketPrice`. At 13:15 UTC on 2026-09-03 Yahoo had not
+yet rolled its "previous close" pointer into the new session, so the field
+`printTapeTapeFrom` documents as the pre window's reference named a close one session too
+early. The verdict is unaffected: it reads `changePct` and never `referenceClose`, which
+§16f pins from source. **`referenceClose` is a provenance field that can disagree with the
+number beside it**, which is the class of thing this repo cares about — it is recorded here
+and in §16's fixture comment rather than silently corrected inside an unrelated change.
 
 ## The income sleeve — the measured classifier, the ex-div gotcha and the caveats
 
@@ -2315,11 +2522,15 @@ without ever opening that file.
   2026-09-08 is Friday 2026-09-04
 - **`printtape:` `divergent` is THREE-VALUED and `null` is a REFUSAL, not a "no".**
   An unknown session, an unpublished actual or a missing consensus means the question
-  could not be asked; `refusalReason` always says which. `divergent === true` is the
-  ONLY thing that may reach the Claude guidance call, by strict equality
+  could not be asked; `refusalReason` always says which. *Since schema 3 (2026-09-03)
+  the boolean is DERIVED from `stage`, never assigned, and a `candidate` — gate 1
+  fired, gate 2 open — is a fourth thing a `null` can mean; the release read is
+  reachable from `candidate` or `divergent`, by strict equality on the stage names*
 - **The print-tape verdict is re-run AFTER `mergePrintTapeRecord`.** One pass cannot
   see both halves — that is why there are two — so a verdict decided pre-merge
-  outlives its own cause and makes guidance unreachable for exactly those names
+  outlives its own cause and makes the Claude call unreachable for exactly those names.
+  *Since schema 3 it is re-decided a SECOND time, after the release read, for the same
+  reason one step later: that call exists to supply gate 2's input*
 - `printtapeday:{ET-DATE}` is written on **every** pass, a zero-eligible one included:
   it is this job's only dispatch evidence, and it sits outside the `printtape:` prefix
 - `longarch:{TICKER}:{PT-DATE}:{SLOT}` is written by the **cron sweeps only**,
@@ -2522,13 +2733,17 @@ The constants table stays in CLAUDE.md. This is the prose around it.
 
 **One record per watchlist name per report day, FIVE cron passes, two read-only
 endpoints, and no change to any existing job.** Added 2026-09-01; rescheduled the
-same day, which is why the schema is already at 2. It measures the PRINT (what was
+same day, which is why the schema reached 2 within a day, and **restructured into two
+gates on 2026-09-03 (schema 3)** once AVGO's record showed the revenue half is not
+obtainable from Yahoo inside the window at all. It measures the PRINT (what was
 reported against consensus) beside the TAPE (what extended hours did with it) and
-fires on exactly one direction: **a double beat the tape sold.**
+fires on exactly one direction: **a double beat the tape sold** — now asked as
+**gate 1** (EPS beat + the tape sold it, free and structured) and **gate 2** (the
+revenue beat, fed by the release read).
 
 | constant | value | what it is |
 |---|---|---|
-| `PRINTTAPE_SCHEMA` | **2** | record shape, **strict equality**. Was 1 for one day |
+| `PRINTTAPE_SCHEMA` | **3** | record shape, **strict equality**. 2 from 2026-09-01, 1 for one day before that; 3 on 2026-09-03 with the two-gate split |
 | `PRINTTAPE_TTL` | **7d** | retention for both the record and the day index — the `TOP3_TTL` / `LONG_ROW_TTL` figure, outliving the weekend and holiday gaps a trading-day writer creates |
 | `PRINTTAPE_DIVERGENCE_PCT` | **-3.0** | the tape gate, read as `changePct <= -3.0` |
 | `PRINTTAPE_QUOTE_CHUNK` | 20 | symbols per v7 quote request, the `yahooSparkCloses` ceiling |
@@ -2537,6 +2752,11 @@ fires on exactly one direction: **a double beat the tape sold.**
 | `PRINTTAPE_CONSENSUS_SOURCES` | `pre-banked` `live-pass` | where a record's consensus figures came from |
 | `PRINTTAPE_PASSES` | **13:15 (pre-bank) · 05:30 · 06:15 · 13:30 · 14:30 PT** | one pre-bank, two BMO, two AMC; each a 15-min window admitting exactly one firing |
 | `PRINTTAPE_GUIDANCE_CLASSES` | `raised` `held` `cut` `not-found` | the only values the guidance field may take |
+| `PRINTTAPE_STAGES` | `not-run` `refused` `agree` `candidate` `divergent` | the five stages, in the order a record moves through them; `divergent` (the boolean) is DERIVED from this |
+| `PRINTTAPE_REVENUE_SOURCES` | `yahoo` `release-via-claude` | where a revenue ACTUAL came from, named on `print.revActualSource` |
+| `PRINTTAPE_REVENUE_CONFLICT_PCT` | **1.0** | the Yahoo-vs-release cross-check tolerance, in percent, and the units cross-check tolerance too |
+| `PRINTTAPE_REVENUE_SANITY_MULT` | **4** | the plausibility band a model-extracted revenue must sit inside relative to the same quarter's consensus — the `IV_OUTLIER_MULT` figure and the `ivPlausible` reasoning |
+| `PRINTTAPE_RELEASE_TOKENS` | **700** | answer ceiling for the release read. Was 350 when it returned one enum and one quote; it now returns two quotes and an attribution |
 
 ---
 

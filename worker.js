@@ -10109,13 +10109,53 @@ async function collectMorningRows(env) {
    is a REFUSAL and never a "no" — an unknown session or a missing consensus
    cannot answer the question, and answering `false` would claim it did.        */
 
-/* SCHEMA 2 (was 1, one day). Two shape changes landed together on 2026-09-01:
-   `tape` became a PAIR of windows (`pre` / `post`) with `usedWindow` naming
-   which one the verdict read, and the record gained `consensusSource` /
-   `consensusBankedTs`. Strict equality means every schema-1 record reads as
-   absent, which is correct — a schema-1 `tape` has `changePct` at the top level
-   and a reader of the new shape would find it nowhere. */
-const PRINTTAPE_SCHEMA = 2;
+/* SCHEMA 3 (2 from 2026-09-01, 1 for one day before that).
+
+   SCHEMA 2 made `tape` a PAIR of windows (`pre` / `post`) with `usedWindow`
+   naming which one the verdict read, and added `consensusSource` /
+   `consensusBankedTs`.
+
+   SCHEMA 3 SPLITS THE TEST INTO TWO GATES and adds `stage` / `stageReason`.
+   MEASURED on AVGO's real 2026-09-02 AMC record, read back out of the deployed
+   Worker on 2026-09-03: the EPS actual and both tape windows landed by the 14:30
+   PT pass, and the REVENUE actual was still absent from
+   `earnings.financialsChart.quarterly` at the 06:15 PT carry-over the next
+   morning — 14 hours after the print. NVDA was still absent SIX DAYS after its
+   own. **The revenue half of the test is not satisfiable inside this feature's
+   window from Yahoo at all**, so a single five-input test can only ever refuse,
+   and the refusal is correct but useless: the record said `divergent: null` on a
+   name whose EPS beat and whose tape was fully read.
+
+   So the free, structured half runs first and on its own — EPS beat AND the tape
+   sold it — and a name that passes is a **`candidate`**, a durable finding in its
+   own right rather than a refusal. The revenue half is then gate 2, fed by the
+   release read (below) with Yahoo kept as the later cross-check.
+
+   Strict equality means every schema-2 record reads as absent, which is correct:
+   a schema-2 record has no `stage`, and a reader that derived one from
+   `divergent` would report every unanswered name as `refused` when the new code
+   would have called most of them `agree` or `candidate`. */
+const PRINTTAPE_SCHEMA = 3;
+
+/* THE FIVE STAGES, in the order a record moves through them.
+
+     not-run    the report has not happened — the pre-bank's state, and the one
+                stage that is not a reading of anything
+     refused    GATE 1 could not be ASKED: unknown session, no print, no usable
+                tape window, or the EPS pair absent
+     agree      the question was asked and answered NO. Either gate 1 came back
+                negative (the tape did not sell an EPS beat, or there was no EPS
+                beat) or gate 1 fired and gate 2 came back negative
+     candidate  GATE 1 FIRED and gate 2 is not yet answerable — the revenue half
+                is missing. THIS IS A FINDING, NOT AN ABSENCE: an EPS beat the
+                tape sold is exactly the shape this feature exists to surface,
+                and it is on screen while the revenue half is still open
+     divergent  both gates fired
+
+   `divergent` (the schema-2 boolean) is DERIVED from this and kept for
+   continuity: `true` at `divergent`, `false` at `agree`, `null` everywhere else.
+   It is never assigned independently — `printTapeStage` is the only writer. */
+const PRINTTAPE_STAGES = ['not-run', 'refused', 'agree', 'candidate', 'divergent'];
 
 /* The two extended-hours windows that can be a reaction to one print, newest
    first for readability only — `printTapeFreshestWindow` decides by quoteTime,
@@ -10145,10 +10185,43 @@ const PRINTTAPE_DIVERGENCE_PCT = -3.0;
 const PRINTTAPE_QUOTE_CHUNK = 20;
 const PRINTTAPE_SWEEP_CAP   = 60;   // same ceiling `sweepUniverse` defaults to
 
-/* Answer tokens for the guidance classification. Small on purpose: it returns
-   one enum and one quoted sentence, nothing else. */
-const PRINTTAPE_GUIDANCE_TOKENS = 350;
+/* Answer tokens for the RELEASE READ — one call returning the guidance
+   classification and the revenue actual together. It was 350 when the answer was
+   one enum and one quoted sentence; it now carries a second quote and the
+   figure's attribution, so the ceiling doubles. `max_tokens` caps thinking and
+   answer TOGETHER, and a truncated answer is refused rather than stored. */
+const PRINTTAPE_RELEASE_TOKENS = 700;
 const PRINTTAPE_GUIDANCE_CLASSES = ['raised', 'held', 'cut', 'not-found'];
+
+/* WHERE A REVENUE ACTUAL CAME FROM. `yahoo` is
+   `earnings.financialsChart.quarterly`, which lags the print by days;
+   `release-via-claude` is the figure read out of the coverage window by the
+   release call. A record carries exactly one of them in `revActual` and names it
+   in `revActualSource`, because the two disagree often enough to need a
+   cross-check and a cross-check needs to know which side is which. */
+const PRINTTAPE_REVENUE_SOURCES = ['yahoo', 'release-via-claude'];
+
+/* THE YAHOO CROSS-CHECK TOLERANCE, in percent. When Yahoo finally publishes the
+   revenue actual days later and it disagrees with the release figure by more
+   than this, the record gains a `revenueConflict` naming BOTH figures — the
+   release figure is NOT overwritten, because it is the primary source (the
+   company's own words, quoted) and the aggregator is the derived one. 1% is wide
+   enough for a rounding difference between "15.95 billion" and 15,952,000,000
+   and narrow enough that a restated or misattributed quarter shows up. */
+const PRINTTAPE_REVENUE_CONFLICT_PCT = 1.0;
+
+/* THE UNITS GATE ON A MODEL-EXTRACTED FIGURE, and it exists because of a named
+   failure in this repo: "when a metric SELECTS using a vendor-supplied number,
+   validate it against its own peers first" (`ivPlausible` / `IV_OUTLIER_MULT`,
+   the AAPL 420-strike 195.72% IV). A revenue read out of prose can be wrong by
+   nine orders of magnitude in one direction — "15.95" for $15.95 billion — and
+   nothing downstream would notice: it would simply read as a catastrophic miss
+   and gate 2 would answer `agree` with total confidence. So the figure is
+   validated against the CONSENSUS FOR THE SAME QUARTER, its own nearest peer,
+   and refused outside 4x either way. Same multiple as `IV_OUTLIER_MULT` and the
+   same reasoning: wide enough that a real 46% miss or a real 3x beat survives,
+   narrow enough that a units error cannot. */
+const PRINTTAPE_REVENUE_SANITY_MULT = 4;
 
 const printTapeKey    = (sym, date) => `printtape:${String(sym).toUpperCase()}:${date}`;
 
@@ -10376,6 +10449,11 @@ function printTapePrintFrom(r, reportDate, bankedQuarter = null) {
     quarterVia,
     epsActual, epsEst, epsSurprisePct,
     revActual, revEst, revSurprisePct,
+    /* WHICH SOURCE THE REVENUE ACTUAL CAME FROM. Yahoo is the only one this
+       function can produce; the release read writes `release-via-claude` onto
+       the record after the merge, and the merge then refuses to let a later
+       Yahoo figure overwrite it. Null when there is no actual to attribute. */
+    revActualSource: revActual != null ? 'yahoo' : null,
     ...(eps ? { eps } : {}),
     ...(rev ? { revenue: rev } : {}),
     epsEstVia, revEstVia,
@@ -10615,24 +10693,68 @@ function printTapeImpliedFrom(row, reportDate) {
   };
 }
 
-/* ── THE DIVERGENCE TEST ────────────────────────────────────────────────────
+/* ── THE TWO GATES ──────────────────────────────────────────────────────────
 
-   ONE DIRECTION ONLY: EPS beat AND revenue beat AND the tape sold it.
+   ONE DIRECTION ONLY, unchanged: EPS beat AND revenue beat AND the tape sold it.
+   What changed at schema 3 is that the three clauses are no longer asked as one
+   question, because two of them are free and structured and the third is not
+   obtainable from Yahoo inside this feature's window.
 
-   `null` IS A REFUSAL AND IS NOT `false`. All five inputs must be present; a
-   missing consensus, an unpublished actual, an unknown session or an
-   unavailable tape means the question could not be asked, and answering `false`
-   would claim it was asked and came back negative. That distinction is the whole
-   reason this returns three values instead of two. */
-function printTapeDivergence(session, print, tape) {
-  const refuse = reason => ({ divergent: null, refusalReason: reason });
+     GATE 1 — FREE AND STRUCTURED. EPS actual > EPS consensus (same quarter, same
+              string-equality rule, nothing relaxed) AND the used tape window's
+              `changePct <= PRINTTAPE_DIVERGENCE_PCT`. Both halves come out of the
+              quoteSummary response the record already fetched, so gate 1 costs
+              nothing beyond what a pass already spends. A pass is a CANDIDATE.
+
+     GATE 2 — REVENUE. Revenue actual > revenue consensus. The consensus is
+              pre-banked; the actual comes from the release read, with Yahoo as
+              the later cross-check. A pass is DIVERGENT.
+
+   WHY IT IS SPLIT, MEASURED: AVGO reported AMC on 2026-09-02. The EPS actual
+   (3.32 vs 3.238) and both tape windows were readable by the 14:30 PT pass; the
+   revenue actual was still absent from `earnings.financialsChart.quarterly` at
+   the 06:15 PT carry-over 14 hours later, and NVDA's was still absent six days
+   after its own print. Asked as one five-input test, that name can only ever be
+   `null` — a refusal that is correct and tells a reader nothing about a report
+   whose EPS and tape were both fully read.
+
+   `null` IS STILL A REFUSAL AND IS STILL NOT `false`, and the boolean is derived
+   from `stage` rather than assigned: `true` at `divergent`, `false` at `agree`,
+   `null` at `not-run` / `refused` / `candidate`.
+
+   THE GATE-1 SHORT CIRCUIT IS A LOGICAL ONE, NOT A GUESS. When gate 1 is fully
+   readable and comes back negative, the answer is `agree` even with the revenue
+   half missing — the test is an AND, so no revenue figure could change it. That
+   is the one place schema 3 answers a question schema 2 refused, and it is the
+   common case: AVGO's own record turns from `divergent: null` into
+   `stage: 'agree'` on exactly this line, because its pre-market sold 2.9871% and
+   the gate wants 3.00%.                                                         */
+function printTapeStage(session, print, tape) {
+  const at = (stage, stageReason, extra = {}) => ({
+    stage,
+    stageReason,
+    divergent: stage === 'divergent' ? true : (stage === 'agree' ? false : null),
+    /* `refusalReason` is kept in lockstep with the boolean: it is non-null in
+       exactly the cases where `divergent` is null, so the schema-2 invariant a
+       reader may already depend on ("a null verdict always says why") survives
+       the restructure unchanged. */
+    refusalReason: (stage === 'divergent' || stage === 'agree') ? null : stageReason,
+    ...extra,
+  });
+
+  /* THE PRE-BANK'S STATE, and it is a fact about the calendar rather than about
+     any reading: the report has not happened. Distinguished from `refused`,
+     which means we looked and could not tell. */
+  if (tape?.status === 'not-yet') {
+    return at('not-run', `the report has not happened yet: ${tape.reason}`);
+  }
 
   if (session !== 'bmo' && session !== 'amc') {
-    return refuse(`session is '${session}' — Yahoo published no session anchor for this report, so the `
+    return at('refused', `session is '${session}' — Yahoo published no session anchor for this report, so the `
       + 'window that traded the print is unknown and the tape reading cannot be attributed to it');
   }
-  if (print?.status) return refuse(`print unavailable: ${print.reason}`);
-  if (tape?.status)  return refuse(`tape unavailable: ${tape.reason}`);
+  if (print?.status) return at('refused', `print unavailable: ${print.reason}`);
+  if (tape?.status)  return at('refused', `tape unavailable: ${tape.reason}`);
 
   /* THE VERDICT READS ONE WINDOW, AND THE RECORD SAYS WHICH. `usedWindow` is
      re-derived by `printTapeFreshestWindow` after every merge, so a record whose
@@ -10642,64 +10764,153 @@ function printTapeDivergence(session, print, tape) {
      number means the number and its provenance cannot come apart. */
   const used = tape && typeof tape.usedWindow === 'string' ? tape[tape.usedWindow] : null;
 
+  // ── GATE 1: can it even be asked? ──
   const missing = [];
   if (!Number.isFinite(print.epsActual)) missing.push('epsActual');
   if (!Number.isFinite(print.epsEst))    missing.push('epsEst');
-  if (!Number.isFinite(print.revActual)) missing.push('revActual');
-  if (!Number.isFinite(print.revEst))    missing.push('revEst');
   if (!used || used.status || !Number.isFinite(used.changePct)) missing.push('tape.changePct');
   if (missing.length) {
-    return refuse(`the test needs all five inputs and ${missing.length} ${missing.length === 1 ? 'is' : 'are'} `
-      + `absent: ${missing.join(', ')}`
-      + (print.revenue?.reason ? ` · revenue: ${print.revenue.reason}` : '')
+    return at('refused',
+      `gate 1 needs all three of epsActual, epsEst and tape.changePct, and ${missing.length} `
+      + `${missing.length === 1 ? 'is' : 'are'} absent: ${missing.join(', ')}`
       + (print.eps?.reason ? ` · eps: ${print.eps.reason}` : ''));
   }
 
   const epsBeat = print.epsActual > print.epsEst;
-  const revBeat = print.revActual > print.revEst;
   const sold    = used.changePct <= PRINTTAPE_DIVERGENCE_PCT;
-  return {
-    divergent: epsBeat && revBeat && sold,
-    refusalReason: null,
-    test: {
-      epsBeat, revBeat, sold,
-      usedWindow: tape.usedWindow,
-      quoteTime: used.quoteTime ?? null,
-      changePct: used.changePct,
-      thresholdPct: PRINTTAPE_DIVERGENCE_PCT,
-      note: 'fires only on beat + beat + sold; any other combination is a real `false`, not a refusal. '
-        + '`changePct` is the reading from `usedWindow` and from nowhere else.',
-    },
+
+  const test = {
+    epsBeat, sold,
+    gate1: epsBeat && sold,
+    /* Three-valued for the same reason the verdict is: `null` here means the
+       revenue pair was not readable, which is not the same as a revenue miss. */
+    revBeat: null,
+    gate2: null,
+    usedWindow: tape.usedWindow,
+    quoteTime: used.quoteTime ?? null,
+    changePct: used.changePct,
+    thresholdPct: PRINTTAPE_DIVERGENCE_PCT,
+    revActualSource: print.revActualSource ?? null,
+    note: 'gate 1 is EPS beat + tape sold, both free and structured; gate 2 is the revenue beat. '
+      + '`changePct` is the reading from `usedWindow` and from nowhere else.',
   };
+
+  // ── GATE 1 answered NO. The AND cannot be rescued by any revenue figure. ──
+  if (!test.gate1) {
+    return at('agree',
+      `gate 1 did not fire: ${epsBeat ? 'EPS beat' : `EPS did not beat (${print.epsActual} vs ${print.epsEst})`}`
+      + ` and the ${tape.usedWindow}-market tape ${sold ? 'sold it' : 'did not sell it'} `
+      + `(${used.changePct}% against a ${PRINTTAPE_DIVERGENCE_PCT}% gate). The test is an AND, so the revenue `
+      + 'half could not change this answer and is not waited for.',
+      { test });
+  }
+
+  // ── GATE 2 ──
+  if (!Number.isFinite(print.revActual) || !Number.isFinite(print.revEst)) {
+    const absent = [
+      !Number.isFinite(print.revActual) ? 'revActual' : null,
+      !Number.isFinite(print.revEst) ? 'revEst' : null,
+    ].filter(Boolean);
+    return at('candidate',
+      `GATE 1 FIRED — EPS beat (${print.epsActual} vs ${print.epsEst}) and the ${tape.usedWindow}-market tape `
+      + `sold it (${used.changePct}% against a ${PRINTTAPE_DIVERGENCE_PCT}% gate). Gate 2 cannot be asked yet: `
+      + `${absent.join(' and ')} ${absent.length === 1 ? 'is' : 'are'} absent`
+      + (print.revenue?.reason ? ` · revenue: ${print.revenue.reason}` : ''),
+      { test });
+  }
+
+  test.revBeat = print.revActual > print.revEst;
+  test.gate2 = test.revBeat;
+  if (!test.revBeat) {
+    return at('agree',
+      `gate 1 fired but gate 2 did not: revenue ${print.revActual} did not beat consensus ${print.revEst}`
+      + (print.revActualSource ? ` (actual via ${print.revActualSource})` : ''),
+      { test });
+  }
+  return at('divergent',
+    `both gates fired: EPS ${print.epsActual} beat ${print.epsEst}, revenue ${print.revActual} beat `
+    + `${print.revEst}${print.revActualSource ? ` (via ${print.revActualSource})` : ''}, and the `
+    + `${tape.usedWindow}-market tape sold it at ${used.changePct}%`,
+    { test });
 }
 
-/* ── GUIDANCE, ONLY ON A DIVERGENT NAME ─────────────────────────────────────
+/* ── THE RELEASE READ, ON A CANDIDATE OR A DIVERGENT NAME ───────────────────
 
-   ONE Claude call, and only when `divergent === true`. It is stored on the
+   ONE Claude call, reading the coverage window ONCE and extracting BOTH halves
+   it can carry: the REVENUE ACTUAL for the reported quarter (gate 2's missing
+   input) and the FORWARD GUIDANCE class with its quote. It is stored on the
    record and never recomputed, so "at most one call per ticker per report" is
-   structural rather than a rule someone has to remember: the second pass reads
-   the banked `guidance` and carries it forward.
+   structural rather than a rule someone has to remember — `releaseRead` stamps
+   that the model answered, the merge carries it forward, and the guard reads it.
+
+   IT RUNS FOR CANDIDATES, NOT ONLY DIVERGENTS, AND THAT COSTS NOTHING EXTRA.
+   Before schema 3 the call fired only on `divergent === true`, which on the
+   measured evidence was almost never reachable: the revenue actual Yahoo needs
+   days to publish is the very input the verdict was waiting on. Now gate 1 —
+   free and structured — decides who is worth a call, and the one call is what
+   supplies gate 2. Same ceiling, same bucket, same once-per-ticker-per-report
+   rule; a candidate that the call turns into a divergent has spent ONE call in
+   total, not two.
 
    INPUT, STATED PLAINLY: `gatherEarningsFacts` — the same gather the
    `/api/earnings` path uses, whose news window is the closest thing this Worker
-   has to a release or 8-K feed. THERE IS NO 8-K SOURCE WIRED HERE and none is
-   invented; `guidance.source` names the window that was actually read, and
+   has to a release or 8-K feed. THERE IS STILL NO 8-K SOURCE WIRED HERE and none
+   is invented; `source` names the window that was actually read,
    `class: 'not-found'` is the honest answer when that window carried no guidance
-   language. Without `ALPACA_KEY` the window is Yahoo search, which cannot be
-   queried by date — so coverage is good for a fresh report and thin for an old
-   one, exactly as `newsStatus` already documents for the earnings card.
+   language, and `status: 'not-found-in-release'` is the honest answer when it
+   carried no revenue figure. Without `ALPACA_KEY` the window is Yahoo search,
+   which cannot be queried by date — so coverage is good for a fresh report and
+   thin for an old one, exactly as `newsStatus` already documents for the
+   earnings card.
+
+   THE FIGURE IS ATTRIBUTED BY INDEX, NOT BY URL. The model names which numbered
+   item in the block it read the figure out of; the Worker resolves that index to
+   the item's own title, source and URL. A URL is not in the prompt and a model
+   asked for one would have to invent it — this is the same rule as "the quote
+   must appear verbatim in the block above", applied to the citation.
 
    The CEILING is the same `AI_RATE_GLOBAL_DAY` bucket every request-path spend
    counts against — see `cronMaySpend`. */
-const PRINTTAPE_GUIDANCE_SCHEMA = {
+const PRINTTAPE_RELEASE_SCHEMA = {
   type: 'object',
   properties: {
-    class: { type: 'string', enum: PRINTTAPE_GUIDANCE_CLASSES },
-    quote: { type: ['string', 'null'] },
+    guidanceClass: { type: 'string', enum: PRINTTAPE_GUIDANCE_CLASSES },
+    guidanceQuote: { type: ['string', 'null'] },
+    /* ABSOLUTE UNITS, and `revenueValueText` is the SECOND DERIVATION that keeps
+       it honest — the figure exactly as the coverage wrote it. The Worker parses
+       the text and refuses the pair when the two disagree, because "15.95" for
+       $15.95 billion is a nine-order-of-magnitude error that reads downstream as
+       an ordinary catastrophic miss. */
+    revenueValue: { type: ['number', 'null'] },
+    revenueValueText: { type: ['string', 'null'] },
+    revenueCurrency: { type: ['string', 'null'] },
+    revenueQuote: { type: ['string', 'null'] },
+    revenueItemIndex: { type: ['integer', 'null'] },
   },
-  required: ['class', 'quote'],
+  required: ['guidanceClass', 'guidanceQuote', 'revenueValue', 'revenueValueText',
+             'revenueCurrency', 'revenueQuote', 'revenueItemIndex'],
   additionalProperties: false,
 };
+
+/* Parse "$15.95 billion" / "15,950 million" / "USD 15.95B" into absolute units,
+   or null when the text carries no scaled figure. It is a CROSS-CHECK on the
+   model's own `revenueValue`, never a substitute for it: a null here means "the
+   text could not be re-derived", which is recorded and does not refuse. */
+const PRINTTAPE_MAGNITUDES = [
+  [/\b(?:trillion|tn)\b|\dT\b/i, 1e12],
+  [/\b(?:billion|bn)\b|\dB\b/i, 1e9],
+  [/\b(?:million|mm)\b|\dM\b/i, 1e6],
+  [/\b(?:thousand)\b|\dK\b/i, 1e3],
+];
+function printTapeParseMoney(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  const m = text.replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+  if (!m) return null;
+  const n = Number(m[0]);
+  if (!Number.isFinite(n)) return null;
+  for (const [re, mult] of PRINTTAPE_MAGNITUDES) if (re.test(text)) return n * mult;
+  return n;
+}
 
 /** The daily AI ceiling, applied from a cron where there is no `Request`.
  *
@@ -10733,70 +10944,178 @@ async function cronMaySpend(env, cost, job) {
   }
 }
 
-async function printTapeGuidance(sym, env, print) {
-  if (!env?.ANTHROPIC_API_KEY) {
-    return { status: 'not-computed', reason: 'ANTHROPIC_API_KEY is not configured on this Worker' };
-  }
-  if (!await cronMaySpend(env, 1, `print-tape guidance ${sym}`)) {
-    return { status: 'not-computed',
-      reason: `the ${AI_RATE_GLOBAL_DAY}/day global AI ceiling refused this call — the divergence stands, only `
-        + 'the guidance read was skipped' };
+/** ONE call, BOTH halves. Returns `{ guidance, revenue, answered }`, where each
+ *  half is independently a measurement or a refusal and `answered` says whether
+ *  the model replied at all.
+ *
+ *  `answered` is what the once-per-ticker-per-report rule is built on: a call
+ *  that never reached Anthropic (no key, ceiling refused, gather threw, response
+ *  truncated) must be retryable on a later pass, and a call that DID answer must
+ *  not be asked again even when both halves came back empty. Both halves get the
+ *  same refusal object in the non-answered cases, because the reason is the same
+ *  fact about the call and duplicating it into two different sentences would let
+ *  them drift.                                                                  */
+async function printTapeReadRelease(sym, env, print) {
+  const bail = (reason) => ({ answered: false,
+    guidance: { status: 'not-computed', reason },
+    revenue:  { status: 'not-computed', reason } });
+
+  if (!env?.ANTHROPIC_API_KEY) return bail('ANTHROPIC_API_KEY is not configured on this Worker');
+  if (!await cronMaySpend(env, 1, `print-tape release read ${sym}`)) {
+    return bail(`the ${AI_RATE_GLOBAL_DAY}/day global AI ceiling refused this call — the gate-1 candidacy `
+      + 'stands, only the release read was skipped');
   }
 
   let facts;
   try { facts = await gatherEarningsFacts(sym, env); }
-  catch (e) { return { status: 'not-computed', reason: `earnings fact gather failed: ${e.message}` }; }
+  catch (e) { return bail(`earnings fact gather failed: ${e.message}`); }
 
+  /* NUMBERED, because the attribution is by index. The numbering is 1-based in
+     the prompt and converted back here, so an off-by-one lands out of range and
+     is refused rather than citing a neighbouring headline. */
   const newsBlock = facts.news.length
-    ? facts.news.map(n => `• [${n.date}${n.source ? ' · ' + n.source : ''}] ${n.title}${n.summary ? ` — ${n.summary}` : ''}`).join('\n')
+    ? facts.news.map((n, i) => `[${i + 1}] [${n.date}${n.source ? ' · ' + n.source : ''}] ${n.title}${n.summary ? ` — ${n.summary}` : ''}`).join('\n')
     : 'NONE AVAILABLE.';
 
-  const prompt = `Classify the FORWARD GUIDANCE ${facts.company} (${sym}) issued with the earnings report dated ${print?.quarter ? 'for the quarter ending ' + print.quarter : 'just released'}.
+  const quarterPhrase = print?.quarter ? `the quarter ending ${print.quarter}` : 'the quarter just reported';
+  const prompt = `Read the coverage of ${facts.company} (${sym})'s earnings report for ${quarterPhrase} and extract two things: the REVENUE ACTUAL the company reported for that quarter, and the FORWARD GUIDANCE it issued.
 
-COVERAGE PUBLISHED AROUND THE REPORT${facts.newsWindow ? ` (window ${facts.newsWindow.from} → ${facts.newsWindow.to}${facts.newsSource ? ', via ' + facts.newsSource : ''})` : ''}:
+COVERAGE PUBLISHED AROUND THE REPORT${facts.newsWindow ? ` (window ${facts.newsWindow.from} → ${facts.newsWindow.to}${facts.newsSource ? ', via ' + facts.newsSource : ''})` : ''}, numbered:
 ${newsBlock}
 
-Return ONLY the classification:
-  class — "raised" if the company raised its forward outlook, "held" if it reaffirmed or left it unchanged, "cut" if it lowered it, "not-found" if the coverage above does not state what the company guided.
-  quote — the single sentence from the coverage above that states the guidance, copied VERBATIM, or null when class is "not-found".
+Return:
+  revenueValue — the revenue the company REPORTED for ${quarterPhrase}, in ABSOLUTE UNITS (write 15950000000, not 15.95), or null if the coverage above does not state it.
+  revenueValueText — that same figure copied exactly as the coverage writes it, e.g. "$15.95 billion", or null.
+  revenueCurrency — the ISO currency code of that figure, e.g. "USD", or null.
+  revenueQuote — the single sentence from the coverage above that states the revenue figure, copied VERBATIM, or null.
+  revenueItemIndex — the number in square brackets of the item that sentence came from, or null.
+  guidanceClass — "raised" if the company raised its forward outlook, "held" if it reaffirmed or left it unchanged, "cut" if it lowered it, "not-found" if the coverage above does not state what the company guided.
+  guidanceQuote — the single sentence from the coverage above that states the guidance, copied VERBATIM, or null when guidanceClass is "not-found".
 
 CRITICAL RULES:
-- Decide ONLY from the coverage block above. Do not use anything you recall about this company.
-- "not-found" is the correct and expected answer when the block is empty or says nothing about guidance. Never infer guidance from the earnings numbers, from the share price, or from what a company like this usually does.
-- The quote must appear verbatim in the block above. If no single sentence there states the guidance, return "not-found" with a null quote.`;
+- Decide ONLY from the coverage block above. Do not use anything you recall about this company, and do not compute, estimate or annualise a figure that is not written there.
+- Nulls are the correct and expected answer when the block is empty or does not carry the thing asked for. Never infer revenue or guidance from the earnings numbers, from the share price, or from what a company like this usually does.
+- The revenue figure must be for ${quarterPhrase} and for that quarter alone — not a full year, not a forecast, not a segment, not a year-ago comparison. If the coverage only gives a growth rate, a segment figure or a forecast, return null.
+- Every quote must appear verbatim in the block above. If no single sentence there states the thing, return null for it.`;
 
   let out;
   try {
-    const res = await workerClaude(prompt, env, PRINTTAPE_GUIDANCE_TOKENS, PRINTTAPE_GUIDANCE_SCHEMA, { raw: true });
+    const res = await workerClaude(prompt, env, PRINTTAPE_RELEASE_TOKENS, PRINTTAPE_RELEASE_SCHEMA, { raw: true });
     /* `claudeText()` cannot tell a complete answer from a truncated one, and a
-       half-sentence stored as a verbatim quote is worse than no quote. */
+       half-sentence stored as a verbatim quote is worse than no quote — as is a
+       figure whose supporting text was cut off. */
     if (res?.stopReason === 'max_tokens') {
-      return { status: 'not-computed', reason: 'the guidance answer hit max_tokens and was truncated — a '
-        + 'cut-off quote would be stored as though it were the whole sentence' };
+      return bail('the release answer hit max_tokens and was truncated — a cut-off quote would be stored as '
+        + 'though it were the whole sentence, and a figure whose evidence was cut off is worse than no figure');
     }
     out = JSON.parse(String(res?.text ?? '').replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim());
   } catch (e) {
-    return { status: 'not-computed', reason: `guidance classification failed: ${e.message}` };
+    return bail(`the release read failed: ${e.message}`);
   }
 
-  const cls = PRINTTAPE_GUIDANCE_CLASSES.includes(out?.class) ? out.class : null;
-  if (!cls) {
-    return { status: 'not-computed',
-      reason: `the model returned class ${JSON.stringify(out?.class)}, which is not one of `
-        + PRINTTAPE_GUIDANCE_CLASSES.join(' | ') };
+  const sourceLine = facts.newsSource
+    ? `${facts.newsSource} · window ${facts.newsWindow?.from} → ${facts.newsWindow?.to} (newsStatus ${facts.newsStatus})`
+    : `no coverage retrieved (newsStatus ${facts.newsStatus}) — there is no 8-K or press-release feed wired to this Worker`;
+  const asOf = new Date().toISOString();
+
+  // ── GUIDANCE ──
+  const cls = PRINTTAPE_GUIDANCE_CLASSES.includes(out?.guidanceClass) ? out.guidanceClass : null;
+  const gQuote = typeof out?.guidanceQuote === 'string' && out.guidanceQuote.trim() ? out.guidanceQuote.trim() : null;
+  const guidance = cls
+    ? {
+        class: cls,
+        quote: cls === 'not-found' ? null : gQuote,
+        /* A `raised`/`held`/`cut` with no quote behind it is a claim with nothing
+           supporting it, so the absence is NAMED rather than left as a bare null. */
+        quoteNote: cls !== 'not-found' && !gQuote
+          ? 'the model classified the guidance but returned no verbatim sentence to support it' : null,
+        source: sourceLine, asOf,
+      }
+    : { status: 'not-computed',
+        reason: `the model returned guidanceClass ${JSON.stringify(out?.guidanceClass)}, which is not one of `
+          + PRINTTAPE_GUIDANCE_CLASSES.join(' | ') };
+
+  // ── REVENUE ──
+  const revenue = printTapeReleaseRevenue(out, print, facts, sourceLine, asOf);
+
+  /* ANSWERED, even when both halves are empty. The model read the window and
+     found nothing in it; asking again from the next pass would spend a second
+     call on the same window for the same answer. */
+  return { answered: true, guidance, revenue };
+}
+
+/** The revenue half of the release read, validated before it is believed.
+ *
+ *  THREE GATES, in order, each of which has a named precedent in this repo:
+ *    1. the figure must BE a finite positive number (guard the null before the
+ *       arithmetic — `(null * 100).toFixed(0)` is `"0"`);
+ *    2. it must re-derive from `revenueValueText`, the model's own second
+ *       statement of the same figure, within 1% — the units trap;
+ *    3. it must sit within `PRINTTAPE_REVENUE_SANITY_MULT` of the CONSENSUS for
+ *       the same quarter, its own nearest peer — the `ivPlausible` rule.
+ *
+ *  A figure that fails any of them is refused with both numbers named. A figure
+ *  that passes carries its quote, its currency and the coverage item it came
+ *  from, resolved BY INDEX rather than from anything the model wrote.           */
+function printTapeReleaseRevenue(out, print, facts, sourceLine, asOf) {
+  const v = typeof out?.revenueValue === 'number' && Number.isFinite(out.revenueValue) ? out.revenueValue : null;
+  if (v == null || v <= 0) {
+    return { status: 'not-found-in-release',
+      reason: 'the coverage window carried no revenue figure for this quarter that the release read would '
+        + `state (revenueValue ${JSON.stringify(out?.revenueValue)}). The window is news coverage, not an 8-K `
+        + 'feed — there is no press-release source wired to this Worker, so an absent figure is an ordinary '
+        + 'outcome and not a fault.' };
   }
-  const quote = cls === 'not-found' ? null : (typeof out.quote === 'string' && out.quote.trim() ? out.quote.trim() : null);
+
+  const reDerived = printTapeParseMoney(out?.revenueValueText);
+  if (reDerived != null && reDerived > 0) {
+    const driftPct = Math.abs((v - reDerived) / reDerived) * 100;
+    if (driftPct > PRINTTAPE_REVENUE_CONFLICT_PCT) {
+      return { status: 'not-found-in-release',
+        reason: `the release read returned ${v} but wrote the same figure as ${JSON.stringify(out.revenueValueText)}, `
+          + `which re-derives to ${reDerived} — ${driftPct.toFixed(1)}% apart. The two statements of one number `
+          + 'disagree, so neither is stored: a units error here is nine orders of magnitude and reads downstream '
+          + 'as an ordinary miss.' };
+    }
+  }
+
+  if (Number.isFinite(print?.revEst) && print.revEst > 0) {
+    const ratio = v / print.revEst;
+    if (ratio > PRINTTAPE_REVENUE_SANITY_MULT || ratio < 1 / PRINTTAPE_REVENUE_SANITY_MULT) {
+      return { status: 'not-found-in-release',
+        reason: `the extracted revenue ${v} is ${ratio.toFixed(4)}x the consensus ${print.revEst} for the same `
+          + `quarter, outside the ${PRINTTAPE_REVENUE_SANITY_MULT}x plausibility band. A figure that far from its `
+          + 'own nearest peer is a units error, not a surprise, and a units error read as a surprise is exactly '
+          + 'the deep-strike IV failure this repo has already shipped once.' };
+    }
+  }
+
+  /* THE CITATION IS RESOLVED FROM THE INDEX THE MODEL NAMED, against the array
+     that built the prompt. An out-of-range index cites nothing rather than
+     citing the wrong headline. */
+  const idx = Number.isInteger(out?.revenueItemIndex) ? out.revenueItemIndex - 1 : -1;
+  const item = idx >= 0 && idx < (facts.news?.length || 0) ? facts.news[idx] : null;
+  const cur = typeof out?.revenueCurrency === 'string' && /^[A-Z]{3}$/.test(out.revenueCurrency.trim().toUpperCase())
+    ? out.revenueCurrency.trim().toUpperCase() : null;
+  const quote = typeof out?.revenueQuote === 'string' && out.revenueQuote.trim() ? out.revenueQuote.trim() : null;
+
   return {
-    class: cls,
+    value: v,
+    valueText: typeof out?.revenueValueText === 'string' ? out.revenueValueText : null,
+    valueReDerived: reDerived,
+    currency: cur,
     quote,
-    /* A `raised`/`held`/`cut` with no quote behind it is a claim with nothing
-       supporting it, so the absence is NAMED rather than left as a bare null. */
-    quoteNote: cls !== 'not-found' && !quote
-      ? 'the model classified the guidance but returned no verbatim sentence to support it' : null,
-    source: facts.newsSource
-      ? `${facts.newsSource} · window ${facts.newsWindow?.from} → ${facts.newsWindow?.to} (newsStatus ${facts.newsStatus})`
-      : `no coverage retrieved (newsStatus ${facts.newsStatus}) — there is no 8-K or press-release feed wired to this Worker`,
-    asOf: new Date().toISOString(),
+    quoteNote: quote ? null
+      : 'the release read returned a figure but no verbatim sentence supporting it',
+    sourceTitle: item?.title ?? null,
+    sourcePublisher: item?.source ?? null,
+    sourceDate: item?.date ?? null,
+    sourceUrl: item?.url ?? null,
+    sourceNote: item ? null
+      : `the release read named coverage item ${JSON.stringify(out?.revenueItemIndex)}, which is not in the `
+        + `${facts.news?.length || 0}-item window it was shown — the figure stands, the attribution does not`,
+    source: `release-via-claude · ${sourceLine}`,
+    asOf,
   };
 }
 
@@ -10843,11 +11162,64 @@ function mergePrintTapeRecord(prev, next) {
         if (!Number.isFinite(nPrint[f]) && Number.isFinite(pPrint[f])) { out.print[f] = pPrint[f]; carried.push(f); }
       }
       if (carried.includes('epsEst') || carried.includes('revEst')) bankUsed = true;
+
+      /* ── THE RELEASE FIGURE IS NOT OVERWRITTEN BY A LATER YAHOO ONE ─────────
+
+         The ordinary merge rule is "a later measurement REPLACES". This is the
+         one place it must not, and the reason is provenance rather than
+         freshness: the release figure is the company's own words, quoted, read
+         within hours of the print; Yahoo's is an aggregator's transcription that
+         arrives days later. So the release figure STANDS and Yahoo's becomes a
+         CROSS-CHECK — recorded either way, and promoted to a `revenueConflict`
+         when the two are more than `PRINTTAPE_REVENUE_CONFLICT_PCT` apart.
+
+         A conflict is a FINDING, not an error to resolve silently: one of the
+         two sources is describing a different quarter, a restatement or a
+         different revenue line, and overwriting would erase the evidence of
+         that. Both figures ride on the record and a reader decides. */
+      const pRelease = pPrint.revActualSource === 'release-via-claude' && Number.isFinite(pPrint.revActual);
+      if (pRelease) {
+        const yahooRev = Number.isFinite(nPrint.revActual) ? nPrint.revActual : null;
+        out.print.revActual = pPrint.revActual;
+        out.print.revActualSource = 'release-via-claude';
+        if (!carried.includes('revActual')) carried.push('revActual');
+        if (pPrint.revenue && !pPrint.revenue.status) out.print.revenue = pPrint.revenue;
+        if (yahooRev != null && yahooRev !== pPrint.revActual) {
+          const diffPct = +(((yahooRev - pPrint.revActual) / Math.abs(pPrint.revActual)) * 100).toFixed(4);
+          const agrees = Math.abs(diffPct) <= PRINTTAPE_REVENUE_CONFLICT_PCT;
+          out.print.revenueCrosscheck = {
+            release: pPrint.revActual, yahoo: yahooRev, diffPct, agrees,
+            tolerancePct: PRINTTAPE_REVENUE_CONFLICT_PCT,
+            note: 'Yahoo published its own revenue actual for this quarter after the release read. The release '
+              + 'figure is the one served; this is the later cross-check on it.',
+          };
+          if (!agrees) {
+            out.print.revenueConflict = {
+              release: pPrint.revActual, yahoo: yahooRev, diffPct,
+              tolerancePct: PRINTTAPE_REVENUE_CONFLICT_PCT,
+              note: `the two sources disagree by ${diffPct}%, past the ${PRINTTAPE_REVENUE_CONFLICT_PCT}% `
+                + 'tolerance. NEITHER is overwritten and the verdict still reads the release figure — one of '
+                + 'the two is describing a different quarter, a restatement or a different revenue line, and '
+                + 'which is which is not decidable from here.',
+            };
+          }
+        }
+      } else if (Number.isFinite(nPrint.revActual) && !out.print.revActualSource) {
+        out.print.revActualSource = 'yahoo';
+      }
+
       if (carried.length) {
         out.print.epsSurprisePct = printTapeSurprise(out.print.epsActual, out.print.epsEst);
         out.print.revSurprisePct = printTapeSurprise(out.print.revActual, out.print.revEst);
         if (Number.isFinite(out.print.epsActual) && Number.isFinite(out.print.epsEst)) delete out.print.eps;
-        if (Number.isFinite(out.print.revActual) && Number.isFinite(out.print.revEst)) delete out.print.revenue;
+        /* A COMPLETE REVENUE PAIR CLEARS A REFUSAL, NEVER A MEASUREMENT. At
+           schema 2 `print.revenue` could only ever be `{status, reason}`, so an
+           unconditional delete was right. It now also holds the release read's
+           own measurement — the figure, its quote and its citation — and
+           deleting that would drop the provenance of the number the verdict is
+           about to be decided on. */
+        if (Number.isFinite(out.print.revActual) && Number.isFinite(out.print.revEst)
+            && out.print.revenue?.status) delete out.print.revenue;
         out.print.carriedFields = carried.slice();
         out.print.carriedFromPass = prev.pass ?? null;
         out.print.carriedFromTs = prev.ts;
@@ -10904,6 +11276,21 @@ function mergePrintTapeRecord(prev, next) {
     carried.push('guidance');
   }
 
+  /* ── `releaseRead`: THE STAMP THAT MAKES ONE-CALL-PER-REPORT STRUCTURAL ─────
+
+     Carried forward UNCONDITIONALLY, like `consensusBankedTs` and for the same
+     reason: it is a fact about the report that stays true however later passes
+     read it. It is what the job's spend guard tests, so losing it on a merge
+     would buy a second Claude call for every remaining pass on the name — and
+     the case it exists for is precisely the one where BOTH halves came back
+     empty, so nothing else on the record would show that the call had happened.
+     A refusal that never reached Anthropic does not stamp it, so a ceiling
+     rejection or a truncated answer stays retryable. */
+  if (prev.releaseRead && !out.releaseRead) {
+    out.releaseRead = prev.releaseRead;
+    carried.push('releaseRead');
+  }
+
   /* ── CONSENSUS PROVENANCE ───────────────────────────────────────────────────
 
      Two fields, deliberately answering two different questions:
@@ -10953,7 +11340,7 @@ async function printTapeMeasure(env, cand, reportDate, passLabel, prev = null) {
   const row = await readLongRow(sym, env);
   const implied = printTapeImpliedFrom(row, reportDate);
 
-  const { divergent, refusalReason, test } = printTapeDivergence(cand.session, print, tape);
+  const { stage, stageReason, divergent, refusalReason, test } = printTapeStage(cand.session, print, tape);
 
   return {
     schema: PRINTTAPE_SCHEMA,
@@ -10970,24 +11357,33 @@ async function printTapeMeasure(env, cand, reportDate, passLabel, prev = null) {
     consensusSource: 'live-pass',
     consensusBankedTs: null,
     print, tape, implied,
+    stage, stageReason,
     divergent, refusalReason,
     ...(test ? { divergenceTest: test } : {}),
     guidance: null,
+    /* Null until the release read ANSWERS. The merge carries it forward, and it
+       is the only thing the once-per-ticker-per-report spend guard consults. */
+    releaseRead: null,
     /* Stated, not computed. Scoring "how often does a beat-and-fade recover"
        needs a logged history of these records resolving forward, and none exists
        — this feature only runs forward from its first deploy. A number here with
        nothing behind it is the `hit rate 0% over n=12` failure. */
     baseRate: { status: 'not-measured', reason: 'no logged history of beat-and-fade outcomes yet' },
-    passes: [{ pass: passLabel, ts: Date.now(), divergent, printOk: !print.status, tapeOk: !tape.status }],
+    passes: [{ pass: passLabel, ts: Date.now(), stage, divergent, printOk: !print.status, tapeOk: !tape.status }],
   };
 }
 
 /** True when a record needs no further pass: the question was ANSWERED (either
  *  way) and every field it needs was present. A refusal is NOT complete — that is
- *  the whole reason the second pass exists. */
+ *  the whole reason the second pass exists.
+ *
+ *  A `candidate` IS NOT COMPLETE. Gate 1 has fired and gate 2 is still open, so
+ *  there is something left for a later pass to read — which is the same answer
+ *  `divergent === null` gave at schema 2, reached through the stage rather than
+ *  through the boolean so the two cannot drift. */
 function printTapeComplete(rec) {
   return !!rec && rec.schema === PRINTTAPE_SCHEMA
-    && (rec.divergent === true || rec.divergent === false)
+    && (rec.stage === 'divergent' || rec.stage === 'agree')
     && !rec.print?.status && !rec.tape?.status;
 }
 
@@ -11020,8 +11416,17 @@ function printTapeNeedsCarryOver(rec) {
       ? `the banked record is schema ${rec.schema}, not ${PRINTTAPE_SCHEMA} — it reads as absent`
       : 'no record was banked for this report at all, so neither of the report session\'s passes wrote one' };
   }
-  if (rec.divergent !== true && rec.divergent !== false) {
-    return { need: true, reason: `divergent is ${JSON.stringify(rec.divergent)} — the question was REFUSED, `
+  /* A `candidate` carries over for a DIFFERENT reason from a `refused` one, and
+     naming which is the difference between "a night might publish the missing
+     input" and "a night might fix a reading that failed". Both need the pass;
+     only one of them is already a finding. */
+  if (rec.stage === 'candidate') {
+    return { need: true, reason: 'stage is CANDIDATE — gate 1 fired and gate 2 is still open'
+      + `${rec.stageReason ? `: ${rec.stageReason}` : ''}` };
+  }
+  if (rec.stage !== 'divergent' && rec.stage !== 'agree') {
+    return { need: true, reason: `stage is ${JSON.stringify(rec.stage ?? null)} (divergent `
+      + `${JSON.stringify(rec.divergent ?? null)}) — the question was REFUSED, `
       + `not answered${rec.refusalReason ? `: ${rec.refusalReason}` : ''}` };
   }
   if (rec.print?.status) {
@@ -11032,7 +11437,8 @@ function printTapeNeedsCarryOver(rec) {
       return { need: true, reason: `print.${half} is ${rec.print[half].status}: ${rec.print[half].reason}` };
     }
   }
-  return { need: false, reason: `answered (divergent: ${rec.divergent}) with every print field published` };
+  return { need: false,
+    reason: `answered — stage ${rec.stage} (divergent: ${rec.divergent}) with every print field published` };
 }
 
 /* ── THE ELIGIBILITY SCAN ───────────────────────────────────────────────────
@@ -11249,7 +11655,10 @@ async function collectPrintTapePreBank(env) {
     const tape = { status: 'not-yet',
       reason: `the ${cand.session} report on ${target} has not happened — there is no extended-hours `
         + 'reaction to read, and this pass exists to bank the consensus before it rolls forward' };
-    const { divergent, refusalReason } = printTapeDivergence(cand.session, print, tape);
+    /* `not-run`, not `refused`: the pre-bank's `tape` is `status: 'not-yet'` and
+       `printTapeStage` reads that as the calendar fact it is. A pre-banked
+       record must never read as "we looked and could not tell". */
+    const { stage, stageReason, divergent, refusalReason } = printTapeStage(cand.session, print, tape);
     const bankedTs = new Date().toISOString();
 
     let rec = {
@@ -11267,10 +11676,12 @@ async function collectPrintTapePreBank(env) {
       implied: { status: 'not-computed',
         reason: 'the pre-bank pass reads the consensus only — the implied move is attached by the '
           + 'measurement passes, from the long: row priced on the report day itself' },
+      stage, stageReason,
       divergent, refusalReason,
       guidance: null,
+      releaseRead: null,
       baseRate: { status: 'not-measured', reason: 'no logged history of beat-and-fade outcomes yet' },
-      passes: [{ pass: label, ts: Date.now(), divergent, printOk: !print.status, tapeOk: false }],
+      passes: [{ pass: label, ts: Date.now(), stage, divergent, printOk: !print.status, tapeOk: false }],
     };
     rec = mergePrintTapeRecord(prev, rec);
 
@@ -11394,11 +11805,26 @@ async function collectPrintTape(env, sessionWanted, passNo) {
      Monday, find no index, and silently carry nothing. */
   const prevDate = sessionWanted === 'bmo' ? prevTradingDay(today) : null;
   const carrySkipped = [], carryScreened = [];
+  /* THE CARRY-OVER'S OWN "scan" IS THE PRIOR DAY INDEX READ, and its outcome
+     rides on both index entries. Named separately from `scan.sourceOk` because
+     they are different reads of different things — conflating them is how a
+     failed eligibility scan on the report day and a failed index read the next
+     morning would print the same sentence. */
+  let carryIndexOk = null, carryIndexReason = null;
   if (prevDate) {
     let prevDay = null, prevDayErr = null;
     try { prevDay = await env.REC_LOG.get(printTapeDayKey(prevDate), 'json'); }
     catch (e) { prevDayErr = e.message; }
-    if (prevDay && prevDay.schema !== PRINTTAPE_SCHEMA) prevDay = null;
+    if (prevDay && prevDay.schema !== PRINTTAPE_SCHEMA) {
+      carryIndexReason = `the prior day index for ${prevDate} is schema ${prevDay.schema}, not `
+        + `${PRINTTAPE_SCHEMA} — it reads as absent`;
+      prevDay = null;
+    } else if (prevDayErr) {
+      carryIndexReason = `the prior day index read for ${prevDate} failed: ${prevDayErr}`;
+    } else if (!prevDay) {
+      carryIndexReason = `no day index exists for the prior session ${prevDate}`;
+    }
+    carryIndexOk = !!prevDay;
 
     const seenCarry = new Set();
     for (const p of (prevDay?.passes || [])) {
@@ -11445,6 +11871,37 @@ async function collectPrintTape(env, sessionWanted, passNo) {
 
   const measured = [], carryMeasured = [], skipped = [...scan.skipped];
   const divergentNames = [], carryDivergent = [];
+  const candidateNames = [], carryCandidates = [];
+
+  /* RE-DECIDE THE STAGE FROM WHAT THE RECORD NOW HOLDS, and write every field
+     that depends on it in ONE place. It is called TWICE per record — after the
+     merge, and again after the release read — because each of those steps can
+     supply an input the previous decision did not have, and a stage that
+     outlives its own cause is the schema-2 defect this whole restructure is
+     downstream of. Nothing else in this job may assign `stage`, `divergent`,
+     `refusalReason` or `divergenceTest`. */
+  const applyStage = (rec, passLabel) => {
+    const s = printTapeStage(rec.session, rec.print, rec.tape);
+    rec.stage = s.stage;
+    rec.stageReason = s.stageReason;
+    rec.divergent = s.divergent;
+    rec.refusalReason = s.refusalReason;
+    /* A stale decomposed test beside a fresh stage is two facts that can
+       disagree, so it is deleted rather than left. */
+    if (s.test) rec.divergenceTest = s.test; else delete rec.divergenceTest;
+    // The pass log entry describes this pass's OUTCOME, so it follows the stage.
+    const own = rec.passes?.[rec.passes.length - 1];
+    if (own && own.pass === passLabel) {
+      own.stage = s.stage;
+      own.divergent = s.divergent;
+      own.printOk = !rec.print?.status;
+      own.tapeOk = !rec.tape?.status;
+      own.usedWindow = rec.tape?.usedWindow ?? null;
+      own.merged = Array.isArray(rec.carriedForward) ? rec.carriedForward : null;
+      own.releaseRead = rec.releaseRead ? { revenueFound: rec.releaseRead.revenueFound } : null;
+    }
+  };
+
   for (const item of work) {
     const cand = item.cand;
     const key = printTapeKey(cand.symbol, item.reportDate);
@@ -11461,8 +11918,8 @@ async function collectPrintTape(env, sessionWanted, passNo) {
        different and stricter question, so it does not re-run this one. */
     if (passNo > 1 && !item.carry && printTapeComplete(prev)) {
       skipped.push({ ticker: cand.symbol,
-        reason: `already answered on ${prev.pass} (divergent: ${prev.divergent}) with print and tape both `
-          + 'present — nothing left for this pass to read' });
+        reason: `already answered on ${prev.pass} — stage ${prev.stage} (divergent: ${prev.divergent}) with `
+          + 'print and tape both present — nothing left for this pass to read' });
       continue;
     }
 
@@ -11486,30 +11943,56 @@ async function collectPrintTape(env, sessionWanted, passNo) {
        its own cause, which also meant `guidance` could never fire on a name whose
        evidence only became complete across two passes — the whole point of
        having more than one. */
-    const merged = printTapeDivergence(rec.session, rec.print, rec.tape);
-    rec.divergent = merged.divergent;
-    rec.refusalReason = merged.refusalReason;
-    if (merged.test) rec.divergenceTest = merged.test; else delete rec.divergenceTest;
-    // The pass log entry describes this pass's OUTCOME, so it follows the verdict.
-    const own = rec.passes?.[rec.passes.length - 1];
-    if (own && own.pass === passLabel) {
-      own.divergent = merged.divergent;
-      own.printOk = !rec.print?.status;
-      own.tapeOk = !rec.tape?.status;
-      own.usedWindow = rec.tape?.usedWindow ?? null;
-      own.merged = Array.isArray(rec.carriedForward) ? rec.carriedForward : null;
+    applyStage(rec, passLabel);
+
+    /* ── THE RELEASE READ, ON A CANDIDATE OR A DIVERGENT ──────────────────────
+
+       ONE Claude call, and it runs for CANDIDATES rather than only divergents —
+       which costs nothing extra, because it is the same call and a candidate
+       that it turns into a divergent has spent one in total. Before schema 3 it
+       fired on `divergent === true`, and the measured evidence is that that was
+       almost never reachable: the revenue actual Yahoo needs days to publish is
+       the very input the verdict was waiting on, so the name that most deserved
+       a guidance read was the one that could never get one.
+
+       `releaseRead` — set only when the model ANSWERED — is what makes "at most
+       one call per ticker per report" structural. A ceiling rejection, a missing
+       key or a truncated answer leaves it null and stays retryable; an answer
+       that found nothing still stamps it, because asking the same window again
+       buys the same nothing. It holds across the carry-over unchanged, because
+       the carry-over writes the SAME key. */
+    const wantsRelease = rec.stage === 'candidate' || rec.stage === 'divergent';
+    if (wantsRelease && !rec.releaseRead) {
+      const rel = await printTapeReadRelease(cand.symbol, env, rec.print);
+      rec.guidance = rel.guidance;
+      if (rel.answered) {
+        rec.releaseRead = { ts: Date.now(), pass: passLabel,
+                            revenueFound: !rel.revenue.status, guidanceFound: !rel.guidance.status };
+      }
+      /* THE RELEASE FIGURE FILLS A GAP; IT NEVER OVERWRITES A YAHOO ACTUAL that
+         is already on the record. Yahoo's is the structured reading and wins
+         when it exists — the release read is what makes the answer reachable at
+         all in the window where Yahoo has published nothing. */
+      if (rel.revenue && !rel.revenue.status && !Number.isFinite(rec.print?.revActual)) {
+        rec.print.revActual = rel.revenue.value;
+        rec.print.revActualSource = 'release-via-claude';
+        rec.print.revenue = rel.revenue;
+        rec.print.revSurprisePct = printTapeSurprise(rec.print.revActual, rec.print.revEst);
+      } else if (rel.revenue?.status && rec.print && !Number.isFinite(rec.print.revActual)) {
+        /* A refusal REPLACES the Yahoo `not-published` note, because it is the
+           newer and more specific fact about the same missing figure — we went
+           and looked in the release too, and it was not there either. */
+        rec.print.revenue = rel.revenue;
+      }
+      /* RE-RUN THE GATES. The whole point of the call is that it can supply gate
+         2's missing input, so a stage decided before it is a stage decided on
+         inputs the record no longer has — the same failure the post-merge re-run
+         exists for, one step later. */
+      applyStage(rec, passLabel);
     }
 
-    /* GUIDANCE FIRES ONLY ON A DIVERGENT NAME, and only when one has not already
-       been banked. `divergent === true` by strict equality — `null` is a refusal
-       and must never spend. The banked-and-carried-forward guidance is what makes
-       "at most one call per ticker per report" structural rather than a rule
-       someone has to remember, and it holds across the carry-over unchanged
-       because the carry-over writes the SAME key. */
-    if (rec.divergent === true && (!rec.guidance || rec.guidance.status)) {
-      rec.guidance = await printTapeGuidance(cand.symbol, env, rec.print);
-    }
-    if (rec.divergent === true) (item.carry ? carryDivergent : divergentNames).push(cand.symbol);
+    if (rec.stage === 'divergent') (item.carry ? carryDivergent : divergentNames).push(cand.symbol);
+    if (rec.stage === 'candidate') (item.carry ? carryCandidates : candidateNames).push(cand.symbol);
 
     try {
       await env.REC_LOG.put(key, JSON.stringify(rec), { expirationTtl: PRINTTAPE_TTL });
@@ -11529,24 +12012,51 @@ async function collectPrintTape(env, sessionWanted, passNo) {
     scanOk: scan.sourceOk, scanReason: scan.sourceReason, scanFetches: scan.fetches,
     universe: tickers.length,
     divergent: divergentNames,
+    candidates: candidateNames,
     /* Named on TODAY's index even when it carried nothing, so "the carry-over
        ran and found everything already answered" is falsifiable in the same way
        a zero-eligible day is. */
     carryOver: prevDate ? {
       date: prevDate, screened: carryScreened.map(e => e.ticker),
-      measured: carryMeasured, skipped: carrySkipped, divergent: carryDivergent,
+      measured: carryMeasured, written: carryMeasured, skipped: carrySkipped,
+      divergent: carryDivergent, candidates: carryCandidates,
+      indexOk: carryIndexOk, indexReason: carryIndexReason,
     } : null,
   });
 
-  /* AND THE REPORT DAY'S OWN INDEX, so the endpoint can find the records this
-     pass wrote under yesterday's date. Only when something was actually
-     measured — an append that adds nothing is two binding ops for no fact. */
-  if (carryMeasured.length) {
+  /* ── AND THE REPORT DAY'S OWN INDEX ────────────────────────────────────────
+
+     THE PASS META HAS TO RECORD WHAT THE CARRY-OVER DID, on the day the report
+     happened, or that day's index is a lie by omission. AVGO's real
+     `printtapeday:2026-09-02` is the case: both morning passes on the report day
+     logged `scanOk: false` (the Yahoo crumb was unavailable), and the record that
+     eventually answered the day was written the NEXT morning by the carry-over.
+     Read without a carry-over entry, that index says a day whose scans failed —
+     with no way to see that the work was finished later.
+
+     So the append happens whenever the carry-over SCREENED anything, not only
+     when it wrote something: "the carry-over ran and found every name already
+     answered" is a fact about the day and costs the same two binding ops to
+     record as the alternative costs to hide. `written` names the records this
+     pass actually put, beside `measured`, because a reader of a report day's
+     index is asking exactly that question.
+
+     It is appended only when `carryScreened` is non-empty, which implies the
+     prior day's index was readable — creating an index for a day that has none
+     would make `/api/printtape?date=` report `ran: true` for a day on which this
+     job never ran. `scanOk` here describes the carry-over's OWN candidate
+     discovery (that index read), not an eligibility scan: it runs none, which is
+     the whole point of reading the index instead. */
+  if (prevDate && carryScreened.length) {
     await printTapeAppendDay(env, prevDate, {
       pass: `${label}-carryover`, ptTs: new Date().toISOString(), wallMs: Date.now() - startedMs,
-      eligible: carryScreened, measured: carryMeasured, skipped: carrySkipped,
-      scanOk: true, scanReason: null, scanFetches: 0,
-      universe: tickers.length, divergent: carryDivergent, ranOn: today,
+      eligible: carryScreened, measured: carryMeasured, written: carryMeasured, skipped: carrySkipped,
+      scanOk: carryIndexOk, scanFetches: 0,
+      scanReason: carryIndexReason
+        ?? 'the carry-over runs NO eligibility scan — its candidates are this index\'s own eligible list, read '
+           + 'back, because a v7 quote row carries the NEXT earnings date and Yahoo has rolled it forward by '
+           + 'the morning',
+      universe: tickers.length, divergent: carryDivergent, candidates: carryCandidates, ranOn: today,
     });
   }
 
@@ -11556,6 +12066,8 @@ async function collectPrintTape(env, sessionWanted, passNo) {
     + `${wanted.length} for this pass · ${measured.length} measured · ${skipped.length} skipped`
     + (prevDate ? ` · carry-over from ${prevDate}: ${carryScreened.length} screened, `
       + `${carryMeasured.length} measured, ${carrySkipped.length} already answered or skipped` : '')
+    + (candidateNames.length || carryCandidates.length
+      ? ` · GATE-1 CANDIDATE ${[...candidateNames, ...carryCandidates].join(', ')}` : '')
     + (divergentNames.length || carryDivergent.length
       ? ` · !! DIVERGENT !! ${[...divergentNames, ...carryDivergent].join(', ')}` : '')
     + (scan.sourceOk ? '' : ` · SCAN INCOMPLETE: ${scan.sourceReason}`)
@@ -11645,9 +12157,18 @@ async function handlePrintTape(params, origin, env) {
       unreadable,
       passes: passes.map(p => ({ pass: p.pass, ptTs: p.ptTs, wallMs: p.wallMs, universe: p.universe,
                                  scanOk: p.scanOk, scanReason: p.scanReason, divergent: p.divergent,
+                                 candidates: p.candidates ?? null, written: p.written ?? null,
                                  banked: p.banked ?? null, carryOver: p.carryOver ?? null,
                                  ranOn: p.ranOn ?? null })),
+      /* THE DAY'S NAMES BY STAGE, read off the records rather than off the pass
+         entries: a pass entry says what THAT pass concluded, and a name whose
+         stage moved between passes would be listed under both. */
+      stages: PRINTTAPE_STAGES.reduce((acc, s) => {
+        acc[s] = records.filter(r => r.stage === s).map(r => r.ticker);
+        return acc;
+      }, {}),
       divergencePct: PRINTTAPE_DIVERGENCE_PCT,
+      stageNames: PRINTTAPE_STAGES,
       schema: PRINTTAPE_SCHEMA,
     },
     _meta: srcMeta('Cloudflare KV — banked print-vs-tape records', {
@@ -14608,6 +15129,12 @@ async function gatherEarningsFacts(sym, env) {
           source:  n.source ?? null,
           title:   n.headline ?? '',
           summary: (n.summary || '').replace(/\s+/g, ' ').slice(0, 400),
+          /* CARRIED, NEVER RENDERED INTO A PROMPT. The print-tape release read
+             attributes an extracted figure to the item it came from, and it
+             resolves that URL HERE, from the item the model NAMED BY INDEX —
+             never from a URL the model wrote, which it has no way to know and
+             every incentive to invent. No prompt in this Worker includes it. */
+          url:     n.url ?? null,
         })).filter(n => n.title);
       } catch (e) {
         console.error(`[earnings] Alpaca news failed for ${sym}:`, e.message);
@@ -14626,6 +15153,7 @@ async function gatherEarningsFacts(sym, env) {
             source:  n.publisher ?? null,
             title:   n.title ?? '',
             summary: '',
+            url:     n.link ?? null,          // see the note on the Alpaca branch
           })).filter(n => n.title && n.date && n.date >= windowFrom && n.date <= windowTo);
         }
       } catch (_) {}

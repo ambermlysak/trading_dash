@@ -319,12 +319,13 @@ function or `workerd` refuses to boot. **`longarch` and `printtape` also IMPORT 
 default export**, which is the ES-module parse `node --check` cannot perform.
 
 Floors (each script's `minComparisons`): **138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 /
-144 / 287 / 91 / 113 / 68 / 99 / 240 / 241 / 543** for moves / long-fixtures / cron-gate
+144 / 287 / 91 / 113 / 68 / 99 / 240 / 241 / 862** for moves / long-fixtures / cron-gate
 / instr-bindings / bs-delta / nd2 / lane-e / lane-f / sweep-universe / macro / mood /
 swing / earnings-timing / daily-slots / analysis-shape / top3 / longarch / printtape —
-**2,274**. A full run on 2026-09-02 observed **2,326, 0 failing**; the 52-comparison gap
-is entirely the two scripts that read **live** data (`swing` **98**, `earnings-timing`
-**158**), whose floors are deliberately their FIXED counts so a quiet tape reports a
+**2,593** (printtape 543 → 862 on 2026-09-03, the two-gate restructure). A full run on
+2026-09-03 observed **2,647, 0 failing**; the 54-comparison gap
+is entirely the two scripts that read **live** data (`swing` **99**, `earnings-timing`
+**159**), whose floors are deliberately their FIXED counts so a quiet tape reports a
 verdict rather than a false NO VERDICT. **Never raise either to an observed total.**
 `node iv-capture.fixture.mjs` is a nineteenth script, deliberately outside that total.
 
@@ -457,7 +458,7 @@ endpoints, the KV key/TTL table and the cron schedule are in `worker-internals`.
   The SLOT names when the snapshot was taken, the row's `ts` when its data was computed,
   and a reused row legitimately disagrees. Served verbatim, forward only
 
-**`printtape:` — the four rules that make the record honest**
+**`printtape:` — the rules that make the record honest**
 
 - **NEVER COMPARE AN ACTUAL AGAINST A CONSENSUS FROM A DIFFERENT QUARTER** — same
   period-end date by **string equality**, or the unmatched half is
@@ -467,12 +468,37 @@ endpoints, the KV key/TTL table and the cron schedule are in `worker-internals`.
   freshest by `quoteTime`, **re-derived after every merge, never carried**, nothing
   hoisted to the top level. **`consensusSource` and `consensusBankedTs` answer DIFFERENT
   questions**: a bank was *taken* vs where **this record's** figures came from
-- **`divergent` is THREE-VALUED and `null` is a REFUSAL, not a "no."** `=== true` is the
-  only thing that may reach the guidance call, and **the verdict is re-run AFTER
-  `mergePrintTapeRecord`**
+- **THE TEST IS TWO GATES AND `stage` IS THE ANSWER (schema 3).** Gate 1 — EPS beat AND
+  the used window sold it — is free and structured; gate 2 is the revenue beat. `stage` ∈
+  `not-run` · `refused` · `agree` · `candidate` · `divergent`, and **`divergent` is DERIVED
+  from it, never assigned**: `printTapeStage` is the only decider and the job's
+  `applyStage` the only assigner. **A `candidate` IS A FINDING, NOT AN ABSENCE** — it is
+  not `printTapeComplete` and it does carry over. **`null` is still a REFUSAL, not a "no."**
+  Measured on AVGO 2026-09-02: the revenue actual is not obtainable from Yahoo inside this
+  feature's window at all (absent 14h after the print, NVDA's absent six days), so a single
+  five-input test could only ever refuse
+- **THE STAGE IS RE-DECIDED TWICE PER RECORD — after `mergePrintTapeRecord` AND after the
+  release read** — because each supplies inputs the previous decision did not have. A stage
+  that outlives its own cause is the defect schema 3 is downstream of
+- **ONE Claude call per ticker per report, reaching BOTH halves.** It runs for a
+  `candidate` or a `divergent` (not divergents alone — that was almost never reachable),
+  gated on the **`releaseRead` stamp, set only when the model ANSWERED**, so a ceiling
+  rejection stays retryable and an empty answer is never re-asked. **A model-extracted
+  revenue passes three gates before it is believed**: a null guard, a units cross-check
+  against the model's own `revenueValueText`, and a 4× plausibility band against the same
+  quarter's consensus. **Its citation is resolved BY INDEX from the numbered coverage
+  block — never from a URL the model wrote**
+- **YAHOO IS THE LATER CROSS-CHECK, NEVER AN OVERWRITE.** A release figure stands; a Yahoo
+  figure past 1% becomes `revenueConflict` carrying BOTH numbers. The gap-fill runs one way
+  only — a Yahoo actual that landed first is never displaced
 - **The carry-over reads YESTERDAY'S DAY INDEX, never a re-scan** (Yahoo rolls
   `earningsTimestampStart` forward within a day); a carried name with no `earningsTs` is
-  REFUSED, and **`prevTradingDay`/`nextTradingDay` skip NYSE holidays**
+  REFUSED, and **`prevTradingDay`/`nextTradingDay` skip NYSE holidays**. **It appends its
+  own entry to the REPORT DAY'S index whenever it SCREENED anything**, carrying
+  `written:[tickers]` — AVGO's real 2026-09-02 index had both morning passes at
+  `scanOk: false` and was answered the next morning, and with no entry a report day reads
+  as one whose scans simply failed. **`scanOk` there is the prior-index read, not an
+  eligibility scan** — the carry-over runs none
 
 ### Feature records and the two skills
 

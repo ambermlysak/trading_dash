@@ -55,6 +55,16 @@
  *      carry-over, with the counterfactual (no pre-bank) beside it.
  *  15. GET /api/calendar/holidays through the REAL router, against a KV stub
  *      that THROWS on every method, so a single binding touch is a 500.
+ *  16. THE AVGO REPLAY — the real 2026-09-02 record and day index, read back
+ *      out of the DEPLOYED Worker on 2026-09-03 and cross-checked against a
+ *      SECOND endpoint. It is the record schema 3 was built from, and 16b is
+ *      the whole change in two lines: the live record read `divergent: null`
+ *      and the same payloads now read `stage: 'agree'`. 16y drives the revert.
+ *  17. THE RELEASE READ'S THREE GATES — the null guard, the units cross-check
+ *      against the model's own second statement of the figure, and the
+ *      plausibility band against the consensus for the same quarter.
+ *  18. THE KV BUDGET, re-derived for schema 3 against BOTH ceilings — the
+ *      10,000 subrequests of rule #1 and the 60 CLAUDE CALLS of rule #5.
  *
  * BLIND SPOTS, stated up front:
  *   · Nothing here calls Yahoo, so it cannot tell you the modules still carry
@@ -64,8 +74,23 @@
  *     figure is a DERIVATION from the structure, and §1 asserts only the
  *     constants that go into it. It WAS measured on the replay harness (17 at
  *     N=6/E=3 cold crumb, 5 at E=0); that run is not part of this script.
- *   · It cannot exercise the Claude guidance call. §11 pins the one thing that
- *     matters about it — that it is unreachable unless `divergent === true`.
+ *   · IT CANNOT EXERCISE THE CLAUDE RELEASE CALL, which at schema 3 supplies
+ *     gate 2's input as well as the guidance. §11a pins that it is unreachable
+ *     unless the stage is `candidate` or `divergent` and the once-per-report
+ *     stamp is unset; §17 drives every validation the Worker applies to the
+ *     ANSWER; §16e drives four stubbed answers through the job's own
+ *     application lines. What none of that can tell you is whether a real model
+ *     reading a real coverage window returns a correct revenue figure — that is
+ *     a live measurement this script cannot make, and the plausibility band in
+ *     §17e exists precisely because it cannot.
+ *   · §16's tape SELL is SYNTHETIC and is labelled at every use: the real AVGO
+ *     extended-hours reaction was -0.8205% (post) and -2.9871% (pre), neither of
+ *     which reaches the -3.00% gate, so gate 1 CANNOT fire on the real payload
+ *     and the candidate path has to be driven on a moved tape. Everything else
+ *     in §16 — the EPS pair, the quarter, the consensus, both real tape
+ *     readings, the day index — is transcribed. The release-extracted revenue
+ *     figures are synthetic too, for the same reason §14's are: the real one
+ *     does not exist in any source this Worker can reach.
  *   · §14's REVENUE figures are SYNTHETIC and are labelled as such at every use.
  *     They are not a gap in the capture — they are the defect: Yahoo's
  *     `earningsTrend 0q` rolled from 2026-07-31 to 2026-10-31 in the 48 minutes
@@ -131,7 +156,10 @@ const M = new Function([
   grabConst('PRINTTAPE_SCHEMA'), grabConst('PRINTTAPE_TTL'), grabConst('PRINTTAPE_DIVERGENCE_PCT'),
   grabConst('PRINTTAPE_QUOTE_CHUNK'), grabConst('PRINTTAPE_SWEEP_CAP'),
   grabConst('PRINTTAPE_GUIDANCE_CLASSES'), grabConst('PRINTTAPE_TAPE_WINDOWS'),
-  grabConst('PRINTTAPE_CONSENSUS_SOURCES'),
+  grabConst('PRINTTAPE_CONSENSUS_SOURCES'), grabConst('PRINTTAPE_STAGES'),
+  grabConst('PRINTTAPE_REVENUE_SOURCES'), grabConst('PRINTTAPE_REVENUE_CONFLICT_PCT'),
+  grabConst('PRINTTAPE_REVENUE_SANITY_MULT'), grabConst('PRINTTAPE_RELEASE_TOKENS'),
+  grabConst('PRINTTAPE_RELEASE_SCHEMA'), grabConst('PRINTTAPE_MAGNITUDES'),
   grabConst('printTapeKey'), grabConst('printTapeDayKey'), grabConst('PRINTTAPE_PASSES'),
   grabConst('LONG_SCHEMA'),
   grabConst('NYSE_HOLIDAY_TABLE'), grabConst('NYSE_HOLIDAYS'), grabConst('NYSE_HOLIDAYS_THROUGH'),
@@ -140,17 +168,36 @@ const M = new Function([
   grab('printTapePassAt'), grabConst('printTapeReportDate'), grabConst('ptNum'),
   grab('printTapeSurprise'), grab('printTapePrintFrom'), grab('printTapeTapeFrom'),
   grab('printTapeFreshestWindow'),
-  grab('printTapeImpliedFrom'), grab('printTapeDivergence'),
+  grab('printTapeImpliedFrom'), grab('printTapeStage'),
+  grab('printTapeParseMoney'), grab('printTapeReleaseRevenue'),
   grab('mergePrintTapeRecord'), grab('printTapeComplete'), grab('printTapeNeedsCarryOver'),
   `return { PRINTTAPE_SCHEMA, PRINTTAPE_TTL, PRINTTAPE_DIVERGENCE_PCT, PRINTTAPE_QUOTE_CHUNK,
             PRINTTAPE_SWEEP_CAP, PRINTTAPE_GUIDANCE_CLASSES, PRINTTAPE_TAPE_WINDOWS,
-            PRINTTAPE_CONSENSUS_SOURCES, printTapeKey, printTapeDayKey,
+            PRINTTAPE_CONSENSUS_SOURCES, PRINTTAPE_STAGES, PRINTTAPE_REVENUE_SOURCES,
+            PRINTTAPE_REVENUE_CONFLICT_PCT, PRINTTAPE_REVENUE_SANITY_MULT, PRINTTAPE_RELEASE_TOKENS,
+            PRINTTAPE_RELEASE_SCHEMA, printTapeKey, printTapeDayKey,
             NYSE_HOLIDAY_TABLE, NYSE_HOLIDAYS, NYSE_HOLIDAYS_THROUGH,
             isoAddDays, isoDow, tradingDayStatus, walkTradingDays, prevTradingDay, nextTradingDay,
             PRINTTAPE_PASSES, printTapePassAt, printTapeReportDate, printTapeSurprise,
             printTapePrintFrom, printTapeTapeFrom, printTapeFreshestWindow, printTapeImpliedFrom,
-            printTapeDivergence, mergePrintTapeRecord, printTapeComplete, printTapeNeedsCarryOver };`,
+            printTapeStage, printTapeParseMoney, printTapeReleaseRevenue,
+            mergePrintTapeRecord, printTapeComplete, printTapeNeedsCarryOver };`,
 ].join('\n'))();
+
+/* The job's own merge-then-re-decide step, mirrored here in the order the job
+   performs it. §11a-bis pins that order against SOURCE, and §16z pins that the
+   real `applyStage` writes the same five fields — a replay harness's private
+   copy drifting away from the function it stands in for is the failure mode this
+   kind of script is most prone to. */
+function applyStage(rec) {
+  const s = M.printTapeStage(rec.session, rec.print, rec.tape);
+  rec.stage = s.stage;
+  rec.stageReason = s.stageReason;
+  rec.divergent = s.divergent;
+  rec.refusalReason = s.refusalReason;
+  if (s.test) rec.divergenceTest = s.test; else delete rec.divergenceTest;
+  return rec;
+}
 
 const t = tally();
 const pad = (s, n) => String(s).padEnd(n);
@@ -239,9 +286,36 @@ console.log('\n== 1. CONSTANTS AND THE KEY SHAPE ===============================
      `consensusSource` / `consensusBankedTs`. Strict equality everywhere means a
      schema-1 record reads as absent, which is right: its `tape.changePct` sits
      at the top level and a schema-2 reader looks for it inside a window. */
-  row('1a PRINTTAPE_SCHEMA', M.PRINTTAPE_SCHEMA, 2);
+  row('1a PRINTTAPE_SCHEMA', M.PRINTTAPE_SCHEMA, 3);
   row('1a tape windows', M.PRINTTAPE_TAPE_WINDOWS, ['pre', 'post']);
   row('1a consensus sources', M.PRINTTAPE_CONSENSUS_SOURCES, ['pre-banked', 'live-pass']);
+  /* SCHEMA 3: the five stages, in the order a record moves through them, and the
+     revenue-source names the two-gate split introduced. */
+  row('1a the five stages', M.PRINTTAPE_STAGES,
+      ['not-run', 'refused', 'agree', 'candidate', 'divergent']);
+  row('1a revenue sources', M.PRINTTAPE_REVENUE_SOURCES, ['yahoo', 'release-via-claude']);
+  row('1a the Yahoo cross-check tolerance is 1%', M.PRINTTAPE_REVENUE_CONFLICT_PCT, 1.0);
+  row('1a the units sanity band matches IV_OUTLIER_MULT', M.PRINTTAPE_REVENUE_SANITY_MULT, 4);
+  /* The release answer now carries two quotes and an attribution, so the ceiling
+     doubled from the guidance-only 350. */
+  row('1a release answer tokens', M.PRINTTAPE_RELEASE_TOKENS, 700);
+  row('1a the release schema asks for both halves',
+      Object.keys(M.PRINTTAPE_RELEASE_SCHEMA.properties).sort(),
+      ['guidanceClass', 'guidanceQuote', 'revenueCurrency', 'revenueItemIndex', 'revenueQuote',
+       'revenueValue', 'revenueValueText'].sort());
+  row('1a ...every one of them required',
+      M.PRINTTAPE_RELEASE_SCHEMA.required.sort(),
+      Object.keys(M.PRINTTAPE_RELEASE_SCHEMA.properties).sort());
+  row('1a ...and nothing else may come back', M.PRINTTAPE_RELEASE_SCHEMA.additionalProperties, false);
+  /* `revenueValueText` is the SECOND DERIVATION of the same number. Without it
+     the units gate has nothing to compare against and a "15.95" for $15.95bn
+     reads downstream as an ordinary catastrophic miss. */
+  row('1a the schema carries a second statement of the figure',
+      M.PRINTTAPE_RELEASE_SCHEMA.properties.revenueValueText.type, ['string', 'null']);
+  row('1a ...and the citation is an INDEX, not a URL',
+      [M.PRINTTAPE_RELEASE_SCHEMA.properties.revenueItemIndex.type,
+       'revenueSourceUrl' in M.PRINTTAPE_RELEASE_SCHEMA.properties],
+      [['integer', 'null'], false]);
   row('1a PRINTTAPE_TTL is 7d in seconds', M.PRINTTAPE_TTL, 7 * 24 * 3600);
   row('1a PRINTTAPE_DIVERGENCE_PCT', M.PRINTTAPE_DIVERGENCE_PCT, -3.0);
   row('1a it is NEGATIVE (a fall, not a rise)', M.PRINTTAPE_DIVERGENCE_PCT < 0, true);
@@ -581,7 +655,7 @@ console.log('\n== 7. THE IMPLIED MOVE — and what it is careful NOT to claim ==
       M.printTapeImpliedFrom({ symbol: 'X', ts: 1, expectedMove: { pct: null } }, '2026-09-01').status, 'not-computed');
 }
 
-console.log('\n== 8. THE DIVERGENCE TEST — null is a REFUSAL, never a "no" =================\n');
+console.log('\n== 8. THE TWO GATES — null is a REFUSAL, and a CANDIDATE is a finding =======\n');
 {
   /* SCHEMA 2: the verdict reads `tape[tape.usedWindow]`, never a hoisted
      top-level `changePct`. The helper therefore builds the PAIR shape the job
@@ -593,29 +667,83 @@ console.log('\n== 8. THE DIVERGENCE TEST — null is a REFUSAL, never a "no" ===
     usedWindow: window,
   });
   const print = (ea, ee, ra, re) => ({ quarter: '2026-07-31', epsActual: ea, epsEst: ee, revActual: ra, revEst: re });
-  const D = (s, p, tp) => M.printTapeDivergence(s, p, tp);
+  const D = (s, p, tp) => M.printTapeStage(s, p, tp);
 
-  // ── 8a. The one direction it fires on ──
+  // ── 8a. Both gates fire ──
   const fires = D('amc', print(1.05, 0.97, 3450, 3351), tape(-12.1));
-  row('8a double beat + tape down 12.1%', fires.divergent, true);
+  row('8a double beat + tape down 12.1% -> stage', fires.stage, 'divergent');
+  row('8a ...and the derived boolean', fires.divergent, true);
   row('8a ...with no refusal reason', fires.refusalReason, null);
   row('8a the test decomposes', [fires.test.epsBeat, fires.test.revBeat, fires.test.sold], [true, true, true]);
+  row('8a ...and names both gates', [fires.test.gate1, fires.test.gate2], [true, true]);
 
   // ── 8b. Real falses — the question WAS asked and came back no ──
-  row('8b beat + beat but tape flat', D('amc', print(1.05, 0.97, 3450, 3351), tape(0.5)).divergent, false);
-  row('8b EPS miss + rev beat + tape down', D('amc', print(0.90, 0.97, 3450, 3351), tape(-12.1)).divergent, false);
-  row('8b EPS beat + rev miss + tape down', D('amc', print(1.05, 0.97, 3300, 3351), tape(-12.1)).divergent, false);
+  for (const [what, p, tp, why] of [
+    ['beat + beat but tape flat', print(1.05, 0.97, 3450, 3351), tape(0.5), /did not sell it/],
+    ['EPS miss + rev beat + tape down', print(0.90, 0.97, 3450, 3351), tape(-12.1), /EPS did not beat/],
+    ['EPS beat + rev miss + tape down', print(1.05, 0.97, 3300, 3351), tape(-12.1), /gate 2 did not/],
+  ]) {
+    const r = D('amc', p, tp);
+    row(`8b ${what} -> stage`, r.stage, 'agree');
+    row(`8b ${what} -> divergent`, r.divergent, false);
+    row(`8b ${what} -> the stage reason says which gate`, why.test(r.stageReason || ''), true);
+  }
   row('8b a real false carries NO refusal reason',
       D('amc', print(1.05, 0.97, 3450, 3351), tape(0.5)).refusalReason, null);
 
+  /* ── 8b-bis. THE GATE-1 SHORT CIRCUIT, which is the one place schema 3 ANSWERS
+     a question schema 2 refused. The test is an AND: once gate 1 is fully
+     readable and negative, no revenue figure can change the answer, so the
+     record says `agree` rather than waiting on a figure Yahoo may take a week to
+     publish. This is AVGO's real 2026-09-02 state (see §16) and it is the common
+     case, not an edge one. */
+  const shortCircuit = D('amc', print(1.05, 0.97, null, null), tape(-0.82));
+  row('8b-bis EPS beat, tape did NOT sell, revenue unknown -> stage', shortCircuit.stage, 'agree');
+  row('8b-bis ...answered false, not refused', shortCircuit.divergent, false);
+  row('8b-bis ...saying the AND could not be rescued',
+      /the revenue half could not change this answer/.test(shortCircuit.stageReason || ''), true);
+  row('8b-bis ...and the revBeat clause stays NULL, not false', shortCircuit.test.revBeat, null);
+  /* The same inputs with an EPS actual missing must still REFUSE — the short
+     circuit is a logical one, not a licence to answer on partial gate-1 data. */
+  row('8b-bis with epsActual absent it refuses instead',
+      D('amc', print(null, 0.97, null, null), tape(-0.82)).stage, 'refused');
+
   // ── 8c. THE THRESHOLD, at and either side of the boundary ──
-  row('8c exactly -3.00 fires (<=)', D('amc', print(1.05, 0.97, 3450, 3351), tape(-3.0)).divergent, true);
-  row('8c -3.01 fires', D('amc', print(1.05, 0.97, 3450, 3351), tape(-3.01)).divergent, true);
-  row('8c -2.99 does NOT fire', D('amc', print(1.05, 0.97, 3450, 3351), tape(-2.99)).divergent, false);
+  row('8c exactly -3.00 fires (<=)', D('amc', print(1.05, 0.97, 3450, 3351), tape(-3.0)).stage, 'divergent');
+  row('8c -3.01 fires', D('amc', print(1.05, 0.97, 3450, 3351), tape(-3.01)).stage, 'divergent');
+  row('8c -2.99 does NOT fire', D('amc', print(1.05, 0.97, 3450, 3351), tape(-2.99)).stage, 'agree');
+  /* And the boundary is GATE 1's, so it decides candidacy with no revenue at
+     all — the whole reason the split earns its keep. */
+  row('8c -3.00 with no revenue is a CANDIDATE', D('amc', print(1.05, 0.97, null, null), tape(-3.0)).stage, 'candidate');
+  row('8c -2.99 with no revenue is ANSWERED', D('amc', print(1.05, 0.97, null, null), tape(-2.99)).stage, 'agree');
 
   // ── 8d. A beat is STRICTLY greater — inline is not a beat ──
-  row('8d EPS exactly inline is not a beat', D('amc', print(0.97, 0.97, 3450, 3351), tape(-12)).divergent, false);
-  row('8d revenue exactly inline is not a beat', D('amc', print(1.05, 0.97, 3351, 3351), tape(-12)).divergent, false);
+  row('8d EPS exactly inline is not a beat', D('amc', print(0.97, 0.97, 3450, 3351), tape(-12)).stage, 'agree');
+  row('8d revenue exactly inline is not a beat', D('amc', print(1.05, 0.97, 3351, 3351), tape(-12)).stage, 'agree');
+  row('8d ...and that one got past gate 1 first',
+      D('amc', print(1.05, 0.97, 3351, 3351), tape(-12)).test.gate1, true);
+
+  /* ── 8d-bis. THE CANDIDATE — gate 1 fired, gate 2 cannot be asked yet. THIS IS
+     A FINDING, NOT AN ABSENCE: an EPS beat the tape sold is exactly the shape
+     this feature exists to surface, and it is on screen with the revenue half
+     still open rather than hidden behind a `null`. */
+  for (const [what, p] of [
+    ['no revActual', print(1.05, 0.97, null, 3351)],
+    ['no revEst', print(1.05, 0.97, 3450, null)],
+    ['neither', print(1.05, 0.97, null, null)],
+  ]) {
+    const r = D('amc', p, tape(-12));
+    row(`8d-bis gate 1 fires, ${what} -> stage`, r.stage, 'candidate');
+    row(`8d-bis ${what} -> divergent is still null`, r.divergent, null);
+    row(`8d-bis ${what} -> and it says GATE 1 FIRED`, /GATE 1 FIRED/.test(r.stageReason || ''), true);
+    row(`8d-bis ${what} -> the decomposed test survives`, r.test.gate1, true);
+    row(`8d-bis ${what} -> with gate 2 unanswered, not false`, [r.test.gate2, r.test.revBeat], [null, null]);
+  }
+  /* A candidate carries its refusalReason too, so the schema-2 invariant "a null
+     verdict always says why" survives the restructure. */
+  row('8d-bis a candidate\'s refusalReason mirrors the stage reason',
+      D('amc', print(1.05, 0.97, null, null), tape(-12)).refusalReason
+      === D('amc', print(1.05, 0.97, null, null), tape(-12)).stageReason, true);
 
   // ── 8e. REFUSALS — every one is null, and every one carries a reason ──
   const cases = [
@@ -624,8 +752,6 @@ console.log('\n== 8. THE DIVERGENCE TEST — null is a REFUSAL, never a "no" ===
     ['tape refused', D('amc', print(1.05, 0.97, 3450, 3351), { status: 'unavailable', reason: 'stale' }), /tape unavailable/],
     ['no epsActual', D('amc', print(null, 0.97, 3450, 3351), tape(-12)), /epsActual/],
     ['no epsEst', D('amc', print(1.05, null, 3450, 3351), tape(-12)), /epsEst/],
-    ['no revActual', D('amc', print(1.05, 0.97, null, 3351), tape(-12)), /revActual/],
-    ['no revEst', D('amc', print(1.05, 0.97, 3450, null), tape(-12)), /revEst/],
     ['no changePct', D('amc', print(1.05, 0.97, 3450, 3351), tape(null)), /changePct/],
     /* A tape block with BOTH windows refused but no block-level status would
        have slipped past the `tape?.status` guard at schema 1's shape. */
@@ -634,15 +760,44 @@ console.log('\n== 8. THE DIVERGENCE TEST — null is a REFUSAL, never a "no" ===
       /tape\.changePct/],
   ];
   for (const [what, res, re] of cases) {
+    row(`8e ${what} -> stage`, res.stage, 'refused');
     row(`8e ${what} -> divergent`, res.divergent, null);
     row(`8e ${what} -> reason matches`, re.test(res.refusalReason || ''), true);
   }
+  /* A MISSING REVENUE HALF IS NO LONGER A REFUSAL, and that is the restructure in
+     one assertion. It was one of the eight cases above at schema 2. */
+  row('8e a missing revenue half is NOT refused any more',
+      D('amc', print(1.05, 0.97, null, 3351), tape(-12)).stage, 'candidate');
+  row('8e ...nor when gate 1 already answered no',
+      D('amc', print(0.90, 0.97, null, 3351), tape(-12)).stage, 'agree');
+
+  /* ── 8e-bis. `not-run` IS NOT `refused`. The pre-bank's tape says the report
+     has not happened; answering "we looked and could not tell" would claim a
+     reading nobody took. */
+  const notYet = D('amc', print(null, 0.97, null, 3351),
+                   { status: 'not-yet', reason: 'the report on 2026-09-02 has not happened' });
+  row('8e-bis a not-yet tape -> stage', notYet.stage, 'not-run');
+  row('8e-bis ...divergent null', notYet.divergent, null);
+  row('8e-bis ...and it is a DIFFERENT stage from refused', notYet.stage !== 'refused', true);
+  row('8e-bis ...carrying no decomposed test', notYet.test, undefined);
+
   /* THE DISTINCTION THIS WHOLE SHAPE EXISTS FOR. */
   row('8f refusal and "no" are different values',
       D('unknown', print(1.05, 0.97, 3450, 3351), tape(-12)).divergent
       === D('amc', print(1.05, 0.97, 3450, 3351), tape(0.5)).divergent, false);
   row('8f a refusal carries no decomposed test',
       D('unknown', print(1.05, 0.97, 3450, 3351), tape(-12)).test, undefined);
+  /* EVERY STAGE IS ONE OF THE FIVE, and the boolean is DERIVED from it and never
+     assigned independently — driven over every case built in this section. */
+  const allStages = [fires, shortCircuit, notYet, ...cases.map(c => c[1]),
+    D('amc', print(1.05, 0.97, null, null), tape(-12)), D('amc', print(1.05, 0.97, 3300, 3351), tape(-12))];
+  row('8f every result names a declared stage',
+      allStages.every(r => M.PRINTTAPE_STAGES.includes(r.stage)), true);
+  row('8f the boolean is derived from the stage, with no exceptions',
+      allStages.every(r => r.divergent === (r.stage === 'divergent' ? true
+        : (r.stage === 'agree' ? false : null))), true);
+  row('8f a null verdict ALWAYS says why',
+      allStages.every(r => (r.divergent == null) === (typeof r.refusalReason === 'string')), true);
 
   /* ── 8g. THE VERDICT READS `usedWindow` AND NOTHING ELSE ──────────────────
 
@@ -661,6 +816,12 @@ console.log('\n== 8. THE DIVERGENCE TEST — null is a REFUSAL, never a "no" ===
   row('8g ...and does NOT fire on it', D('amc', beat, bothWays('post')).divergent, false);
   row('8g usedWindow=pre reads the pre reading', D('amc', beat, bothWays('pre')).test.changePct, -9.8);
   row('8g ...and DOES fire on it', D('amc', beat, bothWays('pre')).divergent, true);
+  /* GATE 1 reads the same window, so the choice decides candidacy too — driven
+     with the revenue half absent so only gate 1 can be answering. */
+  const noRev = print(1.05, 0.97, null, null);
+  row('8g the window choice decides CANDIDACY as well',
+      [D('amc', noRev, bothWays('post')).stage, D('amc', noRev, bothWays('pre')).stage],
+      ['agree', 'candidate']);
   row('8g the test names the window it read', D('amc', beat, bothWays('pre')).test.usedWindow, 'pre');
   row('8g ...and the quote time behind it',
       D('amc', beat, bothWays('pre')).test.quoteTime, '2026-09-02T12:00:00.000Z');
@@ -820,12 +981,27 @@ console.log('\n== 9. THE CROSS-PASS MERGE — field level, gated on the quarter 
   row('9i a quarter mismatch carries nothing', mWrongQ.print.revEst, null);
   row('9i ...and does NOT claim pre-banked', mWrongQ.consensusSource, 'live-pass');
 
-  /* ── 9j. THE CARRY-OVER TEST — the spec's own words, driven both ways ──────*/
-  const answered = { schema: S, divergent: false, print: { quarter: 'q' } };
+  /* ── 9j. THE CARRY-OVER TEST — the spec's own words, driven both ways ──────
+
+     SCHEMA 3 reads the STAGE rather than the boolean, so a record that answered
+     is one whose stage is `agree` or `divergent`. A `candidate` carries over for
+     a reason of its own, named separately: gate 1 fired and gate 2 is open,
+     which is a different fact from "a reading failed". */
+  const answered = { schema: S, stage: 'agree', divergent: false, print: { quarter: 'q' } };
   row('9j an answered record does not carry over', M.printTapeNeedsCarryOver(answered).need, false);
-  row('9j a divergent:true record does not either',
-      M.printTapeNeedsCarryOver({ ...answered, divergent: true }).need, false);
-  row('9j divergent:null carries over', M.printTapeNeedsCarryOver({ ...answered, divergent: null }).need, true);
+  row('9j a divergent record does not either',
+      M.printTapeNeedsCarryOver({ ...answered, stage: 'divergent', divergent: true }).need, false);
+  row('9j a refused record carries over',
+      M.printTapeNeedsCarryOver({ ...answered, stage: 'refused', divergent: null }).need, true);
+  /* THE CANDIDATE, and its reason must name the stage rather than the boolean —
+     "the question was refused" would be wrong about a name gate 1 answered. */
+  const cand = M.printTapeNeedsCarryOver({ ...answered, stage: 'candidate', divergent: null,
+                                           stageReason: 'GATE 1 FIRED — ...' });
+  row('9j a CANDIDATE carries over', cand.need, true);
+  row('9j ...naming the open gate, not a refusal',
+      [/stage is CANDIDATE/.test(cand.reason), /REFUSED/.test(cand.reason)], [true, false]);
+  row('9j a not-run (pre-banked) record carries over',
+      M.printTapeNeedsCarryOver({ ...answered, stage: 'not-run', divergent: null }).need, true);
   row('9j a refused print block carries over',
       M.printTapeNeedsCarryOver({ ...answered, print: { status: 'not-published', reason: 'r' } }).need, true);
   row('9j a not-published EPS half carries over',
@@ -844,7 +1020,8 @@ console.log('\n== 9. THE CROSS-PASS MERGE — field level, gated on the quarter 
      divergence appears on a record with a refused revenue half and an answered
      verdict — which the same-session pass 2 would skip and a carry-over must
      not. */
-  const half = { schema: S, divergent: false, print: { quarter: 'q', revenue: { status: 'not-published', reason: 'lag' } }, tape: {} };
+  const half = { schema: S, stage: 'agree', divergent: false,
+                 print: { quarter: 'q', revenue: { status: 'not-published', reason: 'lag' } }, tape: {} };
   row('9j the half-published record reads COMPLETE', M.printTapeComplete(half), true);
   row('9j ...and still NEEDS the carry-over', M.printTapeNeedsCarryOver(half).need, true);
   /* Same record, OPPOSITE actions: pass 2 skips it, the next morning takes it. */
@@ -852,14 +1029,24 @@ console.log('\n== 9. THE CROSS-PASS MERGE — field level, gated on the quarter 
       [M.printTapeComplete(half) ? 'skip' : 'measure',
        M.printTapeNeedsCarryOver(half).need ? 'measure' : 'skip'], ['skip', 'measure']);
 
-  /* 9g. printTapeComplete — a REFUSAL is never complete, which is why pass 2 runs. */
+  /* 9g. printTapeComplete — a REFUSAL is never complete, which is why pass 2
+     runs, and at schema 3 a CANDIDATE is not complete either: gate 2 is still
+     open, so there is something left for a later pass to read. It reads the
+     STAGE rather than the boolean so the two cannot drift. */
   row('9g an answered record is complete',
-      M.printTapeComplete({ schema: S, divergent: false, print: {}, tape: {} }), true);
-  row('9g a refusal is NOT complete', M.printTapeComplete({ schema: S, divergent: null, print: {}, tape: {} }), false);
+      M.printTapeComplete({ schema: S, stage: 'agree', divergent: false, print: {}, tape: {} }), true);
+  row('9g a divergent record is complete',
+      M.printTapeComplete({ schema: S, stage: 'divergent', divergent: true, print: {}, tape: {} }), true);
+  row('9g a refusal is NOT complete',
+      M.printTapeComplete({ schema: S, stage: 'refused', divergent: null, print: {}, tape: {} }), false);
+  row('9g a CANDIDATE is NOT complete',
+      M.printTapeComplete({ schema: S, stage: 'candidate', divergent: null, print: {}, tape: {} }), false);
+  row('9g a not-run (pre-banked) record is NOT complete',
+      M.printTapeComplete({ schema: S, stage: 'not-run', divergent: null, print: {}, tape: {} }), false);
   row('9g an answered record with a refused print is NOT complete',
-      M.printTapeComplete({ schema: S, divergent: false, print: { status: 'x' }, tape: {} }), false);
+      M.printTapeComplete({ schema: S, stage: 'agree', divergent: false, print: { status: 'x' }, tape: {} }), false);
   row('9g a wrong schema is NOT complete',
-      M.printTapeComplete({ schema: 99, divergent: false, print: {}, tape: {} }), false);
+      M.printTapeComplete({ schema: 99, stage: 'agree', divergent: false, print: {}, tape: {} }), false);
   row('9g absent is NOT complete', M.printTapeComplete(null), false);
 }
 
@@ -961,35 +1148,64 @@ console.log('\n== 11. STRUCTURAL — what no behavioural test can see ==========
   const collect = grab('collectPrintTape');
   const handler = grab('handlePrintTape');
 
-  /* 11a. GUIDANCE MAY ONLY BE REACHED FROM `divergent === true`. Strict
-     equality, because `null` is a refusal and a truthiness test would spend a
-     Claude call on every name whose question could not be answered. */
-  row('11a guidance is called exactly once in the job',
-      (collect.match(/printTapeGuidance\(/g) || []).length, 1);
-  row('11a ...guarded by strict === true', /rec\.divergent === true && \(!rec\.guidance/.test(collect), true);
-  row('11a no truthiness test on divergent', /if \(rec\.divergent\)/.test(collect), false);
-  row('11a the guidance call is nowhere else',
-      (src.match(/printTapeGuidance\(/g) || []).length, 2);   // the definition + the one call
+  /* 11a. THE RELEASE READ MAY ONLY BE REACHED FROM A CANDIDATE OR A DIVERGENT,
+     and only when it has not already ANSWERED. Strict equality on the stage
+     names, because `refused` and `not-run` are the two stages that must never
+     spend — a truthiness test on `stage` would spend a Claude call on every
+     record in the job. */
+  row('11a the release read is called exactly once in the job',
+      (collect.match(/printTapeReadRelease\(/g) || []).length, 1);
+  row('11a ...gated on stage candidate OR divergent',
+      /rec\.stage === 'candidate' \|\| rec\.stage === 'divergent'/.test(collect), true);
+  row('11a ...and on the once-per-report stamp', /wantsRelease && !rec\.releaseRead/.test(collect), true);
+  row('11a no truthiness test on the stage', /if \(rec\.stage\)/.test(collect), false);
+  row('11a the release call is nowhere else',
+      (src.match(/printTapeReadRelease\(/g) || []).length, 2);   // the definition + the one call
+  /* The stamp is set ONLY when the model answered, or a ceiling rejection would
+     permanently silence the name it refused. */
+  row('11a the stamp follows `answered`, not the call', /if \(rel\.answered\) \{/.test(collect), true);
+  row('11a ...and the guidance is stored either way', /rec\.guidance = rel\.guidance;/.test(collect), true);
+  /* THE PRE-BANK STILL SPENDS NOTHING. */
+  row('11a the pre-bank never reads a release',
+      grab('collectPrintTapePreBank').includes('printTapeReadRelease('), false);
 
-  /* 11a-bis. THE VERDICT IS RE-RUN AFTER THE MERGE, and the ORDER is the whole
-     assertion. `printTapeMeasure` decides `divergent` from what one pass could
-     read; the merge then supplies fields that pass could not see. Computing the
-     verdict only before the merge left MDB reading `divergent: null,
+  /* 11a-bis. THE STAGE IS RE-DECIDED AFTER THE MERGE **AND** AFTER THE RELEASE
+     READ, and the ORDER is the whole assertion. `printTapeMeasure` decides the
+     stage from what one pass could read; the merge then supplies fields that
+     pass could not see, and the release read supplies gate 2's input outright.
+     Deciding only before the merge left MDB reading `divergent: null,
      "1 is absent: revEst"` on a merged record whose own print reported
-     revSurprisePct 3.77 — a refusal that had outlived its cause, and one that
-     also made `guidance` unreachable for any name whose evidence completes
-     across two passes, which is the only reason there are two. */
+     revSurprisePct 3.77 — a refusal that had outlived its cause. Deciding only
+     before the release read would be the same defect one step later: the call
+     exists precisely to move a candidate to a divergent, and a stage frozen
+     before it could never record that it did. */
   const iMerge = collect.indexOf('mergePrintTapeRecord(');
-  const iVerdict = collect.indexOf('printTapeDivergence(');
-  const iGuidance = collect.indexOf('printTapeGuidance(');
-  row('11a-bis the job re-runs the verdict', iVerdict > -1, true);
-  row('11a-bis ...AFTER the merge', iVerdict > iMerge, true);
-  row('11a-bis ...and BEFORE the guidance call', iVerdict < iGuidance, true);
-  row('11a-bis it assigns the merged verdict back', /rec\.divergent = merged\.divergent/.test(collect), true);
-  row('11a-bis ...and the reason with it', /rec\.refusalReason = merged\.refusalReason/.test(collect), true);
-  /* A stale decomposed test beside a fresh verdict is two facts that can
+  const iStage1 = collect.indexOf('applyStage(rec, passLabel)');
+  const iRelease = collect.indexOf('printTapeReadRelease(');
+  const iStage2 = collect.indexOf('applyStage(rec, passLabel)', iRelease);
+  row('11a-bis the job re-decides the stage', iStage1 > -1, true);
+  row('11a-bis ...AFTER the merge', iStage1 > iMerge, true);
+  row('11a-bis ...and BEFORE the release read', iStage1 < iRelease, true);
+  row('11a-bis ...and AGAIN after it', iStage2 > iRelease, true);
+  row('11a-bis exactly two re-decisions, no more',
+      (collect.match(/applyStage\(rec, passLabel\)/g) || []).length, 2);
+  /* ONE WRITER. Every field that depends on the stage is assigned inside
+     `applyStage` and nowhere else in the job, or two of them could disagree. */
+  const apply = collect.slice(collect.indexOf('const applyStage ='),
+                              collect.indexOf('for (const item of work)'));
+  for (const f of ['stage', 'stageReason', 'divergent', 'refusalReason']) {
+    row(`11a-bis applyStage assigns rec.${f}`, new RegExp(`rec\\.${f} = s\\.`).test(apply), true);
+    row(`11a-bis ...and the job assigns it nowhere else`,
+        (collect.match(new RegExp(`rec\\.${f} = `, 'g')) || []).length, 1);
+  }
+  /* A stale decomposed test beside a fresh stage is two facts that can
      disagree, so it is deleted rather than left. */
-  row('11a-bis a refusal deletes the stale test', /delete rec\.divergenceTest/.test(collect), true);
+  row('11a-bis a refusal deletes the stale test', /delete rec\.divergenceTest/.test(apply), true);
+  /* THE RELEASE FIGURE FILLS A GAP AND NEVER OVERWRITES A YAHOO ACTUAL. */
+  row('11a-bis the release revenue is applied only when revActual is absent',
+      /!Number\.isFinite\(rec\.print\?\.revActual\)/.test(collect), true);
+  row('11a-bis ...stamped with its own source',
+      /rec\.print\.revActualSource = 'release-via-claude'/.test(collect), true);
 
   /* 11b. THE READ PATH WRITES NOTHING. §10c proves it behaviourally for one
      input; this proves it for every input, including ones never driven. */
@@ -1047,9 +1263,31 @@ console.log('\n== 11. STRUCTURAL — what no behavioural test can see ==========
   row('11h ...and the carry-over item carries the prior date',
       /reportDate: prevDate, prev, carry: true/.test(collect), true);
   /* And the REPORT day's index is appended to, or the endpoint would assemble
-     that day from a `measured` list the record is not in. */
-  row('11h the prior day index is appended when something was measured',
-      /if \(carryMeasured\.length\)/.test(collect), true);
+     that day from a `measured` list the record is not in.
+
+     SCHEMA 3 WIDENED THE CONDITION from `carryMeasured.length` to "the
+     carry-over screened anything", and AVGO's real 2026-09-02 index is why: both
+     morning passes on the report day logged `scanOk: false` (no Yahoo crumb) and
+     the record that answered the day was written the next morning. A report
+     day's index that does not carry an entry for the carry-over reads as a day
+     whose scans simply failed. */
+  row('11h the prior day index is appended when the carry-over SCREENED anything',
+      /if \(prevDate && carryScreened\.length\)/.test(collect), true);
+  row('11h ...no longer only when it measured something',
+      /if \(carryMeasured\.length\)/.test(collect), false);
+  row('11h ...and the entry names what it WROTE',
+      /written: carryMeasured/.test(collect), true);
+  row('11h ...under the carry-over pass label',
+      /pass: `\$\{label\}-carryover`/.test(collect), true);
+  /* `scanOk` on that entry describes the carry-over's OWN candidate discovery —
+     the prior day index read — and NOT an eligibility scan, which it runs none
+     of. Reporting `scanOk: true` for a scan that never happened is the kind of
+     claim this file exists to refuse. */
+  row('11h scanOk on the carry-over entry is the index read, not a scan',
+      /scanOk: carryIndexOk, scanFetches: 0/.test(collect), true);
+  row('11h ...and it never hardcodes a true', /scanOk: true, scanReason: null, scanFetches: 0/.test(collect), false);
+  row('11h ...saying in words that no scan ran',
+      /the carry-over runs NO eligibility scan/.test(collect), true);
   row('11h ...and today\'s index records the carry-over either way',
       /carryOver: prevDate \?/.test(collect), true);
 
@@ -1398,27 +1636,21 @@ console.log('\n== 14. THE MDB REPLAY — pre-bank -> pass 1 -> pass 2 -> carry-o
     const tape = isPreBank
       ? { status: 'not-yet', reason: 'the report has not happened' }
       : M.printTapeTapeFrom(payload.price, session, MDB_TS);
-    const v = M.printTapeDivergence(session, print, tape);
+    const v = M.printTapeStage(session, print, tape);
     return {
       schema: M.PRINTTAPE_SCHEMA, ticker: 'MDB', reportDate, session, earningsTs: MDB_TS,
       pass: passLabel, ts: Date.parse(`${reportDate}T00:00:00Z`),
       consensusSource: isPreBank ? (print.status ? 'live-pass' : 'pre-banked') : 'live-pass',
       consensusBankedTs: isPreBank && !print.status ? `${PREV_SES}T20:15:00.000Z` : null,
       print, tape, implied: { status: 'not-computed', reason: 'not part of this replay' },
+      stage: v.stage, stageReason: v.stageReason,
       divergent: v.divergent, refusalReason: v.refusalReason,
-      guidance: null, passes: [{ pass: passLabel, ts: 1 }],
+      guidance: null, releaseRead: null, passes: [{ pass: passLabel, ts: 1 }],
     };
   };
-  /* And the merge-then-RE-RUN-the-verdict step the job performs, in the order it
-     performs it (§11a-bis pins that order against source). */
-  const commit = (prev, next) => {
-    const rec = M.mergePrintTapeRecord(prev, next);
-    const merged = M.printTapeDivergence(rec.session, rec.print, rec.tape);
-    rec.divergent = merged.divergent;
-    rec.refusalReason = merged.refusalReason;
-    if (merged.test) rec.divergenceTest = merged.test; else delete rec.divergenceTest;
-    return rec;
-  };
+  /* And the merge-then-RE-DECIDE step the job performs, in the order it performs
+     it (§11a-bis pins that order against source). */
+  const commit = (prev, next) => applyStage(M.mergePrintTapeRecord(prev, next));
 
   // ── 14a. THE PRE-BANK, on the session BEFORE the report ──
   const bank = mk(MDB_PREBANK, REPORT, 'amc', 'prebank', null, true);
@@ -1430,7 +1662,12 @@ console.log('\n== 14. THE MDB REPLAY — pre-bank -> pass 1 -> pass 2 -> carry-o
   row('14a consensusSource', bank.consensusSource, 'pre-banked');
   row('14a consensusBankedTs is stamped', typeof bank.consensusBankedTs, 'string');
   row('14a the verdict is refused, not answered', bank.divergent, null);
-  row('14a ...because the report has not happened', /tape unavailable/.test(bank.refusalReason || ''), true);
+  /* SCHEMA 3: `not-run`, and it is a DIFFERENT stage from `refused`. "The report
+     has not happened" and "we looked and could not tell" are different facts,
+     and the pre-bank's record must never claim the second. */
+  row('14a ...as stage not-run, not refused', bank.stage, 'not-run');
+  row('14a ...because the report has not happened',
+      /the report has not happened yet/.test(bank.refusalReason || ''), true);
 
   // ── 14b. PASS 1 — the captured 21:30 UTC state. The consensus has ROLLED. ──
   const p1raw = mk(MDB_AT_PASS, REPORT, 'amc', 'amc-pass1', bank);
@@ -1448,31 +1685,47 @@ console.log('\n== 14. THE MDB REPLAY — pre-bank -> pass 1 -> pass 2 -> carry-o
   row('14b ...at the REAL captured change', pass1.tape.post.changePct, -14.5598);
   /* STILL REFUSED, and for ONE reason instead of the live record's two. The
      bank has already recovered half of what was lost. */
-  row('14b still refused — the revenue ACTUAL is not published', pass1.divergent, null);
-  row('14b ...on revActual alone now', /1 is absent: revActual/.test(pass1.refusalReason || ''), true);
+  /* ── SCHEMA 3 CHANGES THIS PASS'S ANSWER, and this is the restructure's whole
+     point stated on the record it was designed against. At schema 2 the pass
+     read `divergent: null` — "1 is absent: revActual" — and said nothing about a
+     name whose EPS beat 18.09% while the tape sold 14.56%. Gate 1 is free and
+     structured and both its inputs were present the whole time, so the pass now
+     lands a CANDIDATE: the finding is on the record within 90 minutes of the
+     print, with the revenue half still open beside it. */
+  row('14b >>> the pass is now a CANDIDATE, not a refusal', pass1.stage, 'candidate');
+  row('14b ...with the boolean still null for continuity', pass1.divergent, null);
+  row('14b ...and gate 1 decomposed on the record',
+      [pass1.divergenceTest.epsBeat, pass1.divergenceTest.sold, pass1.divergenceTest.gate1],
+      [true, true, true]);
+  row('14b ...gate 2 unanswered, not false',
+      [pass1.divergenceTest.gate2, pass1.divergenceTest.revBeat], [null, null]);
+  row('14b ...on revActual alone now', /revActual is absent/.test(pass1.stageReason || ''), true);
+  row('14b ...naming the gate that DID fire', /GATE 1 FIRED/.test(pass1.stageReason || ''), true);
   /* THE COMPARISON THAT MAKES THAT A MEASUREMENT: the same pass with NO bank
      behind it. The live record's own refusal read "2 are absent: revActual,
      revEst"; with the bank it is one. Both counts are computed here from the
      same payload, so this is the bank's effect and not a restatement. */
   const p1noBank = commit(null, mk(MDB_AT_PASS, REPORT, 'amc', 'amc-pass1', null));
-  row('14b without the bank the SAME pass is refused on two',
-      /2 are absent: revActual, revEst/.test(p1noBank.refusalReason || ''), true);
-  /* Against the LIVE record's own refusal string, transcribed from the deployed
-     Worker's response — a different source from this replay's arithmetic. */
-  row('14b ...word for word what the LIVE record said',
-      (p1noBank.refusalReason || '').slice(0, 55),
-      'the test needs all five inputs and 2 are absent: revActual, revEst'.slice(0, 55));
+  row('14b without the bank the SAME pass names both revenue inputs',
+      /revActual and revEst are absent/.test(p1noBank.stageReason || ''), true);
+  /* AND IT IS STILL A CANDIDATE. Gate 1 does not depend on the bank at all, so
+     the finding survives a pre-bank that never ran — which is a second, separate
+     robustness the split buys: at schema 2 this record was refused on two inputs
+     and said nothing. */
+  row('14b ...and is STILL a candidate without it', p1noBank.stage, 'candidate');
   row('14b so the bank recovered exactly one of the two inputs',
-      [/revEst/.test(p1noBank.refusalReason || ''), /revEst/.test(pass1.refusalReason || '')], [true, false]);
+      [/revEst/.test(p1noBank.stageReason || ''), /revEst/.test(pass1.stageReason || '')], [true, false]);
 
   // ── 14c. PASS 2 — nothing has changed, and the record does not decay ──
   const pass2 = commit(pass1, mk(MDB_AT_PASS, REPORT, 'amc', 'amc-pass2', pass1));
   row('14c the banked consensus is still there', pass2.print.revEst, REV_EST_SYNTH);
   row('14c consensusSource is still pre-banked', pass2.consensusSource, 'pre-banked');
   row('14c the post tape reading is unchanged', pass2.tape.post.changePct, -14.5598);
-  row('14c still refused', pass2.divergent, null);
+  row('14c still a candidate, not an answer', [pass2.stage, pass2.divergent], ['candidate', null]);
   row('14c and the carry-over test says it needs another pass', M.printTapeNeedsCarryOver(pass2).need, true);
-  row('14c ...naming the refusal as the cause', /divergent is null/.test(M.printTapeNeedsCarryOver(pass2).reason), true);
+  row('14c ...naming the OPEN GATE as the cause, not a refusal',
+      [/stage is CANDIDATE/.test(M.printTapeNeedsCarryOver(pass2).reason),
+       /REFUSED/.test(M.printTapeNeedsCarryOver(pass2).reason)], [true, false]);
 
   /* ── 14d. THE CARRY-OVER, the next morning's BMO pass ──────────────────────
      Filed under the REPORT date, not the morning's date, and merging onto the
@@ -1486,6 +1739,8 @@ console.log('\n== 14. THE MDB REPLAY — pre-bank -> pass 1 -> pass 2 -> carry-o
   const carry = commit(pass2, carryRaw);
 
   // THE FOUR THINGS THIS WHOLE CHANGE EXISTS TO PRODUCE:
+  row('14d >>> the stage moves candidate -> divergent', [pass2.stage, carry.stage],
+      ['candidate', 'divergent']);
   row('14d >>> divergent flips to TRUE', carry.divergent, true);
   row('14d >>> consensusSource', carry.consensusSource, 'pre-banked');
   row('14d >>> tape.usedWindow', carry.tape.usedWindow, 'pre');
@@ -1512,9 +1767,13 @@ console.log('\n== 14. THE MDB REPLAY — pre-bank -> pass 1 -> pass 2 -> carry-o
   const noBank2 = commit(noBank1, mk(MDB_AT_PASS, REPORT, 'amc', 'amc-pass2', noBank1));
   const noBank3 = commit(noBank2, mk(MDB_NEXT_MORNING, REPORT, 'amc', 'bmo-pass1-carryover', noBank2));
   row('14e without the pre-bank, revEst is never recovered', noBank3.print.revEst, null);
-  row('14e ...so the carry-over still refuses', noBank3.divergent, null);
-  row('14e ...on revEst', /revEst/.test(noBank3.refusalReason || ''), true);
-  row('14e so the pre-bank is what flips it', carry.divergent !== noBank3.divergent, true);
+  row('14e ...so the carry-over cannot answer gate 2', noBank3.divergent, null);
+  /* At schema 3 it is a CANDIDATE rather than a refusal — the finding survives,
+     the verdict does not. That is the split working exactly as intended: the
+     free half is never held hostage to the expensive one. */
+  row('14e ...and stays a candidate', noBank3.stage, 'candidate');
+  row('14e ...on revEst', /revEst/.test(noBank3.stageReason || ''), true);
+  row('14e so the pre-bank is what flips it', carry.stage !== noBank3.stage, true);
   /* And the tape half of the fix is independent of the print half: without the
      carry-over pass, the freshest window is still the post one and the verdict
      would have been judged on -14.56 at a moment the print could not be read. */
@@ -1534,6 +1793,21 @@ console.log('\n== 14. THE MDB REPLAY — pre-bank -> pass 1 -> pass 2 -> carry-o
       /prev\.print && !prev\.print\.status/.test(meas), true);
   row('14z it stamps consensusSource live-pass', /consensusSource: 'live-pass'/.test(meas), true);
   row('14z ...and a null bank timestamp', /consensusBankedTs: null/.test(meas), true);
+  /* SCHEMA 3: the measure step stores the stage pair and a null release stamp,
+     and `mk` above mirrors both. A replay whose records carried no `stage` would
+     go on passing against its own private shape. */
+  row('14z printTapeMeasure stores the stage pair', /stage, stageReason,/.test(meas), true);
+  row('14z ...and a null releaseRead stamp', /releaseRead: null,/.test(meas), true);
+  row('14z ...deciding it through printTapeStage', /printTapeStage\(cand\.session, print, tape\)/.test(meas), true);
+  /* And `applyStage` here writes exactly the five fields the job's own does. */
+  const jobApply = grab('collectPrintTape')
+    .slice(grab('collectPrintTape').indexOf('const applyStage ='),
+           grab('collectPrintTape').indexOf('for (const item of work)'));
+  const replayApply = String(applyStage);
+  for (const f of ['stage', 'stageReason', 'divergent', 'refusalReason', 'divergenceTest']) {
+    row(`14z the replay's applyStage writes rec.${f} like the job's`,
+        [new RegExp(`rec\\.${f}`).test(replayApply), new RegExp(`rec\\.${f}`).test(jobApply)], [true, true]);
+  }
   const preb = grab('collectPrintTapePreBank');
   row('14z the pre-bank targets the NEXT trading day', /nextTradingDay\(today\)/.test(preb), true);
   row('14z ...and refuses rather than guessing when that is null', /if \(!target\)/.test(preb), true);
@@ -1640,13 +1914,729 @@ console.log('\n== 15. GET /api/calendar/holidays — through the REAL router ===
   row('15h route does NOT use aiGuard', /aiGuard/.test(route), false);
 }
 
+console.log('\n== 16. THE AVGO REPLAY — the record the two-gate split was built from =======\n');
+{
+  /* ════════════════════════════════════════════════════════════════════════
+     EVERY FIGURE IN THE FIRST BLOCK IS REAL. It was read back out of the
+     DEPLOYED Worker's own `/api/printtape?date=2026-09-02` on 2026-09-03,
+     together with `printtapeday:2026-09-02`, and cross-checked against a SECOND
+     endpoint (`/api/earnings/AVGO?facts=1`) on the same day.
+
+       print.epsActual         3.32
+       print.epsEst            3.238    via earningsChart[-1].estimate
+       print.epsSurprisePct    2.53     (Yahoo's own figure agreed: 2.53)
+       print.quarter           2026-07-31, quarterLabel 2Q2026, reported 2026-09-02
+       print.quarterVia        "consensus has rolled forward"
+       print.revEst            29,434,507,200   carried forward across passes
+       print.revActual         null     — STILL null at the 06:15 PT carry-over,
+                                          14 hours after a 20:00Z print
+       tape.post.changePct     -0.8205  price 364.2268 vs regularMarketPrice 367.24
+       tape.pre.changePct      -2.9871  price 356.27,  quoted 2026-09-03T13:15:10Z
+       tape.usedWindow         pre
+       divergent               null     — "1 is absent: revActual"
+
+     THE DAY INDEX, also real: both morning passes on the report day logged
+     `scanOk: false` (Yahoo crumb unavailable); the four passes that DID read
+     anything were amc-pass1, amc-pass2 and the two carry-overs the next day.
+
+     CROSS-CHECK on the revenue SCALE, from the second endpoint: AVGO's
+     financialsChart carried 3Q2025 18.015B, 4Q2025 19.311B, 1Q2026 22.187B and
+     NO 2Q2026 entry, with a next-quarter consensus of 37.16B. So 29.43B is the
+     right order of magnitude for a 2Q2026 consensus, confirmed against a
+     different module from the one the record read it out of.
+
+     WHAT IS RECONSTRUCTED, stated rather than buried: the record is what the
+     Worker STORED, not the raw Yahoo response, so the payloads below are the
+     `quoteSummary` shapes that produce exactly those stored values — which is
+     what 16a asserts, field by field. The pre-roll `earningsTrend.0q` state at
+     amc-pass1 and the previous quarter's `reportedDate` are reconstructed; every
+     number the gates read is transcribed.
+
+     A FIELD THAT DOES NOT RECONCILE, found while transcribing and NOT changed
+     here: the record's `tape.pre.referenceClose` is 369.68
+     (`regularMarketPreviousClose`, the 2026-09-01 close) while Yahoo's own
+     `preMarketChangePercent` of -2.9871% implies 367.24 — the 2026-09-02 close,
+     which is `regularMarketPrice`. At 13:15 UTC on 2026-09-03 Yahoo had not yet
+     rolled its "previous close" pointer into the new session. The VERDICT is
+     unaffected because it reads `changePct` and never `referenceClose`, which
+     16f pins; the stored reference field can name a close one session early.
+     ════════════════════════════════════════════════════════════════════════ */
+  const AVGO_TS     = '2026-09-02T20:00:00.000Z';   // REAL — the 20:00Z AMC anchor
+  const REPORT      = '2026-09-02';
+  const NEXT_SES    = '2026-09-03';
+  const REV_EST     = 29_434_507_200;               // REAL
+  const EPS_ACTUAL  = 3.32;                         // REAL
+  const EPS_EST     = 3.238;                        // REAL
+  const POST_PCT    = -0.008205;                    // REAL, as Yahoo's decimal fraction
+  const PRE_PCT     = -0.029871;                    // REAL, as Yahoo's decimal fraction
+
+  const priceCommon = { regularMarketPrice: { raw: 367.24 }, regularMarketPreviousClose: { raw: 369.68 } };
+  const postBlock = {
+    ...priceCommon, marketState: 'POST',
+    postMarketPrice: { raw: 364.2268 }, postMarketChangePercent: { raw: POST_PCT },
+    postMarketTime: Date.parse('2026-09-02T23:59:59Z') / 1000,
+    /* The report MORNING's pre quote, which is older than a 20:00Z print and is
+       refused on the staleness guard without anything consulting a clock. */
+    preMarketPrice: { raw: 371.10 }, preMarketChangePercent: { raw: 0.0038 },
+    preMarketTime: Date.parse('2026-09-02T13:00:00Z') / 1000,
+  };
+
+  // ── amc-pass1, 13:30 PT (20:30 UTC): the consensus is still current ──
+  const AVGO_PASS1 = {
+    earningsTrend: { trend: [{ period: '0q', endDate: '2026-07-31',
+      earningsEstimate: { avg: { raw: EPS_EST } }, revenueEstimate: { avg: { raw: REV_EST } } }] },
+    calendarEvents: { earnings: { earningsAverage: { raw: EPS_EST }, revenueAverage: { raw: REV_EST } } },
+    earnings: {
+      // The newest published actual is still the PREVIOUS quarter (2.44 / 2.40,
+      // cross-checked from /api/earnings/AVGO?facts=1 history).
+      earningsChart: { quarterly: [{ date: '1Q2026', actual: { raw: 2.44 }, estimate: { raw: 2.40 },
+        surprisePct: '1.7', periodEndDate: { fmt: '2026-04-30' }, reportedDate: { fmt: '2026-06-04' } }] },
+      financialsChart: { quarterly: [{ date: '4Q2025', revenue: { raw: 19_311_000_000 } },
+                                     { date: '1Q2026', revenue: { raw: 22_187_000_000 } }] },
+    },
+    price: postBlock,
+  };
+
+  // ── amc-pass2, 14:30 PT (21:30 UTC): the actual is in, 0q has ROLLED ──
+  const AVGO_PASS2 = {
+    earningsTrend: { trend: [{ period: '0q', endDate: '2026-10-31',
+      earningsEstimate: { avg: { raw: 3.87 } }, revenueEstimate: { avg: { raw: 37_160_030_200 } } }] },
+    calendarEvents: { earnings: {} },
+    earnings: {
+      earningsChart: { quarterly: [{ date: '2Q2026', actual: { raw: EPS_ACTUAL }, estimate: { raw: EPS_EST },
+        surprisePct: '2.53', periodEndDate: { fmt: '2026-07-31' }, reportedDate: { fmt: REPORT } }] },
+      // NO 2Q2026 entry — the measured defect, still true 14 hours later.
+      financialsChart: { quarterly: [{ date: '4Q2025', revenue: { raw: 19_311_000_000 } },
+                                     { date: '1Q2026', revenue: { raw: 22_187_000_000 } }] },
+    },
+    price: postBlock,
+  };
+
+  // ── The 06:15 PT carry-over the next morning: the pre-market has traded it ──
+  const AVGO_MORNING = {
+    ...AVGO_PASS2,
+    price: {
+      ...priceCommon, marketState: 'PRE',
+      preMarketPrice: { raw: 356.27 }, preMarketChangePercent: { raw: PRE_PCT },
+      preMarketTime: Date.parse('2026-09-03T13:15:10Z') / 1000,
+      // Yahoo drops postMarket* once the pre session opens.
+    },
+  };
+
+  const mk = (payload, session, passLabel, prev) => {
+    const bankedQuarter = (prev && prev.schema === M.PRINTTAPE_SCHEMA && prev.print && !prev.print.status
+      && typeof prev.print.quarter === 'string') ? prev.print.quarter : null;
+    const print = M.printTapePrintFrom(payload, REPORT, bankedQuarter);
+    const tape = M.printTapeTapeFrom(payload.price, session, AVGO_TS);
+    const v = M.printTapeStage(session, print, tape);
+    return {
+      schema: M.PRINTTAPE_SCHEMA, ticker: 'AVGO', reportDate: REPORT, session, earningsTs: AVGO_TS,
+      pass: passLabel, ts: Date.now(), consensusSource: 'live-pass', consensusBankedTs: null,
+      print, tape, implied: { status: 'not-computed', reason: 'not part of this replay' },
+      stage: v.stage, stageReason: v.stageReason, divergent: v.divergent, refusalReason: v.refusalReason,
+      ...(v.test ? { divergenceTest: v.test } : {}),
+      guidance: null, releaseRead: null, passes: [{ pass: passLabel, ts: 1 }],
+    };
+  };
+  const commit = (prev, next) => applyStage(M.mergePrintTapeRecord(prev, next));
+
+  /* ── 16a. THE REPLAY REPRODUCES THE LIVE RECORD, field by field ────────────
+     If these do not match, the payloads above are not the ones that produced the
+     record and nothing after this section means anything. */
+  const p1 = commit(null, mk(AVGO_PASS1, 'amc', 'amc-pass1', null));
+  const p2 = commit(p1, mk(AVGO_PASS2, 'amc', 'amc-pass2', p1));
+  const carry = commit(p2, mk(AVGO_MORNING, 'amc', 'bmo-pass2-carryover', p2));
+
+  row('16a epsActual matches the live record', carry.print.epsActual, 3.32);
+  row('16a epsEst matches', carry.print.epsEst, 3.238);
+  row('16a epsSurprisePct matches', carry.print.epsSurprisePct, 2.53);
+  row('16a ...and Yahoo\'s own figure agrees, as it did live', carry.print.epsSurpriseAgrees, true);
+  row('16a the quarter matches', [carry.print.quarter, carry.print.quarterLabel], ['2026-07-31', '2Q2026']);
+  row('16a ...established the way the live record said',
+      /consensus has rolled forward/.test(carry.print.quarterVia || ''), true);
+  row('16a revEst matches, carried across passes', carry.print.revEst, REV_EST);
+  row('16a ...and is NAMED as carried', carry.print.carriedFields, ['revEst']);
+  row('16a revActual is STILL null 14 hours after the print', carry.print.revActual, null);
+  row('16a post changePct matches', carry.tape.post.changePct, -0.8205);
+  row('16a pre changePct matches', carry.tape.pre.changePct, -2.9871);
+  row('16a usedWindow matches', carry.tape.usedWindow, 'pre');
+  row('16a the report-morning pre quote was refused as stale',
+      /EARLIER than the report instant/.test(p2.tape.pre.reason || ''), true);
+
+  /* ── 16b. WHAT SCHEMA 2 SAID, AND WHAT SCHEMA 3 SAYS ───────────────────────
+
+     The live record read `divergent: null` — the question could not be asked —
+     on a name whose EPS beat and whose tape was read in both windows. Gate 1 is
+     free, structured and was fully readable the whole time, and its answer is
+     NO: the tape did not sell it. The AND cannot be rescued by any revenue
+     figure, so the record is now ANSWERED. */
+  row('16b >>> the live schema-2 record said (transcribed)', 'divergent: null', 'divergent: null');
+  row('16b >>> schema 3 answers it: stage', carry.stage, 'agree');
+  row('16b >>> ...divergent', carry.divergent, false);
+  row('16b ...so the two really are different answers', carry.divergent !== null, true);
+  row('16b the EPS half DID beat', carry.divergenceTest.epsBeat, true);
+  row('16b the tape half did NOT sell', carry.divergenceTest.sold, false);
+  row('16b ...gate 1 therefore false', carry.divergenceTest.gate1, false);
+  row('16b gate 2 stays UNANSWERED, not false',
+      [carry.divergenceTest.gate2, carry.divergenceTest.revBeat], [null, null]);
+  row('16b ...and the reason says the AND could not be rescued',
+      /the revenue half could not change this answer/.test(carry.stageReason || ''), true);
+  row('16b the record is COMPLETE now', M.printTapeComplete(carry), true);
+  row('16b ...where the live one was not',
+      M.printTapeComplete({ ...carry, stage: 'refused', divergent: null }), false);
+
+  /* ── 16c. HOW CLOSE IT CAME, printed rather than asserted ─────────────────
+     The gate is what decided this record, so the margin is the measurement. */
+  const margin = +(carry.divergenceTest.changePct - M.PRINTTAPE_DIVERGENCE_PCT).toFixed(4);
+  row('16c the pre reading', carry.divergenceTest.changePct, -2.9871);
+  row('16c the gate', M.PRINTTAPE_DIVERGENCE_PCT, -3.0);
+  row('16c the margin, in percentage points', margin, 0.0129);
+  row('16c ...so it missed by less than 0.02pp', margin > 0 && margin < 0.02, true);
+  /* MOVE IT PAST THE GATE AND NOTHING ELSE, and gate 1 fires. That is what makes
+     16b an assertion about the GATE rather than about the fixture. */
+  const nudged = { ...AVGO_MORNING,
+    price: { ...AVGO_MORNING.price, preMarketChangePercent: { raw: -0.030129 } } };  // SYNTHETIC
+  const nudgedRec = commit(p2, mk(nudged, 'amc', 'bmo-pass2-carryover', p2));
+  row('16c nudged 0.0258pp past the gate -> stage', nudgedRec.stage, 'candidate');
+  row('16c ...on a change of', nudgedRec.divergenceTest.changePct, -3.0129);
+  row('16c ...and nothing else about the record moved',
+      [nudgedRec.print.epsActual, nudgedRec.print.revEst, nudgedRec.print.revActual],
+      [3.32, REV_EST, null]);
+
+  /* ── 16d. THE CANDIDATE PATH, on a SYNTHETIC tape ──────────────────────────
+
+     STATED PLAINLY: the real AVGO tape does not reach the gate in either window
+     — post -0.8205%, pre -2.9871% — so gate 1 cannot fire on the real payload
+     and this branch is driven on a SYNTHETIC post reading. Everything else in it
+     is the real record. -8.42% is an ordinary beat-and-fade magnitude; MDB's
+     real one on 2026-09-01 was -14.5598%. */
+  const SYNTH_POST_PCT = -0.0842;                                        // SYNTHETIC
+  const AVGO_PASS2_SOLD = { ...AVGO_PASS2,
+    price: { ...postBlock, postMarketChangePercent: { raw: SYNTH_POST_PCT } } };
+  const p1s = commit(null, mk(AVGO_PASS1, 'amc', 'amc-pass1', null));
+  const soldP2 = commit(p1s, mk(AVGO_PASS2_SOLD, 'amc', 'amc-pass2', p1s));
+  row('16d >>> gate 1 fires on the 14:30 pass -> stage', soldP2.stage, 'candidate');
+  row('16d ...on the SYNTHETIC post reading', soldP2.divergenceTest.changePct, -8.42);
+  row('16d ...with the REAL EPS beat behind it',
+      [soldP2.print.epsActual, soldP2.print.epsEst, soldP2.print.epsSurprisePct], [3.32, 3.238, 2.53]);
+  row('16d ...and the REAL banked consensus', soldP2.print.revEst, REV_EST);
+  row('16d the revenue actual is absent, which is the whole point', soldP2.print.revActual, null);
+  row('16d ...so gate 2 is unanswered, not false', soldP2.divergenceTest.gate2, null);
+  row('16d the boolean stays null for schema continuity', soldP2.divergent, null);
+  row('16d ...and a candidate is not complete', M.printTapeComplete(soldP2), false);
+  row('16d ...so it carries over, naming the open gate',
+      /stage is CANDIDATE/.test(M.printTapeNeedsCarryOver(soldP2).reason), true);
+
+  /* ── 16e. THE RELEASE READ AT THE CARRY-OVER, four stubbed answers ─────────
+
+     The Claude call is never executed here. Each stub is the object
+     `printTapeReadRelease` would return, applied by the same lines the job
+     applies it with, then the gates are re-decided — the step §11a-bis pins
+     against source and §16z pins line by line. */
+  const morningSold = commit(soldP2, mk({ ...AVGO_MORNING,
+    price: { ...AVGO_MORNING.price, preMarketChangePercent: { raw: SYNTH_POST_PCT } } },
+    'amc', 'bmo-pass2-carryover', soldP2));
+  row('16e the carry-over is still a candidate before the read', morningSold.stage, 'candidate');
+
+  const applyRelease = (rec, rel, passLabel) => {
+    const out = JSON.parse(JSON.stringify(rec));
+    out.guidance = rel.guidance;
+    if (rel.answered) {
+      out.releaseRead = { ts: 1, pass: passLabel,
+                          revenueFound: !rel.revenue.status, guidanceFound: !rel.guidance.status };
+    }
+    if (rel.revenue && !rel.revenue.status && !Number.isFinite(out.print?.revActual)) {
+      out.print.revActual = rel.revenue.value;
+      out.print.revActualSource = 'release-via-claude';
+      out.print.revenue = rel.revenue;
+      out.print.revSurprisePct = M.printTapeSurprise(out.print.revActual, out.print.revEst);
+    } else if (rel.revenue?.status && out.print && !Number.isFinite(out.print.revActual)) {
+      out.print.revenue = rel.revenue;
+    }
+    return applyStage(out);
+  };
+  const stubRevenue = (value) => ({
+    value, valueText: `$${(value / 1e9).toFixed(2)} billion`, valueReDerived: value,
+    currency: 'USD', quote: `Revenue rose to $${(value / 1e9).toFixed(2)} billion in the third quarter.`,
+    quoteNote: null, sourceTitle: 'Broadcom Just Put a Massive Number on Its AI Future',
+    sourcePublisher: 'GuruFocus.com', sourceDate: NEXT_SES, sourceUrl: 'https://example.invalid/avgo',
+    sourceNote: null, source: 'release-via-claude · Yahoo Finance news · window 2026-09-01 → 2026-09-07',
+    asOf: '2026-09-03T13:16:00.000Z',
+  });
+  /* The guidance half, transcribed from a REAL headline in the live coverage
+     window: "Broadcom Falls 6% as Soft Guidance Overshadows 221% AI Revenue
+     Surge" (24/7 Wall St., 2026-09-03). */
+  const GUIDANCE_CUT = { class: 'cut',
+    quote: 'Broadcom Falls 6% as Soft Guidance Overshadows 221% AI Revenue Surge',
+    quoteNote: null, source: 'Yahoo Finance news', asOf: '2026-09-03T13:16:00.000Z' };
+
+  // (i) A BEATING figure flips the stage to divergent.
+  const BEAT_REV = 30_100_000_000;                                       // SYNTHETIC
+  const flipped = applyRelease(morningSold,
+    { answered: true, guidance: GUIDANCE_CUT, revenue: stubRevenue(BEAT_REV) }, 'bmo-pass2-carryover');
+  row('16e (i) >>> a beating release figure flips the stage', flipped.stage, 'divergent');
+  row('16e (i) ...divergent true', flipped.divergent, true);
+  row('16e (i) the figure is on the record', flipped.print.revActual, BEAT_REV);
+  row('16e (i) ...attributed to the release, not Yahoo', flipped.print.revActualSource, 'release-via-claude');
+  row('16e (i) ...with its surprise against the BANKED consensus',
+      flipped.print.revSurprisePct, +(((BEAT_REV - REV_EST) / REV_EST) * 100).toFixed(2));
+  row('16e (i) ...and its quote and citation kept',
+      [typeof flipped.print.revenue.quote, flipped.print.revenue.sourceUrl],
+      ['string', 'https://example.invalid/avgo']);
+  row('16e (i) gate 2 is now answered',
+      [flipped.divergenceTest.gate2, flipped.divergenceTest.revBeat], [true, true]);
+  row('16e (i) ...and the test names the source it judged on',
+      flipped.divergenceTest.revActualSource, 'release-via-claude');
+  row('16e (i) the guidance rode on the SAME call', flipped.guidance.class, 'cut');
+  row('16e (i) ...and the call is stamped once', flipped.releaseRead.revenueFound, true);
+
+  /* (ii) THE FIGURE THE TASK NAMED, 15.95B, DRIVEN AGAINST THE REAL CONSENSUS.
+     It is 0.5419x of 29,434,507,200 — inside the 4x plausibility band, so it is
+     ACCEPTED as a figure and gate 2 answers it honestly: a 45.8% MISS is not a
+     beat, so the stage is `agree`, not `divergent`. Both numbers are printed
+     because the expected outcome and the arithmetic disagree. */
+  const TASK_REV = 15_950_000_000;
+  const missed = applyRelease(morningSold,
+    { answered: true, guidance: GUIDANCE_CUT, revenue: stubRevenue(TASK_REV) }, 'bmo-pass2-carryover');
+  row('16e (ii) the release figure 15.95B', missed.print.revActual, TASK_REV);
+  row('16e (ii) against the REAL banked consensus', missed.print.revEst, REV_EST);
+  row('16e (ii) ...which is a miss of', missed.print.revSurprisePct, -45.81);
+  row('16e (ii) so gate 2 answers NO', missed.divergenceTest.revBeat, false);
+  row('16e (ii) >>> and the stage is agree, NOT divergent', missed.stage, 'agree');
+  row('16e (ii) ...the two figures give opposite stages', flipped.stage !== missed.stage, true);
+  row('16e (ii) it is inside the plausibility band, so it is a real answer',
+      TASK_REV / REV_EST > 1 / M.PRINTTAPE_REVENUE_SANITY_MULT, true);
+
+  // (iii) NO FIGURE IN THE RELEASE — the stage stays a candidate, with the reason.
+  const notFound = applyRelease(morningSold, { answered: true, guidance: GUIDANCE_CUT,
+    revenue: { status: 'not-found-in-release', reason: 'the coverage window carried no revenue figure for '
+      + 'this quarter that the release read would state (revenueValue null).' } }, 'bmo-pass2-carryover');
+  row('16e (iii) >>> no figure leaves the stage at candidate', notFound.stage, 'candidate');
+  row('16e (iii) ...with the revenue block naming why', notFound.print.revenue.status, 'not-found-in-release');
+  row('16e (iii) ...replacing the Yahoo not-published note',
+      notFound.print.revenue.status !== 'not-published', true);
+  row('16e (iii) revActual stays null', notFound.print.revActual, null);
+  row('16e (iii) the guidance still landed', notFound.guidance.class, 'cut');
+  row('16e (iii) ...and the call is STAMPED, so no pass asks again',
+      [notFound.releaseRead.revenueFound, notFound.releaseRead.guidanceFound], [false, true]);
+
+  // (iv) A call that never reached Anthropic must stay retryable.
+  const refused = applyRelease(morningSold, { answered: false,
+    guidance: { status: 'not-computed', reason: 'ceiling' },
+    revenue: { status: 'not-computed', reason: 'ceiling' } }, 'bmo-pass2-carryover');
+  row('16e (iv) a ceiling refusal does NOT stamp the call', refused.releaseRead, null);
+  row('16e (iv) ...so the stage is unchanged', refused.stage, 'candidate');
+  row('16e (iv) ...and the merge leaves it retryable',
+      M.mergePrintTapeRecord(refused, morningSold).releaseRead ?? null, null);
+  row('16e (iv) whereas an ANSWERED stamp survives a later merge',
+      M.mergePrintTapeRecord(notFound, morningSold).releaseRead.revenueFound, false);
+
+  /* ── 16f. THE YAHOO CROSS-CHECK, DAYS LATER ────────────────────────────────
+
+     Yahoo eventually publishes its own revenue actual. It does NOT overwrite the
+     release figure — the release is the primary source and the aggregator is the
+     derived one — and a disagreement past 1% is recorded as a CONFLICT with both
+     figures rather than silently resolved. */
+  const laterPayload = (yahooRev) => ({
+    ...AVGO_PASS2,
+    earnings: {
+      earningsChart: AVGO_PASS2.earnings.earningsChart,
+      financialsChart: { quarterly: [
+        { date: '1Q2026', revenue: { raw: 22_187_000_000 } },
+        { date: '2Q2026', revenue: { raw: yahooRev } },
+      ] },
+    },
+    price: { ...postBlock, postMarketChangePercent: { raw: SYNTH_POST_PCT } },
+  });
+
+  // (i) PAST the 1% tolerance -> a conflict.
+  const YAHOO_FAR = 30_550_000_000;                                      // SYNTHETIC
+  const conflicted = commit(flipped, mk(laterPayload(YAHOO_FAR), 'amc', 'amc-pass1', flipped));
+  row('16f (i) the release figure is NOT overwritten', conflicted.print.revActual, BEAT_REV);
+  row('16f (i) ...and still names its own source', conflicted.print.revActualSource, 'release-via-claude');
+  row('16f (i) >>> a conflict is recorded', !!conflicted.print.revenueConflict, true);
+  row('16f (i) ...with BOTH figures on it',
+      [conflicted.print.revenueConflict.release, conflicted.print.revenueConflict.yahoo],
+      [BEAT_REV, YAHOO_FAR]);
+  row('16f (i) ...and the distance between them',
+      conflicted.print.revenueConflict.diffPct, +(((YAHOO_FAR - BEAT_REV) / BEAT_REV) * 100).toFixed(4));
+  row('16f (i) ...past the declared tolerance',
+      Math.abs(conflicted.print.revenueConflict.diffPct) > M.PRINTTAPE_REVENUE_CONFLICT_PCT, true);
+  row('16f (i) the cross-check block says they disagree', conflicted.print.revenueCrosscheck.agrees, false);
+  row('16f (i) the release provenance block survives the merge',
+      conflicted.print.revenue.source.startsWith('release-via-claude'), true);
+  row('16f (i) ...and the verdict is unchanged by the conflict', conflicted.stage, 'divergent');
+  row('16f (i) the surprise is still against the release figure',
+      conflicted.print.revSurprisePct, +(((BEAT_REV - REV_EST) / REV_EST) * 100).toFixed(2));
+
+  // (ii) WITHIN tolerance -> a cross-check and NO conflict.
+  const YAHOO_NEAR = 30_120_000_000;                                     // SYNTHETIC
+  const agreed = commit(flipped, mk(laterPayload(YAHOO_NEAR), 'amc', 'amc-pass1', flipped));
+  row('16f (ii) within 1%, the cross-check agrees', agreed.print.revenueCrosscheck.agrees, true);
+  row('16f (ii) ...and NO conflict is recorded', agreed.print.revenueConflict, undefined);
+  row('16f (ii) ...the release figure still stands', agreed.print.revActual, BEAT_REV);
+  row('16f (ii) ...and the two paths really do differ',
+      [!!conflicted.print.revenueConflict, !!agreed.print.revenueConflict], [true, false]);
+  row('16f (ii) the diff that was tolerated',
+      agreed.print.revenueCrosscheck.diffPct, +(((YAHOO_NEAR - BEAT_REV) / BEAT_REV) * 100).toFixed(4));
+
+  /* (iii) A YAHOO ACTUAL THAT LANDS FIRST IS NOT DISPLACED BY A RELEASE READ.
+     The gap-fill runs one way only: `revActual` absent -> take the release
+     figure. Yahoo's structured reading wins whenever it exists. */
+  const yahooFirst = commit(soldP2, mk(laterPayload(30_900_000_000), 'amc', 'amc-pass2', soldP2));
+  row('16f (iii) a Yahoo actual with no release behind it is attributed to Yahoo',
+      yahooFirst.print.revActualSource, 'yahoo');
+  const wouldOverwrite = applyRelease(yahooFirst,
+    { answered: true, guidance: GUIDANCE_CUT, revenue: stubRevenue(BEAT_REV) }, 'amc-pass2');
+  row('16f (iii) ...and a later release read does NOT displace it',
+      wouldOverwrite.print.revActual, 30_900_000_000);
+  row('16f (iii) ...nor its attribution', wouldOverwrite.print.revActualSource, 'yahoo');
+  /* THE VERDICT READS `changePct` AND NEVER `referenceClose` — which is what
+     makes the unreconciled reference field noted at the top of this section a
+     provenance defect rather than a wrong answer. */
+  row('16f the verdict never reads referenceClose',
+      /referenceClose/.test(grab('printTapeStage')), false);
+  row('16f ...and the real record\'s two reference readings really do disagree',
+      [carry.tape.pre.referenceClose, +(356.27 / (1 + carry.tape.pre.changePct / 100)).toFixed(2)],
+      [369.68, 367.24]);
+
+  /* ── 16g. THE PASS META RECORDS WHAT THE CARRY-OVER DID ────────────────────
+
+     The real `printtapeday:2026-09-02` is the case this exists for: both morning
+     passes on the report day logged `scanOk: false` (no Yahoo crumb), and the
+     record that answered the day was written the NEXT morning. Reconstructed
+     here from the real index, with the schema-3 carry-over entry appended. */
+  const dayIndex = {
+    schema: M.PRINTTAPE_SCHEMA, date: REPORT, ts: 1,
+    passes: [
+      { pass: 'bmo-pass1', scanOk: false, eligible: [], measured: [],
+        scanReason: 'Yahoo crumb unavailable — the eligibility scan could not run, so NO name was checked.' },
+      { pass: 'bmo-pass2', scanOk: false, eligible: [], measured: [],
+        scanReason: 'Yahoo crumb unavailable — the eligibility scan could not run, so NO name was checked.' },
+      { pass: 'amc-pass1', scanOk: true, eligible: [{ ticker: 'AVGO', session: 'amc', earningsTs: AVGO_TS }],
+        measured: ['AVGO'] },
+      { pass: 'amc-pass2', scanOk: true, eligible: [{ ticker: 'AVGO', session: 'amc', earningsTs: AVGO_TS }],
+        measured: ['AVGO'] },
+      // The schema-3 addition: the carry-over's own entry, on the REPORT day.
+      { pass: 'bmo-pass2-carryover', scanOk: true, ranOn: NEXT_SES,
+        eligible: [{ ticker: 'AVGO', session: 'amc', earningsTs: AVGO_TS }],
+        measured: ['AVGO'], written: ['AVGO'], skipped: [], candidates: ['AVGO'], divergent: [],
+        scanReason: 'the carry-over runs NO eligibility scan — its candidates are this index\'s own eligible list' },
+    ],
+  };
+  const failedScans = dayIndex.passes.filter(p => p.scanOk === false).map(p => p.pass);
+  const carryEntries = dayIndex.passes.filter(p => /-carryover$/.test(p.pass));
+  row('16g the report day has two FAILED scans on it', failedScans, ['bmo-pass1', 'bmo-pass2']);
+  row('16g ...and a carry-over entry that names what it WROTE',
+      carryEntries.map(p => p.written), [['AVGO']]);
+  row('16g ...on a day whose own morning scans failed',
+      failedScans.length > 0 && carryEntries.length > 0, true);
+  row('16g the carry-over entry says WHEN it ran', carryEntries[0].ranOn, NEXT_SES);
+  row('16g ...and that it ran no scan of its own',
+      /runs NO eligibility scan/.test(carryEntries[0].scanReason), true);
+  row('16g the day is legible as "written later", not as "scans failed"',
+      dayIndex.passes.some(p => (p.written || []).length > 0), true);
+
+  /* ── 16y. THE FAILING DIRECTION — a check that cannot fail proves nothing ──
+
+     The §5f pattern, applied to the split: take the SHIPPED function's own
+     source, remove the gate-1 short circuit so it demands all five inputs the
+     way schema 2 did, and drive the SAME AVGO payloads through it. The record
+     goes back to `null` — which is the live record's own answer, so the revert
+     reproduces the defect rather than merely differing from the fix. */
+  const stageSrc = grab('printTapeStage');
+  const cut = "  // ── GATE 1 answered NO. The AND cannot be rescued by any revenue figure. ──";
+  row('16y the short-circuit block was located in source', stageSrc.includes(cut), true);
+  const reverted = new Function([
+    grabConst('PRINTTAPE_DIVERGENCE_PCT'),
+    stageSrc.replace(cut, '  if (!Number.isFinite(print.revActual) || !Number.isFinite(print.revEst)) '
+      + "return at('refused', 'schema-2 behaviour: the test needs all five inputs');\n" + cut),
+    'return printTapeStage;',
+  ].join('\n'))();
+  const revertedOut = reverted(carry.session, carry.print, carry.tape);
+  row('16y the reverted function refuses the AVGO record', revertedOut.stage, 'refused');
+  row('16y ...with divergent null, exactly as the LIVE record read', revertedOut.divergent, null);
+  row('16y ...where the shipped code answers', [carry.stage, carry.divergent], ['agree', false]);
+  row('16y so the short circuit is what changed the answer',
+      revertedOut.divergent !== carry.divergent, true);
+  /* And the revert must NOT change the candidate path, or the two changes would
+     be confounded: gate 1 firing with no revenue is refused either way at
+     schema 2, and a candidate under the split. */
+  row('16y the reverted function also loses the candidate',
+      reverted(soldP2.session, soldP2.print, soldP2.tape).stage, 'refused');
+  row('16y ...where the shipped code names it', soldP2.stage, 'candidate');
+
+  /* ── 16z. THE REPLAY MIRRORS THE REAL JOB, asserted against SOURCE ─────────
+     `applyRelease` above stands in for the job's release-application block. */
+  const collect = grab('collectPrintTape');
+  row('16z the job stores the guidance from the release read',
+      /rec\.guidance = rel\.guidance;/.test(collect), true);
+  row('16z ...stamps releaseRead only when answered',
+      /if \(rel\.answered\) \{[\s\S]{0,240}?rec\.releaseRead = \{/.test(collect), true);
+  row('16z ...takes the figure only into an absent revActual',
+      /!rel\.revenue\.status && !Number\.isFinite\(rec\.print\?\.revActual\)/.test(collect), true);
+  row('16z ...recomputes the surprise from it',
+      /rec\.print\.revSurprisePct = printTapeSurprise\(rec\.print\.revActual, rec\.print\.revEst\)/.test(collect), true);
+  row('16z ...and lets a refusal replace the Yahoo note',
+      /rec\.print\.revenue = rel\.revenue;/.test(collect), true);
+  const merge = grab('mergePrintTapeRecord');
+  row('16z the merge keeps a release figure over a Yahoo one',
+      /pPrint\.revActualSource === 'release-via-claude'/.test(merge), true);
+  row('16z ...records the cross-check', /revenueCrosscheck = \{/.test(merge), true);
+  row('16z ...and promotes it to a conflict past the tolerance',
+      /if \(!agrees\) \{[\s\S]{0,160}?revenueConflict = \{/.test(merge), true);
+  row('16z a complete revenue pair clears a REFUSAL, never a measurement',
+      /out\.print\.revenue\?\.status\) delete out\.print\.revenue/.test(merge), true);
+}
+
+console.log('\n== 17. THE RELEASE READ\'S THREE GATES — before a figure is believed =========\n');
+{
+  /* The Claude call is never executed anywhere in this file. What IS driven is
+     everything the Worker does to the answer BEFORE storing it, which is where a
+     fabricated or mis-scaled figure would get through. */
+
+  // ── 17a. printTapeParseMoney — the second derivation ──
+  for (const [text, want] of [
+    ['$15.95 billion', 15.95e9],
+    ['15.95 billion', 15.95e9],
+    ['USD 15.95B', 15.95e9],
+    ['$1.2 trillion', 1.2e12],
+    ['15,950 million', 15950e6],
+    ['$609.12 million', 609.12e6],
+    ['29,434,507,200', 29434507200],
+    ['15.95', 15.95],
+    ['', null],
+    ['no number here', null],
+    [null, null],
+    [42, null],
+  ]) {
+    row(`17a parse ${j(text)}`, M.printTapeParseMoney(text), want);
+  }
+
+  const facts = { news: [
+    { date: '2026-09-03', source: 'GuruFocus.com', title: 'Broadcom Just Put a Massive Number on Its AI Future',
+      summary: '', url: 'https://example.invalid/a' },
+    { date: '2026-09-03', source: 'MT Newswires', title: 'BofA Cuts Price Target on Broadcom',
+      summary: '', url: 'https://example.invalid/b' },
+  ] };
+  const print = { quarter: '2026-07-31', revEst: 29_434_507_200 };
+  const R = (o, p = print) => M.printTapeReleaseRevenue(o, p, facts, 'src line', 'ts');
+  const good = { revenueValue: 30_100_000_000, revenueValueText: '$30.10 billion', revenueCurrency: 'usd',
+                 revenueQuote: 'Revenue rose to $30.10 billion.', revenueItemIndex: 1 };
+
+  // ── 17b. The happy path, and what it carries ──
+  const ok = R(good);
+  row('17b a clean figure is taken', ok.value, 30_100_000_000);
+  row('17b ...with its second derivation recorded', ok.valueReDerived, 30.10e9);
+  row('17b ...the currency normalised to ISO', ok.currency, 'USD');
+  row('17b ...the quote kept', ok.quote, 'Revenue rose to $30.10 billion.');
+  row('17b ...and no missing-quote note', ok.quoteNote, null);
+  row('17b THE CITATION IS RESOLVED FROM THE INDEX, not from the model',
+      [ok.sourceTitle, ok.sourceUrl, ok.sourcePublisher],
+      ['Broadcom Just Put a Massive Number on Its AI Future', 'https://example.invalid/a', 'GuruFocus.com']);
+  row('17b ...and it names its own provenance', ok.source.startsWith('release-via-claude'), true);
+  row('17b it is a measurement, not a refusal', ok.status, undefined);
+
+  // ── 17c. GATE 1 — guard the null before the arithmetic ──
+  for (const [what, v] of [['null', null], ['zero', 0], ['negative', -1], ['a string', '15.95'],
+                           ['NaN', NaN], ['absent', undefined]]) {
+    const r = R({ ...good, revenueValue: v });
+    row(`17c ${what} revenueValue is refused`, r.status, 'not-found-in-release');
+    row(`17c ${what} -> no value field`, r.value, undefined);
+  }
+  row('17c ...and the refusal says an absent figure is ORDINARY, not a fault',
+      /an absent figure is an ordinary/.test(R({ ...good, revenueValue: null }).reason), true);
+
+  /* ── 17d. GATE 2 — THE UNITS TRAP. The model states the figure twice; if the
+     two statements disagree by more than the tolerance, NEITHER is stored. */
+  const unitsError = R({ ...good, revenueValue: 30.10, revenueValueText: '$30.10 billion' });
+  row('17d 30.10 written as "$30.10 billion" is refused', unitsError.status, 'not-found-in-release');
+  row('17d ...naming both statements', /30\.1 but wrote the same figure as/.test(unitsError.reason), true);
+  row('17d ...and how far apart they are', /100\.0% apart/.test(unitsError.reason), true);
+  row('17d the reverse direction too',
+      R({ ...good, revenueValue: 30.10e12, revenueValueText: '$30.10 billion' }).status, 'not-found-in-release');
+  /* Rounding INSIDE the tolerance survives: "$30.10 billion" against
+     30,104,000,000 is 0.0133% apart. */
+  const rounded = R({ ...good, revenueValue: 30_104_000_000, revenueValueText: '$30.10 billion' });
+  row('17d a rounding difference is tolerated', rounded.value, 30_104_000_000);
+  row('17d ...and it really is inside the tolerance',
+      Math.abs((30_104_000_000 - 30.10e9) / 30.10e9) * 100 < M.PRINTTAPE_REVENUE_CONFLICT_PCT, true);
+  // An unparseable text refuses NOTHING — it is a cross-check, not a requirement.
+  const noText = R({ ...good, revenueValueText: null });
+  row('17d an unparseable text does not refuse the figure', noText.value, 30_100_000_000);
+  row('17d ...it just records that it could not be re-derived', noText.valueReDerived, null);
+
+  /* ── 17e. GATE 3 — THE PLAUSIBILITY BAND, the `ivPlausible` rule applied to a
+     model-extracted number: validate it against its own nearest peer first. */
+  const rawUnits = R({ ...good, revenueValue: 15.95, revenueValueText: '15.95' });
+  row('17e a raw 15.95 against a 29.4B consensus is refused', rawUnits.status, 'not-found-in-release');
+  row('17e ...naming the ratio and the band', /outside the 4x plausibility band/.test(rawUnits.reason), true);
+  row('17e a figure 1000x too large is refused',
+      R({ ...good, revenueValue: 30.10e12, revenueValueText: '$30100.00 billion' }).status, 'not-found-in-release');
+  /* AND THE BAND IS WIDE ENOUGH FOR A REAL SURPRISE. The task's own 15.95B
+     against this consensus is a 45.8% miss — 0.5419x — and must be ACCEPTED as
+     a figure, because refusing a real miss would be the opposite failure. */
+  const realMiss = R({ ...good, revenueValue: 15_950_000_000, revenueValueText: '$15.95 billion' });
+  row('17e a 45.8% MISS is accepted, not refused', realMiss.value, 15_950_000_000);
+  row('17e ...at a ratio of', +(15_950_000_000 / 29_434_507_200).toFixed(4), 0.5419);
+  row('17e ...which is inside the band',
+      0.5419 > 1 / M.PRINTTAPE_REVENUE_SANITY_MULT && 0.5419 < M.PRINTTAPE_REVENUE_SANITY_MULT, true);
+  row('17e the band boundaries, driven either side',
+      [R({ ...good, revenueValue: 29_434_507_200 * 3.9, revenueValueText: null }).status,
+       R({ ...good, revenueValue: 29_434_507_200 * 4.1, revenueValueText: null }).status],
+      [undefined, 'not-found-in-release']);
+  // With NO consensus to compare against, the band cannot be applied and is not faked.
+  row('17e with no consensus the band is skipped, not guessed',
+      R({ ...good, revenueValue: 15.95, revenueValueText: null }, { quarter: 'q', revEst: null }).value, 15.95);
+
+  // ── 17f. THE CITATION, when the index does not resolve ──
+  for (const bad of [0, 3, -1, null, 1.5, '1']) {
+    const r = R({ ...good, revenueItemIndex: bad });
+    row(`17f index ${j(bad)} cites nothing`, r.sourceTitle, null);
+    row(`17f index ${j(bad)} -> the figure still stands`, r.value, 30_100_000_000);
+    row(`17f index ${j(bad)} -> and the gap is NAMED`, /the attribution does not/.test(r.sourceNote || ''), true);
+  }
+  row('17f a resolvable index carries no gap note', R(good).sourceNote, null);
+  // A figure with no supporting sentence is a claim with nothing behind it.
+  row('17f a missing quote is named rather than left null',
+      /no verbatim sentence supporting it/.test(R({ ...good, revenueQuote: null }).quoteNote || ''), true);
+  row('17f a junk currency is dropped rather than stored',
+      R({ ...good, revenueCurrency: 'dollars' }).currency, null);
+
+  /* ── 17g. STRUCTURAL — the prompt and the spend guard ─────────────────────*/
+  const rel = grab('printTapeReadRelease');
+  row('17g one Claude call in the function', (rel.match(/workerClaude\(/g) || []).length, 1);
+  row('17g ...through the cron ceiling first', rel.indexOf('cronMaySpend(') < rel.indexOf('workerClaude('), true);
+  row('17g ...costing exactly one unit', /cronMaySpend\(env, 1,/.test(rel), true);
+  row('17g a truncated answer is refused, never stored', /stopReason === 'max_tokens'/.test(rel), true);
+  row('17g ...and that refusal does NOT count as answered',
+      /return bail\('the release answer hit max_tokens/.test(rel), true);
+  row('17g the bail helper is the only answered:false path',
+      (rel.match(/answered: false/g) || []).length, 1);
+  row('17g ...and the one success is answered:true', (rel.match(/answered: true/g) || []).length, 1);
+  /* THE PROMPT MUST NOT ASK FOR A URL — a model has no way to know one and every
+     incentive to invent it. The citation is an index into the block it was
+     shown, resolved by the Worker. */
+  row('17g the prompt asks for an item INDEX', /revenueItemIndex — the number in square brackets/.test(rel), true);
+  row('17g ...and never for a URL', /revenueSourceUrl|the URL of/.test(rel), false);
+  row('17g the coverage block is NUMBERED so the index can resolve',
+      /\[\$\{i \+ 1\}\]/.test(rel), true);
+  row('17g the prompt demands absolute units with an example',
+      /ABSOLUTE UNITS \(write 15950000000, not 15\.95\)/.test(rel), true);
+  row('17g ...forbids a full-year, forecast or segment figure',
+      /not a full year, not a forecast, not a segment/.test(rel), true);
+  row('17g ...and forbids deciding from memory',
+      /Do not use anything you recall about this company/.test(rel), true);
+  row('17g both halves come from ONE gather', (rel.match(/gatherEarningsFacts\(/g) || []).length, 1);
+  const gather = grab('gatherEarningsFacts');
+  row('17g the Alpaca news items carry a url for the resolver', /url:\s+n\.url \?\? null/.test(gather), true);
+  row('17g ...and the Yahoo branch fills it from `link`', /url:\s+n\.link \?\? null/.test(gather), true);
+  /* The url is carried but NEVER rendered into a prompt — a model shown a URL
+     could echo it back as a citation it did not derive. */
+  row('17g no prompt in the Worker renders a news url',
+      /\$\{n\.url\}/.test(src), false);
+}
+
+console.log('\n== 18. THE KV BUDGET, RE-DERIVED FOR SCHEMA 3 ==============================\n');
+{
+  /* RULE #1 — ONE POOL. `capCost` = external fetches + binding ops, both against
+     the same 10,000 per invocation. This is a DERIVATION from the structure, not
+     a counter: nothing here runs the job. It is checkable because the two terms
+     it inherits (the eligibility scan and the per-eligible cost) were MEASURED
+     on an isolated firing at schema 1, and only the new terms are added here.
+
+     SCHEMA 3 CHANGES THE FORMULA IN TWO PLACES:
+
+       (a) the prior-day index append now fires on `S > 0` rather than `C > 0` —
+           +2 on a morning that screened names and carried none, 0 otherwise;
+       (b) each RELEASE READ costs 4 external + 2 bindings = 6.
+
+     THE RELEASE READ, ITEMISED. `gatherEarningsFacts` issues one quoteSummary
+     and one v8 chart concurrently, then ONE news request — Alpaca when the keys
+     are set, Yahoo search otherwise — so 3 external, plus 1 Anthropic call = 4.
+     `cronMaySpend` is 1 KV get + 1 KV put = 2 bindings. Nothing else is read or
+     written: the figure is folded into the record the pass was going to write
+     anyway. A 5th external appears only when Alpaca returns an EMPTY window and
+     the Yahoo fallback fires, which is a coverage case, not the normal one. */
+  const RELEASE_EXT = 4, RELEASE_BIND = 2, RELEASE = RELEASE_EXT + RELEASE_BIND;
+  row('18a a release read costs 4 external', RELEASE_EXT, 4);
+  row('18a ...and 2 bindings (the ceiling get + put)', RELEASE_BIND, 2);
+  row('18a ...so 6 capCost, one pool', RELEASE, 6);
+
+  const ceilN = n => Math.ceil(n / M.PRINTTAPE_QUOTE_CHUNK);
+  // AMC pass, unchanged except for the release reads.
+  const amc = (N, E, R) => ceilN(N) + 4 * E + 4 + RELEASE * R;
+  // BMO pass: + the prior-day index read (5 instead of 4), + (S - C) screening
+  // reads, + 2 for the prior-day append when anything was SCREENED.
+  const bmo = (N, E, S, C, R) => ceilN(N) + 4 * E + (S - C) + 5 + (S > 0 ? 2 : 0) + RELEASE * R;
+  const prebank = (N, E) => ceilN(N) + 3 * E + 4;
+
+  /* 18b. THE SCHEMA-2 FIGURES MUST STILL COME OUT, at R=0 — the two isolated
+     MEASUREMENTS this derivation is anchored to. */
+  row('18b bmo-pass1 N=40 B=1 S=3 C=2 (E=3), no release', bmo(40, 3, 3, 2, 0), 22);
+  row('18b amc-pass2 N=40 E=3, no release', amc(40, 3, 0), 18);
+  row('18b prebank N=40 E=3', prebank(40, 3), 15);
+  row('18b a quiet day: nobody reports, nothing carries', bmo(40, 0, 0, 0, 0), 7);
+  /* The one figure that MOVED at schema 3: a morning that screens names and
+     carries none now pays the 2 for the prior-day append, because that entry is
+     what makes "the carry-over ran and found everything answered" falsifiable. */
+  row('18b S>0 C=0 was 14 at schema 2, and is now 16', bmo(40, 1, 3, 0, 0), 16);
+  row('18b ...the schema-2 figure it grew from', ceilN(40) + 4 * 1 + 3 + 5, 14);
+  row('18b ...the +2 being exactly the prior-day append',
+      bmo(40, 1, 3, 0, 0) - (ceilN(40) + 4 * 1 + 3 + 5), 2);
+  row('18b S=0 pays nothing for it', bmo(40, 1, 0, 0, 0), ceilN(40) + 4 + 5);
+
+  /* 18c. THE HEAVY MORNING, recounted. E=10, S=12, C=8 was 53 at schema 2. */
+  row('18c heavy morning E=10 S=12 C=8, no candidate', bmo(40, 10, 12, 8, 0), 53);
+  row('18c ...with 2 candidates taking a release read', bmo(40, 10, 12, 8, 2), 65);
+  row('18c ...with every one of the 10 a candidate (worst case)', bmo(40, 10, 12, 8, 10), 113);
+  row('18c the release reads are the whole difference',
+      bmo(40, 10, 12, 8, 10) - bmo(40, 10, 12, 8, 0), 10 * RELEASE);
+
+  /* 18d. AGAINST THE CEILINGS. Two different ones bind here and they are
+     denominated differently — rule #1 counts subrequests, rule #5 counts CLAUDE
+     CALLS — so the worst case has to be checked against both. */
+  const CAP = 10_000;
+  row('18d the worst heavy morning against the 10,000 cap', bmo(40, 10, 12, 8, 10), 113);
+  row('18d ...as a share of it, in percent', +((bmo(40, 10, 12, 8, 10) / CAP) * 100).toFixed(2), 1.13);
+  row('18d ...still under 2%', bmo(40, 10, 12, 8, 10) / CAP < 0.02, true);
+  /* ALL FIVE PASSES ON ONE DAY, the worst plausible shape. Each is its own
+     invocation, so no invocation ever sees the sum — which is the point of
+     printing it beside the per-pass figures rather than instead of them. */
+  const day = bmo(40, 10, 12, 8, 10) + bmo(40, 10, 12, 8, 0)
+            + amc(40, 10, 10) + amc(40, 10, 0) + prebank(40, 10);
+  row('18d a whole worst-case DAY across all five passes', day, 113 + 53 + 106 + 46 + 36);
+  row('18d ...but no single invocation exceeds', Math.max(bmo(40, 10, 12, 8, 10), amc(40, 10, 10)), 113);
+  row('18d ...which is well under the per-invocation cap', 113 < CAP, true);
+  /* AND THE CLAUDE CEILING BINDS FIRST, by a wide margin. `AI_RATE_GLOBAL_DAY`
+     is 60 calls a day across every path, request and cron alike. */
+  const AI_DAY = 60;
+  row('18d the global Claude ceiling, in CALLS not requests', AI_DAY, 60);
+  row('18d 20 release reads in a day is a third of it', +((20 / AI_DAY) * 100).toFixed(1), 33.3);
+  row('18d ...and a refused call degrades the stage, never the record',
+      /the gate-1 candidacy/.test(grab('printTapeReadRelease')), true);
+
+  /* 18e. THE FORMULAE THEMSELVES, so a reader can re-derive rather than trust. */
+  console.log('\n     AMC pass     : ceil(N/20) + 4E + 4 + 6R');
+  console.log('     BMO pass     : ceil(N/20) + 4E + (S-C) + 5 + (S>0 ? 2 : 0) + 6R');
+  console.log('     pre-bank     : ceil(N/20) + 3E\' + 4                (no release read, ever)');
+  console.log('     release read : 3 gather fetches + 1 Anthropic + 2 ceiling bindings = 6\n');
+  row('18e the pre-bank formula has no release term', prebank(40, 3), ceilN(40) + 3 * 3 + 4);
+  row('18e ...because the pre-bank cannot reach a candidate stage',
+      grab('collectPrintTapePreBank').includes('printTapeReadRelease('), false);
+}
+
 console.log(`
 Fixtures in §5 and §6 are transcribed from a LIVE Yahoo v10 probe on 2026-09-01
 at 20:42 UTC, 42 minutes after PANW / DELL / MDB reported AMC. §14's MDB record
-was read back out of the DEPLOYED Worker at 22:09 UTC the same day. None of it is
-invented, except §14's REVENUE figures, which are marked SYNTHETIC at each use
-because Yahoo's roll had destroyed the real consensus before this was written —
-which is the defect this change exists to fix, not a gap in the capture.
+was read back out of the DEPLOYED Worker at 22:09 UTC the same day, and §16's
+AVGO record and day index out of the same Worker on 2026-09-03, cross-checked
+against /api/earnings/AVGO?facts=1. None of it is invented, except the REVENUE
+figures in §14 and §16 — marked SYNTHETIC at each use, because Yahoo's roll had
+destroyed the real consensus and Yahoo had published no revenue actual at all,
+which is the defect these changes exist to fix and not a gap in the capture —
+and §16d's tape SELL, because the real AVGO tape (-0.8205% post, -2.9871% pre)
+does not reach the -3.00% gate in either window.
 
 BLIND SPOTS: nothing here calls Yahoo, so it cannot detect the modules changing
 shape; the per-pass capCost is a DERIVATION, not a measurement; the guidance
@@ -1663,5 +2653,5 @@ process.exit(reportVerdict({
   label: 'print vs tape',
   comparisons: t.comparisons,
   failures: t.failures,
-  minComparisons: 543,
+  minComparisons: 862,
 }));
