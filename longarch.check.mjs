@@ -576,6 +576,18 @@ console.log('\n== 6. DISPATCH — the real scheduled(), offline ================
   row('6a ...dispatches exactly one job', at700.jobs, 1);
   const at715 = await fire('2026-09-02T07:15:00-07:00');
   row('6a 07:15 PT is the SECOND firing, same branch', at715.branch, 'morning-rows');
+  /* THE POST-OPEN READ RIDES THE SAME 7am HOUR FROM 2026-11-13, dispatched
+     outside the if/else chain on its own clock test because 07:15–07:44 is a
+     strict SUBSET of this branch's window and an `else if` after it would be
+     unreachable. Both halves are pinned: the branch label must still be
+     `morning-rows` (this job did NOT take the branch over) and the job COUNT
+     must go to 2 (it was in fact dispatched). Asserting only one of those lets
+     a regression hide in the other. */
+  row('6a 07:15 PT ALSO dispatches the post-open read', at715.jobs, 2);
+  row('6a ...and the log line names it',
+      at715.logs.some(l => l.includes('branch=morning-rows') && l.includes('+ post-open-read')), true);
+  const at700b = await fire('2026-09-02T07:00:00-07:00');
+  row('6a 07:00 PT is BEFORE the post-open window — morning-rows alone', at700b.jobs, 1);
   /* THE THIRD FIRING, added when the window was widened `m < 30` -> `m < 45` on
      2026-09-02. That morning BOTH firings of the two-firing window hit the same
      transient Yahoo crumb outage, all 40 tickers failed on both, and the branch
@@ -583,7 +595,9 @@ console.log('\n== 6. DISPATCH — the real scheduled(), offline ================
      away. This assertion is the one that goes red if anyone narrows it back. */
   const at730 = await fire('2026-09-02T07:30:00-07:00');
   row('6a 07:30 PT is the THIRD firing, same branch', at730.branch, 'morning-rows');
-  row('6a ...and it dispatches the job rather than idling', at730.jobs, 1);
+  /* TWO jobs from 2026-11-13: morning-rows plus the post-open read's own retry
+     firing. Was 1 before that slot existed. */
+  row('6a ...and it dispatches the jobs rather than idling', at730.jobs, 2);
   /* THE EDGES ON BOTH SIDES. 06:45 is idle because the morning-briefing window is
      `h === 6 && m < 30` — so 7:00 is a NEW branch rather than an extension of the
      briefing's, and 07:45 closes it again. Getting 06:45 wrong on the first run
@@ -688,6 +702,7 @@ console.log('\n== 6. DISPATCH — the real scheduled(), offline ================
   /* Every OTHER scheduled Pacific hour, re-derived the same way — so widening or
      narrowing the window can never silently orphan a job that already exists. */
   for (const [ptH, ptM, what] of [[6, 0, 'morning briefing'], [7, 0, 'morning rows'],
+                                  [7, 15, 'post-open read'], [7, 30, 'post-open read retry'],
                                   [10, 0, '13F slice'], [11, 30, 'midday pulse'],
                                   [13, 15, 'EOD branch'], [14, 0, '2pm branch'],
                                   [5, 30, 'print-tape BMO pass 1'], [6, 15, 'print-tape BMO pass 2'],
@@ -1069,5 +1084,5 @@ process.exit(reportVerdict({
      distinguish from a fixed one, and the floor is the exact number of
      comparisons the script makes. If a section stops running, the count drops
      and the run reports NO VERDICT rather than a pass over nothing. */
-  minComparisons: 241,
+  minComparisons: 246,
 }));

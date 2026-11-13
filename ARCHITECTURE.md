@@ -333,13 +333,45 @@ in this codebase and shipped:
    schema edit is the easy part.
 
 28. **A whole-object rewrite is a delete of every slot the writer does not own.**
-   `/api/daily` is three KV keys merged at read time, and `generateDailySnapshot`
-   deleted the other two on every successful write — correct at 6:00am, destructive
+   `/api/daily` is **four** KV keys merged at read time, and `generateDailySnapshot`
+   deleted the others on every successful write — correct at 6:00am, destructive
    at 18:11 on the same day, when a 12h-staleness self-heal regenerated the briefing
    and took the midday pulse with it. The slot came back only where a self-heal
    existed, so the blast radius was a property of the *other* slots, which the writer
    never consulted. Now date-gated: a sibling is cleared only when it demonstrably
    belongs to an earlier PT day. See CLAUDE.md's named failure mode of the same name.
+
+## The four daily slots
+
+`/api/daily` is composed at read time from four independent KV keys. Each is written
+by exactly one job, and a writer may clear a sibling **only** on a PT-date rollover.
+
+| slot | key | written | field carrying the prose | completeness |
+|---|---|---|---|---|
+| top-level + `open{}` | `daily:snapshot` | 6:00am PT, **30 min BEFORE the cash open** | `headline`, `open.body` | `newsCards.length > 0 \|\| opportunity`; `ts: 0` on a placeholder |
+| **`postOpen{}`** | **`daily:postopen`** | **7:15am PT, 45 min AFTER the open** (retry 7:30) | **`body`** | **`complete`**, with `reason` |
+| `midday{}` | `daily:midday` | 11:30am PT | `narrative` | `narrative` present |
+| `eod{}` | `daily:eod` | 1:15pm PT | `body` | `complete`, `ts: 0` on a placeholder |
+
+**The post-open read exists because the 6:00am briefing is written before the market
+opens, and the next reading of the day was 11:30am.** For five and a half hours the
+only morning record on the page described a session that had not started; what the
+open did to the briefing's premise is the most perishable thing it says, and nothing
+was measuring it. **It is a SECOND reading, not a replacement** — it reads
+`daily:snapshot` and never writes it, and the two are meant to be rendered side by
+side, because the comparison is the product.
+
+**`dashboard.html` does NOT render `postOpen{}` yet** — this is Worker-side only, and
+the field is inert on the existing render path (verified differentially: the real
+`loadDailySnapshot` produces byte-identical DOM across 20 elements × 4 properties with
+and without the field). The consumer is decision_dash. **That is the normal direction
+here reversed** — usually the frontend ships ahead of the Worker — so the Worker-side
+state to render is "present but unrendered", not "expected but missing".
+
+**Two states a consumer must not collapse.** `complete: false` with a `reason` is a
+REFUSAL or a degraded reading, and the body says which; an ABSENT `postOpen` means the
+job has not run (before 7:15am PT, or on a non-trading day). `baseline: 'none'` is a
+third: the read ran, and today's 6:00am record was not there to compare against.
 
 ## Design note: overlapping windows and the proxy-vs-thing failure
 
@@ -855,8 +887,10 @@ GET  /api/peers/:ticker            Yahoo recommendationsBySymbol
 POST /api/claude                   REMOVED — returns 410. Was an unauthenticated LLM passthrough.
 POST /api/log-rec                  {ticker, rating, confidence, price, factors}
 GET  /api/track/:ticker            Rating history + calibration
-GET  /api/daily                    Morning briefing + EOD + midday, MERGED at read time from
-                                   three keys (daily:snapshot / daily:midday / daily:eod)
+GET  /api/daily                    Morning briefing + post-open + midday + EOD, MERGED at read
+                                   time from FOUR keys (daily:snapshot / daily:postopen /
+                                   daily:midday / daily:eod). Each writer touches only its own
+                                   key; a sibling is cleared ONLY on a PT-date rollover
 GET  /api/market/snapshot          Index / futures / commodities strip
 GET  /api/market/movers            Pre-market and day movers (≥ ±10%)
 GET  /api/market/ipos              Upcoming IPO calendar

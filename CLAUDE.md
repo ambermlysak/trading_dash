@@ -102,6 +102,7 @@ PT hour  →  UTC under PDT (-7)  |  UTC under PST (-8)     the window is 12-22
  4:00am  →  11:00  ✗ OUTSIDE    |  12:00  ✓   <- the early edge
  5:00am  →  12:00  ✓            |  13:00  ✓
  5:30am  →  12:30  ✓            |  13:30  ✓   print-tape BMO pass 1
+ 7:15am  →  14:15  ✓            |  15:15  ✓   post-open read (retry 7:30)
  2:30pm  →  21:30  ✓            |  22:30  ✓   print-tape AMC pass 2 — the last job
  3:00pm  →  22:00  ✓            |  23:00  ✗ OUTSIDE  <- the late edge
 ```
@@ -319,15 +320,31 @@ function or `workerd` refuses to boot. **`longarch` and `printtape` also IMPORT 
 default export**, which is the ES-module parse `node --check` cannot perform.
 
 Floors (each script's `minComparisons`): **138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 /
-144 / 287 / 91 / 113 / 68 / 99 / 240 / 241 / 862** for moves / long-fixtures / cron-gate
+144 / 287 / 87 / 113 / 138 / 80 / 235 / 246 / 862** for moves / long-fixtures / cron-gate
 / instr-bindings / bs-delta / nd2 / lane-e / lane-f / sweep-universe / macro / mood /
 swing / earnings-timing / daily-slots / analysis-shape / top3 / longarch / printtape —
-**2,593** (printtape 543 → 862 on 2026-09-03, the two-gate restructure). A full run on
-2026-09-03 observed **2,647, 0 failing**; the 54-comparison gap
-is entirely the two scripts that read **live** data (`swing` **99**, `earnings-timing`
-**159**), whose floors are deliberately their FIXED counts so a quiet tape reports a
-verdict rather than a false NO VERDICT. **Never raise either to an observed total.**
-`node iv-capture.fixture.mjs` is a nineteenth script, deliberately outside that total.
+**2,640** (printtape 543 → 862 on 2026-09-03, the two-gate restructure; daily-slots
+55 → 138 and longarch 241 → 246 on 2026-11-13, the post-open slot). A full run on
+2026-11-13 observed **2,717, 1 failing** — the failure is `earnings-timing`'s live-tape
+section (`anchored entries 8/40 = 20.0%` against an >80% expectation, a property of
+Yahoo's payload that morning, not of the code) and it was present before that day's
+changes too. **CORRECTED 2026-11-13: four of these numbers were OBSERVED totals, not
+floors** — swing 91/87, daily-slots 68/55, analysis-shape 99/80, top3 240/235, which is
+why the stated sum was 2,593 against a real floor sum of 2,552. The list is now read
+from each file's `minComparisons`; re-derive it the same way rather than transcribing a
+run's output. The gap between floor and observed is mostly the two scripts that read
+**live** data (`swing`, `earnings-timing`), whose floors are deliberately their FIXED
+counts so a quiet tape reports a verdict rather than a false NO VERDICT. **Never raise
+either to an observed total.**
+
+`node iv-capture.fixture.mjs` is a nineteenth script, deliberately outside that total,
+and **`postopen.verify.mjs` / `postopen.crosscheck.mjs` are a twentieth and twenty-first
+for the same reason**: both hit the live tape and the live clock, so neither can be a
+gate. `postopen.verify.mjs` drives the real `scheduled()` at a chosen PT instant and
+prints the whole record plus the prompt; `postopen.crosscheck.mjs` re-reads the same
+quantities from `v8/finance/chart` and recomputes the regression channel from a SECOND
+implementation, so the numbers are checked against something other than the code that
+produced them.
 
 **`node --check` IS NOT A SUFFICIENT PRE-DEPLOY PARSE.** `worker.js` is an ES module
 and `node --check` parses it as CommonJS, so it has returned exit 0 twice on a file
@@ -377,14 +394,46 @@ endpoints, the KV key/TTL table and the cron schedule are in `worker-internals`.
   `setBadge()`, never authored
 - **Market Mood's states are decided by rules**; Claude may only rephrase the verdict,
   and `sentenceSource` says which the reader is seeing
+- **`meta.chartPreviousClose` IS NOT THE PRIOR CLOSE ON A *RANGED* SPARK** — it is the
+  close before the RANGE begins. Measured 2026-11-13 at `range=3mo`: NVDA reported
+  225.30 against an actual prior close of 166.19, a **35.6%** error that renders as an
+  overnight gap. On a `range=1d` CHART it *is* the prior close, which is why
+  `generateDailySnapshot` may read it and `yahooSparkQuotes` may not; the latter takes
+  `pairs[n-2]`. Same field name, two endpoints, two meanings. Spark's
+  `regularMarketChangePercent` is **already a percent**; `quoteSummary.price`'s
+  identically-named `{raw}` is a **fraction** and is ×10000 at every call site
+- **A LEVEL PRINTED BESIDE A VENDOR PERCENTAGE MUST BE PRECISE ENOUGH TO RECONCILE.**
+  The percentage is computed from unrounded values, so `toFixed(2)` on the level puts
+  two figures side by side that no longer agree: `^TNX` printed *"now 5.13 … prior close
+  5.10 … +0.47%"*, from which a reader derives +0.59% and concludes one of the three is
+  wrong. None was — two decimals is lossy on a quantity trading in thousandths.
+  `postOpenLevel()` is 4dp with trailing zeros trimmed, so 7521.83 is unchanged and
+  5.127 reconciles
 
 **KV records**
 
 - Do not declare a local `const TTL` — `TTL` is a module-level table
-- **`/api/daily` is THREE KEYS merged at read time.** A run writes its own slot and may
-  clear a sibling **only** on a PT-date rollover, via `purgeStaleDailySlots()` — never
-  restore an unconditional `delete('daily:eod'/'daily:midday')`. All three carry
-  `ptDate`; absent `ptDate` **and** unusable `ts` means STALE, which regenerates
+- **`/api/daily` is FOUR KEYS merged at read time** (`daily:snapshot` · `daily:postopen`
+  · `daily:midday` · `daily:eod`). A run writes its own slot and may clear a sibling
+  **only** on a PT-date rollover, via `purgeStaleDailySlots()` — never restore an
+  unconditional `delete('daily:eod'/'daily:midday')`. All four carry `ptDate`; absent
+  `ptDate` **and** unusable `ts` means STALE, which regenerates. **A NEW SLOT JOINS THE
+  PURGE'S KEY ARRAY IN THE SAME COMMIT THAT CREATES IT** — a slot the rollover does not
+  know about renders yesterday's reading under today's date, which is the failure the
+  purge exists to prevent, reintroduced by omission
+- **`daily:postopen` — the 7:15am PT post-open read (schema 1, 2d).** A SECOND READING
+  of the morning, never a replacement: it READS `daily:snapshot` and must never write
+  it. `body · ts · dataAsOf · complete · baseline · ptDate · reason · inputs · _instr`.
+  **`dataAsOf` is the freshest CASH-index `regularMarketTime`, not the run time** —
+  futures quote overnight, so a futures timestamp would mask a dead cash feed.
+  **`ts` is ALWAYS the real write time and never a `ts: 0` sentinel**, because the dedup
+  carries a content term (`complete === true && ptDate === today`) instead; a refusal is
+  a servable record AND a retryable one. **A SNAPSHOT OLDER THAN 06:30 PT IS A REFUSAL,
+  NOT A DEGRADATION** — a pre-open price narrated as a post-open reading is wrong about
+  which session it describes — and the refusal fires BEFORE the Claude call, so it costs
+  nothing. `baseline` is `'06:00'` or `'none'`; `'none'` means today's briefing record
+  was absent and the body must say so rather than compare against yesterday. A down
+  source is NAMED in the body with `complete: false`, never replaced by a fallback
 - **`analysis:{TICKER}`: never read the key directly — go through
   `readAnalysisRecord()`**, or a legacy record reads as unanalysed and re-spends. Core
   `rating · confidence · recommendation · drivers[] · summary`; `factors{}`/`thesis` are
@@ -453,6 +502,19 @@ endpoints, the KV key/TTL table and the cron schedule are in `worker-internals`.
   `top3:{PT-date}` or `top3sweep:last`. That dedup is a PT-date compare, so a 7am stamp
   would make the 1:15pm firing skip and replace the day's post-close ranking with one
   priced off opening spreads. Own stamp `morningrows:last`; `h === 7 && m < 45`
+- **The 7:15am PT post-open read is dispatched OUTSIDE the `if/else` chain**, on its own
+  `postOpenDueAt(h, m)` test — the print-tape precedent, for the same structural reason
+  and not as a stylistic echo. Its window `07:15–07:44` is a strict SUBSET of
+  morning-rows' `h === 7 && m < 45`, so an `else if` placed after that branch is
+  **unreachable code** whose only symptom is a permanently absent slot. Folding it INTO
+  that branch is the other trap: it would tie this job to a window already widened once
+  (30 → 45 min on 2026-09-02) for unrelated reasons. The decision is appended to the
+  `[cron]` line (`branch=morning-rows + post-open-read`), so a missing read is
+  falsifiable. **It shares the invocation with morning-rows' ~800-capCost sweep, so no
+  per-job `_instr` from a normal firing is a measurement** — quote the derivation,
+  `ceil(23/20) + ceil(N/20) + 1` external and 6–8 bindings = **capCost 10–11** at N=40.
+  **It touches NO crumb**: both spark pulls are the unauthenticated v7 endpoint, chosen
+  deliberately because this is the hour whose crumb acquisition failed on 2026-09-02
 - `longarch:{TICKER}:{PT-DATE}:{SLOT}` is written by the **cron sweeps only** — a
   fixed-clock write is a daily series, an on-demand one a record of what someone opened.
   The SLOT names when the snapshot was taken, the row's `ts` when its data was computed,

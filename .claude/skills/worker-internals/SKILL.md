@@ -61,7 +61,12 @@ GET  /api/market/movers           Pre-market / day gainers + losers (≥±10%)
 GET  /api/market/ipos             Upcoming IPO calendar (12h KV cache)
 GET  /api/watchlist               The saved list (read path for the adopt-on-empty bootstrap)
 GET  /api/watchlist/batch         Bulk fundamentals + RSI + SMA/EMA cross + Claude analysis
-GET  /api/daily                   Daily Claude synthesis (served from KV)
+GET  /api/daily                   Daily Claude synthesis (served from KV). FOUR slots merged at read
+                                  time from four independent keys: the top-level headline +
+                                  `open{}` (`daily:snapshot`, 6:00am PT), `postOpen{}`
+                                  (`daily:postopen`, 7:15am PT), `midday{}` (11:30am) and
+                                  `eod{}` (1:15pm). No request-path self-heal for postOpen or
+                                  midday — both are meaningful only inside their own window
 GET  /api/market/mood             Market Mood — candlestick emotion board (KV read only, capCost 1)
 GET  /api/market/sectors          Sector summaries + top opportunity/avoid per sector (4h KV cache)
 GET  /api/market/scanner?preset=  Day-trading momentum scanner (5 Pillars, 90s KV cache)
@@ -686,7 +691,8 @@ differs from its retention, both are given and the reason is in the notes.
 | Key | TTL | What it holds |
 |---|---|---|
 | `yahoo:crumb` | **2d** (`CRUMB_KV_TTL`) | Yahoo session crumb + cookie. **NO freshness term at all — reused whatever its age**, in memory and in KV. Was 1h with a 50-min in-memory `CRUMB_TTL` until 2026-09-02, which made the 7:00am PT sweep permanently cold (17.75h downstream of the 1:15pm writer) and cost 40 tickers their morning. Safe because every 401/403 path re-acquires with `force: true`, which skips both caches and overwrites this key. |
-| `daily:snapshot` | 2d | 6:00am PT Claude morning briefing. Carries `ptDate` (2026-08-20+) |
+| `daily:snapshot` | 2d | 6:00am PT Claude morning briefing. Carries `ptDate` (2026-08-20+) and, from 2026-11-13, **`marketLevels`** — the eleven `SNAPSHOT_SYMBOLS` as `{label, price, prevClose, changePct, marketTime}`, banked at **zero added subrequests** from the same eleven chart responses the prompt's prose lines are built from. It exists so the 7:15am post-open read can answer "where did the 6:00am brief have this" from DATA; reading a number back out of the briefing's own sentences is a guess at whichever figures the model chose to mention. Banked on the `ts: 0` placeholder write too, since a Claude failure and a Yahoo failure are independent |
+| `daily:postopen` | 2d (`POSTOPEN_TTL`) | **THE 7:15am PT POST-OPEN READ, schema 1** — a SECOND reading of the morning, written 45 minutes after the 06:30 cash open, not a replacement for the 6:00am briefing. It READS `daily:snapshot` and MUST NEVER WRITE IT. Fields: `body` (the narrative) · `ts` (write time) · `dataAsOf` (the freshest CASH-index `regularMarketTime` — **cash only**, because futures quote overnight and a futures stamp would mask a dead cash feed) · `complete` · `baseline` (`'06:00'` \| `'none'`) · `ptDate` · `reason` · `inputs` · `_instr`.<br><br>**`ts` IS ALWAYS THE REAL WRITE TIME, NEVER A `ts: 0` SENTINEL.** The dedup carries a CONTENT term instead (`complete === true && ptDate === today`), so a refusal is both a servable record and a retryable one — the EOD placeholder solved the same problem the other way and this slot does not need its sentinel.<br><br>**THREE REFUSALS, each storing a record with its reason rather than dropping one.** (1) no cash-index print at all; (2) **`dataAsOf` before 06:30 PT** — a pre-open price narrated as a post-open reading is wrong about which SESSION it describes, not merely imprecise, and this fires BEFORE the Claude call so it costs nothing; (3) `stopReason === 'max_tokens'`, where the truncated paragraph is DISCARDED rather than stored, because a cut-off answer in a prose slot renders as a finished one. A DOWN source is different again: it is NAMED in the body with `complete: false` and never replaced by a fallback.<br><br>`baseline: 'none'` means today's briefing record was absent and the body must say so — it may NOT fall back to yesterday's. `inputs.baselineParts` is `['prose']` / `['levels']` / both, so a consumer can tell which half existed. **~11 capCost**, 1 Claude call, no crumb |
 | `daily:midday` | 2d | 11:30am PT midday pulse (narrative, topics, tomorrow, trades, bigMovers). Carries `ptDate` |
 | `daily:eod` | 2d | 1:15pm PT end-of-day summary. Carries `ptDate`, on the placeholder too |
 | `market:week-ahead` | 18h | Friday-only week-ahead preview |
@@ -806,6 +812,36 @@ the badge. They are now **`CRUMB_TTL`, `SCAN_TTL`, `GOLDEN_TTL`, `IPO_TTL`**. An
 new local cache window needs its own name.
 
 **Cron trigger:** a single `*/15 12-22 * * *` UTC cron (the hour range widened from `13-22` on 2026-09-01 so the 05:30 PT print-tape BMO pass, which is 12:30 UTC under PDT, is covered in both regimes — rule #2) — every day, because the expression is a coarse wakeup and carries no calendar logic (rule #2). `scheduled()` first gates on the Pacific trading day (weekends and `NYSE_HOLIDAYS` are skipped, with the decision logged either way), then dispatches by Pacific wall-clock time to the morning briefing (6am PT), the **`morning-rows`** branch (**7:00am PT — added 2026-08-31**: one job, `collectMorningRows`, running the same sequential watchlist sweep the 1:15pm top-3 job runs so every name has a fresh `long:{TICKER}` row for the trading morning, plus the `open` slot of the sweep archive. **It RANKS NOTHING** — no `collectTop3`, no `top3:{PT-date}`, no `top3sweep:last`, because that dedup is a PT-date compare and a 7am stamp would make the 1:15pm firing skip and replace the day's post-close ranking with one priced off opening spreads. Own key `morningrows:last`; **`m < 45` admits three firings — 7:00, 7:15 and 7:30**, widened from `m < 30` on 2026-09-02 after both firings of the two-firing window burned on one transient crumb outage. That is a change to `scheduled()`, not to the cron expression, and it is **no longer the same width as the 1:15pm window** (`m >= 15 && m < 45`: 30 min, two firings). **One job on the branch, so its `_instr` IS a measurement.** ~20 capCost a name all-cold, ~800 at N≈40, zero Claude calls. 14:00 UTC on PDT / 15:00 UTC on PST — inside the trigger window in both regimes), midday pulse (11:30am PT), the **`eod+iv-sweep+macro`** branch (1:15pm PT — EOD summary, IV sample sweep, the macro-regime collection, **and, dispatched after the macro bank, the daily top-3 options ranking**), the **`forward-returns+moves+mood`** branch (2pm PT — the forward-return fill, the move-series sweep, *and* the Market Mood collection), and a 13F slice (10am PT). The premium screen is deliberately **not** here — it loads on demand.
+
+**THE 7:15am PT POST-OPEN READ — `daily:postopen`, added 2026-11-13.** Dispatched **OUTSIDE the
+if/else chain**, on its own `postOpenDueAt(h, m)` predicate, for the print-tape reason and not as a
+stylistic echo of it: its window **`h === 7 && m >= 15 && m < 45`** is a strict SUBSET of the
+morning-rows branch above, so an `else if` written after that branch is **unreachable code** whose
+only symptom would be a slot that is permanently absent. Folding it INTO morning-rows is the other
+trap — that would tie its schedule to a window already widened once (30 → 45 min on 2026-09-02) for
+reasons having nothing to do with this read. The decision is appended to the `[cron]` line
+(`branch=morning-rows + post-open-read`), so a read that did not happen is falsifiable.
+
+**TWO FIRINGS, 07:15 and 07:30.** A COMPLETE record dedups the second out for one KV read; a REFUSAL
+deliberately does not, because a 07:15 refusal on a quote feed that had not caught up is precisely
+the case where 07:30 succeeds.
+
+**COST: `ceil(23/20) + ceil(N/20)` spark fetches + 1 Anthropic + 6–8 bindings = capCost 10–11 at
+N=40**, measured ISOLATED (morning-rows deduped out) at **ext 3 · bind 7–8 · capCost 10–11** on
+2026-11-13 under `workerd`. On a NORMAL firing it shares the invocation with morning-rows' ~800, so
+**no per-job `_instr` from a real morning is a measurement** — quote the derivation. 23 symbols is
+the eleven `SNAPSHOT_SYMBOLS` + `^VIX3M` + the eleven `SECTOR_ETFS`, all in ONE spark request pair.
+
+**IT TOUCHES NO CRUMB.** Both pulls go through `yahooSparkQuotes`, the UNAUTHENTICATED v7 endpoint.
+That is deliberate rather than incidental: this is the same 7am hour whose crumb acquisition failed
+on 2026-09-02 and cost all 40 tickers their morning rows, and spending auth pressure there to read
+eleven index levels would be a poor trade. `swingChannel` is reused over the same 3-month close
+series the quotes arrive on, so the key-level verdict in the brief and the Watchlist tab's Swing
+column cannot disagree — and the verdict is handed to the model ALREADY DECIDED against the
+`±SWING_Z_THRESHOLD` gate, never left to the prose.
+
+**IT ADDS ZERO CRON ENTRIES.** 07:15 PT is 14:15 UTC under PDT and 15:15 UTC under PST, both inside
+`12-22`, and `*/15` already fires on `:15` and `:30` (rule #2).
 
 **`collectPrintTape` is dispatched OUTSIDE the branch chain** (added 2026-09-01), on its own clock
 test `printTapePassAt(h, m)` placed ahead of the `if/else`. **FIVE passes since 2026-09-01: a

@@ -1712,6 +1712,85 @@ async function yahooSparkCloses(symbols, range = '3y', concurrency = 4, { withTi
   return out;
 }
 
+/* ── Yahoo v7 spark, KEEPING the quote meta ─────────────────────────────────
+ * `yahooSparkCloses` throws `response[0].meta` away, and three of the four
+ * things an intraday read needs live in it: `regularMarketPrice`,
+ * `regularMarketChangePercent`, and `regularMarketTime` — which is the only
+ * as-of this codebase can honestly print beside a 15-minute-delayed number.
+ *
+ * A SEPARATE FUNCTION RATHER THAN A THIRD FLAG ON THE EXISTING ONE. Four
+ * callers index that Map's values as a bare array (golden-cross, the watchlist
+ * batch, the move sweep, the macro collection); widening its return shape is a
+ * four-site edit on paths that have nothing to do with this one, and
+ * `withTimestamps` already shows what a second return shape costs to reason
+ * about.
+ *
+ * NEVER READ `meta.chartPreviousClose` OFF A RANGED SPARK. It is the close
+ * before the RANGE begins, not the prior session's. Measured 2026-11-13 07:09
+ * PT at range=3mo: NVDA reported `chartPreviousClose` 225.30 against an actual
+ * prior close of 166.19 — a 35.6% error that would have rendered as an
+ * overnight gap. The prior close is `pairs[n-2]` while today's forming bar is
+ * present, and that agrees with Yahoo's own percentage to the printed digit
+ * (^GSPC the same minute: (7532.87 − 7592.40) / 7592.40 = −0.7841%, meta said
+ * −0.784).
+ *
+ * `regularMarketChangePercent` HERE IS ALREADY A PERCENT, unlike the
+ * `quoteSummary.price` module's `{raw}` of the same name, which is a FRACTION
+ * and is multiplied by 10000 at every call site in this file. Two endpoints,
+ * two conventions, one field name — so this is stated rather than inferred.
+ *
+ * NO CRUMB. This is the unauthenticated v7 endpoint, so it adds nothing to the
+ * Yahoo auth pressure that failed all 40 tickers on both `morning-rows` firings
+ * on 2026-09-02 — which matters, because the post-open read runs in that same
+ * 7am hour.
+ *
+ * @returns {Promise<Map<string, {price, changePct, prevClose, marketTime, pairs}>>}
+ */
+async function yahooSparkQuotes(symbols, range = '3mo', concurrency = 4) {
+  const out = new Map();
+  const chunks = [];
+  for (let i = 0; i < symbols.length; i += 20) chunks.push(symbols.slice(i, i + 20));
+
+  for (let i = 0; i < chunks.length; i += concurrency) {
+    await allSettledCounted(chunks.slice(i, i + concurrency).map(async (chunk) => {
+      const url = 'https://query1.finance.yahoo.com/v7/finance/spark'
+                + `?symbols=${chunk.map(encodeURIComponent).join(',')}&range=${range}&interval=1d`;
+      const r = await fetch(url, { headers: YAHOO_HEADERS });
+      if (!r.ok) throw new Error(`spark ${r.status}`);
+      const d = await r.json();
+      for (const item of (d?.spark?.result || [])) {
+        const resp   = item?.response?.[0];
+        const meta   = resp?.meta || {};
+        const closes = resp?.indicators?.quote?.[0]?.close;
+        const stamps = resp?.timestamp;
+        if (!Array.isArray(closes)) continue;
+
+        /* Date-aligned, same idiom and same UTC slice the watchlist batch feeds
+           `swingChannel`. Safe for DAILY bars only: Yahoo stamps them at the
+           open (13:30Z under EDT, 14:30Z under EST), so the UTC day and the ET
+           day cannot disagree. Do not reuse this on an intraday interval. */
+        const pairs = [];
+        for (let k = 0; k < closes.length; k++) {
+          const c = closes[k];
+          const s = Array.isArray(stamps) ? stamps[k] : null;
+          if (c == null || s == null) continue;
+          pairs.push({ iso: new Date(s * 1000).toISOString().slice(0, 10), close: c });
+        }
+
+        out.set(item.symbol, {
+          price:      Number.isFinite(meta.regularMarketPrice) ? meta.regularMarketPrice : null,
+          changePct:  Number.isFinite(meta.regularMarketChangePercent)
+                        ? Math.round(meta.regularMarketChangePercent * 100) / 100 : null,
+          prevClose:  pairs.length >= 2 ? pairs[pairs.length - 2].close : null,
+          marketTime: Number.isFinite(meta.regularMarketTime) ? meta.regularMarketTime * 1000 : null,
+          pairs,
+        });
+      }
+    }), `spark-quotes:${range}`);
+  }
+  return out;
+}
+
 /* ── Worker-side Claude call ──
    Retries transient failures (429 rate limit, 5xx overload) with backoff.
    A single un-retried hiccup during the 6am cron used to wipe out the daily
@@ -14678,14 +14757,23 @@ async function handleWatchlistAuction(symbols, origin, env, ctx) {
 
 async function handleDailyGet(origin, env, ctx, request) {
   try {
-    const [snapshotRes, eodRes, middayRes] = await Promise.allSettled([
+    const [snapshotRes, eodRes, middayRes, postOpenRes] = await Promise.allSettled([
       env?.REC_LOG?.get('daily:snapshot', 'json'),
       env?.REC_LOG?.get('daily:eod', 'json'),
       env?.REC_LOG?.get('daily:midday', 'json'),
+      env?.REC_LOG?.get(POSTOPEN_KEY, 'json'),
     ]);
     const snapshot = snapshotRes.status === 'fulfilled' ? snapshotRes.value : null;
     const eod      = eodRes.status === 'fulfilled' ? eodRes.value : null;
     const midday   = middayRes.status === 'fulfilled' ? middayRes.value : null;
+    /* THE FOURTH SLOT. Read alongside the other three and merged into the same
+       envelope — one more binding op on a path that already costs three.
+       NO REQUEST-PATH SELF-HEAL, deliberately, and for the midday pulse's
+       reason rather than the EOD one: this job spends a Claude call and is
+       meaningful only inside its own 45-minute window, so a page load at 2pm
+       triggering it would buy a billed call to describe an open five hours gone.
+       The 07:30 PT firing is the only retry it gets. */
+    const postOpen = postOpenRes.status === 'fulfilled' ? postOpenRes.value : null;
 
     const ptNow     = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' }));
     const isWeekday = ptNow.getDay() >= 1 && ptNow.getDay() <= 5;
@@ -14735,7 +14823,8 @@ async function handleDailyGet(origin, env, ctx, request) {
       // friendly loading state instead of an empty briefing.
       const loading = !isComplete;
       return json({
-        ...snapshot, eod: eod || null, eodLoading, midday: midday || null, middayLoading, loading,
+        ...snapshot, eod: eod || null, eodLoading, midday: midday || null, middayLoading,
+        postOpen: postOpen || null, loading,
         _meta: srcMeta('Claude synthesis', {
           ok: isComplete, ttlSeconds: TTL.daily,
           asOf: snapshot.ts ? new Date(snapshot.ts).toISOString() : null,
@@ -15539,7 +15628,11 @@ function dailySlotPtDate(rec) {
  *  look identical in the tail otherwise, which is rule #7 all over again. */
 async function purgeStaleDailySlots(env, today = ptDate()) {
   const outcome = {};
-  for (const key of ['daily:eod', 'daily:midday']) {
+  /* `daily:postopen` JOINED THIS LIST IN THE SAME COMMIT THAT CREATED IT.
+     A slot the rollover purge does not know about is a slot that renders
+     yesterday's reading under today's date — the exact failure the date gate
+     below exists to prevent, reintroduced by omission. */
+  for (const key of ['daily:eod', 'daily:midday', 'daily:postopen']) {
     let rec = null;
     try { rec = await env?.REC_LOG?.get(key, 'json'); } catch (_) { outcome[key] = 'unreadable'; continue; }
     if (!rec) { outcome[key] = 'absent'; continue; }
@@ -15552,7 +15645,8 @@ async function purgeStaleDailySlots(env, today = ptDate()) {
     if (day === today) { outcome[key] = 'kept'; continue; }
     try { await env?.REC_LOG?.delete(key); outcome[key] = 'cleared'; } catch (_) { outcome[key] = 'unreadable'; }
   }
-  console.log(`[cron] daily slots ${today} · eod=${outcome['daily:eod']} midday=${outcome['daily:midday']}`);
+  console.log(`[cron] daily slots ${today} · eod=${outcome['daily:eod']} midday=${outcome['daily:midday']}`
+    + ` postopen=${outcome['daily:postopen']}`);
   return outcome;
 }
 
@@ -15602,6 +15696,18 @@ async function generateDailySnapshot(env) {
 
   // Gather market context
   let marketLines = '';
+  /* THE SAME NUMBERS, BANKED AS DATA AND NOT ONLY AS PROSE.
+     `generatePostOpenRead` (7:15am PT) has to answer "where did the 6:00am brief
+     have this", and reading a number back out of the briefing's own sentences is
+     not an answer — it is a guess at whichever figures the model chose to
+     mention, in whatever rounding it chose. So the levels the prompt was built
+     from are stored beside the prose it produced.
+
+     ZERO ADDED SUBREQUESTS: this is the same eleven responses `marketLines` is
+     already built from, read twice instead of once. `marketTime` rides along
+     because a pre-open level and an intraday one are not comparable without both
+     as-ofs — the post-open read prints both. */
+  const marketLevels = {};
   try {
     const tickers = Object.keys(SNAPSHOT_SYMBOLS);
     const results = await allSettledCounted(
@@ -15614,6 +15720,17 @@ async function generateDailySnapshot(env) {
       const prev      = meta.chartPreviousClose ?? meta.previousClose;
       if (price == null || prev == null) return null;
       const chg = ((price - prev) / prev * 100).toFixed(2);
+      /* `chartPreviousClose` IS the prior session's close here, because this is a
+         `range=1d` chart. It is NOT on a ranged spark — see the warning on
+         `yahooSparkQuotes`, which is how the post-open side reads the same
+         quantity. Two endpoints, same field name, different meaning. */
+      marketLevels[t] = {
+        label:      SNAPSHOT_SYMBOLS[t],
+        price:      Math.round(price * 10000) / 10000,
+        prevClose:  Math.round(prev * 10000) / 10000,
+        changePct:  Math.round((price - prev) / prev * 10000) / 100,
+        marketTime: Number.isFinite(meta.regularMarketTime) ? meta.regularMarketTime * 1000 : null,
+      };
       return `${SNAPSHOT_SYMBOLS[t]}: ${price.toFixed(2)} (${chg > 0 ? '+' : ''}${chg}%)`;
     }).filter(Boolean).join('\n');
   } catch (_) {}
@@ -15687,7 +15804,7 @@ Return ONLY valid JSON, no markdown fences.`;
   if (hasContent) {
     await env?.REC_LOG?.put(
       'daily:snapshot',
-      JSON.stringify({ ...snapshot, ts: Date.now(), ptDate: todayPt, _instr: instrSince(mark, 'briefing') }),
+      JSON.stringify({ ...snapshot, ts: Date.now(), ptDate: todayPt, marketLevels, _instr: instrSince(mark, 'briefing') }),
       { expirationTtl: 172800 },
     );
     console.log('[cron] daily snapshot saved');
@@ -15714,7 +15831,13 @@ Return ONLY valid JSON, no markdown fences.`;
       // but with ts=0 so handleDailyGet treats it as stale and keeps retrying.
       await env?.REC_LOG?.put(
         'daily:snapshot',
-        JSON.stringify({ headline: `Market update for ${today}`, newsCards: [], opportunity: null, avoid: null, ts: 0, ptDate: todayPt }),
+        /* The levels ride on the placeholder too. A Claude failure and a Yahoo
+           failure are independent, and when only the first one happened the
+           banked levels are real — so the 7:15am read still gets a numeric
+           baseline even on a morning with no briefing prose. `baseline` on that
+           record then reads `06:00` with `baselineParts: ['levels']`, which says
+           exactly which half existed. */
+        JSON.stringify({ headline: `Market update for ${today}`, newsCards: [], opportunity: null, avoid: null, ts: 0, ptDate: todayPt, marketLevels }),
         { expirationTtl: 172800 },
       );
       console.warn('[cron] headline generation failed and no prior snapshot — wrote stale placeholder');
@@ -16075,6 +16198,516 @@ Return ONLY valid JSON.`;
     { expirationTtl: 86400 },
   );
   console.log('[cron] midday pulse saved');
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   THE 7:15am PT POST-OPEN READ  —  `daily:postopen`, served as `postOpen`
+
+   WHY A FOURTH SLOT EXISTS. The 6:00am briefing is written THIRTY MINUTES
+   BEFORE the cash open, and the next reading of the day is the 11:30am pulse —
+   so for five and a half hours the only morning record on the page describes a
+   session that had not started. What the open did to the briefing's premise is
+   the most perishable thing it says, and nothing was measuring it.
+
+   IT IS A SECOND READING, NOT A REPLACEMENT. `daily:snapshot` is READ here and
+   never written; the 6:00am record and this one render side by side, and the
+   comparison IS the product. A post-open read that quietly replaced the pre-open
+   one would destroy the only thing it has to say. Mechanically that is already
+   structural — the four slots are four independent KV keys (see the note above
+   `dailySlotPtDate`) — and it is restated because this is the first slot added
+   since that property was written down.
+
+   ONE DELAYED SNAPSHOT IS NOT A TAPE, AND THAT BOUNDS WHAT MAY BE WRITTEN.
+   Yahoo is 15 minutes behind and this job takes exactly ONE sample. So the
+   record may state a price-to-level RELATIONSHIP with its as-of, and may never
+   state when anything happened: "through 7,500 as of 06:58 PT" is supportable,
+   "broke 7,500 at 06:42" is not, from one observation. The prompt forbids the
+   second in those words, because it is the failure a reader cannot detect.
+
+   IF THE SNAPSHOT PREDATES THE 06:30 OPEN, THIS REFUSES. A pre-open price
+   narrated as a post-open reading is not a degraded answer, it is a wrong one
+   about which session it describes — and a refusal is a finding, so it is
+   stored, with its reason, rather than dropped.
+   ═══════════════════════════════════════════════════════════════════════════ */
+const POSTOPEN_KEY           = 'daily:postopen';
+const POSTOPEN_TTL           = 172_800;   // 2d — the `daily:snapshot` retention
+const POSTOPEN_RECORD_SCHEMA = 1;
+const POSTOPEN_TOKENS        = 700;       // ANSWER room; workerClaude adds the thinking headroom
+/* The cash open as PT minutes-of-day. The staleness refusal is measured against
+   this and nothing else. */
+const POSTOPEN_OPEN_PT_MIN   = 6 * 60 + 30;
+const POSTOPEN_MOVE_PCT      = 3;         // the ±% that puts a watchlist name in the brief
+/* `swingChannel` fires BUY/SELL at |z| >= SWING_Z_THRESHOLD, so a name is "at or
+   through" its level at that gate and "approaching" from this band below it.
+   DERIVED from the gate, never a second copy of 1.5 — the rule that keeps the
+   frontend from re-deriving the Swing column applies to a prompt just as much. */
+const POSTOPEN_NEAR_Z        = SWING_Z_THRESHOLD - 0.5;
+/* Cash indices ONLY. Futures quote overnight, so `ES=F`'s `regularMarketTime` is
+   fresh at 4am and would mask a dead cash feed — the as-of has to come from the
+   session the record claims to describe. */
+const POSTOPEN_CASH_SYMBOLS  = ['^GSPC', '^IXIC', '^DJI', '^RUT'];
+const POSTOPEN_VIX3M         = '^VIX3M';  // the term-structure leg, `MACRO_SYMBOLS.vix3m`
+/* A schema makes malformed JSON ungenerable — the same reason `ANALYSIS_SCHEMA`
+   exists. One field: this slot is a narrative and nothing else. */
+const POSTOPEN_ANSWER_SCHEMA = {
+  type: 'object',
+  properties: { body: { type: 'string' } },
+  required: ['body'],
+  additionalProperties: false,
+};
+
+/** Is a post-open read due at this Pacific wall-clock time?
+ *
+ *  ITS OWN CLOCK TEST, DISPATCHED OUTSIDE THE if/else CHAIN — the print-tape
+ *  precedent, for the identical reason. 07:15–07:44 is a strict SUBSET of the
+ *  `h === 7 && m < 45` morning-rows window, so an `else if` written after that
+ *  branch is unreachable: it would never fire once, silently, and the only
+ *  symptom would be a slot that is always absent.
+ *
+ *  TWO FIRINGS — 07:15 and 07:30. The second is the retry that 2026-09-02 is the
+ *  argument for (both firings of a two-firing window burned on one transient
+ *  Yahoo outage). A COMPLETE record dedups it out at the cost of one KV read; a
+ *  REFUSAL deliberately does not, because a 07:15 refusal on a snapshot that had
+ *  not caught up is precisely the case where 07:30 succeeds. */
+function postOpenDueAt(h, m) { return h === 7 && m >= 15 && m < 45; }
+
+/** Pacific minutes-of-day for an epoch-ms instant, or null.
+ *  `hourCycle: 'h23'` rather than `hour12: false`, which prints "24" for
+ *  midnight under some ICU builds — the same trap `etMinutesOfDay` documents. */
+function ptMinutesOfDay(ms) {
+  if (!Number.isFinite(ms)) return null;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date(ms));
+  const h = Number(parts.find(p => p.type === 'hour')?.value);
+  const m = Number(parts.find(p => p.type === 'minute')?.value);
+  return Number.isFinite(h) && Number.isFinite(m) ? h * 60 + m : null;
+}
+
+/** A PT wall-clock label for an as-of line. Never a bare time: the zone is half
+ *  the fact, and this record's whole subject is which session a number belongs
+ *  to. */
+function ptClockLabel(ms) {
+  if (!Number.isFinite(ms)) return 'unknown';
+  return new Date(ms).toLocaleString('en-US', {
+    timeZone: 'America/Los_Angeles', month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }) + ' PT';
+}
+
+const postOpenSigned = (v, digits = 2) =>
+  (v == null || !Number.isFinite(v)) ? 'n/a' : `${v >= 0 ? '+' : ''}${v.toFixed(digits)}`;
+
+/** A level, printed at 4dp with trailing zeros trimmed — NOT `toFixed(2)`.
+ *
+ *  THE PERCENTAGE BESIDE IT IS YAHOO'S OWN, computed from unrounded values, so
+ *  rounding the LEVEL to two places puts two figures side by side that no longer
+ *  reconcile. Measured 2026-11-13 07:29 PT: `^TNX` printed "now 5.13 … prior
+ *  close 5.10 … +0.47%", from which a reader derives +0.59% and concludes one of
+ *  the three is wrong. None of them was — two decimals is simply lossy on a
+ *  quantity that trades in thousandths. 7521.83 still prints as 7521.83;
+ *  5.127 prints as 5.127 and reconciles. */
+const postOpenLevel = (v) =>
+  (v == null || !Number.isFinite(v)) ? 'n/a' : String(Math.round(v * 10000) / 10000);
+
+/* ── Cron: the post-open read (7:15am PT) ── */
+async function generatePostOpenRead(env) {
+  const mark    = instrMark();
+  const todayPt = ptDate();
+
+  /* DEDUP ON `complete` AND THE PT DATE, NOT ON FRESHNESS. A refusal written at
+     07:15 is a real, servable record — and it must not dedup the 07:30 retry out
+     of the day, which is the defect the EOD placeholder's `ts: 0` closed by a
+     different route. Because the content term is here, `ts` on this slot is
+     ALWAYS the real write time and never a sentinel. */
+  try {
+    const existing = await env?.REC_LOG?.get(POSTOPEN_KEY, 'json');
+    if (existing && existing.complete === true && existing.ptDate === todayPt) {
+      console.log(`[cron] post-open read already complete for ${todayPt}, skipping`);
+      return;
+    }
+  } catch (_) {}
+
+  /* Sources that are DOWN. Named in the body and they force `complete: false` —
+     never silently replaced with a substitute value. A fallback that looks like
+     a reading is worse than a stated gap. */
+  const missing = [];
+
+  /** The one place a record is written, so every exit has the same shape. */
+  const store = async ({ body, complete, baseline, baselineParts, dataAsOf, phase, reason = null, inputs = {} }) => {
+    const rec = {
+      schema: POSTOPEN_RECORD_SCHEMA,
+      body,
+      ts: Date.now(),
+      dataAsOf,
+      complete,
+      baseline,
+      ptDate: todayPt,
+      reason,
+      /* Provenance, so a consumer can tell a thin reading from a broken one
+         without re-deriving it from the prose. `baselineParts` says WHICH half of
+         the 6:00am record was available: a briefing that failed Claude but not
+         Yahoo banks levels and no prose, and that is a real state. */
+      inputs: { baselineParts, missingSources: missing.slice(), ...inputs },
+      _instr: instrSince(mark, phase),
+    };
+    try {
+      await env?.REC_LOG?.put(POSTOPEN_KEY, JSON.stringify(rec), { expirationTtl: POSTOPEN_TTL });
+    } catch (e) {
+      console.error(`[cron] !! POSTOPEN-WRITE !! KV put failed — ${e.message}. No record for ${todayPt}.`);
+      return;
+    }
+    console.log(`[cron] post-open read ${todayPt} · complete=${complete} · baseline=${baseline}`
+      + ` · dataAsOf=${dataAsOf ? ptClockLabel(dataAsOf) : 'none'}`
+      + (reason ? ` · reason=${reason}` : '')
+      + ` · ${JSON.stringify(rec._instr)}`);
+  };
+
+  /* ── 1. The 6:00am baseline ───────────────────────────────────────────────
+     TODAY'S record or none. Comparing an open against YESTERDAY'S pre-market
+     brief is the specific wrong answer this guard exists to prevent — it would
+     read as a plausible paragraph and be about the wrong day. */
+  let snapshot = null;
+  try { snapshot = await env?.REC_LOG?.get('daily:snapshot', 'json'); } catch (_) {}
+  const snapDay       = dailySlotPtDate(snapshot);
+  const baseLevels    = (snapDay === todayPt && snapshot?.marketLevels) ? snapshot.marketLevels : null;
+  const hasBaseProse  = snapDay === todayPt && !!(snapshot?.open?.body || snapshot?.headline);
+  const baselineParts = [
+    ...(hasBaseProse ? ['prose'] : []),
+    ...(baseLevels && Object.keys(baseLevels).length ? ['levels'] : []),
+  ];
+  const baseline = baselineParts.length ? '06:00' : 'none';
+
+  /* ── 2. One market snapshot: indices, futures, the VIX pair, the 11 sectors ──
+     23 symbols, 20 per spark request, so TWO external fetches for the whole
+     thing. UNAUTHENTICATED v7 — no crumb is touched, which is deliberate: this
+     runs in the same 7am hour whose crumb acquisition failed on 2026-09-02, and
+     adding auth pressure there to read eleven index levels would be a poor
+     trade. */
+  const marketSyms = [...Object.keys(SNAPSHOT_SYMBOLS), POSTOPEN_VIX3M, ...Object.keys(SECTOR_ETFS)];
+  let quotes = new Map();
+  try {
+    quotes = await yahooSparkQuotes(marketSyms, '3mo');
+  } catch (e) {
+    console.error(`[cron] post-open: market spark failed — ${e.message}`);
+  }
+
+  /* The as-of comes from the CASH session only. `dataAsOf` is the FRESHEST cash
+     index print, which is what every intraday number in the record is relative
+     to — not the run time, which is up to 15 minutes ahead of all of it. */
+  const cashTimes = POSTOPEN_CASH_SYMBOLS
+    .map(s => quotes.get(s)?.marketTime)
+    .filter(t => Number.isFinite(t));
+  const dataAsOf = cashTimes.length ? Math.max(...cashTimes) : null;
+
+  /* ── REFUSAL 1: no market snapshot at all ─────────────────────────────── */
+  if (dataAsOf == null) {
+    missing.push('Yahoo index quotes (v7 spark returned no cash-index print)');
+    return store({
+      body: 'No post-open read for today. The Yahoo quote snapshot this slot is built from returned no '
+        + 'cash-index print, so there is no priced reading of the open to report. Nothing here is a '
+        + 'reading of today’s session, and no value has been substituted for the missing one. '
+        + 'The 7:30am PT firing retries.',
+      complete: false, baseline, baselineParts, dataAsOf: null,
+      phase: 'refused', reason: 'market-snapshot-unavailable',
+    });
+  }
+
+  /* ── REFUSAL 2: the snapshot predates the 06:30 PT open ───────────────────
+     Two terms, and both are load-bearing. The MINUTE test catches a feed that
+     has not ticked since the pre-market; the PT-DATE test catches one frozen on
+     a previous session, which an afternoon-stamped value would otherwise walk
+     straight past. */
+  const asOfPtMin  = ptMinutesOfDay(dataAsOf);
+  const asOfPtDate = ptDate(new Date(dataAsOf));
+  if (asOfPtDate !== todayPt || asOfPtMin == null || asOfPtMin < POSTOPEN_OPEN_PT_MIN) {
+    missing.push(`Yahoo quote snapshot is stale (as-of ${ptClockLabel(dataAsOf)})`);
+    return store({
+      body: `No post-open read for today. The freshest cash-index quote available is ${ptClockLabel(dataAsOf)}, `
+        + 'which is before the 06:30 PT open, so every price in it is a PRE-OPEN price. A reading of the '
+        + 'open cannot honestly be built on them and none has been. The 7:30am PT firing retries.',
+      complete: false, baseline, baselineParts, dataAsOf,
+      phase: 'refused', reason: 'snapshot-predates-open',
+    });
+  }
+
+  /* ── 3. Index / futures / rates / vol lines, each against its 6:00am level ── */
+  const levelLines = [];
+  for (const sym of Object.keys(SNAPSHOT_SYMBOLS)) {
+    const q = quotes.get(sym);
+    if (!q || q.price == null) continue;
+    const label = SNAPSHOT_SYMBOLS[sym];
+    const base  = baseLevels?.[sym];
+    let line = `${label} (${sym}): now ${postOpenLevel(q.price)}, ${postOpenSigned(q.changePct)}% on the day`
+             + (q.prevClose != null ? ` (prior close ${postOpenLevel(q.prevClose)})` : '');
+    if (base && base.price != null) {
+      const deltaAbs = q.price - base.price;
+      const deltaPct = base.price ? (q.price - base.price) / base.price * 100 : null;
+      line += ` | 6:00am brief had ${postOpenLevel(base.price)} (${postOpenSigned(base.changePct)}% then)`
+            + ` | since the 6:00am read: ${postOpenSigned(deltaAbs, 4)} (${postOpenSigned(deltaPct)}%)`;
+    } else {
+      line += ' | NO 6:00am level banked for this symbol';
+    }
+    levelLines.push(line);
+  }
+  if (!levelLines.length) missing.push('Yahoo index quotes (no symbol resolved)');
+
+  /* ── 4. VIX term structure, in `collectMacroState`'s sign convention ──────
+     ONE convention in this Worker, not two: vixTermSpread = VIX − VIX3M, and
+     POSITIVE = backwardation = hostile. The 6:00am record banks no VIX3M, so the
+     only honest earlier term reading is the last banked macro state — which is a
+     PRIOR SESSION's close, and is labelled as one rather than passed off as a
+     6:00am baseline. */
+  const vixNow   = quotes.get('^VIX')?.price ?? null;
+  const vix3mNow = quotes.get(POSTOPEN_VIX3M)?.price ?? null;
+  const termNow  = (vixNow != null && vix3mNow != null)
+    ? Math.round((vixNow - vix3mNow) * 100) / 100 : null;
+  let macroState = null;
+  try { macroState = await env?.REC_LOG?.get(MACRO_KEY, 'json'); } catch (_) {}
+  const termLines = [];
+  if (termNow != null) {
+    termLines.push(`VIX term structure NOW: VIX ${postOpenLevel(vixNow)} − VIX3M ${postOpenLevel(vix3mNow)} = `
+      + `${postOpenSigned(termNow)} (NEGATIVE = contango = constructive; POSITIVE = backwardation = hostile)`);
+  } else {
+    termLines.push('VIX term structure NOW: NOT AVAILABLE (one of ^VIX / ^VIX3M did not resolve)');
+    missing.push('VIX term structure (^VIX or ^VIX3M did not resolve)');
+  }
+  if (macroState && macroState.vixTermSpread != null) {
+    termLines.push(`Last BANKED macro state (a prior session’s close, as-of ${macroState.asOfClose}): `
+      + `raw term ${postOpenSigned(macroState.vixTermSpread)}, smoothed `
+      + `${postOpenSigned(macroState.vixTermSpreadSmoothed)}, regime "${macroState.state}". `
+      + 'This is NOT a 6:00am baseline and must not be described as one.');
+  } else {
+    termLines.push('No banked macro state is available, so there is no earlier term-structure reading to compare against.');
+  }
+
+  /* ── 5. Sector heat ──────────────────────────────────────────────────────
+     Live from the same spark. The 6:00am briefing banks no sector levels (its
+     own pre-warm writes `market:sectors`, whose timestamp is read and PRINTED
+     below rather than assumed to be 6:00am), so this is labelled a NOW reading. */
+  const sectorLines = Object.keys(SECTOR_ETFS).map((etf) => {
+    const q = quotes.get(etf);
+    if (!q || q.changePct == null) return null;
+    return `${SECTOR_ETFS[etf]} (${etf}): ${postOpenSigned(q.changePct)}%`;
+  }).filter(Boolean);
+  if (!sectorLines.length) missing.push('sector ETF quotes');
+
+  let sectorBaseLine = 'No earlier sector snapshot is banked for today.';
+  try {
+    const banked = await env?.REC_LOG?.get(SECTORS_KV_KEY, 'json');
+    if (banked?.ts && ptDate(new Date(banked.ts)) === todayPt && Array.isArray(banked.sectors)) {
+      const parts = banked.sectors
+        .filter(s => s?.etf && s.changePct != null)
+        .map(s => `${s.etf} ${postOpenSigned(s.changePct)}%`);
+      if (parts.length) {
+        sectorBaseLine = `Earlier sector snapshot, as-of ${ptClockLabel(banked.ts)} — ${parts.join(', ')}. `
+          + 'Use that as-of verbatim; do not call it the 6:00am reading unless the as-of says 06.';
+      }
+    }
+  } catch (_) {}
+
+  /* ── 6. The watchlist: movers and key-level proximity ─────────────────────
+     ONE spark request per 20 names (2 at the live N=40), and it carries BOTH
+     answers: the day's move comes off the quote meta, and the key level is the
+     Worker's own regression channel over the same 3-month close series — the
+     SAME `swingChannel` the Watchlist tab's Swing column is decided by, so the
+     brief and the column can never disagree about where a name sits. The page
+     never re-derives that gate and neither does this prompt. */
+  const tickers = await sweepUniverse(env, 'post-open read', 60);
+  const moverLines = [], levelNames = [];
+  let watchlistCount = 0;
+  if (!tickers) {
+    missing.push('watchlist:tickers (no saved watchlist — see the EMPTY-UNIVERSE log line)');
+  } else {
+    let wl = new Map();
+    try {
+      wl = await yahooSparkQuotes(tickers, '3mo');
+    } catch (e) {
+      console.error(`[cron] post-open: watchlist spark failed — ${e.message}`);
+    }
+    if (!wl.size) {
+      missing.push(`Yahoo watchlist quotes (0 of ${tickers.length} names resolved)`);
+    } else {
+      watchlistCount = wl.size;
+      if (wl.size < tickers.length) {
+        missing.push(`Yahoo watchlist quotes (${wl.size} of ${tickers.length} names resolved)`);
+      }
+      for (const sym of tickers) {
+        const q = wl.get(sym);
+        if (!q || q.price == null) continue;
+        if (q.changePct != null && Math.abs(q.changePct) >= POSTOPEN_MOVE_PCT) {
+          moverLines.push(`${sym} ${q.price.toFixed(2)} ${postOpenSigned(q.changePct)}%`);
+        }
+        const sw = swingChannel(q.pairs, q.price);
+        if (sw.swingZ == null) continue;
+        const z = sw.swingZ;
+        /* THE WORDS ARE DECIDED HERE, FROM THE WORKER'S OWN GATE, and handed to
+           the model already decided. Leaving "is it through its level?" to the
+           prose is a page-side re-derivation of a Worker gate under another
+           name. */
+        const where = Math.abs(z) >= SWING_Z_THRESHOLD
+          ? (z > 0 ? 'AT OR THROUGH the upper band' : 'AT OR THROUGH the lower band')
+          : Math.abs(z) >= POSTOPEN_NEAR_Z
+            ? (z > 0 ? 'APPROACHING the upper band' : 'APPROACHING the lower band')
+            : null;
+        if (!where) continue;
+        levelNames.push(`${sym} ${q.price.toFixed(2)}: ${where} — regression fit ${sw.swingFit}, `
+          + `σ ${sw.swingSigma}, z ${postOpenSigned(z)}σ (gate ±${SWING_Z_THRESHOLD}σ, `
+          + `fit over ${SWING_REG_BARS} completed daily closes through ${sw.swingAsOf})`);
+      }
+    }
+  }
+
+  /* ── 7. Macro calendar for today, WITH NO ACTUALS ────────────────────────
+     The Worker holds release DATES and holds no released FIGURES anywhere, for
+     any series. So the calendar is passed as a schedule only, and the prompt
+     says so in terms that cannot be read as an invitation to supply one. */
+  const fredEvents  = (await getEconReleases(env)).events;
+  const etDay       = etToday();
+  const todayEvents = econPromptLines(econEventsBetween(etDay, etDay, fredEvents));
+
+  /* ── 8. The prompt ───────────────────────────────────────────────────────── */
+  const dateStr = new Date().toLocaleDateString('en-US', {
+    weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
+    timeZone: 'America/Los_Angeles',
+  });
+  const baselineBlock = baseline === 'none'
+    ? 'THERE IS NO 6:00am BASELINE FOR TODAY. The pre-market briefing record for this Pacific date is '
+      + 'absent. You must say so in the body, and you must NOT compare today against any earlier day: '
+      + 'yesterday’s briefing is not a substitute for this morning’s.'
+    : [
+        `6:00am PT BRIEFING (written ${snapshot?.ts ? ptClockLabel(snapshot.ts) : 'at an unrecorded time'}, `
+          + 'BEFORE the 06:30 open):',
+        hasBaseProse ? `Headline: ${snapshot.headline || '(none)'}` : 'Headline: NOT AVAILABLE',
+        hasBaseProse ? `Open outlook: ${snapshot.open?.headline || '(none)'}` : '',
+        hasBaseProse ? `Open plan: ${snapshot.open?.body || '(none)'}` : '',
+        snapshot?.opportunity ? `Named opportunity: ${snapshot.opportunity.ticker} — ${snapshot.opportunity.reason}` : '',
+        snapshot?.avoid ? `Named avoid: ${snapshot.avoid.ticker} — ${snapshot.avoid.reason}` : '',
+        baselineParts.includes('levels') ? '' : 'NO 6:00am index levels were banked on that record, so no '
+          + 'numeric since-6:00am comparison is available for any index. Say that rather than estimating one.',
+      ].filter(Boolean).join('\n');
+
+  const prompt = `You are a professional market analyst writing the POST-OPEN READ for ${dateStr}.
+It is 7:15am PT. The cash session opened at 6:30am PT, so the market has been open about 45 minutes.
+
+Every price below comes from ONE 15-minute-delayed Yahoo snapshot whose as-of is ${ptClockLabel(dataAsOf)}.
+That is the as-of for every intraday number in this briefing. There is no second sample and no tape.
+
+${baselineBlock}
+
+INDEX, FUTURES, RATES AND VOL — now, and against the 6:00am level where one was banked:
+${levelLines.join('\n') || 'NOT AVAILABLE'}
+
+VOLATILITY TERM STRUCTURE:
+${termLines.join('\n')}
+
+SECTOR HEAT NOW (SPDR sector ETFs, same snapshot and same as-of):
+${sectorLines.join('\n') || 'NOT AVAILABLE'}
+${sectorBaseLine}
+
+WATCHLIST NAMES MOVING ±${POSTOPEN_MOVE_PCT}% OR MORE ON THE DAY:
+${moverLines.join('\n') || `None of the ${watchlistCount} watchlist names resolved is moving ±${POSTOPEN_MOVE_PCT}% or more.`}
+
+WATCHLIST NAMES AT, THROUGH, OR APPROACHING THEIR KEY LEVEL:
+The level is this Worker's regression channel — an OLS fit through ${SWING_REG_BARS} completed daily
+closes, with σ the standard error of that regression. The verdict on each name below is ALREADY
+DECIDED against the ±${SWING_Z_THRESHOLD}σ gate; repeat it, do not re-judge it.
+${levelNames.join('\n') || `No watchlist name is within ${POSTOPEN_NEAR_Z}σ of its channel band.`}
+
+MACRO RELEASES SCHEDULED FOR TODAY (official Fed / BLS calendar — the ONLY source for these):
+${todayEvents || 'Nothing scheduled in the tracked calendar for today.'}
+THIS WORKER HOLDS NO RELEASED FIGURES. For any release above you may state that it was scheduled and
+nothing more. Do NOT state an actual, a consensus, a surprise, a direction, or a market reaction to it.
+
+${missing.length ? `INPUT SOURCES THAT ARE DOWN OR INCOMPLETE — name these in the body:\n${missing.map(s => `• ${s}`).join('\n')}` : 'All input sources returned data.'}
+
+WRITE the post-open read. The question it answers is: WHAT CHANGED SINCE THE 6:00am READ. Cover, in
+one paragraph and in this order:
+1. Where the indices and futures are now against the 6:00am levels — and whether the opening gap
+   HELD, FADED or EXTENDED, judged only from the two levels you were given.
+2. VIX and the term structure, and the 10Y, against 6:00am where a 6:00am level exists.
+3. Where the sector heat is concentrated now.
+4. Watchlist names moving ±${POSTOPEN_MOVE_PCT}%, and names at/through or approaching their key level.
+5. Which items of the 6:00am plan the open CONFIRMED, CONTRADICTED, or LEFT UNTESTED — and say
+   plainly when something is untested rather than forcing a verdict.
+6. Any macro release scheduled today, schedule only.
+
+HARD RULES. These are correctness constraints, not style preferences.
+A. EVERY NUMBER you write must appear in the data above, copied as given. You have no other source.
+   Do not compute a new figure, do not re-round, do not recall a level from memory. If a number you
+   want is not above, write that it is not available — never supply one.
+B. NO CLOCK TIMES AGAINST A PRICE, and no event timing. This is ONE delayed snapshot, not a tape. You
+   may write "X is above / below / through Y as of ${ptClockLabel(dataAsOf)}". You may NOT write when
+   anything happened, crossed, reversed, peaked or broke. "Broke 7,500 at 06:42" is forbidden: it is
+   not supportable from a single observation, and a reader cannot tell that it isn't.
+C. NO CONFIDENCE PERCENTAGES, no probabilities, no odds, no "70% chance".
+D. Name every source listed as down or incomplete. Do not reason around a gap with a substitute.
+E. 6 to 9 sentences. ONE paragraph. No headings, no bullets, no markdown, and no ticker list longer
+   than the names you actually discuss.
+
+Return JSON: {"body": "<the paragraph>"}`;
+
+  /* ── 9. Generate ─────────────────────────────────────────────────────────
+     `raw: true` for `stopReason`. `claudeText()` cannot tell a complete answer
+     from one the token cap cut off, and a truncated paragraph stored in `body`
+     renders as finished prose — a slot like this one is exactly where that
+     invariant bites. */
+  let answer = null, stopReason = null;
+  try {
+    const res = await workerClaude(prompt, env, POSTOPEN_TOKENS, POSTOPEN_ANSWER_SCHEMA, { raw: true });
+    stopReason = res.stopReason;
+    const cleaned = (res.text || '').replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    answer = JSON.parse(cleaned);
+  } catch (e) {
+    console.error(`[cron] post-open generation failed: ${e.message}`);
+  }
+
+  const inputs = {
+    indexSymbols:   levelLines.length,
+    sectorSymbols:  sectorLines.length,
+    watchlistNames: watchlistCount,
+    movers:         moverLines.length,
+    atLevel:        levelNames.length,
+    termSpread:     termNow,
+    scheduledReleasesToday: todayEvents ? todayEvents.split('\n').length : 0,
+    stopReason,
+  };
+
+  if (stopReason === 'max_tokens') {
+    /* NOT STORED AS `body`. A cut-off paragraph is indistinguishable from a
+       finished one once it is in the slot, and this slot's consumer renders it
+       as prose. The answer is discarded and the record says why. */
+    return store({
+      body: 'No post-open read for today. The model’s answer hit the token cap and was cut off mid-sentence, '
+        + 'so it has been discarded rather than stored as a finished paragraph. Nothing here is a reading of '
+        + 'today’s open. The 7:30am PT firing retries.',
+      complete: false, baseline, baselineParts, dataAsOf,
+      phase: 'truncated', reason: 'answer-truncated', inputs,
+    });
+  }
+
+  const body = typeof answer?.body === 'string' ? answer.body.trim() : '';
+  if (!body) {
+    return store({
+      body: 'No post-open read for today. The 7:15am PT job did not get a usable narrative back from the '
+        + 'model. Nothing here is a reading of today’s open. The 7:30am PT firing retries.',
+      complete: false, baseline, baselineParts, dataAsOf,
+      phase: 'generation-failed', reason: 'no-narrative', inputs,
+    });
+  }
+
+  /* A DOWN SOURCE DOES NOT SUPPRESS THE NARRATIVE, IT FLAGS IT. The prompt
+     required the gap to be named in the body, and a partial reading over the
+     sources that DID answer is a finding; `complete: false` is what tells the
+     reader it is partial. */
+  await store({
+    body,
+    complete: missing.length === 0,
+    baseline, baselineParts, dataAsOf,
+    phase: missing.length ? 'degraded' : 'complete',
+    reason: missing.length ? `inputs-missing: ${missing.join('; ')}` : null,
+    inputs,
+  });
 }
 
 /* ── Sector Updates ── */
@@ -16559,6 +17192,34 @@ export default {
       }
     }
 
+    /* ── THE 7:15am PT POST-OPEN READ — dispatched OUTSIDE the chain too ─────
+       Same structural reason as the print-tape block above, and it is not a
+       stylistic echo of it. Its window, 07:15–07:44, is a strict SUBSET of the
+       `h === 7 && m < 45` morning-rows branch below, so an `else if` written
+       after that branch is UNREACHABLE — it would never fire once, and the only
+       symptom would be a slot that is permanently absent, which is rule #7's
+       signature exactly. Folding it INTO the morning-rows branch is the other
+       trap: that would tie this job's schedule to a window that has already
+       been widened once (30 → 45 minutes on 2026-09-02) for reasons that have
+       nothing to do with this read.
+
+       So it gets its own clock test, and the decision is appended to the
+       `[cron]` line below — every 7am firing now says whether a post-open read
+       was due, which is what makes a missing one falsifiable.
+
+       IT SHARES THE INVOCATION'S SUBREQUEST BUDGET with `morning-rows`, which
+       is a ~800-capCost sequential sweep. `ctx.waitUntil` gets no budget of its
+       own, so no per-job `_instr` from this job is a measurement — it is an
+       upper bound on the job and a lower bound on the invocation (rule #1). The
+       DERIVATION is the figure to quote: `ceil(23/20) + ceil(N/20) + 1 Claude`
+       external and 6 bindings = **capCost 11** at N=40. Together with
+       morning-rows that is ~811 against this invocation's own 10,000.
+
+       07:15 PT is inside the trigger's UTC window under BOTH regimes — 14:15
+       UTC on PDT, 15:15 UTC on PST (rule #2). */
+    const postOpenDue = postOpenDueAt(h, m);
+    if (postOpenDue) dispatchJob(ctx, 'post-open-read', () => generatePostOpenRead(env));
+
     let branch = 'idle';                        // in-window wakeup with no job due
     if (h === 6 && m < 30) {
       branch = 'morning-briefing';
@@ -16652,7 +17313,8 @@ export default {
 
     console.log(
       `[cron] ${at} · ${via} · trading day · branch=${branch}`
-      + (ptLabel ? ` + print-tape=${ptLabel}` : '') +
+      + (ptLabel ? ` + print-tape=${ptLabel}` : '')
+      + (postOpenDue ? ' + post-open-read' : '') +
       (day.calendarStale ? ` · WARN holiday calendar ends ${NYSE_HOLIDAYS_THROUGH}, holidays no longer skipped` : ''),
     );
   },
