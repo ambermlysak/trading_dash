@@ -692,7 +692,7 @@ differs from its retention, both are given and the reason is in the notes.
 |---|---|---|
 | `yahoo:crumb` | **2d** (`CRUMB_KV_TTL`) | Yahoo session crumb + cookie. **NO freshness term at all — reused whatever its age**, in memory and in KV. Was 1h with a 50-min in-memory `CRUMB_TTL` until 2026-09-02, which made the 7:00am PT sweep permanently cold (17.75h downstream of the 1:15pm writer) and cost 40 tickers their morning. Safe because every 401/403 path re-acquires with `force: true`, which skips both caches and overwrites this key. |
 | `daily:snapshot` | 2d | 6:00am PT Claude morning briefing. Carries `ptDate` (2026-08-20+) and, from 2026-11-13, **`marketLevels`** — the eleven `SNAPSHOT_SYMBOLS` as `{label, price, prevClose, changePct, marketTime}`, banked at **zero added subrequests** from the same eleven chart responses the prompt's prose lines are built from. It exists so the 7:15am post-open read can answer "where did the 6:00am brief have this" from DATA; reading a number back out of the briefing's own sentences is a guess at whichever figures the model chose to mention. Banked on the `ts: 0` placeholder write too, since a Claude failure and a Yahoo failure are independent |
-| `daily:postopen` | 2d (`POSTOPEN_TTL`) | **THE 7:15am PT POST-OPEN READ, schema 1** — a SECOND reading of the morning, written 45 minutes after the 06:30 cash open, not a replacement for the 6:00am briefing. It READS `daily:snapshot` and MUST NEVER WRITE IT. Fields: `body` (the narrative) · `ts` (write time) · `dataAsOf` (the freshest CASH-index `regularMarketTime` — **cash only**, because futures quote overnight and a futures stamp would mask a dead cash feed) · `complete` · `baseline` (`'06:00'` \| `'none'`) · `ptDate` · `reason` · `inputs` · `_instr`.<br><br>**`ts` IS ALWAYS THE REAL WRITE TIME, NEVER A `ts: 0` SENTINEL.** The dedup carries a CONTENT term instead (`complete === true && ptDate === today`), so a refusal is both a servable record and a retryable one — the EOD placeholder solved the same problem the other way and this slot does not need its sentinel.<br><br>**THREE REFUSALS, each storing a record with its reason rather than dropping one.** (1) no cash-index print at all; (2) **`dataAsOf` before 06:30 PT** — a pre-open price narrated as a post-open reading is wrong about which SESSION it describes, not merely imprecise, and this fires BEFORE the Claude call so it costs nothing; (3) `stopReason === 'max_tokens'`, where the truncated paragraph is DISCARDED rather than stored, because a cut-off answer in a prose slot renders as a finished one. A DOWN source is different again: it is NAMED in the body with `complete: false` and never replaced by a fallback.<br><br>`baseline: 'none'` means today's briefing record was absent and the body must say so — it may NOT fall back to yesterday's. `inputs.baselineParts` is `['prose']` / `['levels']` / both, so a consumer can tell which half existed. **~11 capCost**, 1 Claude call, no crumb |
+| `daily:postopen` | 2d (`POSTOPEN_TTL`) | **THE 7:15am PT POST-OPEN READ, schema 1** — a SECOND reading of the morning, written 45 minutes after the 06:30 cash open, not a replacement for the 6:00am briefing. It READS `daily:snapshot` and MUST NEVER WRITE IT. Fields: `body` (the narrative) · `ts` (write time) · `dataAsOf` (the freshest CASH-index `regularMarketTime` — **cash only**, because futures quote overnight and a futures stamp would mask a dead cash feed) · `complete` · `baseline` (`'06:00'` \| `'none'`) · `ptDate` · `reason` · `inputs` · `_instr`.<br><br>**`ts` IS ALWAYS THE REAL WRITE TIME, NEVER A `ts: 0` SENTINEL.** The dedup carries a CONTENT term instead (`complete === true && ptDate === today`), so a refusal is both a servable record and a retryable one — the EOD placeholder solved the same problem the other way and this slot does not need its sentinel.<br><br>**THREE REFUSALS, each storing a record with its reason rather than dropping one.** (1) no cash-index print at all; (2) **`dataAsOf` before 06:30 PT** — a pre-open price narrated as a post-open reading is wrong about which SESSION it describes, not merely imprecise, and this fires BEFORE the Claude call so it costs nothing; (3) `stopReason === 'max_tokens'`, where the truncated paragraph is DISCARDED rather than stored, because a cut-off answer in a prose slot renders as a finished one. A DOWN source is different again: it is NAMED in the body with `complete: false` and never replaced by a fallback.<br><br>`baseline: 'none'` means today's briefing record was absent and the body must say so — it may NOT fall back to yesterday's. `inputs.baselineParts` is `['prose']` / `['levels']` / both, so a consumer can tell which half existed. **capCost 12–13 at N=40 (live 2026-11-16: 12), 13–14 at the 60-name cap**, 1 Claude call, no crumb.<br><br>**`detail{}` — ADDITIVE, 2026-11-16, schema still 1**: `movers[{ticker,changePct}]` · `levels[{ticker,price,z,state}]` (`at-through-lower`/`approaching-lower`/`approaching-upper`/`at-through-upper`) · `plan[{id,kind,item,claim,verdict,evidence}]` (verdict `null` = not scored, never a defaulted `untested`). Absent only on the two no-data refusals. `inputs.movers`/`inputs.atLevel` equal the array lengths. New `inputs` keys: `namedTickers`, `planItems`, `reconcile`, and on a generated body `bodyChars`, `bodySentences`, `unsourcedNumbers`, `planUnsourcedNumbers`, `style`, `foldCheck`, `planCheck` — ALL RECORD-ONLY, none changes `complete` or `phase` |
 | `daily:midday` | 2d | 11:30am PT midday pulse (narrative, topics, tomorrow, trades, bigMovers). Carries `ptDate` |
 | `daily:eod` | 2d | 1:15pm PT end-of-day summary. Carries `ptDate`, on the placeholder too |
 | `market:week-ahead` | 18h | Friday-only week-ahead preview |
@@ -826,11 +826,36 @@ reasons having nothing to do with this read. The decision is appended to the `[c
 deliberately does not, because a 07:15 refusal on a quote feed that had not caught up is precisely
 the case where 07:30 succeeds.
 
-**COST: `ceil(23/20) + ceil(N/20)` spark fetches + 1 Anthropic + 6–8 bindings = capCost 10–11 at
-N=40**, measured ISOLATED (morning-rows deduped out) at **ext 3 · bind 7–8 · capCost 10–11** on
-2026-11-13 under `workerd`. On a NORMAL firing it shares the invocation with morning-rows' ~800, so
-**no per-job `_instr` from a real morning is a measurement** — quote the derivation. 23 symbols is
-the eleven `SNAPSHOT_SYMBOLS` + `^VIX3M` + the eleven `SECTOR_ETFS`, all in ONE spark request pair.
+**COST — CORRECTED 2026-11-16: `ceil((23+K)/20) + ceil(N/20)` spark fetches + 1 Anthropic + 7–8
+bindings.** K ≤ 2 is the 06:00 record's opportunity/avoid tickers, appended to the market request,
+so the market half is **2 requests whatever K is** (ceil(25/20) = ceil(23/20) = 2 — the old "ONE
+spark request pair" meant those two). Bindings: dedup get, `daily:snapshot`, `macro:state`,
+`market:sectors`, `watchlist:tickers`, `econ:fred` (+1 put when that cache refreshes), the slot
+put. **Live 2026-11-16 at N=40: ext 5 · bind 7 · capCost 12**, and that firing ran ALONE
+(`invocationCapCost` 12 = `capCost` 12 — morning-rows had already deduped). **N=40 → 12–13; the
+60-name `sweepUniverse` cap → 6 ext + 7–8 = 13–14, 0.14% of the 10,000.** The 2026-11-13 figure
+("ext 3 · capCost 10–11") was taken by `postopen.verify.mjs` with a **15-name** fixture AND that
+driver answers Anthropic above the INSTR wrapper, so the Claude call was never counted — two
+undercounts, not one. On a NORMAL firing that shares the invocation with morning-rows' ~800,
+**no per-job `_instr` is a measurement** — quote the derivation.
+
+**WHAT THE MODEL IS HANDED, AND WHAT IS CHECKED AFTER (2026-11-16).** The prompt is rendered by
+`postOpenPrompt` from ONE pure object built by `postOpenBuildPayload`; both are named function
+exports so `postopen.check.mjs` replays the real 2026-11-16 records through them offline.
+- **Every percent is derived** (`postOpenQuote` → `postOpenPct`) from the 4dp price and 4dp prior
+  close printed beside it; the prior close is the bar before the quote's OWN session (ET date of
+  `regularMarketTime`), so a name with no print yet today does not reach back two sessions. Yahoo's
+  figure rides as `vendorChangePct`, diagnosis only. `postOpenReconcile` re-derives every percent
+  (indices, their 06:00 levels and since-06:00, sectors, movers, named) → `inputs.reconcile`.
+- **Plan items** come from `postOpenPlanItems(today's 06:00 record, its marketLevels)`; the answer
+  schema is `{body, plan:[{id, verdict ∈ confirmed|contradicted|untested, evidence}]}`. A level item
+  needs a number within `POSTOPEN_LEVEL_PLAN_BAND_PCT` (10%) of a banked 06:00 level AND a level
+  word NEAREST to it in its own clause — a comma inside "7,650" is not a clause break.
+- **`postOpenAudit` records, never gates**: `bodyChars`, `bodySentences` (the consumer's own
+  splitter), `unsourcedNumbers` / `planUnsourcedNumbers` (tokens checked against the DATA half of
+  the rendered prompt — everything above `RETURN TWO THINGS.` — plus an allowlist of dates, the
+  as-of and session clocks, and the gate constants; magnitudes, so a sign flip is not caught),
+  `style`, `foldCheck`, `planCheck`. `detail{}` carries the full mover / level / plan lists.
 
 **IT TOUCHES NO CRUMB.** Both pulls go through `yahooSparkQuotes`, the UNAUTHENTICATED v7 endpoint.
 That is deliberate rather than incidental: this is the same 7am hour whose crumb acquisition failed

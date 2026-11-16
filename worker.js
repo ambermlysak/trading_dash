@@ -16232,7 +16232,10 @@ Return ONLY valid JSON.`;
 const POSTOPEN_KEY           = 'daily:postopen';
 const POSTOPEN_TTL           = 172_800;   // 2d — the `daily:snapshot` retention
 const POSTOPEN_RECORD_SCHEMA = 1;
-const POSTOPEN_TOKENS        = 700;       // ANSWER room; workerClaude adds the thinking headroom
+/* ANSWER room; workerClaude adds the thinking headroom. 700 -> 1400 on
+   2026-11-16, when the answer gained the per-item `plan` array beside `body`.
+   Raising a cap bounds spend, it does not cause it. */
+const POSTOPEN_TOKENS        = 1400;
 /* The cash open as PT minutes-of-day. The staleness refusal is measured against
    this and nothing else. */
 const POSTOPEN_OPEN_PT_MIN   = 6 * 60 + 30;
@@ -16247,12 +16250,100 @@ const POSTOPEN_NEAR_Z        = SWING_Z_THRESHOLD - 0.5;
    session the record claims to describe. */
 const POSTOPEN_CASH_SYMBOLS  = ['^GSPC', '^IXIC', '^DJI', '^RUT'];
 const POSTOPEN_VIX3M         = '^VIX3M';  // the term-structure leg, `MACRO_SYMBOLS.vix3m`
-/* A schema makes malformed JSON ungenerable — the same reason `ANALYSIS_SCHEMA`
-   exists. One field: this slot is a narrative and nothing else. */
+
+/* ── THE PROSE CONTRACT (2026-11-16) ─────────────────────────────────────────
+   The first live body was 2,739 characters in 8 sentences, enumerated all 21
+   movers in prose, used ALL-CAPS emphasis and the first person — and the
+   consumer folds a brief after its THIRD sentence, so the fold showed a single
+   run-on list. These limits go into the prompt AND are measured on the answer.
+   OVER A LIMIT IS RECORDED (`inputs.bodyChars`, `inputs.bodySentences`,
+   `inputs.style`), NEVER REFUSED: a long, correct reading is still a reading.
+   The full lists ride as STRUCTURED data in `detail{}`, so nothing the prose no
+   longer enumerates is lost. */
+const POSTOPEN_PROSE_TOP_MOVERS      = 5;
+const POSTOPEN_PROSE_MAX_LEVEL_NAMES = 3;
+const POSTOPEN_BODY_MIN_SENTENCES    = 6;
+const POSTOPEN_BODY_MAX_SENTENCES    = 9;
+const POSTOPEN_SENTENCE_MAX_WORDS    = 40;
+const POSTOPEN_BODY_TARGET_CHARS     = 1400;
+/* THE FRONTEND'S OWN SPLITTER, copied from decision_dash `briefCard()` (deployed
+   build, read 2026-11-16): a sentence end followed by whitespace and a capital or
+   quote. Counting sentences any other way would report a body as fitting the
+   three-sentence fold while the page folds it somewhere else. */
+const POSTOPEN_SENTENCE_SPLIT        = /(?<=[.!?])\s+(?=[A-Z"'])/;
+
+/* ── THE RECONCILE INVARIANT, ALL SYMBOLS (2026-11-16) ───────────────────────
+   Every percentage handed to the model is DERIVED here from the exact price and
+   prior close printed beside it, at the printed precision (4dp levels, 2dp
+   percents) — never Yahoo's `regularMarketChangePercent`. Measured 2026-11-16:
+   the 07:15 body printed "VIX is 21.48, +11.36%" beside a 19.3 prior close
+   (21.48 / 19.30 = +11.30%), and a live probe the same morning found Yahoo's
+   ^VIX percent off its own printed level and prior close by 0.009 pt (8.903 vs
+   8.9119) while ^GSPC, ^TNX, the sector ETFs and single names agreed to 4dp. The
+   vendor figure is computed from values this Worker never sees; a percent that
+   cannot be re-derived from the numbers beside it is a figure a reader will
+   correctly conclude is wrong. `vendorChangePct` is kept on the quote for
+   diagnosis only and NEVER reaches the prompt. `postOpenReconcile` re-derives
+   every percent in the payload and the job records any difference above this
+   tolerance — which, by construction, is zero. */
+const POSTOPEN_RECONCILE_TOL         = 0.005;
+
+/* ── THE PLAN-ITEM RULE (2026-11-16) ─────────────────────────────────────────
+   "The plan said" may cover ONLY what the 06:00 record states. The first live
+   body scored "the value cushion from financials and energy" as a CONTRADICTED
+   plan item; the 06:00 text never named either (that observation came from the
+   06:03 sector snapshot), and Industrials, which the plan DID name, was never
+   scored. So the items are EXTRACTED HERE, mechanically, from the 06:00 record —
+   headline, open outlook, open plan, opportunity, avoid — and the model must
+   return exactly one verdict per listed item, none skipped and none added.
+   Changes against the 06:03 sector read are a separate source, reported as
+   "since the 06:03 sector read", and never enter this list. */
+const POSTOPEN_PLAN_VERDICTS         = ['confirmed', 'contradicted', 'untested'];
+/* A number in the 06:00 prose is a LEVEL item only when it sits within this
+   band of a banked 06:00 level AND a level word is in its own clause — so
+   "S&P futures at 7532" (a description) is not an item and "7500 the first line
+   of defense" is. */
+const POSTOPEN_LEVEL_PLAN_BAND_PCT   = 10;
+const POSTOPEN_LEVEL_WORDS = /\b(?:support|resistance|defen[cs]e|shelf|floor|ceiling|pivot|levels?|line in the sand|targets?|breakdown|breakout)\b/i;
+const POSTOPEN_SECTOR_ALIASES = {
+  XLK:  /\btech(?:nology)?\b/i,
+  XLF:  /\bfinancials?\b|\bbanks\b/i,
+  XLE:  /\benergy\b/i,
+  XLV:  /\bhealth ?care\b/i,
+  XLY:  /\bdiscretionary\b/i,
+  XLP:  /\bstaples\b/i,
+  XLI:  /\bindustrials\b/i,
+  XLB:  /\bmaterials\b/i,
+  XLRE: /\breal estate\b|\bREITs?\b/i,
+  XLC:  /\bcommunication(?:s| services)?\b/i,
+  XLU:  /\butilities\b/i,
+};
+/* Standard abbreviations the ALL-CAPS-emphasis audit must not flag. Tickers and
+   ETF symbols in the payload are exempt separately. */
+const POSTOPEN_ACRONYMS = new Set(['VIX', 'ETF', 'ETFS', 'NYSE', 'FOMC', 'CPI', 'PPI', 'PCE', 'GDP', 'OLS',
+  'USD', 'EPS', 'WTI', 'PST', 'PDT', 'EST', 'EDT', 'BLS', 'FRED', 'NASDAQ', 'SPDR', 'AMC', 'BMO']);
+
+/* The model returns its prose AND one verdict per plan item. A schema makes
+   malformed JSON ungenerable — the same reason `ANALYSIS_SCHEMA` exists. */
 const POSTOPEN_ANSWER_SCHEMA = {
   type: 'object',
-  properties: { body: { type: 'string' } },
-  required: ['body'],
+  properties: {
+    body: { type: 'string' },
+    plan: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id:       { type: 'string' },
+          verdict:  { type: 'string', enum: POSTOPEN_PLAN_VERDICTS },
+          evidence: { type: 'string' },
+        },
+        required: ['id', 'verdict', 'evidence'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['body', 'plan'],
   additionalProperties: false,
 };
 
@@ -16309,6 +16400,639 @@ const postOpenSigned = (v, digits = 2) =>
  *  5.127 prints as 5.127 and reconciles. */
 const postOpenLevel = (v) =>
   (v == null || !Number.isFinite(v)) ? 'n/a' : String(Math.round(v * 10000) / 10000);
+/** A signed level difference at the same 4dp precision. */
+const postOpenSignedLevel = (v) =>
+  (v == null || !Number.isFinite(v)) ? 'n/a' : `${v >= 0 ? '+' : '-'}${postOpenLevel(Math.abs(v))}`;
+const postOpenR4 = (v) => Math.round(v * 10000) / 10000;
+const postOpenR2 = (v) => Math.round(v * 100) / 100;
+
+/** The percent change from `prev` to `price`, DERIVED FROM THE PRINTED VALUES:
+ *  both rounded to the 4dp they are printed at, the result to the 2dp it is
+ *  printed at. Recomputing it from the two printed numbers can therefore never
+ *  differ by more than the 0.005 pt half-unit of its own rounding. */
+function postOpenPct(price, prev) {
+  if (!Number.isFinite(price) || !Number.isFinite(prev) || prev === 0) return null;
+  const p = postOpenR4(price), c = postOpenR4(prev);
+  if (c === 0) return null;
+  return Math.round((p - c) / c * 10000) / 100;
+}
+
+/** The ET calendar date of an instant — the date a daily bar is stamped with. */
+function postOpenEtIso(ms) {
+  if (!Number.isFinite(ms)) return null;
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York' }).format(new Date(ms));
+}
+
+/** One spark quote, normalised for the prompt: 4dp price and prior close, and
+ *  the percent DERIVED from those two printed numbers.
+ *
+ *  THE PRIOR CLOSE IS THE BAR BEFORE THE QUOTE'S OWN SESSION. `pairs[n-2]` is
+ *  right only while today's forming bar is present; for a name with no print yet
+ *  today the last bar IS the prior session, and `n-2` would be two sessions
+ *  back — harmless while the percent was Yahoo's, wrong now that it is derived
+ *  from this number. The session is the ET date of `regularMarketTime`, which is
+ *  the date a daily bar is stamped with (see the alignment note in
+ *  `yahooSparkQuotes`). With no market time, `n-2` as before.
+ *
+ *  NEVER `meta.chartPreviousClose` — on a ranged spark that is the close before
+ *  the RANGE begins (NVDA 225.30 vs 166.19, measured 2026-11-13). */
+function postOpenQuote(q) {
+  if (!q || !Number.isFinite(q.price)) return null;
+  const pairs = Array.isArray(q.pairs) ? q.pairs : [];
+  const sessionIso = postOpenEtIso(q.marketTime);
+  let k = pairs.length - 2;
+  if (sessionIso && pairs.length && pairs[pairs.length - 1].iso !== sessionIso) k = pairs.length - 1;
+  const prevRaw = k >= 0 && Number.isFinite(pairs[k]?.close) ? pairs[k].close : null;
+  const price     = postOpenR4(q.price);
+  const prevClose = prevRaw == null ? null : postOpenR4(prevRaw);
+  return {
+    price, prevClose,
+    prevCloseIso: k >= 0 ? pairs[k]?.iso ?? null : null,
+    changePct: postOpenPct(price, prevClose),
+    vendorChangePct: Number.isFinite(q.changePct) ? q.changePct : null,   // diagnosis only — never prompted
+    marketTime: Number.isFinite(q.marketTime) ? q.marketTime : null,
+  };
+}
+
+/** The 06:00 record's opportunity / avoid tickers, symbol-checked. These are
+ *  appended to the MARKET spark so the plan's named names can always be scored
+ *  (Defect 3, 2026-11-16) — at zero added fetches: 23 market symbols + at most 2
+ *  is 25, and ceil(25/20) = ceil(23/20) = 2. */
+function postOpenNamedSymbols(snapshot) {
+  const out = [];
+  for (const role of ['opportunity', 'avoid']) {
+    const t = snapshot?.[role]?.ticker;
+    if (typeof t !== 'string') continue;
+    const sym = t.toUpperCase().trim();
+    if (REC_SYMBOL_RE.test(sym) && !out.includes(sym)) out.push(sym);
+  }
+  return out;
+}
+
+/** EXTRACT THE PLAN ITEMS from TODAY'S 06:00 record — mechanically, so the
+ *  model is handed a fixed list instead of deciding what the plan said.
+ *
+ *  Five kinds, in this order:
+ *   · tape        — the open outlook (`open.headline`) and every `open.body`
+ *                   sentence that states an expectation ("expect …")
+ *   · level       — a number in the 06:00 prose within POSTOPEN_LEVEL_PLAN_BAND_PCT
+ *                   of a banked 06:00 level, with a level word in its own clause
+ *   · sector      — each SPDR sector the 06:00 prose names, once, with the
+ *                   sentence that named it
+ *   · opportunity / avoid — the named tickers
+ *  Sources scanned: `headline`, `open.headline`, `open.body`, `opportunity`,
+ *  `avoid`. NOTHING ELSE — the news cards are context, not the plan, and the
+ *  06:03 sector snapshot is a separate source altogether.
+ *
+ *  @returns {{kind, item, claim, level?, symbols?, etf?, ticker?}[]} without ids */
+function postOpenPlanItems(snapshot, baseLevels) {
+  if (!snapshot || typeof snapshot !== 'object') return [];
+  const items = [];
+  const sentencesOf = t => String(t || '').split(POSTOPEN_SENTENCE_SPLIT).map(s => s.trim()).filter(Boolean);
+  const texts = [snapshot.headline, snapshot.open?.headline, snapshot.open?.body]
+    .filter(t => typeof t === 'string' && t.trim());
+
+  // tape
+  if (typeof snapshot.open?.headline === 'string' && snapshot.open.headline.trim()) {
+    items.push({ kind: 'tape', item: 'Open outlook', claim: snapshot.open.headline.trim() });
+  }
+  for (const s of sentencesOf(snapshot.open?.body)) {
+    if (/\bexpect/i.test(s)) items.push({ kind: 'tape', item: 'Tape expectation', claim: s });
+  }
+
+  // levels — clause by clause; each level word belongs to the NEAREST in-band
+  // number in its own clause. A comma inside a number ("7,650") is not a clause
+  // break: splitting there once attached "resistance at 7,650" to the "7612"
+  // before it, which is a description, not a level.
+  const levelsSeen = new Set();
+  const banked = Object.entries(baseLevels || {}).filter(([, b]) => Number.isFinite(b?.price) && b.price > 0);
+  const inBand = (value) => banked
+    .filter(([, b]) => Math.abs(value - b.price) / b.price * 100 <= POSTOPEN_LEVEL_PLAN_BAND_PCT)
+    .map(([sym]) => sym);
+  for (const t of texts) {
+    for (const s of sentencesOf(t)) {
+      for (const clause of s.split(/,(?!\d{3}\b)|[;:]|\band\b|\bwhile\b|\bbut\b/)) {
+        const nums = [];
+        const re = /(?<![\w.,])\d[\d,]*(?:\.\d+)?(?![\w%])/g;
+        let m;
+        while ((m = re.exec(clause))) {
+          const value = Number(m[0].replace(/,/g, ''));
+          const symbols = Number.isFinite(value) ? inBand(value) : [];
+          if (symbols.length) nums.push({ value, symbols, at: m.index + m[0].length / 2 });
+        }
+        if (!nums.length) continue;
+        const wre = new RegExp(POSTOPEN_LEVEL_WORDS.source, 'gi');
+        const chosen = new Set();
+        let w;
+        while ((w = wre.exec(clause))) {
+          const at = w.index + w[0].length / 2;
+          chosen.add(nums.reduce((best, n) => (Math.abs(n.at - at) < Math.abs(best.at - at) ? n : best)));
+        }
+        for (const n of nums) {
+          if (!chosen.has(n) || levelsSeen.has(n.value)) continue;
+          levelsSeen.add(n.value);
+          const labels = n.symbols.map(sym => baseLevels[sym]?.label || sym).join(' / ');
+          items.push({ kind: 'level', item: `${labels} ${postOpenLevel(n.value)}`, claim: s, level: n.value, symbols: n.symbols });
+        }
+      }
+    }
+  }
+
+  // sectors
+  for (const [etf, re] of Object.entries(POSTOPEN_SECTOR_ALIASES)) {
+    const byTicker = new RegExp(`\\b${etf}\\b`);
+    let claim = null;
+    for (const t of texts) {
+      claim = sentencesOf(t).find(s => re.test(s) || byTicker.test(s)) || null;
+      if (claim) break;
+    }
+    if (claim) items.push({ kind: 'sector', item: `${SECTOR_ETFS[etf]} (${etf})`, claim, etf });
+  }
+
+  // named tickers
+  for (const role of ['opportunity', 'avoid']) {
+    const r = snapshot[role];
+    if (!r || typeof r.ticker !== 'string' || !r.ticker.trim()) continue;
+    const ticker = r.ticker.toUpperCase().trim();
+    items.push({ kind: role, item: `Named ${role} ${ticker}`, claim: String(r.reason || '').trim(), ticker });
+  }
+  return items;
+}
+
+/** Build the ENTIRE payload the model is handed, as data, from what the job
+ *  fetched. PURE — no I/O — so a check can replay a banked morning through it.
+ *
+ *  Every delta the narrative may state is PRECOMPUTED here (since 06:00 for each
+ *  index / future / VIX / 10Y, since the 06:03 sector read for each sector,
+ *  distance to each plan level, each named ticker against the S&P), so the model
+ *  does no arithmetic and every number it may write is in this object — which
+ *  is what makes `postOpenAudit`'s provenance check possible at all. */
+function postOpenBuildPayload({
+  quotes = new Map(), wlQuotes = null, tickers = null, snapshot = null, baseLevels = null,
+  hasBaseProse = false, baseline = 'none', baselineParts = [], todayPt, dataAsOf, dateStr = '',
+  macroState = null, sectorsBanked = null, todayEvents = '', missing = [], clock = {},
+} = {}) {
+  const nq = (sym) => postOpenQuote(quotes?.get?.(sym));
+  const asOfMin = ptMinutesOfDay(dataAsOf);
+  const asOfClock = asOfMin == null ? null
+    : `${String(Math.floor(asOfMin / 60)).padStart(2, '0')}:${String(asOfMin % 60).padStart(2, '0')}`;
+
+  // ── indices, futures, rates, vol — each against its 06:00 level ──
+  const indices = [];
+  for (const sym of Object.keys(SNAPSHOT_SYMBOLS)) {
+    const q = nq(sym);
+    if (!q) continue;
+    const b = baseLevels?.[sym];
+    const at0600 = b && Number.isFinite(b.price)
+      ? { price: postOpenR4(b.price),
+          prevClose: Number.isFinite(b.prevClose) ? postOpenR4(b.prevClose) : null,
+          changePct: Number.isFinite(b.prevClose) ? postOpenPct(b.price, b.prevClose) : null }
+      : null;
+    indices.push({
+      sym, label: SNAPSHOT_SYMBOLS[sym], ...q, at0600,
+      since0600: at0600 ? { abs: postOpenR4(q.price - at0600.price), pct: postOpenPct(q.price, at0600.price) } : null,
+    });
+  }
+  if (!indices.length) missing.push('Yahoo index quotes (no symbol resolved)');
+  const spx = indices.find(r => r.sym === '^GSPC') || null;
+
+  // ── VIX term structure, `collectMacroState`'s sign convention ──
+  const vixQ = nq('^VIX'), vix3mQ = nq(POSTOPEN_VIX3M);
+  const term = {
+    vix: vixQ?.price ?? null, vix3m: vix3mQ?.price ?? null,
+    spread: (vixQ && vix3mQ) ? postOpenR4(vixQ.price - vix3mQ.price) : null,
+    macro: (macroState && macroState.vixTermSpread != null) ? {
+      asOfClose: macroState.asOfClose ?? null, raw: macroState.vixTermSpread,
+      smoothed: macroState.vixTermSpreadSmoothed ?? null, state: macroState.state ?? null,
+    } : null,
+  };
+  if (term.spread == null) missing.push('VIX term structure (^VIX or ^VIX3M did not resolve)');
+
+  // ── sectors now, and against the earlier sector read (a SEPARATE source) ──
+  let sectorRead = null;
+  if (sectorsBanked?.ts && ptDate(new Date(sectorsBanked.ts)) === todayPt && Array.isArray(sectorsBanked.sectors)) {
+    const by = {};
+    for (const s of sectorsBanked.sectors) if (s?.etf && Number.isFinite(s.changePct)) by[s.etf] = s.changePct;
+    if (Object.keys(by).length) {
+      const mins = ptMinutesOfDay(sectorsBanked.ts);
+      sectorRead = { ts: sectorsBanked.ts, label: ptClockLabel(sectorsBanked.ts),
+        clock: mins == null ? null : `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`,
+        byEtf: by };
+    }
+  }
+  const sectors = [];
+  for (const etf of Object.keys(SECTOR_ETFS)) {
+    const q = nq(etf);
+    if (!q || q.changePct == null) continue;
+    const at = sectorRead?.byEtf?.[etf];
+    sectors.push({ etf, name: SECTOR_ETFS[etf], ...q,
+      atSectorRead: Number.isFinite(at) ? at : null,
+      sinceSectorRead: Number.isFinite(at) ? postOpenR2(q.changePct - at) : null });
+  }
+  [...sectors].sort((a, b) => b.changePct - a.changePct).forEach((s, i) => { s.rank = i + 1; });
+  if (!sectors.length) missing.push('sector ETF quotes');
+
+  // ── watchlist: movers and key-level proximity ──
+  const movers = [], levels = [];
+  let watchlistNames = 0;
+  if (Array.isArray(tickers) && wlQuotes?.size) {
+    for (const sym of tickers) {
+      const q = wlQuotes.get(sym);
+      const n = postOpenQuote(q);
+      if (!n) continue;
+      watchlistNames++;
+      if (n.changePct != null && Math.abs(n.changePct) >= POSTOPEN_MOVE_PCT) {
+        movers.push({ ticker: sym, price: n.price, prevClose: n.prevClose, changePct: n.changePct });
+      }
+      /* THE SAME `swingChannel` the Watchlist tab's Swing column is decided by,
+         so the brief and the column cannot disagree about where a name sits.
+         The state is DECIDED HERE against the Worker's own gate and handed to
+         the model already decided. `clock` is empty on the cron path (live
+         defaults); a replay passes the morning's ET date and hour. */
+      const sw = swingChannel(q.pairs, q.price, clock.etIso, clock.etHour);
+      if (sw.swingZ == null) continue;
+      const z = sw.swingZ;
+      const state = Math.abs(z) >= SWING_Z_THRESHOLD
+        ? (z > 0 ? 'at-through-upper' : 'at-through-lower')
+        : Math.abs(z) >= POSTOPEN_NEAR_Z
+          ? (z > 0 ? 'approaching-upper' : 'approaching-lower')
+          : null;
+      if (!state) continue;
+      levels.push({ ticker: sym, price: n.price, fit: sw.swingFit, sigma: sw.swingSigma, z, state, fitThrough: sw.swingAsOf });
+    }
+  }
+  movers.sort((a, b) => Math.abs(b.changePct) - Math.abs(a.changePct) || a.ticker.localeCompare(b.ticker));
+  levels.sort((a, b) => Math.abs(b.z) - Math.abs(a.z) || a.ticker.localeCompare(b.ticker));
+  const atThrough = levels.filter(l => l.state.startsWith('at-through')).length;
+
+  // ── the 06:00 record's named tickers, always quoted (Defect 3) ──
+  const named = [];
+  for (const role of ['opportunity', 'avoid']) {
+    const t = snapshot?.[role]?.ticker;
+    if (typeof t !== 'string' || !t.trim()) continue;
+    const sym = t.toUpperCase().trim();
+    const raw = quotes?.get?.(sym) || wlQuotes?.get?.(sym) || null;
+    const n = postOpenQuote(raw);
+    named.push(n
+      ? { role, ticker: sym, source: quotes?.get?.(sym) ? 'market-spark' : 'watchlist-spark',
+          onWatchlist: Array.isArray(tickers) && tickers.includes(sym),
+          price: n.price, prevClose: n.prevClose, changePct: n.changePct,
+          vsSpx: (spx?.changePct != null && n.changePct != null) ? postOpenR2(n.changePct - spx.changePct) : null }
+      : { role, ticker: sym, source: null, onWatchlist: Array.isArray(tickers) && tickers.includes(sym),
+          unavailable: `${sym} did not resolve in either spark request, so there is no price to score it against` });
+  }
+
+  // ── plan items, each with the precomputed numbers that can decide it ──
+  const plan = postOpenPlanItems(snapshot, baseLevels).map((it, i) => {
+    const data = [];
+    if (it.kind === 'level') {
+      for (const sym of it.symbols) {
+        const r = indices.find(x => x.sym === sym);
+        if (!r) { data.push(`${sym}: no quote now`); continue; }
+        const dist = postOpenR4(r.price - it.level);
+        data.push(`${r.label} (${sym}) now ${postOpenLevel(r.price)}, ${postOpenSignedLevel(dist)} from ${postOpenLevel(it.level)} `
+          + `(${postOpenSigned(postOpenPct(r.price, it.level))}%) — ${dist > 0 ? 'above' : dist < 0 ? 'below' : 'at'} it`);
+      }
+    } else if (it.kind === 'sector') {
+      const r = sectors.find(x => x.etf === it.etf);
+      data.push(r ? `${it.etf} ${postOpenSigned(r.changePct)}% on the day, rank ${r.rank} of ${sectors.length}`
+                    + (spx?.changePct != null ? `; S&P 500 ${postOpenSigned(spx.changePct)}%` : '')
+                  : `${it.etf}: no quote now`);
+    } else if (it.kind === 'opportunity' || it.kind === 'avoid') {
+      const r = named.find(x => x.role === it.kind);
+      data.push(!r ? `${it.ticker}: not quoted`
+        : r.unavailable ? `NO QUOTE — ${r.unavailable}`
+        : `${r.ticker} now ${postOpenLevel(r.price)}, prior close ${postOpenLevel(r.prevClose)}, ${postOpenSigned(r.changePct)}% on the day`
+          + (r.vsSpx != null ? `; ${postOpenSigned(r.vsSpx)} pt against the S&P 500's ${postOpenSigned(spx.changePct)}%` : ''));
+    } else {
+      data.push('decide from the index, volatility and sector blocks above');
+    }
+    return { id: `P${i + 1}`, ...it, data };
+  });
+
+  return {
+    dateStr, todayPt, asOf: dataAsOf, asOfLabel: ptClockLabel(dataAsOf), asOfClock,
+    minutesSinceOpen: asOfMin == null ? null : asOfMin - POSTOPEN_OPEN_PT_MIN,
+    baseline, baselineParts,
+    brief: snapshot ? {
+      tsLabel: snapshot.ts ? ptClockLabel(snapshot.ts) : null,
+      headline: hasBaseProse ? (snapshot.headline || null) : null,
+      outlook: hasBaseProse ? (snapshot.open?.headline || null) : null,
+      plan: hasBaseProse ? (snapshot.open?.body || null) : null,
+      hasLevels: baselineParts.includes('levels'),
+    } : null,
+    indices, term, sectors,
+    sectorRead: sectorRead ? { ts: sectorRead.ts, label: sectorRead.label, clock: sectorRead.clock } : null,
+    watchlist: {
+      movers, levels, topMovers: movers.slice(0, POSTOPEN_PROSE_TOP_MOVERS),
+      counts: { names: watchlistNames, movers: movers.length, atThrough, approaching: levels.length - atThrough },
+    },
+    named, plan,
+    releases: todayEvents || '',
+    missing: missing.slice(),
+  };
+}
+
+/** The prompt, rendered from the payload and from nothing else. Every number in
+ *  it is a payload number printed through `postOpenLevel` / `postOpenSigned`. */
+function postOpenPrompt(p) {
+  const lvl = postOpenLevel, sg = postOpenSigned;
+  const indexLines = p.indices.map(r => `${r.label} (${r.sym}): price ${lvl(r.price)} · prior close ${lvl(r.prevClose)} · `
+    + `day change ${sg(r.changePct)}%`
+    + (r.at0600 ? ` · 6:00am brief had ${lvl(r.at0600.price)} · since 6:00am ${postOpenSignedLevel(r.since0600.abs)} `
+                  + `(${sg(r.since0600.pct)}%)` : ' · no 6:00am level banked'));
+  const t = p.term;
+  const termLines = [
+    t.spread != null
+      ? `VIX ${lvl(t.vix)} − VIX3M ${lvl(t.vix3m)} = ${sg(t.spread)} (NEGATIVE = contango = constructive; POSITIVE = backwardation = hostile)`
+      : 'VIX term structure now: NOT AVAILABLE (one of ^VIX / ^VIX3M did not resolve)',
+    t.macro
+      ? `Last banked macro state — a PRIOR SESSION's close, as-of ${t.macro.asOfClose}: raw term ${sg(t.macro.raw)}, `
+        + `smoothed ${sg(t.macro.smoothed)}, regime "${t.macro.state}". This is NOT a 6:00am baseline.`
+      : 'No banked macro state, so there is no earlier term-structure reading.',
+  ];
+  const sr = p.sectorRead;
+  const sectorLines = p.sectors.map(s => `${s.name} (${s.etf}): price ${lvl(s.price)} · prior close ${lvl(s.prevClose)} · `
+    + `day change ${sg(s.changePct)}% · rank ${s.rank} of ${p.sectors.length}`
+    + (s.atSectorRead != null ? ` · ${sr.clock} sector read ${sg(s.atSectorRead)}% · since the ${sr.clock} sector read ${sg(s.sinceSectorRead)} pt` : ''));
+  const w = p.watchlist;
+  const moverLine = m => `${m.ticker} ${sg(m.changePct)}% (price ${lvl(m.price)}, prior close ${lvl(m.prevClose)})`;
+  const levelLine = l => `${l.ticker} price ${lvl(l.price)} · fit ${l.fit} · σ ${l.sigma} · z ${sg(l.z)}σ · ${l.state}`;
+  const namedLines = p.named.map(n => n.unavailable
+    ? `${n.ticker} (${n.role}): NO QUOTE — ${n.unavailable}`
+    : `${n.ticker} (${n.role}): price ${lvl(n.price)} · prior close ${lvl(n.prevClose)} · day change ${sg(n.changePct)}%`
+      + (n.vsSpx != null ? ` · ${sg(n.vsSpx)} pt against the S&P 500` : ''));
+  const planLines = p.plan.map(it => `${it.id} [${it.kind}] ${it.item} — the 6:00am text: "${it.claim}"\n    deciding data: ${it.data.join('; ')}`);
+
+  const b = p.brief;
+  const briefBlock = p.baseline === 'none'
+    ? 'THERE IS NO 6:00am BASELINE FOR TODAY. The pre-market briefing record for this Pacific date is absent. Say so in '
+      + 'the body, and do NOT compare today against any earlier day: yesterday’s briefing is not a substitute.'
+    : [`6:00am PT BRIEFING (written ${b?.tsLabel || 'at an unrecorded time'}, BEFORE the 06:30 open) — context only; `
+        + 'what it STATED is the PLAN ITEMS list below:',
+       b?.headline ? `Headline: ${b.headline}` : 'Headline: NOT AVAILABLE',
+       b?.outlook ? `Open outlook: ${b.outlook}` : '',
+       b?.plan ? `Open plan: ${b.plan}` : '',
+       b?.hasLevels ? '' : 'NO 6:00am index levels were banked, so no since-6:00am comparison exists for any index. Say so rather than estimating one.',
+      ].filter(Boolean).join('\n');
+
+  return `You are a professional market analyst writing the POST-OPEN READ for ${p.dateStr}.
+The cash session opened at 06:30 PT. The snapshot below is ${p.minutesSinceOpen} minutes after the open.
+
+Every price below comes from ONE 15-minute-delayed Yahoo snapshot whose as-of is ${p.asOfLabel}. That is the as-of
+for every intraday number here. There is no second sample and no tape.
+
+${briefBlock}
+
+INDEX, FUTURES, RATES AND VOL. Every change is already computed from the two numbers beside it — copy it, never recompute:
+${indexLines.join('\n') || 'NOT AVAILABLE'}
+
+VOLATILITY TERM STRUCTURE (now):
+${termLines.join('\n')}
+
+SECTORS NOW (SPDR sector ETFs, same snapshot; rank 1 = strongest):
+${sectorLines.join('\n') || 'NOT AVAILABLE'}
+${sr ? `The ${sr.clock} SECTOR READ (as-of ${sr.label}) is a SEPARATE SOURCE from the 6:00am plan. Changes against it are `
+       + `"since the ${sr.clock} sector read" and are NEVER plan items.` : 'No earlier sector read is banked for today.'}
+
+WATCHLIST (${w.counts.names} names resolved):
+Movers ±${POSTOPEN_MOVE_PCT}% or more on the day: ${w.counts.movers}.
+The ${Math.min(POSTOPEN_PROSE_TOP_MOVERS, w.movers.length)} largest by magnitude: ${w.topMovers.map(moverLine).join('; ') || 'none'}
+All movers, for identifying the THEME only — never list them in the body: ${w.movers.map(m => `${m.ticker} ${sg(m.changePct)}%`).join(', ') || 'none'}
+Key levels — this Worker's regression channel, an OLS fit through ${SWING_REG_BARS} completed daily closes${w.levels[0]?.fitThrough ? ` (through ${w.levels[0].fitThrough})` : ''}, σ the standard
+error of that regression, the state ALREADY DECIDED against the ±${SWING_Z_THRESHOLD}σ gate (approaching from ±${POSTOPEN_NEAR_Z}σ):
+at or through a band: ${w.counts.atThrough} · approaching a band: ${w.counts.approaching}
+${w.levels.map(levelLine).join('\n') || 'No watchlist name is at or approaching its channel band.'}
+
+THE 6:00am BRIEF'S NAMED TICKERS:
+${namedLines.join('\n') || 'The 6:00am record named no opportunity or avoid ticker.'}
+
+PLAN ITEMS — the ONLY things the 6:00am plan stated. Exactly ${p.plan.length}:
+${planLines.join('\n') || '(none — there is no 6:00am plan to score today)'}
+
+MACRO RELEASES SCHEDULED FOR TODAY (official Fed / BLS calendar — the ONLY source for these):
+${p.releases || 'Nothing scheduled in the tracked calendar for today.'}
+THIS WORKER HOLDS NO RELEASED FIGURES. For a release above you may state that it was scheduled and nothing more.
+
+${p.missing.length ? `INPUT SOURCES THAT ARE DOWN OR INCOMPLETE — name these in the body:\n${p.missing.map(s => `• ${s}`).join('\n')}` : 'All input sources returned data.'}
+
+RETURN TWO THINGS.
+
+1. "plan": exactly ${p.plan.length} entries, one per PLAN ITEM above, in the same order, each with its id (P1, P2 …).
+   "verdict" is "confirmed", "contradicted" or "untested". "evidence" is one short clause quoting the number from the
+   data above that decides it. Use "untested" when the data above cannot decide the item, and say which number is
+   missing. Never skip an item and never add one.
+
+2. "body": the post-open read — ONE paragraph of ${POSTOPEN_BODY_MIN_SENTENCES} to ${POSTOPEN_BODY_MAX_SENTENCES} sentences, each ${POSTOPEN_SENTENCE_MAX_WORDS} words or fewer, about ${POSTOPEN_BODY_TARGET_CHARS} characters
+   or fewer in total. A reader may see only the first three sentences, so each must stand alone, in this order:
+   Sentence 1 — whether the opening gap held, faded or extended, with the S&P 500 level and day change and the S&P
+     futures change since 6:00am.
+   Sentence 2 — VIX, the term structure and the 10Y, each against 6:00am where a 6:00am level exists.
+   Sentence 3 — the plan scorecard in one sentence: how many plan items were confirmed, contradicted and untested
+     (write those three counts in words), naming the most important of each.
+   Then: where sector heat sits now and what changed since the sector read (call it exactly that, never the plan);
+   the watchlist movers as their count, their theme and the five largest named above; levels as the count at or
+   through and the count approaching, naming at most ${POSTOPEN_PROSE_MAX_LEVEL_NAMES}; any macro release scheduled today, schedule only.
+
+HARD RULES. These are correctness constraints, not style preferences.
+A. EVERY NUMBER you write must appear in the data above, copied as given. Do no arithmetic — every difference you may
+   state is already computed above. Do not re-round. Do not recall a level from memory. If a number is not above,
+   write that it is not available.
+B. "The plan" / "the 6:00am brief" may refer ONLY to the PLAN ITEMS list. A sector, level or ticker that is not on that
+   list is never described as something the plan said.
+C. No clock time beside a price except the as-of, ${p.asOfClock} PT. Never state when anything happened, crossed,
+   reversed, peaked or broke: this is one delayed snapshot, not a tape.
+D. No confidence percentages, probabilities or odds.
+E. No ALL-CAPS words for emphasis (tickers and standard abbreviations such as VIX are fine). No first person — no
+   "I", "we", "my", "our".
+F. Name every source listed as down or incomplete. Never reason around a gap with a substitute.
+G. No headings, no bullets, no markdown. Never begin a sentence with a digit or a symbol: the page splits sentences
+   only before a capital letter, so "…%. 21 names…" renders as one run-on sentence.
+
+Return JSON: {"body": "<the paragraph>", "plan": [{"id": "P1", "verdict": "confirmed|contradicted|untested", "evidence": "<clause>"}]}`;
+}
+
+/** Split prose exactly as the consumer's three-sentence fold does. */
+function postOpenSentences(body) {
+  const s = String(body || '').trim();
+  return s ? s.split(POSTOPEN_SENTENCE_SPLIT).map(x => x.trim()).filter(Boolean) : [];
+}
+
+const POSTOPEN_MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+/** Pull the numeric tokens out of prose, in three classes. Names that carry a
+ *  number (S&P 500, Russell 2000, 10-year, VIX3M) are not numbers; clock times
+ *  and dates are their own classes so the allowlist can name them. */
+function postOpenTokens(text) {
+  let s = String(text || '');
+  const clocks = [], dates = [], numbers = [];
+  s = s.replace(/\b\d{1,2}:\d{2}(?::\d{2})?(?:\s?[ap]\.?m\.?)?/gi, m => { clocks.push(m); return ' '; });
+  s = s.replace(/\b\d{4}-\d{2}-\d{2}\b/g, m => { dates.push(m); return ' '; });
+  s = s.replace(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:st|nd|rd|th)?\b(?:,?\s+\d{4}\b)?/g,
+    m => { dates.push(m); return ' '; });
+  s = s.replace(/S&P 500|Russell 2000|\b\d+-(?:year|yr|month|week|day|session|minute|hour)s?\b/gi, ' ');
+  s.replace(/(?<![\w.])[-+−±]?\d[\d,]*(?:\.\d+)?(?![\w])/g, m => { numbers.push(m); return m; });
+  return { clocks, dates, numbers };
+}
+const postOpenNormNum = (tok) => {
+  const v = Number(String(tok).replace(/[-+−±,]/g, ''));
+  return Number.isFinite(v) ? String(v) : null;
+};
+const postOpenNormClock = (tok) => {
+  const m = String(tok).match(/(\d{1,2}):(\d{2})/);
+  return m ? `${Number(m[1])}:${m[2]}` : null;
+};
+const postOpenNormDate = (tok) => {
+  const iso = String(tok).match(/\d{4}-(\d{2})-(\d{2})/);
+  if (iso) return `${Number(iso[1])}-${Number(iso[2])}`;
+  const md = String(tok).match(/^([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})/);
+  if (md) { const mi = POSTOPEN_MONTHS.indexOf(md[1].toLowerCase()); return mi < 0 ? null : `${mi + 1}-${Number(md[2])}`; }
+  return null;
+};
+
+/** Every number, clock and date the model was HANDED: the DATA half of the
+ *  rendered prompt (everything above the instructions), tokenised exactly as the
+ *  body is. Deliberately not a walk of the payload object — that object also
+ *  carries `vendorChangePct`, which never reaches the prompt, and a figure the
+ *  model was never shown must not count as sourced. */
+const POSTOPEN_PROMPT_INSTRUCTIONS_MARK = '\nRETURN TWO THINGS.';
+function postOpenPayloadVocabulary(p) {
+  const nums = new Set(), clocks = new Set(), dates = new Set();
+  const data = postOpenPrompt(p).split(POSTOPEN_PROMPT_INSTRUCTIONS_MARK)[0];
+  const t = postOpenTokens(data);
+  t.numbers.forEach(x => { const n = postOpenNormNum(x); if (n) nums.add(n); });
+  t.clocks.forEach(x => { const c = postOpenNormClock(x); if (c) clocks.add(c); });
+  t.dates.forEach(x => { const d = postOpenNormDate(x); if (d) dates.add(d); });
+  return { nums, clocks, dates };
+}
+
+/** THE EXPLICIT ALLOWLIST: dates, the as-of and session clock labels, and the
+ *  gate constants. Everything else must be in the payload. */
+function postOpenAllowlist(p) {
+  const [y, mo, d] = String(p.todayPt || '').split('-').map(Number);
+  return {
+    nums: new Set([POSTOPEN_MOVE_PCT, SWING_Z_THRESHOLD, POSTOPEN_NEAR_Z, SWING_REG_BARS,
+      POSTOPEN_PROSE_TOP_MOVERS, POSTOPEN_PROSE_MAX_LEVEL_NAMES, y, d].filter(Number.isFinite).map(v => String(v))),
+    clocks: new Set(['6:00', '6:30', p.asOfClock, p.sectorRead?.clock].filter(Boolean).map(postOpenNormClock)),
+    dates: new Set(Number.isFinite(mo) && Number.isFinite(d) ? [`${mo}-${d}`] : []),
+  };
+}
+
+/** Provenance of every numeric token in a piece of prose: `[{token, kind, matched}]`. */
+function postOpenProvenance(text, p) {
+  const vocab = postOpenPayloadVocabulary(p), allow = postOpenAllowlist(p);
+  const t = postOpenTokens(text);
+  return [
+    ...t.numbers.map(tok => ({ token: tok, kind: 'number', matched: (n => n != null && (vocab.nums.has(n) || allow.nums.has(n)))(postOpenNormNum(tok)) })),
+    ...t.clocks.map(tok => ({ token: tok, kind: 'clock', matched: (c => c != null && (vocab.clocks.has(c) || allow.clocks.has(c)))(postOpenNormClock(tok)) })),
+    ...t.dates.map(tok => ({ token: tok, kind: 'date', matched: (d => d != null && (vocab.dates.has(d) || allow.dates.has(d)))(postOpenNormDate(tok)) })),
+  ];
+}
+
+/** POST-GENERATION AUDIT. RECORDS ONLY — nothing here changes `complete` or
+ *  `phase`. The provenance half in particular is new and its false-positive rate
+ *  is unknown, so a week of live runs has to show it before it gates anything. */
+function postOpenAudit(body, plan, p) {
+  const sentences = postOpenSentences(body);
+  const words = sentences.map(s => s.split(/\s+/).filter(Boolean).length);
+  const prov = postOpenProvenance(body, p);
+
+  const tickerSet = new Set([
+    ...p.indices.map(r => r.sym.replace(/^\^/, '').replace(/=F$/, '')),
+    ...p.sectors.map(s => s.etf), ...p.watchlist.movers.map(m => m.ticker),
+    ...p.watchlist.levels.map(l => l.ticker), ...p.named.map(n => n.ticker),
+  ]);
+  const allCaps = [...new Set((String(body).match(/\b[A-Z]{3,}\b/g) || [])
+    .filter(w => !tickerSet.has(w) && !POSTOPEN_ACRONYMS.has(w)))];
+  const firstPerson = [...new Set(String(body).match(/\b(?:I|I'm|I've|I'd|me|my|mine|we|our|ours|us|We|Our|My)\b/g) || [])];
+  const sessionClocks = new Set(['6:00', '6:30', p.sectorRead?.clock].filter(Boolean).map(postOpenNormClock));
+  const clockTimes = prov.filter(x => x.kind === 'clock' && postOpenNormClock(x.token) !== postOpenNormClock(p.asOfClock)
+    && !sessionClocks.has(postOpenNormClock(x.token))).map(x => x.token);
+  const named = (list) => list.filter(t => new RegExp(`\\b${t.replace(/[.^$]/g, '\\$&')}\\b`).test(body));
+  const top = new Set(p.watchlist.topMovers.map(m => m.ticker));
+  const exempt = new Set([...p.named.map(n => n.ticker), ...p.watchlist.levels.map(l => l.ticker)]);
+  const moversBeyondTop = named(p.watchlist.movers.map(m => m.ticker)).filter(t => !top.has(t) && !exempt.has(t));
+  const levelNames = named(p.watchlist.levels.map(l => l.ticker));
+
+  // plan coverage — one verdict per listed item, none skipped, none added
+  const expected = p.plan.map(it => it.id);
+  const got = Array.isArray(plan) ? plan : [];
+  const ids = got.map(x => x?.id);
+  const planCheck = {
+    expected: expected.length, returned: got.length,
+    missing: expected.filter(id => !ids.includes(id)),
+    added: ids.filter(id => !expected.includes(id)),
+    duplicated: [...new Set(ids.filter((id, i) => ids.indexOf(id) !== i))],
+    invalidVerdicts: got.filter(x => !POSTOPEN_PLAN_VERDICTS.includes(x?.verdict)).map(x => x?.id ?? null),
+  };
+  const planProv = got.flatMap(x => postOpenProvenance(String(x?.evidence || ''), p).filter(t => !t.matched).map(t => t.token));
+
+  return {
+    bodyChars: String(body || '').length,
+    bodySentences: sentences.length,
+    unsourcedNumbers: prov.filter(x => !x.matched).map(x => x.token),
+    planUnsourcedNumbers: planProv,
+    provenance: prov,          // the full token table; NOT stored on the record
+    style: {
+      overLimits: {
+        chars: String(body || '').length > POSTOPEN_BODY_TARGET_CHARS,
+        sentences: sentences.length < POSTOPEN_BODY_MIN_SENTENCES || sentences.length > POSTOPEN_BODY_MAX_SENTENCES,
+        longSentences: words.map((n, i) => ({ sentence: i + 1, words: n })).filter(x => x.words > POSTOPEN_SENTENCE_MAX_WORDS),
+      },
+      allCaps, firstPerson, clockTimes,
+      moversNamedBeyondTop: moversBeyondTop,
+      levelNamesNamed: levelNames.length,
+    },
+    foldCheck: {
+      s1Gap: /S&P/.test(sentences[0] || '') && /%/.test(sentences[0] || ''),
+      s2Vol: /\bVIX\b/.test(sentences[1] || ''),
+      s3Plan: /\bplan\b/i.test(sentences[2] || ''),
+    },
+    planCheck,
+  };
+}
+
+/** RE-DERIVE every percent in the payload from its own price / prior close and
+ *  report any difference above POSTOPEN_RECONCILE_TOL. By construction there are
+ *  none; this is the instrument that would say otherwise. */
+function postOpenReconcile(p) {
+  const rows = [];
+  const check = (where, sym, price, prev, printed) => {
+    if (printed == null) return;
+    const exact = (postOpenR4(price) - postOpenR4(prev)) / postOpenR4(prev) * 100;
+    rows.push({ where, sym, price, prev, printed, recomputed: exact, diff: Math.abs(printed - exact) });
+  };
+  for (const r of p.indices) {
+    check('index', r.sym, r.price, r.prevClose, r.changePct);
+    if (r.at0600) {
+      check('index@06:00', r.sym, r.at0600.price, r.at0600.prevClose, r.at0600.changePct);
+      check('index since 06:00', r.sym, r.price, r.at0600.price, r.since0600.pct);
+    }
+  }
+  for (const s of p.sectors) check('sector', s.etf, s.price, s.prevClose, s.changePct);
+  for (const m of p.watchlist.movers) check('mover', m.ticker, m.price, m.prevClose, m.changePct);
+  for (const n of p.named) if (!n.unavailable) check(`named:${n.role}`, n.ticker, n.price, n.prevClose, n.changePct);
+  const failures = rows.filter(r => !(r.diff <= POSTOPEN_RECONCILE_TOL + 1e-9));
+  return { checked: rows.length, failures, rows };
+}
+
+/** The structured lists the prose no longer enumerates. ADDITIVE to the slot. */
+function postOpenDetail(p, answerPlan, unscoredReason = null) {
+  const by = new Map((Array.isArray(answerPlan) ? answerPlan : []).filter(x => x?.id).map(x => [x.id, x]));
+  return {
+    movers: p.watchlist.movers.map(m => ({ ticker: m.ticker, changePct: m.changePct })),
+    levels: p.watchlist.levels.map(l => ({ ticker: l.ticker, price: l.price, z: l.z, state: l.state })),
+    plan: p.plan.map(it => {
+      const a = by.get(it.id);
+      const ok = a && POSTOPEN_PLAN_VERDICTS.includes(a.verdict);
+      /* A MISSING VERDICT IS `null`, NEVER A DEFAULTED 'untested'. "The model
+         returned nothing for this item" and "the model judged it untestable"
+         are different facts and must not render the same. */
+      return { id: it.id, kind: it.kind, item: it.item, claim: it.claim,
+        verdict: ok ? a.verdict : null,
+        evidence: ok ? String(a.evidence || '') : (unscoredReason || 'not scored: the model returned no valid verdict for this item') };
+    }),
+  };
+}
 
 /* ── Cron: the post-open read (7:15am PT) ── */
 async function generatePostOpenRead(env) {
@@ -16333,8 +17057,10 @@ async function generatePostOpenRead(env) {
      a reading is worse than a stated gap. */
   const missing = [];
 
-  /** The one place a record is written, so every exit has the same shape. */
-  const store = async ({ body, complete, baseline, baselineParts, dataAsOf, phase, reason = null, inputs = {} }) => {
+  /** The one place a record is written, so every exit has the same shape.
+   *  `detail` is ADDITIVE (2026-11-16): present whenever there was data to put
+   *  in it, absent on the two no-data refusals. */
+  const store = async ({ body, complete, baseline, baselineParts, dataAsOf, phase, reason = null, inputs = {}, detail = null }) => {
     const rec = {
       schema: POSTOPEN_RECORD_SCHEMA,
       body,
@@ -16349,6 +17075,7 @@ async function generatePostOpenRead(env) {
          the 6:00am record was available: a briefing that failed Claude but not
          Yahoo banks levels and no prose, and that is a real state. */
       inputs: { baselineParts, missingSources: missing.slice(), ...inputs },
+      ...(detail ? { detail } : {}),
       _instr: instrSince(mark, phase),
     };
     try {
@@ -16370,6 +17097,7 @@ async function generatePostOpenRead(env) {
   let snapshot = null;
   try { snapshot = await env?.REC_LOG?.get('daily:snapshot', 'json'); } catch (_) {}
   const snapDay       = dailySlotPtDate(snapshot);
+  const todaySnapshot = snapDay === todayPt ? snapshot : null;
   const baseLevels    = (snapDay === todayPt && snapshot?.marketLevels) ? snapshot.marketLevels : null;
   const hasBaseProse  = snapDay === todayPt && !!(snapshot?.open?.body || snapshot?.headline);
   const baselineParts = [
@@ -16378,16 +17106,22 @@ async function generatePostOpenRead(env) {
   ];
   const baseline = baselineParts.length ? '06:00' : 'none';
 
-  /* ── 2. One market snapshot: indices, futures, the VIX pair, the 11 sectors ──
-     23 symbols, 20 per spark request, so TWO external fetches for the whole
-     thing. UNAUTHENTICATED v7 — no crumb is touched, which is deliberate: this
-     runs in the same 7am hour whose crumb acquisition failed on 2026-09-02, and
-     adding auth pressure there to read eleven index levels would be a poor
-     trade. */
+  /* ── 2. One market snapshot: indices, futures, the VIX pair, the 11 sectors,
+     AND the 06:00 record's opportunity / avoid tickers (Defect 3, 2026-11-16).
+     23 + at most 2 = 25 symbols, 20 per spark request: TWO external fetches
+     either way, so scoring the named tickers costs nothing. They are appended
+     here even when they are on the watchlist — the 2026-11-16 body called UNH
+     "untested, no price in this snapshot" although UNH IS a watchlist name: the
+     job fetched it and the prompt dropped it, because only ±3% movers and
+     level names were printed. Appended here rather than to the watchlist request
+     because at N=40 that one fills its two chunks exactly and a 41st name would
+     buy a third. UNAUTHENTICATED v7 — no crumb is touched; this runs in the 7am
+     hour whose crumb acquisition failed on 2026-09-02. */
   const marketSyms = [...Object.keys(SNAPSHOT_SYMBOLS), POSTOPEN_VIX3M, ...Object.keys(SECTOR_ETFS)];
+  const namedSyms  = postOpenNamedSymbols(todaySnapshot).filter(s => !marketSyms.includes(s));
   let quotes = new Map();
   try {
-    quotes = await yahooSparkQuotes(marketSyms, '3mo');
+    quotes = await yahooSparkQuotes([...marketSyms, ...namedSyms], '3mo');
   } catch (e) {
     console.error(`[cron] post-open: market spark failed — ${e.message}`);
   }
@@ -16431,134 +17165,34 @@ async function generatePostOpenRead(env) {
     });
   }
 
-  /* ── 3. Index / futures / rates / vol lines, each against its 6:00am level ── */
-  const levelLines = [];
-  for (const sym of Object.keys(SNAPSHOT_SYMBOLS)) {
-    const q = quotes.get(sym);
-    if (!q || q.price == null) continue;
-    const label = SNAPSHOT_SYMBOLS[sym];
-    const base  = baseLevels?.[sym];
-    let line = `${label} (${sym}): now ${postOpenLevel(q.price)}, ${postOpenSigned(q.changePct)}% on the day`
-             + (q.prevClose != null ? ` (prior close ${postOpenLevel(q.prevClose)})` : '');
-    if (base && base.price != null) {
-      const deltaAbs = q.price - base.price;
-      const deltaPct = base.price ? (q.price - base.price) / base.price * 100 : null;
-      line += ` | 6:00am brief had ${postOpenLevel(base.price)} (${postOpenSigned(base.changePct)}% then)`
-            + ` | since the 6:00am read: ${postOpenSigned(deltaAbs, 4)} (${postOpenSigned(deltaPct)}%)`;
-    } else {
-      line += ' | NO 6:00am level banked for this symbol';
-    }
-    levelLines.push(line);
-  }
-  if (!levelLines.length) missing.push('Yahoo index quotes (no symbol resolved)');
-
-  /* ── 4. VIX term structure, in `collectMacroState`'s sign convention ──────
-     ONE convention in this Worker, not two: vixTermSpread = VIX − VIX3M, and
-     POSITIVE = backwardation = hostile. The 6:00am record banks no VIX3M, so the
-     only honest earlier term reading is the last banked macro state — which is a
-     PRIOR SESSION's close, and is labelled as one rather than passed off as a
-     6:00am baseline. */
-  const vixNow   = quotes.get('^VIX')?.price ?? null;
-  const vix3mNow = quotes.get(POSTOPEN_VIX3M)?.price ?? null;
-  const termNow  = (vixNow != null && vix3mNow != null)
-    ? Math.round((vixNow - vix3mNow) * 100) / 100 : null;
+  /* ── 3. The other reads: the banked macro state (a PRIOR session's close —
+     the 6:00am record banks no VIX3M, so this is the only earlier term reading
+     and is labelled as one) and the earlier sector read (`market:sectors`,
+     written by the briefing's own pre-warm; its as-of is read and PRINTED, never
+     assumed to be 6:00am). ── */
   let macroState = null;
   try { macroState = await env?.REC_LOG?.get(MACRO_KEY, 'json'); } catch (_) {}
-  const termLines = [];
-  if (termNow != null) {
-    termLines.push(`VIX term structure NOW: VIX ${postOpenLevel(vixNow)} − VIX3M ${postOpenLevel(vix3mNow)} = `
-      + `${postOpenSigned(termNow)} (NEGATIVE = contango = constructive; POSITIVE = backwardation = hostile)`);
-  } else {
-    termLines.push('VIX term structure NOW: NOT AVAILABLE (one of ^VIX / ^VIX3M did not resolve)');
-    missing.push('VIX term structure (^VIX or ^VIX3M did not resolve)');
-  }
-  if (macroState && macroState.vixTermSpread != null) {
-    termLines.push(`Last BANKED macro state (a prior session’s close, as-of ${macroState.asOfClose}): `
-      + `raw term ${postOpenSigned(macroState.vixTermSpread)}, smoothed `
-      + `${postOpenSigned(macroState.vixTermSpreadSmoothed)}, regime "${macroState.state}". `
-      + 'This is NOT a 6:00am baseline and must not be described as one.');
-  } else {
-    termLines.push('No banked macro state is available, so there is no earlier term-structure reading to compare against.');
-  }
+  let sectorsBanked = null;
+  try { sectorsBanked = await env?.REC_LOG?.get(SECTORS_KV_KEY, 'json'); } catch (_) {}
 
-  /* ── 5. Sector heat ──────────────────────────────────────────────────────
-     Live from the same spark. The 6:00am briefing banks no sector levels (its
-     own pre-warm writes `market:sectors`, whose timestamp is read and PRINTED
-     below rather than assumed to be 6:00am), so this is labelled a NOW reading. */
-  const sectorLines = Object.keys(SECTOR_ETFS).map((etf) => {
-    const q = quotes.get(etf);
-    if (!q || q.changePct == null) return null;
-    return `${SECTOR_ETFS[etf]} (${etf}): ${postOpenSigned(q.changePct)}%`;
-  }).filter(Boolean);
-  if (!sectorLines.length) missing.push('sector ETF quotes');
-
-  let sectorBaseLine = 'No earlier sector snapshot is banked for today.';
-  try {
-    const banked = await env?.REC_LOG?.get(SECTORS_KV_KEY, 'json');
-    if (banked?.ts && ptDate(new Date(banked.ts)) === todayPt && Array.isArray(banked.sectors)) {
-      const parts = banked.sectors
-        .filter(s => s?.etf && s.changePct != null)
-        .map(s => `${s.etf} ${postOpenSigned(s.changePct)}%`);
-      if (parts.length) {
-        sectorBaseLine = `Earlier sector snapshot, as-of ${ptClockLabel(banked.ts)} — ${parts.join(', ')}. `
-          + 'Use that as-of verbatim; do not call it the 6:00am reading unless the as-of says 06.';
-      }
-    }
-  } catch (_) {}
-
-  /* ── 6. The watchlist: movers and key-level proximity ─────────────────────
-     ONE spark request per 20 names (2 at the live N=40), and it carries BOTH
-     answers: the day's move comes off the quote meta, and the key level is the
-     Worker's own regression channel over the same 3-month close series — the
-     SAME `swingChannel` the Watchlist tab's Swing column is decided by, so the
-     brief and the column can never disagree about where a name sits. The page
-     never re-derives that gate and neither does this prompt. */
+  /* ── 4. The watchlist — ONE spark request per 20 names (2 at N=40), carrying
+     both the day's move and the 3-month closes `swingChannel` fits. The
+     formatting and the level verdicts are in `postOpenBuildPayload`. ── */
   const tickers = await sweepUniverse(env, 'post-open read', 60);
-  const moverLines = [], levelNames = [];
-  let watchlistCount = 0;
+  let wl = new Map();
   if (!tickers) {
     missing.push('watchlist:tickers (no saved watchlist — see the EMPTY-UNIVERSE log line)');
   } else {
-    let wl = new Map();
     try {
       wl = await yahooSparkQuotes(tickers, '3mo');
     } catch (e) {
       console.error(`[cron] post-open: watchlist spark failed — ${e.message}`);
     }
-    if (!wl.size) {
-      missing.push(`Yahoo watchlist quotes (0 of ${tickers.length} names resolved)`);
-    } else {
-      watchlistCount = wl.size;
-      if (wl.size < tickers.length) {
-        missing.push(`Yahoo watchlist quotes (${wl.size} of ${tickers.length} names resolved)`);
-      }
-      for (const sym of tickers) {
-        const q = wl.get(sym);
-        if (!q || q.price == null) continue;
-        if (q.changePct != null && Math.abs(q.changePct) >= POSTOPEN_MOVE_PCT) {
-          moverLines.push(`${sym} ${q.price.toFixed(2)} ${postOpenSigned(q.changePct)}%`);
-        }
-        const sw = swingChannel(q.pairs, q.price);
-        if (sw.swingZ == null) continue;
-        const z = sw.swingZ;
-        /* THE WORDS ARE DECIDED HERE, FROM THE WORKER'S OWN GATE, and handed to
-           the model already decided. Leaving "is it through its level?" to the
-           prose is a page-side re-derivation of a Worker gate under another
-           name. */
-        const where = Math.abs(z) >= SWING_Z_THRESHOLD
-          ? (z > 0 ? 'AT OR THROUGH the upper band' : 'AT OR THROUGH the lower band')
-          : Math.abs(z) >= POSTOPEN_NEAR_Z
-            ? (z > 0 ? 'APPROACHING the upper band' : 'APPROACHING the lower band')
-            : null;
-        if (!where) continue;
-        levelNames.push(`${sym} ${q.price.toFixed(2)}: ${where} — regression fit ${sw.swingFit}, `
-          + `σ ${sw.swingSigma}, z ${postOpenSigned(z)}σ (gate ±${SWING_Z_THRESHOLD}σ, `
-          + `fit over ${SWING_REG_BARS} completed daily closes through ${sw.swingAsOf})`);
-      }
-    }
+    if (!wl.size) missing.push(`Yahoo watchlist quotes (0 of ${tickers.length} names resolved)`);
+    else if (wl.size < tickers.length) missing.push(`Yahoo watchlist quotes (${wl.size} of ${tickers.length} names resolved)`);
   }
 
-  /* ── 7. Macro calendar for today, WITH NO ACTUALS ────────────────────────
+  /* ── 5. Macro calendar for today, WITH NO ACTUALS ────────────────────────
      The Worker holds release DATES and holds no released FIGURES anywhere, for
      any series. So the calendar is passed as a schedule only, and the prompt
      says so in terms that cannot be read as an invitation to supply one. */
@@ -16566,88 +17200,23 @@ async function generatePostOpenRead(env) {
   const etDay       = etToday();
   const todayEvents = econPromptLines(econEventsBetween(etDay, etDay, fredEvents));
 
-  /* ── 8. The prompt ───────────────────────────────────────────────────────── */
+  /* ── 6. The payload, then the prompt rendered from it and from nothing else ── */
   const dateStr = new Date().toLocaleDateString('en-US', {
     weekday: 'long', month: 'long', day: 'numeric', year: 'numeric',
     timeZone: 'America/Los_Angeles',
   });
-  const baselineBlock = baseline === 'none'
-    ? 'THERE IS NO 6:00am BASELINE FOR TODAY. The pre-market briefing record for this Pacific date is '
-      + 'absent. You must say so in the body, and you must NOT compare today against any earlier day: '
-      + 'yesterday’s briefing is not a substitute for this morning’s.'
-    : [
-        `6:00am PT BRIEFING (written ${snapshot?.ts ? ptClockLabel(snapshot.ts) : 'at an unrecorded time'}, `
-          + 'BEFORE the 06:30 open):',
-        hasBaseProse ? `Headline: ${snapshot.headline || '(none)'}` : 'Headline: NOT AVAILABLE',
-        hasBaseProse ? `Open outlook: ${snapshot.open?.headline || '(none)'}` : '',
-        hasBaseProse ? `Open plan: ${snapshot.open?.body || '(none)'}` : '',
-        snapshot?.opportunity ? `Named opportunity: ${snapshot.opportunity.ticker} — ${snapshot.opportunity.reason}` : '',
-        snapshot?.avoid ? `Named avoid: ${snapshot.avoid.ticker} — ${snapshot.avoid.reason}` : '',
-        baselineParts.includes('levels') ? '' : 'NO 6:00am index levels were banked on that record, so no '
-          + 'numeric since-6:00am comparison is available for any index. Say that rather than estimating one.',
-      ].filter(Boolean).join('\n');
+  const payload = postOpenBuildPayload({
+    quotes, wlQuotes: wl, tickers, snapshot: todaySnapshot, baseLevels, hasBaseProse, baseline, baselineParts,
+    todayPt, dataAsOf, dateStr, macroState, sectorsBanked, todayEvents, missing,
+  });
+  const reconcile = postOpenReconcile(payload);
+  if (reconcile.failures.length) {
+    console.error(`[cron] !! POSTOPEN-RECONCILE !! ${reconcile.failures.length} of ${reconcile.checked} percents do not `
+      + `re-derive from their own price/prior close: ${JSON.stringify(reconcile.failures.slice(0, 5))}`);
+  }
+  const prompt = postOpenPrompt(payload);
 
-  const prompt = `You are a professional market analyst writing the POST-OPEN READ for ${dateStr}.
-It is 7:15am PT. The cash session opened at 6:30am PT, so the market has been open about 45 minutes.
-
-Every price below comes from ONE 15-minute-delayed Yahoo snapshot whose as-of is ${ptClockLabel(dataAsOf)}.
-That is the as-of for every intraday number in this briefing. There is no second sample and no tape.
-
-${baselineBlock}
-
-INDEX, FUTURES, RATES AND VOL — now, and against the 6:00am level where one was banked:
-${levelLines.join('\n') || 'NOT AVAILABLE'}
-
-VOLATILITY TERM STRUCTURE:
-${termLines.join('\n')}
-
-SECTOR HEAT NOW (SPDR sector ETFs, same snapshot and same as-of):
-${sectorLines.join('\n') || 'NOT AVAILABLE'}
-${sectorBaseLine}
-
-WATCHLIST NAMES MOVING ±${POSTOPEN_MOVE_PCT}% OR MORE ON THE DAY:
-${moverLines.join('\n') || `None of the ${watchlistCount} watchlist names resolved is moving ±${POSTOPEN_MOVE_PCT}% or more.`}
-
-WATCHLIST NAMES AT, THROUGH, OR APPROACHING THEIR KEY LEVEL:
-The level is this Worker's regression channel — an OLS fit through ${SWING_REG_BARS} completed daily
-closes, with σ the standard error of that regression. The verdict on each name below is ALREADY
-DECIDED against the ±${SWING_Z_THRESHOLD}σ gate; repeat it, do not re-judge it.
-${levelNames.join('\n') || `No watchlist name is within ${POSTOPEN_NEAR_Z}σ of its channel band.`}
-
-MACRO RELEASES SCHEDULED FOR TODAY (official Fed / BLS calendar — the ONLY source for these):
-${todayEvents || 'Nothing scheduled in the tracked calendar for today.'}
-THIS WORKER HOLDS NO RELEASED FIGURES. For any release above you may state that it was scheduled and
-nothing more. Do NOT state an actual, a consensus, a surprise, a direction, or a market reaction to it.
-
-${missing.length ? `INPUT SOURCES THAT ARE DOWN OR INCOMPLETE — name these in the body:\n${missing.map(s => `• ${s}`).join('\n')}` : 'All input sources returned data.'}
-
-WRITE the post-open read. The question it answers is: WHAT CHANGED SINCE THE 6:00am READ. Cover, in
-one paragraph and in this order:
-1. Where the indices and futures are now against the 6:00am levels — and whether the opening gap
-   HELD, FADED or EXTENDED, judged only from the two levels you were given.
-2. VIX and the term structure, and the 10Y, against 6:00am where a 6:00am level exists.
-3. Where the sector heat is concentrated now.
-4. Watchlist names moving ±${POSTOPEN_MOVE_PCT}%, and names at/through or approaching their key level.
-5. Which items of the 6:00am plan the open CONFIRMED, CONTRADICTED, or LEFT UNTESTED — and say
-   plainly when something is untested rather than forcing a verdict.
-6. Any macro release scheduled today, schedule only.
-
-HARD RULES. These are correctness constraints, not style preferences.
-A. EVERY NUMBER you write must appear in the data above, copied as given. You have no other source.
-   Do not compute a new figure, do not re-round, do not recall a level from memory. If a number you
-   want is not above, write that it is not available — never supply one.
-B. NO CLOCK TIMES AGAINST A PRICE, and no event timing. This is ONE delayed snapshot, not a tape. You
-   may write "X is above / below / through Y as of ${ptClockLabel(dataAsOf)}". You may NOT write when
-   anything happened, crossed, reversed, peaked or broke. "Broke 7,500 at 06:42" is forbidden: it is
-   not supportable from a single observation, and a reader cannot tell that it isn't.
-C. NO CONFIDENCE PERCENTAGES, no probabilities, no odds, no "70% chance".
-D. Name every source listed as down or incomplete. Do not reason around a gap with a substitute.
-E. 6 to 9 sentences. ONE paragraph. No headings, no bullets, no markdown, and no ticker list longer
-   than the names you actually discuss.
-
-Return JSON: {"body": "<the paragraph>"}`;
-
-  /* ── 9. Generate ─────────────────────────────────────────────────────────
+  /* ── 7. Generate ─────────────────────────────────────────────────────────
      `raw: true` for `stopReason`. `claudeText()` cannot tell a complete answer
      from one the token cap cut off, and a truncated paragraph stored in `body`
      renders as finished prose — a slot like this one is exactly where that
@@ -16662,38 +17231,70 @@ Return JSON: {"body": "<the paragraph>"}`;
     console.error(`[cron] post-open generation failed: ${e.message}`);
   }
 
-  const inputs = {
-    indexSymbols:   levelLines.length,
-    sectorSymbols:  sectorLines.length,
-    watchlistNames: watchlistCount,
-    movers:         moverLines.length,
-    atLevel:        levelNames.length,
-    termSpread:     termNow,
+  /* `inputs.movers` / `inputs.atLevel` ARE the `detail` array lengths — read
+     off the same arrays, so they cannot disagree; the assertion below is the
+     instrument that would say otherwise. */
+  const baseInputs = (detail) => ({
+    indexSymbols:   payload.indices.length,
+    sectorSymbols:  payload.sectors.length,
+    watchlistNames: payload.watchlist.counts.names,
+    movers:         detail.movers.length,
+    atLevel:        detail.levels.length,
+    termSpread:     payload.term.spread,
     scheduledReleasesToday: todayEvents ? todayEvents.split('\n').length : 0,
     stopReason,
-  };
+    namedTickers:   payload.named.map(n => ({ role: n.role, ticker: n.ticker, source: n.source, onWatchlist: n.onWatchlist })),
+    planItems:      payload.plan.length,
+    reconcile:      { checked: reconcile.checked, failures: reconcile.failures.length },
+  });
 
   if (stopReason === 'max_tokens') {
     /* NOT STORED AS `body`. A cut-off paragraph is indistinguishable from a
        finished one once it is in the slot, and this slot's consumer renders it
        as prose. The answer is discarded and the record says why. */
+    const detail = postOpenDetail(payload, null, 'not scored: the answer was truncated and discarded');
     return store({
       body: 'No post-open read for today. The model’s answer hit the token cap and was cut off mid-sentence, '
         + 'so it has been discarded rather than stored as a finished paragraph. Nothing here is a reading of '
         + 'today’s open. The 7:30am PT firing retries.',
       complete: false, baseline, baselineParts, dataAsOf,
-      phase: 'truncated', reason: 'answer-truncated', inputs,
+      phase: 'truncated', reason: 'answer-truncated', inputs: baseInputs(detail), detail,
     });
   }
 
   const body = typeof answer?.body === 'string' ? answer.body.trim() : '';
   if (!body) {
+    const detail = postOpenDetail(payload, null, 'not scored: no narrative was generated');
     return store({
       body: 'No post-open read for today. The 7:15am PT job did not get a usable narrative back from the '
         + 'model. Nothing here is a reading of today’s open. The 7:30am PT firing retries.',
       complete: false, baseline, baselineParts, dataAsOf,
-      phase: 'generation-failed', reason: 'no-narrative', inputs,
+      phase: 'generation-failed', reason: 'no-narrative', inputs: baseInputs(detail), detail,
     });
+  }
+
+  /* ── 8. The audit — RECORDS ONLY. It changes neither `complete` nor `phase`:
+     the provenance check is new and its false-positive rate is unmeasured, so a
+     week of live runs has to show it before anything gates on it. ── */
+  const audit  = postOpenAudit(body, answer?.plan, payload);
+  const detail = postOpenDetail(payload, answer?.plan);
+  const inputs = {
+    ...baseInputs(detail),
+    bodyChars:            audit.bodyChars,
+    bodySentences:        audit.bodySentences,
+    unsourcedNumbers:     audit.unsourcedNumbers,
+    planUnsourcedNumbers: audit.planUnsourcedNumbers,
+    style:                audit.style,
+    foldCheck:            audit.foldCheck,
+    planCheck:            audit.planCheck,
+  };
+  if (inputs.movers !== detail.movers.length || inputs.atLevel !== detail.levels.length) {
+    console.error(`[cron] !! POSTOPEN-INVARIANT !! inputs.movers ${inputs.movers} / detail ${detail.movers.length}, `
+      + `inputs.atLevel ${inputs.atLevel} / detail ${detail.levels.length}`);
+  }
+  if (audit.unsourcedNumbers.length || audit.planUnsourcedNumbers.length) {
+    console.warn(`[cron] post-open: unsourced numbers (recorded, not gating) — body ${JSON.stringify(audit.unsourcedNumbers)}`
+      + ` · plan ${JSON.stringify(audit.planUnsourcedNumbers)}`);
   }
 
   /* A DOWN SOURCE DOES NOT SUPPRESS THE NARRATIVE, IT FLAGS IT. The prompt
@@ -16706,9 +17307,14 @@ Return JSON: {"body": "<the paragraph>"}`;
     baseline, baselineParts, dataAsOf,
     phase: missing.length ? 'degraded' : 'complete',
     reason: missing.length ? `inputs-missing: ${missing.join('; ')}` : null,
-    inputs,
+    inputs, detail,
   });
 }
+
+/* Named FUNCTION exports for the post-open checks — every named export must be
+   a function or workerd refuses to boot. */
+export { postOpenQuote, postOpenPct, postOpenPlanItems, postOpenBuildPayload, postOpenPrompt, postOpenSentences,
+         postOpenTokens, postOpenProvenance, postOpenAudit, postOpenReconcile, postOpenDetail, postOpenNamedSymbols };
 
 /* ── Sector Updates ── */
 const SECTORS_KV_KEY = 'market:sectors';

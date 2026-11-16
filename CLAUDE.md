@@ -313,22 +313,25 @@ sends `Origin: null`, which the Worker rejects along with every other absent ori
 Serve over http locally (`npx http-server -p 8123`); `http://localhost:*` and
 `http://127.0.0.1:*` are allowlisted.
 
-There is no build step. **Eighteen check scripts** (`*.check.mjs`) cover `worker.js`.
+There is no build step. **Nineteen check scripts** (`*.check.mjs`) cover `worker.js`.
 Every one **prints computed vs expected** rather than asserting, and extracts what it
 tests **from `worker.js` by source**, because every named export there must be a
 function or `workerd` refuses to boot. **`longarch` and `printtape` also IMPORT the
 default export**, which is the ES-module parse `node --check` cannot perform.
+**`postopen` imports NAMED function exports** and installs its fetch stub and fixed
+`Date` BEFORE the import, because INSTR captures `globalThis.fetch` at module load.
 
 Floors (each script's `minComparisons`): **138 / 31 / 28 / 35 / 13 / 30 / 70 / 36 / 67 /
-144 / 287 / 87 / 113 / 138 / 80 / 235 / 246 / 862** for moves / long-fixtures / cron-gate
-/ instr-bindings / bs-delta / nd2 / lane-e / lane-f / sweep-universe / macro / mood /
-swing / earnings-timing / daily-slots / analysis-shape / top3 / longarch / printtape —
-**2,640** (printtape 543 → 862 on 2026-09-03, the two-gate restructure; daily-slots
-55 → 138 and longarch 241 → 246 on 2026-11-13, the post-open slot). A full run on
-2026-11-13 observed **2,717, 1 failing** — the failure is `earnings-timing`'s live-tape
+144 / 287 / 87 / 113 / 139 / 80 / 235 / 246 / 862 / 234** for moves / long-fixtures /
+cron-gate / instr-bindings / bs-delta / nd2 / lane-e / lane-f / sweep-universe / macro /
+mood / swing / earnings-timing / daily-slots / analysis-shape / top3 / longarch /
+printtape / postopen — **2,875** (printtape 543 → 862 on 2026-09-03, the two-gate
+restructure; daily-slots 55 → 138 and longarch 241 → 246 on 2026-11-13, the post-open
+slot; postopen 234 new and daily-slots 138 → 139 on 2026-11-16, the post-open defects —
+`postopen` is offline on a fixed clock, so its floor IS its fixed count). A full run on
+2026-11-16 observed **2,952, 1 failing** — the failure is `earnings-timing`'s live-tape
 section (`anchored entries 8/40 = 20.0%` against an >80% expectation, a property of
-Yahoo's payload that morning, not of the code) and it was present before that day's
-changes too. **CORRECTED 2026-11-13: four of these numbers were OBSERVED totals, not
+Yahoo's payload that morning, not of the code), identical before that day's changes. **CORRECTED 2026-11-13: four of these numbers were OBSERVED totals, not
 floors** — swing 91/87, daily-slots 68/55, analysis-shape 99/80, top3 240/235, which is
 why the stated sum was 2,593 against a real floor sum of 2,552. The list is now read
 from each file's `minComparisons`; re-derive it the same way rather than transcribing a
@@ -341,7 +344,9 @@ either to an observed total.**
 and **`postopen.verify.mjs` / `postopen.crosscheck.mjs` are a twentieth and twenty-first
 for the same reason**: both hit the live tape and the live clock, so neither can be a
 gate. `postopen.verify.mjs` drives the real `scheduled()` at a chosen PT instant and
-prints the whole record plus the prompt; `postopen.crosscheck.mjs` re-reads the same
+prints the whole record plus the prompt — **its `_instr` OMITS the Anthropic call**, which
+it answers above the INSTR wrapper, so its `extFetches` is Yahoo only (that is how the
+2026-11-13 "ext 3, capCost 10" figure undercounted); `postopen.crosscheck.mjs` re-reads the same
 quantities from `v8/finance/chart` and recomputes the regression channel from a SECOND
 implementation, so the numbers are checked against something other than the code that
 produced them.
@@ -409,6 +414,16 @@ endpoints, the KV key/TTL table and the cron schedule are in `worker-internals`.
   wrong. None was — two decimals is lossy on a quantity trading in thousandths.
   `postOpenLevel()` is 4dp with trailing zeros trimmed, so 7521.83 is unchanged and
   5.127 reconciles
+- **…AND FROM 2026-11-16 THE POST-OPEN PROMPT CARRIES NO VENDOR PERCENTAGE AT ALL.**
+  Precision was not the whole defect: the 07:15 body printed *"VIX is 21.48, +11.36%"*
+  beside a 19.3 prior close (= +11.30%), and a live probe that morning found Yahoo's
+  `regularMarketChangePercent` off its own printed price and prior close by > 0.005 pt
+  on **4 of 63** symbols (^VIX, SI=F, SMR, CEG — up to 0.175 pt). **Every percent handed
+  to the model is derived by `postOpenPct` from the exact price and prior close printed
+  beside it** (4dp levels, 2dp percent), for every index, future, sector, watchlist and
+  named symbol; `vendorChangePct` survives on the quote for diagnosis and never reaches
+  the prompt. `postOpenReconcile` re-derives all of them and records failures above
+  `POSTOPEN_RECONCILE_TOL` (0.005); `postopen.check.mjs` §1 fails on one
 
 **KV records**
 
@@ -433,7 +448,28 @@ endpoints, the KV key/TTL table and the cron schedule are in `worker-internals`.
   which session it describes — and the refusal fires BEFORE the Claude call, so it costs
   nothing. `baseline` is `'06:00'` or `'none'`; `'none'` means today's briefing record
   was absent and the body must say so rather than compare against yesterday. A down
-  source is NAMED in the body with `complete: false`, never replaced by a fallback
+  source is NAMED in the body with `complete: false`, never replaced by a fallback.
+  **`detail{}` (2026-11-16, ADDITIVE — schema stays 1, no field renamed)**:
+  `{ movers:[{ticker,changePct}], levels:[{ticker,price,z,state}], plan:[{id,kind,item,
+  claim,verdict,evidence}] }`, absent only on the two no-data refusals.
+  `inputs.movers`/`inputs.atLevel` ARE `detail.movers.length`/`detail.levels.length`. A
+  plan item the model did not score has `verdict: null`, **never a defaulted
+  `'untested'`** — "not scored" and "judged untestable" are different facts
+- **THE PLAN IS WHAT THE 06:00 RECORD SAYS, ITEM BY ITEM.** `postOpenPlanItems` extracts
+  the list mechanically (tape expectations, levels named with a level word, sectors
+  named, opportunity, avoid) from `headline`/`open`/`opportunity`/`avoid` and nothing
+  else; the model returns exactly one verdict per id. The 2026-11-16 body scored
+  "financials and energy" as a contradicted plan item the 06:00 text never named — that
+  came from the **06:03 sector read**, which is a separate source, labelled "since the
+  06:03 sector read", and never a plan item
+- **`inputs.unsourcedNumbers` IS RECORD-ONLY.** `postOpenAudit` checks every numeric token
+  in the body against the DATA half of the rendered prompt (not the payload object, which
+  carries the unprompted vendor percent) plus an explicit allowlist (dates, the as-of and
+  session clocks, gate constants). It changes neither `complete` nor `phase` until a week
+  of live runs shows its false-positive rate. **Blind spot: it compares magnitudes, so a
+  sign-flipped payload number passes.** Length/sentence/style limits are likewise
+  recorded (`bodyChars`, `bodySentences`, `style`), never refused. **A sentence that
+  starts with a digit does not split in the consumer's fold** (`/(?<=[.!?])\s+(?=[A-Z"'])/`)
 - **`analysis:{TICKER}`: never read the key directly — go through
   `readAnalysisRecord()`**, or a legacy record reads as unanalysed and re-spends. Core
   `rating · confidence · recommendation · drivers[] · summary`; `factors{}`/`thesis` are
@@ -512,7 +548,11 @@ endpoints, the KV key/TTL table and the cron schedule are in `worker-internals`.
   `[cron]` line (`branch=morning-rows + post-open-read`), so a missing read is
   falsifiable. **It shares the invocation with morning-rows' ~800-capCost sweep, so no
   per-job `_instr` from a normal firing is a measurement** — quote the derivation,
-  `ceil(23/20) + ceil(N/20) + 1` external and 6–8 bindings = **capCost 10–11** at N=40.
+  `ceil((23+K)/20) + ceil(N/20) + 1` external (K ≤ 2 named tickers, so always 2 for the
+  market half) and 7–8 bindings = **capCost 12–13 at N=40** (live 2026-11-16 ran ALONE —
+  morning-rows had already deduped, `invocationCapCost` 12 = `capCost` 12 — at ext 5 ·
+  bind 7) and **13–14 at the 60-name `sweepUniverse` cap** —
+  0.14% of the 10,000. The 2026-11-13 "capCost 10–11" omitted the Anthropic call.
   **It touches NO crumb**: both spark pulls are the unauthenticated v7 endpoint, chosen
   deliberately because this is the hour whose crumb acquisition failed on 2026-09-02
 - `longarch:{TICKER}:{PT-DATE}:{SLOT}` is written by the **cron sweeps only** — a

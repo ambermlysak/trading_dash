@@ -364,7 +364,10 @@ side, because the comparison is the product.
 **`dashboard.html` does NOT render `postOpen{}` yet** — this is Worker-side only, and
 the field is inert on the existing render path (verified differentially: the real
 `loadDailySnapshot` produces byte-identical DOM across 20 elements × 4 properties with
-and without the field). The consumer is decision_dash. **That is the normal direction
+and without the field). The consumer is decision_dash — whose DEPLOYED build, read
+2026-11-16, does not reference `postOpen` either; a differential render of its real
+`BRIEF_SLOTS` + `briefCard` and of this repo's `loadDailySnapshot` over `/daily` with and
+without `postOpen.detail` gave **20 comparisons, 0 differences**. **That is the normal direction
 here reversed** — usually the frontend ships ahead of the Worker — so the Worker-side
 state to render is "present but unrendered", not "expected but missing".
 
@@ -372,6 +375,62 @@ state to render is "present but unrendered", not "expected but missing".
 REFUSAL or a degraded reading, and the body says which; an ABSENT `postOpen` means the
 job has not run (before 7:15am PT, or on a non-trading day). `baseline: 'none'` is a
 third: the read ran, and today's 6:00am record was not there to compare against.
+
+**The slot as built, after the 2026-11-16 defects (schema still 1 — every change is
+ADDITIVE):**
+
+```
+postOpen {
+  schema: 1, body, ts, dataAsOf, complete, baseline, ptDate, reason,
+  inputs {
+    baselineParts, missingSources, indexSymbols, sectorSymbols, watchlistNames,
+    movers, atLevel, termSpread, scheduledReleasesToday, stopReason,      ← as 345f9c3
+    namedTickers[{role,ticker,source,onWatchlist}], planItems,
+    reconcile{checked,failures},                                           ← every run with data
+    bodyChars, bodySentences, unsourcedNumbers[], planUnsourcedNumbers[],
+    style{overLimits{chars,sentences,longSentences[]}, allCaps[], firstPerson[],
+          clockTimes[], moversNamedBeyondTop[], levelNamesNamed},
+    foldCheck{s1Gap,s2Vol,s3Plan}, planCheck{expected,returned,missing[],added[],
+          duplicated[],invalidVerdicts[]}                                  ← complete/degraded only
+  },
+  detail {                                                                 ← absent on the 2 no-data refusals
+    movers [{ticker, changePct}],                  sorted by |changePct|
+    levels [{ticker, price, z, state}],            state ∈ at-through-lower | approaching-lower
+                                                         | approaching-upper | at-through-upper
+    plan   [{id, kind, item, claim, verdict, evidence}]   verdict ∈ confirmed | contradicted
+                                                          | untested | null (= not scored)
+  },
+  _instr
+}
+```
+
+**What the model is handed is built by one pure function, `postOpenBuildPayload`, and
+the prompt is rendered from it by `postOpenPrompt`** — so a check replays a banked
+morning through the real code (`postopen.check.mjs`, against the real 2026-11-16
+records in `fixtures/`). Four rules it enforces:
+
+- **Every percent is derived from the price and prior close printed beside it**, never
+  Yahoo's `regularMarketChangePercent` (off its own printed numbers by up to 0.175 pt on
+  4 of 63 symbols in a 2026-11-16 probe). Every delta the prose may state — since 06:00,
+  since the sector read, distance to a plan level, a named ticker against the S&P — is
+  precomputed, so the model does no arithmetic.
+- **The plan is a list extracted from the 06:00 record** (`postOpenPlanItems`), and the
+  answer schema returns one verdict per id. The earlier sector snapshot
+  (`market:sectors`, 06:03 on 2026-11-16) is a separate source and never a plan item.
+- **The opportunity and avoid tickers are always quoted**, appended to the market spark
+  (23 → ≤25 symbols, still 2 requests). On 2026-11-16 the body called UNH "untested — no
+  UNH price in this snapshot" although UNH is on the watchlist: the job fetched it and
+  the old prompt printed only ±3% movers and level names.
+- **Prose limits are in the prompt and measured on the answer, never refused**: 6–9
+  sentences of ≤ 40 words, ≤ ~1,400 chars, the first three fixed (gap / vol / plan
+  scorecard) because decision_dash folds a brief after its third sentence, movers as
+  count + theme + top five, levels as counts + ≤ 3 names, no ALL-CAPS emphasis, no first
+  person, no clock time beside a price but the as-of. The first live body was 2,739
+  chars in 8 sentences.
+
+**Cost**: `ceil((23+K)/20) + ceil(N/20) + 1` external (K ≤ 2) and 7–8 bindings —
+**capCost 12–13 at N=40** (measured live 2026-11-16, running alone: ext 5 · bind 7 ·
+12) and **13–14 at the 60-name cap**, 0.14% of the 10,000 per-invocation limit.
 
 ## Design note: overlapping windows and the proxy-vs-thing failure
 

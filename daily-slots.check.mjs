@@ -518,8 +518,15 @@ console.log('\n== 10. THE POST-OPEN SLOT - its clock, its gates, its refusals ==
       /ts: Date\.now\(\)/.test(genCode) && !/ts: 0/.test(genCode), true);
   row('10e uses the unauthenticated spark, not a crumb path',
       /yahooSparkQuotes\(/.test(gen) && !/yahooAuth\(/.test(gen), true);
+  /* Since 2026-11-16 the level verdicts are decided in the PURE payload builder
+     the generator calls, so a check can replay a banked morning through it. The
+     property is unchanged: the SAME swingChannel as the Swing column, never a
+     re-derivation — and the generator must actually route through the builder. */
+  const builder = grab('postOpenBuildPayload');
   row('10e reuses swingChannel rather than re-deriving a level',
-      /swingChannel\(q\.pairs, q\.price\)/.test(gen), true);
+      /swingChannel\(q\.pairs, q\.price[,)]/.test(builder), true);
+  row('10e ...and the generator builds its prompt through it',
+      /postOpenBuildPayload\(\{/.test(gen) && /postOpenPrompt\(payload\)/.test(gen), true);
 
   // (f) THE 6:00am WRITER BANKS THE LEVELS the post-open read compares against.
   //     Without this the comparison is unanswerable, and the tempting wrong
@@ -552,5 +559,5 @@ console.log('\n== 10. THE POST-OPEN SLOT - its clock, its gates, its refusals ==
 }
 
 process.exit(reportVerdict({
-  label: 'daily slot merge', comparisons: t.comparisons, failures: t.failures, minComparisons: 138,
+  label: 'daily slot merge', comparisons: t.comparisons, failures: t.failures, minComparisons: 139,
 }));

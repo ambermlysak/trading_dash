@@ -94,11 +94,15 @@ function mechanicalAnswer(prompt) {
   const line = (re) => (prompt.match(re) || [])[0] || '';
   return '[STUB ANSWER — not a model] '
     + line(/S&P 500 \(\^GSPC\): [^\n|]+/) + ' // '
-    + line(/VIX term structure NOW: [^\n]+/) + ' // '
+    + line(/VIX [\d.]+ − VIX3M [^\n]+/) + ' // '
     + 'This paragraph was assembled mechanically by postopen.verify.mjs and is not a reading of anything.';
 }
 function stubText(prompt) {
-  if (/POST-OPEN READ/.test(prompt))        return JSON.stringify({ body: mechanicalAnswer(prompt) });
+  /* Since 2026-11-16 the answer also carries one verdict per PLAN ITEM. The stub
+     returns `untested` for each id it finds in the prompt — mechanically, so the
+     record's `detail.plan` and `inputs.planCheck` paths are exercised. */
+  if (/POST-OPEN READ/.test(prompt))        return JSON.stringify({ body: mechanicalAnswer(prompt),
+    plan: [...prompt.matchAll(/^(P\d+) \[/gm)].map(m => ({ id: m[1], verdict: 'untested', evidence: '[STUB]' })) });
   if (/morning market briefing/.test(prompt)) return JSON.stringify({
     headline: '[STUB] re-run briefing',
     open: { headline: '[STUB] open', body: '[STUB] open body' },

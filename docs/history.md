@@ -26,6 +26,7 @@ Where to look for the other halves of the record:
 
 ## Contents
 
+- [The first live post-open read — five defects, 2026-11-16](#the-first-live-post-open-read-five-defects-2026-11-16) *(newest, placed first)*
 - [Rule 1 — fan-out, `capCost`, and the `_instr` contamination rule](#rule-1-fan-out-capcost-and-the-_instr-contamination-rule)
 - [Rule 2 — the `1-5` day-of-week failure](#rule-2-the-1-5-day-of-week-failure)
 - [Rule 2 — why the UTC range widened 13-22 → 12-22 on 2026-09-01](#rule-2-why-the-utc-range-widened-13-22-→-12-22-on-2026-09-01)
@@ -57,6 +58,53 @@ Where to look for the other halves of the record:
 - [Appendix — the pre-compaction wording of the rules that stayed](#appendix-the-pre-compaction-wording-of-the-rules-that-stayed)
 
 ---
+
+## The first live post-open read — five defects, 2026-11-16
+
+The 07:15 PT slot (345f9c3) ran live for the first time on Monday 2026-11-16: `ts` 07:16:10,
+`dataAsOf` 07:15:50, complete, baseline `06:00` with both parts, 40 names, 21 movers, 11 at a
+level, ext 5 · bind 7 · capCost 12. The real records are banked as `fixtures/postopen-2026-11-16.*`.
+
+**1 — a percent that did not reconcile.** *"VIX is 21.48, +11.36%"* beside a 19.3 prior close
+(+11.30%). The prompt printed Yahoo's `regularMarketChangePercent` beside OUR `pairs[n-2]` close —
+two sources in one line. The 07:15 quote itself is not recoverable (the record keeps none; 1-minute
+bars reproduced 0 of 10 printed levels), but a live probe at 08:47 PT found the vendor figure off its
+own printed price/prior close by > 0.005 pt on **4 of 63** symbols — ^VIX 0.013, SI=F 0.175, SMR
+0.017, CEG 0.151 — while every other symbol agreed to 4dp. Not a rounding defect on our side and not
+VIX-specific. Fix: every prompted percent is derived from the printed numbers (`postOpenPct`).
+
+**2 — a plan item the plan never stated.** The body scored "the value cushion from financials and
+energy" as CONTRADICTED. The 06:00 text named healthcare, staples and industrials; the
+financials/energy observation was the 06:03 `market:sectors` read. Industrials was never scored.
+Fix: `postOpenPlanItems` extracts the list mechanically; one verdict per id. Today's list is ten
+items: open outlook, the "expect a jumpy tape" sentence, levels 7500 and 7450, XLK/XLV/XLP/XLI,
+UNH, APLD. The synthetic second day in `postopen.check.mjs` §2 caught a real extractor bug before
+commit: a clause split on the comma inside "7,650" attached "resistance" to the "7612" before it.
+
+**3 — the named opportunity could not be scored. THE BRIEF'S DIAGNOSIS WAS WRONG.** The task said
+UNH was off-watchlist and never fetched. UNH IS on the 2026-11-16 watchlist; the job fetched it and
+the prompt dropped it, because it printed only ±3% movers and level names (UNH was +0.8%, inside its
+channel). Fix: opportunity/avoid are appended to the market spark (23 → 25 symbols, still 2 requests,
+**0 added fetches**) and printed with their quote and their spread against the S&P.
+
+**4 — too dense to read.** 2,739 chars, 8 sentences by the consumer's splitter, all 21 movers listed,
+ALL-CAPS emphasis, "I cannot score it". Fix: limits in the prompt, measured after; lists moved to
+`detail{}`. Found while testing: **a sentence that starts with a digit does not split** in the
+consumer's fold (`/(?<=[.!?])\s+(?=[A-Z"'])/`), so "…−2.57%. 22 names…" renders as one sentence; the
+prompt now forbids digit-led sentences.
+
+**5 — provenance asserted, never checked.** Fix: `postOpenAudit` tokenises the body and checks every
+number against the DATA half of the rendered prompt plus an allowlist. Against the real 07:15 body
+replayed through the new payload: **101 tokens, 100 matched, 1 unmatched: `+11.36`** — Defect 1.
+RECORD-ONLY until a week of live runs shows its false-positive rate.
+
+**The budget figure was wrong twice.** Docs said capCost 10–11 at N=40 from a dev run that used a
+15-name fixture AND a harness (`postopen.verify.mjs`) that answers Anthropic above the INSTR wrapper,
+so the Claude call was never counted. Live: 12 at N=40; 13–14 at the 60-name cap.
+
+**Not verified at commit time:** no `.dev.vars`/Anthropic key on this machine, so the new prompt has
+not produced a single real body. The prose limits, plan coverage and provenance rate are unverified
+until the first live 07:15 run after deploy.
 
 ## Rule 1 — fan-out, `capCost`, and the `_instr` contamination rule
 
